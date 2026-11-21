@@ -269,12 +269,13 @@ impl HttpHeaders {
     }
 }
 
-/// Standard HTTP Content-Encoding types.
+/// Standard HTTP Content-Encoding types (RFC 7230 / RFC 7694).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentEncoding {
     Identity,
     Gzip,
     Deflate,
+    Brotli,
     Other(String),
 }
 
@@ -284,6 +285,7 @@ impl ContentEncoding {
             ContentEncoding::Identity => "identity",
             ContentEncoding::Gzip => "gzip",
             ContentEncoding::Deflate => "deflate",
+            ContentEncoding::Brotli => "br",
             ContentEncoding::Other(s) => s.as_str(),
         }
     }
@@ -294,6 +296,8 @@ impl ContentEncoding {
             ContentEncoding::Gzip
         } else if lower.contains("deflate") {
             ContentEncoding::Deflate
+        } else if lower.contains("br") || lower.contains("brotli") {
+            ContentEncoding::Brotli
         } else if lower.contains("identity") || lower.trim().is_empty() {
             ContentEncoding::Identity
         } else {
@@ -491,6 +495,118 @@ pub fn decompress_gzip(gz: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     Ok(decompressed)
+}
+
+/// Compress arbitrary byte payload into RFC 7932 / RFC 7694 Brotli uncompressed meta-blocks (Content-Encoding: br).
+pub fn compress_brotli(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        return vec![0x3B];
+    }
+    const CHUNK_SIZE: usize = 32768;
+    let mut out = Vec::new();
+    let total = data.len();
+    let mut pos = 0;
+    let mut first = true;
+    while pos < total {
+        let mut chunk_len = total - pos;
+        if chunk_len > CHUNK_SIZE {
+            chunk_len = CHUNK_SIZE;
+        }
+        let chunk = &data[pos..pos + chunk_len];
+        pos += chunk_len;
+        let n = chunk.len();
+        if first {
+            // First meta-block with WBITS=22:
+            // bits 0..3: 1101 (WBITS), bit 4: ISLAST (0), bits 5..6: MNIBBLES (00)
+            // bits 7..22: n - 1 (16-bit int), bit 23: ISUNCOMPRESSED (1)
+            let val = 0x0B | (((n - 1) as u32) << 7) | (1 << 23);
+            out.extend_from_slice(&val.to_le_bytes()[..3]);
+            out.extend_from_slice(chunk);
+            first = false;
+        } else {
+            // Subsequent meta-blocks without WBITS:
+            // bit 0: ISLAST (0), bits 1..2: MNIBBLES (00), bits 3..18: n - 1 (16-bit int), bit 19: ISUNCOMPRESSED (1)
+            let val = (((n - 1) as u32) << 3) | (1 << 19);
+            out.extend_from_slice(&val.to_le_bytes()[..3]);
+            out.extend_from_slice(chunk);
+        }
+    }
+    // Terminating empty meta-block (ISLAST = 1, ISLASTEMPTY = 1) -> 0x03
+    out.push(0x03);
+    out
+}
+
+/// Decompress an RFC 7932 / RFC 7694 Brotli stream containing uncompressed meta-blocks.
+pub fn decompress_brotli(compressed: &[u8]) -> Result<Vec<u8>, String> {
+    if compressed.is_empty() {
+        return Err("Brotli stream is empty".to_string());
+    }
+    if compressed == [0x3B] {
+        return Ok(Vec::new());
+    }
+    let comp_len = compressed.len();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    let mut first = true;
+
+    while pos < comp_len {
+        if first {
+            if pos + 3 > comp_len {
+                return Err("Incomplete brotli stream header".to_string());
+            }
+            let val = (compressed[pos] as u32)
+                | ((compressed[pos + 1] as u32) << 8)
+                | ((compressed[pos + 2] as u32) << 16);
+            pos += 3;
+            let is_last = (val >> 4) & 1;
+            let n = (((val >> 7) & 0xFFFF) as usize) + 1;
+            let is_uncompressed = (val >> 23) & 1;
+            if is_uncompressed != 1 {
+                return Err(
+                    "Unsupported compressed brotli block (expected uncompressed meta-block)"
+                        .to_string(),
+                );
+            }
+            if pos + n > comp_len {
+                return Err("Brotli meta-block data truncated".to_string());
+            }
+            out.extend_from_slice(&compressed[pos..pos + n]);
+            pos += n;
+            first = false;
+            if is_last == 1 {
+                break;
+            }
+        } else {
+            if pos >= comp_len {
+                break;
+            }
+            if compressed[pos..] == [0x03] {
+                break;
+            }
+            if pos + 3 > comp_len {
+                return Err("Incomplete subsequent brotli header".to_string());
+            }
+            let val = (compressed[pos] as u32)
+                | ((compressed[pos + 1] as u32) << 8)
+                | ((compressed[pos + 2] as u32) << 16);
+            pos += 3;
+            let is_last = val & 1;
+            let n = (((val >> 3) & 0xFFFF) as usize) + 1;
+            let is_uncompressed = (val >> 19) & 1;
+            if is_uncompressed != 1 {
+                return Err("Unsupported compressed brotli block".to_string());
+            }
+            if pos + n > comp_len {
+                return Err("Brotli meta-block data truncated".to_string());
+            }
+            out.extend_from_slice(&compressed[pos..pos + n]);
+            pos += n;
+            if is_last == 1 {
+                break;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Streaming Gzip encoder that produces RFC 1952 byte stream chunks on the fly.
@@ -798,6 +914,215 @@ impl GzipStreamDecoder {
     }
 }
 
+/// Streaming Deflate decoder that accepts chunks of an RFC 1951 deflate byte stream
+/// containing uncompressed blocks (BTYPE 00) and produces decompressed bytes incrementally.
+#[derive(Debug, Clone)]
+pub struct DeflateStreamDecoder {
+    buffer: Vec<u8>,
+    finished: bool,
+}
+
+impl Default for DeflateStreamDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeflateStreamDecoder {
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            finished: false,
+        }
+    }
+
+    /// Feed compressed bytes into the decoder and return any newly decompressed data.
+    pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<u8>, String> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        self.buffer.extend_from_slice(chunk);
+        let mut decompressed_out = Vec::new();
+
+        while self.buffer.len() >= 5 {
+            let header = self.buffer[0];
+            let is_final = header & 1;
+            let btype = (header >> 1) & 3;
+            if btype != 0 {
+                return Err(format!(
+                    "Unsupported deflate compression block type: {}",
+                    btype
+                ));
+            }
+            let len = (self.buffer[1] as usize) | ((self.buffer[2] as usize) << 8);
+            let nlen = (self.buffer[3] as usize) | ((self.buffer[4] as usize) << 8);
+            if (len ^ nlen) != 0xFFFF {
+                return Err("Corrupted uncompressed block length integrity".to_string());
+            }
+            if self.buffer.len() < 5 + len {
+                break;
+            }
+            decompressed_out.extend_from_slice(&self.buffer[5..5 + len]);
+            self.buffer.drain(..5 + len);
+            if is_final == 1 {
+                self.finished = true;
+                break;
+            }
+        }
+        Ok(decompressed_out)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+}
+
+/// Streaming Brotli decoder that accepts chunks of an RFC 7932 / RFC 7694 Brotli byte stream
+/// containing uncompressed meta-blocks and produces decompressed bytes incrementally.
+#[derive(Debug, Clone)]
+pub struct BrotliStreamDecoder {
+    buffer: Vec<u8>,
+    first_block: bool,
+    finished: bool,
+}
+
+impl Default for BrotliStreamDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BrotliStreamDecoder {
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            first_block: true,
+            finished: false,
+        }
+    }
+
+    /// Feed compressed bytes into the decoder and return any newly decompressed data.
+    pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<u8>, String> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        self.buffer.extend_from_slice(chunk);
+        let mut decompressed_out = Vec::new();
+
+        while !self.buffer.is_empty() {
+            if self.buffer == [0x3B] {
+                self.buffer.clear();
+                self.finished = true;
+                break;
+            }
+            if !self.first_block && self.buffer == [0x03] {
+                self.buffer.clear();
+                self.finished = true;
+                break;
+            }
+            if self.first_block {
+                if self.buffer.len() < 3 {
+                    break;
+                }
+                let val = (self.buffer[0] as u32)
+                    | ((self.buffer[1] as u32) << 8)
+                    | ((self.buffer[2] as u32) << 16);
+                let is_last = (val >> 4) & 1;
+                let n = (((val >> 7) & 0xFFFF) as usize) + 1;
+                let is_uncompressed = (val >> 23) & 1;
+                if is_uncompressed != 1 {
+                    return Err(
+                        "Unsupported compressed brotli block (expected uncompressed meta-block)"
+                            .to_string(),
+                    );
+                }
+                if self.buffer.len() < 3 + n {
+                    break;
+                }
+                decompressed_out.extend_from_slice(&self.buffer[3..3 + n]);
+                self.buffer.drain(..3 + n);
+                self.first_block = false;
+                if is_last == 1 {
+                    self.finished = true;
+                    break;
+                }
+            } else {
+                if self.buffer.len() < 3 {
+                    if self.buffer == [0x03] {
+                        self.buffer.clear();
+                        self.finished = true;
+                    }
+                    break;
+                }
+                let val = (self.buffer[0] as u32)
+                    | ((self.buffer[1] as u32) << 8)
+                    | ((self.buffer[2] as u32) << 16);
+                let is_last = val & 1;
+                let n = (((val >> 3) & 0xFFFF) as usize) + 1;
+                let is_uncompressed = (val >> 19) & 1;
+                if is_uncompressed != 1 {
+                    return Err("Unsupported compressed brotli block".to_string());
+                }
+                if self.buffer.len() < 3 + n {
+                    break;
+                }
+                decompressed_out.extend_from_slice(&self.buffer[3..3 + n]);
+                self.buffer.drain(..3 + n);
+                if is_last == 1 {
+                    self.finished = true;
+                    break;
+                }
+            }
+        }
+        Ok(decompressed_out)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+}
+
+/// Unified streaming content-encoding decoder supporting RFC 1952 Gzip, RFC 1951 Deflate,
+/// and RFC 7932 / RFC 7694 Brotli.
+#[derive(Debug, Clone)]
+pub enum HttpContentDecoder {
+    Gzip(GzipStreamDecoder),
+    Deflate(DeflateStreamDecoder),
+    Brotli(BrotliStreamDecoder),
+}
+
+impl HttpContentDecoder {
+    /// Construct a streaming decoder for the specified ContentEncoding, or None if Identity/unsupported.
+    pub fn for_encoding(encoding: ContentEncoding) -> Option<Self> {
+        match encoding {
+            ContentEncoding::Gzip => Some(HttpContentDecoder::Gzip(GzipStreamDecoder::new())),
+            ContentEncoding::Deflate => {
+                Some(HttpContentDecoder::Deflate(DeflateStreamDecoder::new()))
+            }
+            ContentEncoding::Brotli => Some(HttpContentDecoder::Brotli(BrotliStreamDecoder::new())),
+            _ => None,
+        }
+    }
+
+    /// Feed compressed bytes into the decoder and return any newly decompressed data.
+    pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<u8>, String> {
+        match self {
+            HttpContentDecoder::Gzip(d) => d.feed(chunk),
+            HttpContentDecoder::Deflate(d) => d.feed(chunk),
+            HttpContentDecoder::Brotli(d) => d.feed(chunk),
+        }
+    }
+
+    /// Whether this content stream has finished decoding.
+    pub fn is_finished(&self) -> bool {
+        match self {
+            HttpContentDecoder::Gzip(d) => d.is_finished(),
+            HttpContentDecoder::Deflate(d) => d.is_finished(),
+            HttpContentDecoder::Brotli(d) => d.is_finished(),
+        }
+    }
+}
+
 /// Incoming or outgoing HTTP Request message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequest {
@@ -964,16 +1289,50 @@ impl HttpRequest {
         self
     }
 
+    /// Compress request body using RFC 1951 Deflate and set Content-Encoding header.
+    pub fn deflate(mut self) -> Self {
+        self.body = compress_deflate(&self.body);
+        self.headers.set("Content-Encoding", "deflate");
+        self.headers
+            .set("Content-Length", self.body.len().to_string());
+        self
+    }
+
+    /// Compress request body using RFC 7932 / RFC 7694 Brotli and set Content-Encoding: br.
+    pub fn brotli(mut self) -> Self {
+        self.body = compress_brotli(&self.body);
+        self.headers.set("Content-Encoding", "br");
+        self.headers
+            .set("Content-Length", self.body.len().to_string());
+        self
+    }
+
     /// Decompress request body based on Content-Encoding header.
     pub fn decompress_body(&self) -> Result<Vec<u8>, String> {
         match self.content_encoding() {
             ContentEncoding::Identity => Ok(self.body.clone()),
             ContentEncoding::Gzip => decompress_gzip(&self.body),
             ContentEncoding::Deflate => decompress_deflate(&self.body),
+            ContentEncoding::Brotli => decompress_brotli(&self.body),
             ContentEncoding::Other(enc) => {
                 Err(format!("Unsupported request Content-Encoding: {}", enc))
             }
         }
+    }
+
+    /// Transparently decompress request body in-place if Content-Encoding is present (RFC 7230 / RFC 7694),
+    /// stripping Content-Encoding and setting Content-Length to decompressed payload length.
+    /// Returns Ok(true) if decompressed, Ok(false) if identity / uncompressed.
+    pub fn decompress_in_place(&mut self) -> Result<bool, String> {
+        if self.content_encoding() == ContentEncoding::Identity {
+            return Ok(false);
+        }
+        let decompressed = self.decompress_body()?;
+        self.body = decompressed;
+        self.headers.remove("content-encoding");
+        self.headers
+            .set("content-length", self.body.len().to_string());
+        Ok(true)
     }
 }
 
@@ -1272,16 +1631,41 @@ impl HttpResponse {
         self
     }
 
+    /// Compress response body using RFC 7932 / RFC 7694 Brotli and set Content-Encoding: br.
+    pub fn brotli(mut self) -> Self {
+        self.body = compress_brotli(&self.body);
+        self.headers.set("Content-Encoding", "br");
+        self.headers
+            .set("Content-Length", self.body.len().to_string());
+        self
+    }
+
     /// Decompress response body according to Content-Encoding header.
     pub fn decompress_body(&self) -> Result<Vec<u8>, String> {
         match self.content_encoding() {
             ContentEncoding::Identity => Ok(self.body.clone()),
             ContentEncoding::Gzip => decompress_gzip(&self.body),
             ContentEncoding::Deflate => decompress_deflate(&self.body),
+            ContentEncoding::Brotli => decompress_brotli(&self.body),
             ContentEncoding::Other(enc) => {
                 Err(format!("Unsupported response Content-Encoding: {}", enc))
             }
         }
+    }
+
+    /// Transparently decompress response body in-place if Content-Encoding is present (RFC 7230 / RFC 7694),
+    /// stripping Content-Encoding and setting Content-Length to decompressed payload length.
+    /// Returns Ok(true) if decompressed, Ok(false) if identity / uncompressed.
+    pub fn decompress_in_place(&mut self) -> Result<bool, String> {
+        if self.content_encoding() == ContentEncoding::Identity {
+            return Ok(false);
+        }
+        let decompressed = self.decompress_body()?;
+        self.body = decompressed;
+        self.headers.remove("content-encoding");
+        self.headers
+            .set("content-length", self.body.len().to_string());
+        Ok(true)
     }
 
     /// Decompress response body and decode as UTF-8 string.
@@ -1290,13 +1674,18 @@ impl HttpResponse {
         String::from_utf8(bytes).map_err(|e| format!("UTF-8 decode error: {}", e))
     }
 
-    /// Conditionally compress response using Gzip if client accepts gzip encoding and min_bytes threshold is met.
+    /// Conditionally compress response using Gzip, Brotli, or Deflate if client accepts encoding and min_bytes threshold is met.
     pub fn compress_if_accepted(self, req: &HttpRequest, min_bytes: usize) -> Self {
-        if req.accepts_encoding("gzip")
-            && self.body.len() >= min_bytes
-            && !self.headers.has("content-encoding")
-        {
-            self.gzip()
+        if self.body.len() >= min_bytes && !self.headers.has("content-encoding") {
+            if req.accepts_encoding("gzip") {
+                self.gzip()
+            } else if req.accepts_encoding("br") {
+                self.brotli()
+            } else if req.accepts_encoding("deflate") {
+                self.deflate()
+            } else {
+                self
+            }
         } else {
             self
         }
@@ -8029,5 +8418,105 @@ mod tests {
         assert_eq!(resp3.status, HttpStatus::OK);
         assert_eq!(resp3.headers.get("x-cache"), Some("REVALIDATED"));
         assert_eq!(resp3.body_str().unwrap(), "real cached payload");
+    }
+
+    #[test]
+    fn test_compress_decompress_brotli_roundtrip() {
+        // 1. Empty payload
+        let empty_comp = compress_brotli(b"");
+        assert_eq!(empty_comp, [0x3B]);
+        let empty_decomp = decompress_brotli(&empty_comp).expect("Empty brotli decompress failed");
+        assert_eq!(empty_decomp, b"");
+
+        // 2. Short text payload
+        let text = b"RFC 7694 Brotli content encoding with IFA stdlib!";
+        let comp = compress_brotli(text);
+        let decomp = decompress_brotli(&comp).expect("Brotli decompress failed");
+        assert_eq!(decomp, text);
+
+        // 3. Multi-block payload exceeding 32768 chunk boundary (e.g. 70,000 bytes)
+        let mut large = Vec::with_capacity(70000);
+        for i in 0..70000 {
+            large.push((i % 247) as u8);
+        }
+        let comp_large = compress_brotli(&large);
+        let decomp_large = decompress_brotli(&comp_large).expect("Multi-block brotli failed");
+        assert_eq!(decomp_large, large);
+
+        // 4. Corrupted data detection
+        assert!(decompress_brotli(b"").is_err());
+        assert!(decompress_brotli(b"\x00\x00\x00").is_err());
+    }
+
+    #[test]
+    fn test_deflate_and_brotli_stream_decoders() {
+        // DeflateStreamDecoder test
+        let data = b"Chunked progressive streaming deflate decompression in IFA net!";
+        let deflated = compress_deflate(data);
+        let mut def_decoder = DeflateStreamDecoder::new();
+        let mut def_out = Vec::new();
+        // Feed in 7-byte chunks
+        for chunk in deflated.chunks(7) {
+            let part = def_decoder.feed(chunk).expect("deflate feed chunk");
+            def_out.extend_from_slice(&part);
+        }
+        assert!(def_decoder.is_finished());
+        assert_eq!(def_out, data);
+
+        // BrotliStreamDecoder test
+        let brotli_data = b"Progressive streaming RFC 7694 Brotli chunks decoded incrementally!";
+        let compressed_br = compress_brotli(brotli_data);
+        let mut br_decoder = BrotliStreamDecoder::new();
+        let mut br_out = Vec::new();
+        // Feed in 5-byte chunks
+        for chunk in compressed_br.chunks(5) {
+            let part = br_decoder.feed(chunk).expect("brotli feed chunk");
+            br_out.extend_from_slice(&part);
+        }
+        assert!(br_decoder.is_finished());
+        assert_eq!(br_out, brotli_data);
+
+        // HttpContentDecoder unified abstraction test
+        let mut content_dec = HttpContentDecoder::for_encoding(ContentEncoding::Brotli)
+            .expect("brotli content decoder");
+        let mut content_out = Vec::new();
+        for chunk in compressed_br.chunks(9) {
+            content_out.extend(content_dec.feed(chunk).expect("feed"));
+        }
+        assert!(content_dec.is_finished());
+        assert_eq!(content_out, brotli_data);
+    }
+
+    #[test]
+    fn test_request_response_brotli_and_in_place_decompression() {
+        // HttpRequest brotli & in-place decompression
+        let mut req = HttpRequest::new(HttpMethod::Post, "/api/brotli")
+            .body(b"Payload for brotli compression in HttpRequest".to_vec())
+            .brotli();
+        assert_eq!(req.content_encoding(), ContentEncoding::Brotli);
+        assert_eq!(req.headers.get("content-encoding"), Some("br"));
+        assert!(req.decompress_in_place().expect("decompress in place"));
+        assert_eq!(req.content_encoding(), ContentEncoding::Identity);
+        assert_eq!(req.headers.get("content-encoding"), None);
+        assert_eq!(
+            req.body_str().unwrap(),
+            "Payload for brotli compression in HttpRequest"
+        );
+
+        // HttpResponse brotli & in-place decompression
+        let mut resp = HttpResponse::ok()
+            .text("Payload for brotli response compression")
+            .brotli();
+        assert_eq!(resp.content_encoding(), ContentEncoding::Brotli);
+        assert_eq!(resp.headers.get("content-encoding"), Some("br"));
+        assert!(resp
+            .decompress_in_place()
+            .expect("resp decompress in place"));
+        assert_eq!(resp.content_encoding(), ContentEncoding::Identity);
+        assert_eq!(resp.headers.get("content-encoding"), None);
+        assert_eq!(
+            resp.body_str().unwrap(),
+            "Payload for brotli response compression"
+        );
     }
 }

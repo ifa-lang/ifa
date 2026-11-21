@@ -2910,6 +2910,8 @@ pub struct AsyncHttp2Connection {
     flow_control_last_observation: Option<std::time::Instant>,
     /// Accumulated inbound bytes observed since last flow control replenishment / tuning update.
     flow_control_bytes_observed: usize,
+    /// Total count of response payloads transparently decompressed on this connection.
+    pub decompressed_count: usize,
 }
 
 impl AsyncHttp2Connection {
@@ -2925,6 +2927,7 @@ impl AsyncHttp2Connection {
             auto_tune_flow_control: false,
             flow_control_last_observation: None,
             flow_control_bytes_observed: 0,
+            decompressed_count: 0,
         }
     }
 
@@ -3120,6 +3123,7 @@ impl AsyncHttp2Connection {
             auto_tune_flow_control: false,
             flow_control_last_observation: None,
             flow_control_bytes_observed: 0,
+            decompressed_count: 0,
         })
     }
 
@@ -3181,6 +3185,7 @@ impl AsyncHttp2Connection {
             auto_tune_flow_control: false,
             flow_control_last_observation: None,
             flow_control_bytes_observed: 0,
+            decompressed_count: 0,
         })
     }
 
@@ -3896,9 +3901,9 @@ impl AsyncHttp2Connection {
         resp.headers = resp_headers;
         resp.body = raw_body;
 
-        // Transparent stream-level decompression if content-encoding is gzip or deflate
-        if let Ok(decompressed) = resp.decompress_body() {
-            resp.body = decompressed;
+        // Transparent stream-level decompression if content-encoding is gzip, deflate or br (RFC 7230 / RFC 7694)
+        if let Ok(true) = resp.decompress_in_place() {
+            self.decompressed_count += 1;
         }
 
         Ok(resp)
@@ -4010,6 +4015,9 @@ impl AsyncHttp2Connection {
             }
         }
 
+        if decoder.content_decoder.is_some() {
+            self.decompressed_count += 1;
+        }
         decoder.assemble_response_recycling()
     }
 
@@ -4515,8 +4523,8 @@ pub struct Http2StreamingResponseDecoder {
     pub headers: crate::http::HttpHeaders,
     /// Trailing headers received in a final HEADERS frame, if any.
     pub trailers: crate::http::HttpHeaders,
-    /// Progressive streaming gzip decoder if content-encoding is gzip.
-    gzip_decoder: Option<crate::http::GzipStreamDecoder>,
+    /// Progressive streaming content decoder if content-encoding is gzip, deflate, or br.
+    content_decoder: Option<crate::http::HttpContentDecoder>,
     /// Optional chunk buffer pool for high-frequency allocation reuse.
     pub buffer_pool: Option<Http2ChunkBufferPool>,
     /// Accumulated decoded body chunks.
@@ -4543,7 +4551,7 @@ impl Http2StreamingResponseDecoder {
             status: None,
             headers: crate::http::HttpHeaders::new(),
             trailers: crate::http::HttpHeaders::new(),
-            gzip_decoder: None,
+            content_decoder: None,
             buffer_pool: None,
             decoded_chunks: Vec::new(),
             total_bytes_decoded: 0,
@@ -4572,12 +4580,9 @@ impl Http2StreamingResponseDecoder {
                 self.headers.set(k.clone(), v.clone());
             }
         }
-        if self
-            .headers
-            .get("content-encoding")
-            .is_some_and(|e| e.eq_ignore_ascii_case("gzip"))
-        {
-            self.gzip_decoder = Some(crate::http::GzipStreamDecoder::new());
+        if let Some(enc_val) = self.headers.get("content-encoding") {
+            let enc = crate::http::ContentEncoding::from_header(enc_val);
+            self.content_decoder = crate::http::HttpContentDecoder::for_encoding(enc);
         }
     }
 
@@ -4598,8 +4603,8 @@ impl Http2StreamingResponseDecoder {
         self.total_raw_bytes += raw_chunk.len();
         self.chunk_count += 1;
 
-        if let Some(ref mut gzip) = self.gzip_decoder {
-            let decompressed = gzip
+        if let Some(ref mut decoder) = self.content_decoder {
+            let decompressed = decoder
                 .feed(raw_chunk)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             self.total_bytes_decoded += decompressed.len();
@@ -4631,8 +4636,8 @@ impl Http2StreamingResponseDecoder {
         self.total_raw_bytes += chunk.len();
         self.chunk_count += 1;
 
-        if let Some(ref mut gzip) = self.gzip_decoder {
-            let decompressed = gzip
+        if let Some(ref mut decoder) = self.content_decoder {
+            let decompressed = decoder
                 .feed(&chunk)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             self.total_bytes_decoded += decompressed.len();
@@ -4724,12 +4729,12 @@ impl Http2StreamingResponseDecoder {
         resp.body = body;
 
         // If not already decompressed via GzipStreamDecoder, attempt transparent decompression
-        if self.gzip_decoder.is_none() {
-            if let Ok(decompressed) = resp.decompress_body() {
-                resp.body = decompressed;
-            }
+        if self.content_decoder.is_none() {
+            let _ = resp.decompress_in_place();
         } else {
             resp.headers.remove("content-encoding");
+            resp.headers
+                .set("content-length", resp.body.len().to_string());
         }
 
         Ok(resp)
@@ -4761,12 +4766,12 @@ impl Http2StreamingResponseDecoder {
         }
         resp.body = body;
 
-        if self.gzip_decoder.is_none() {
-            if let Ok(decompressed) = resp.decompress_body() {
-                resp.body = decompressed;
-            }
+        if self.content_decoder.is_none() {
+            let _ = resp.decompress_in_place();
         } else {
             resp.headers.remove("content-encoding");
+            resp.headers
+                .set("content-length", resp.body.len().to_string());
         }
 
         Ok(resp)
@@ -4952,6 +4957,8 @@ pub struct Http2PoolStats {
     pub http_cache_evictions: usize,
     /// Total count of HTTP cache entries purged due to explicit invalidation or RFC 7234 §4.4 unsafe method updates.
     pub http_cache_invalidations: usize,
+    /// Total count of response payloads transparently decompressed by the pool.
+    pub decompressed_responses: usize,
 }
 
 impl Http2PoolStats {
@@ -5437,6 +5444,23 @@ impl Http2PoolCacheEntry {
             }
         }
     }
+
+    /// Retrieve Content-Encoding of the cached response payload.
+    #[inline]
+    pub fn content_encoding(&self) -> crate::http::ContentEncoding {
+        self.response.content_encoding()
+    }
+
+    /// Whether this cached response possesses compressed body payload.
+    #[inline]
+    pub fn is_compressed(&self) -> bool {
+        self.content_encoding() != crate::http::ContentEncoding::Identity
+    }
+
+    /// Transparently decompress cached response body in-place, stripping Content-Encoding and updating Content-Length.
+    pub fn decompress_in_place(&mut self) -> Result<bool, String> {
+        self.response.decompress_in_place()
+    }
 }
 
 /// An idle pooled HTTP/2 connection paired with the timestamp at which it became idle.
@@ -5488,6 +5512,9 @@ pub struct AsyncHttp2Pool {
     stale_error_fallbacks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     background_revalidations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     revalidating_keys: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    auto_decompress: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    accept_encoding: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    decompressed_responses: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl AsyncHttp2Pool {
@@ -5542,6 +5569,11 @@ impl AsyncHttp2Pool {
             revalidating_keys: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            auto_decompress: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            accept_encoding: std::sync::Arc::new(std::sync::Mutex::new(Some(
+                "gzip, deflate, br".to_string(),
+            ))),
+            decompressed_responses: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -5597,6 +5629,51 @@ impl AsyncHttp2Pool {
     /// Whether transparent RFC 7234 HTTP response caching is enabled on this pool.
     pub fn http_cache_enabled(&self) -> bool {
         self.enable_http_cache
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Configure whether transparent response body decompression (RFC 7230 / RFC 7694) is enabled.
+    pub fn with_auto_decompress(self, enabled: bool) -> Self {
+        self.auto_decompress
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// Set whether transparent response body decompression is enabled.
+    pub fn set_auto_decompress(&self, enabled: bool) {
+        self.auto_decompress
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether transparent response body decompression is enabled on this pool.
+    pub fn auto_decompress(&self) -> bool {
+        self.auto_decompress
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Configure the default `Accept-Encoding` header advertised on outbound requests.
+    pub fn with_accept_encoding(self, encodings: impl Into<String>) -> Self {
+        if let Ok(mut ae) = self.accept_encoding.lock() {
+            *ae = Some(encodings.into());
+        }
+        self
+    }
+
+    /// Set or clear the default `Accept-Encoding` header advertised on outbound requests.
+    pub fn set_accept_encoding(&self, encodings: Option<String>) {
+        if let Ok(mut ae) = self.accept_encoding.lock() {
+            *ae = encodings;
+        }
+    }
+
+    /// Retrieve the currently configured default `Accept-Encoding` header value, if any.
+    pub fn accept_encoding(&self) -> Option<String> {
+        self.accept_encoding.lock().ok().and_then(|ae| ae.clone())
+    }
+
+    /// Total count of response payloads transparently decompressed by the pool.
+    pub fn decompressed_responses(&self) -> usize {
+        self.decompressed_responses
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -6150,6 +6227,7 @@ impl AsyncHttp2Pool {
             background_revalidations: self.background_revalidations(),
             http_cache_evictions: self.http_cache_evictions(),
             http_cache_invalidations: self.http_cache_invalidations(),
+            decompressed_responses: self.decompressed_responses(),
         }
     }
 
@@ -6555,6 +6633,20 @@ impl AsyncHttp2Pool {
             }
         }
 
+        // Automatic Accept-Encoding injection if auto_decompress is enabled and not explicitly specified
+        if self.auto_decompress()
+            && !client_req
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+        {
+            if let Some(ref ae) = self.accept_encoding() {
+                client_req
+                    .headers
+                    .push(("accept-encoding".to_string(), ae.clone()));
+            }
+        }
+
         let key = format!(
             "{}:{}",
             client_req.method.to_ascii_uppercase(),
@@ -6743,6 +6835,13 @@ impl AsyncHttp2Pool {
                     .collect();
                 let body_ref = client_req.body.as_deref();
                 let r = conn.request(&client_req.method, &client_req.path, &header_refs, body_ref);
+                if conn.decompressed_count > 0 {
+                    self.decompressed_responses.fetch_add(
+                        conn.decompressed_count,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    conn.decompressed_count = 0;
+                }
                 (Some(conn), r)
             }
             Err(e) => (None, Err(e)),
@@ -6836,6 +6935,14 @@ impl AsyncHttp2Pool {
                         } else if !routes.is_empty() {
                             pool_routes.insert(origin, routes);
                         }
+                    }
+                }
+
+                // Transparent response body decompression (RFC 7230 / RFC 7694)
+                if self.auto_decompress() && resp.headers.has("content-encoding") {
+                    if let Ok(true) = resp.decompress_in_place() {
+                        self.decompressed_responses
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
 
@@ -6969,6 +7076,20 @@ impl AsyncHttp2Pool {
                     resp_interceptor(&client_req, &mut short_circuit_resp);
                 }
                 return Ok(short_circuit_resp);
+            }
+        }
+
+        // Automatic Accept-Encoding injection if auto_decompress is enabled and not explicitly specified
+        if self.auto_decompress()
+            && !client_req
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+        {
+            if let Some(ref ae) = self.accept_encoding() {
+                client_req
+                    .headers
+                    .push(("accept-encoding".to_string(), ae.clone()));
             }
         }
 
@@ -7324,6 +7445,14 @@ impl AsyncHttp2Pool {
                         } else if !routes.is_empty() {
                             pool_routes.insert(origin, routes);
                         }
+                    }
+                }
+
+                // Transparent response body decompression (RFC 7230 / RFC 7694)
+                if self.auto_decompress() && resp.headers.has("content-encoding") {
+                    if let Ok(true) = resp.decompress_in_place() {
+                        self.decompressed_responses
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
 
@@ -12527,7 +12656,7 @@ mod tests {
             }
         });
 
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(60));
         let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
         let resp = pool
             .execute_request_with_retry("GET", "/", &[], None, 5)
@@ -16023,5 +16152,150 @@ mod tls_alpn_tests {
         assert_eq!(pool.http_cache_count(), 1);
 
         server_handle.join().expect("server join");
+    }
+
+    #[test]
+    fn test_http2_pool_transparent_compression_negotiation_and_decompression() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server_handle = std::thread::spawn(move || {
+            let (tcp_stream, _) = listener.accept().expect("accept connection");
+            let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async stream");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
+
+            // Request 1: GET /compressed/br
+            let frame1 = loop {
+                if let Some(f) = server.try_recv_frame().expect("recv frame 1") {
+                    if matches!(f, crate::simd_parser::Http2Frame::Headers { .. }) {
+                        break f;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(frame1.stream_id(), 1);
+            let s1 = server.session.streams.get(&1).expect("stream 1");
+            let ae1 = s1
+                .received_headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+                .map(|(_, v)| v.as_str());
+            assert_eq!(ae1, Some("gzip, deflate, br"));
+
+            let br_body =
+                crate::http::compress_brotli(b"Hello Brotli Transparent HTTP/2 Response!");
+            let h1 = [
+                (":status", "200"),
+                ("content-encoding", "br"),
+                ("cache-control", "public, max-age=120"),
+            ];
+            server
+                .send_response(1, &h1, Some(&br_body))
+                .expect("send 200 br");
+
+            // Request 2: GET /compressed/gzip
+            let frame2 = loop {
+                if let Some(f) = server.try_recv_frame().expect("recv frame 2") {
+                    if matches!(f, crate::simd_parser::Http2Frame::Headers { .. }) {
+                        break f;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(frame2.stream_id(), 3);
+            let gz_body = crate::http::compress_gzip(b"Hello Gzip Transparent HTTP/2 Response!");
+            let h2 = [
+                (":status", "200"),
+                ("content-encoding", "gzip"),
+                ("cache-control", "public, max-age=120"),
+            ];
+            server
+                .send_response(3, &h2, Some(&gz_body))
+                .expect("send 200 gzip");
+
+            for _ in 0..10 {
+                let _ = server.try_recv_frame();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2)
+            .with_http_cache(true)
+            .with_auto_decompress(true);
+
+        assert!(pool.auto_decompress());
+        assert_eq!(
+            pool.accept_encoding(),
+            Some("gzip, deflate, br".to_string())
+        );
+
+        // 1. Request 1: GET /compressed/br without Accept-Encoding header -> pool auto-injects and transparently decodes br
+        let resp1 = pool
+            .execute_request("GET", "/compressed/br", &[], None)
+            .expect("request br");
+        assert_eq!(resp1.status.0, 200);
+        assert_eq!(resp1.body, b"Hello Brotli Transparent HTTP/2 Response!");
+        assert_eq!(resp1.headers.get("content-encoding"), None);
+        assert_eq!(
+            resp1.headers.get("content-length"),
+            Some(
+                b"Hello Brotli Transparent HTTP/2 Response!"
+                    .len()
+                    .to_string()
+                    .as_str()
+            )
+        );
+        assert_eq!(pool.decompressed_responses(), 1);
+        assert_eq!(pool.stats().decompressed_responses, 1);
+        assert_eq!(pool.http_cache_count(), 1);
+
+        // Subsequent cache hit returns the uncompressed response
+        let resp1_cached = pool
+            .execute_request("GET", "/compressed/br", &[], None)
+            .expect("cached br");
+        assert_eq!(
+            resp1_cached.body,
+            b"Hello Brotli Transparent HTTP/2 Response!"
+        );
+        assert_eq!(resp1_cached.headers.get("content-encoding"), None);
+
+        // 2. Request 2: GET /compressed/gzip -> transparently decodes gzip
+        let resp2 = pool
+            .execute_request("GET", "/compressed/gzip", &[], None)
+            .expect("request gzip");
+        assert_eq!(resp2.status.0, 200);
+        assert_eq!(resp2.body, b"Hello Gzip Transparent HTTP/2 Response!");
+        assert_eq!(resp2.headers.get("content-encoding"), None);
+        assert_eq!(pool.decompressed_responses(), 2);
+
+        server_handle.join().expect("server join");
+    }
+
+    #[test]
+    fn test_http2_pool_cache_entry_decompression_methods() {
+        let compressed_resp = crate::http::HttpResponse::ok()
+            .text("Payload inside Http2PoolCacheEntry")
+            .brotli();
+        let mut entry = Http2PoolCacheEntry::new("GET", "/cached/entry", compressed_resp);
+
+        assert!(entry.is_compressed());
+        assert_eq!(
+            entry.content_encoding(),
+            crate::http::ContentEncoding::Brotli
+        );
+        assert_eq!(entry.response.headers.get("content-encoding"), Some("br"));
+
+        let decompressed = entry
+            .decompress_in_place()
+            .expect("decompress entry in place");
+        assert!(decompressed);
+        assert!(!entry.is_compressed());
+        assert_eq!(
+            entry.content_encoding(),
+            crate::http::ContentEncoding::Identity
+        );
+        assert_eq!(entry.response.headers.get("content-encoding"), None);
+        assert_eq!(entry.response.body, b"Payload inside Http2PoolCacheEntry");
     }
 }

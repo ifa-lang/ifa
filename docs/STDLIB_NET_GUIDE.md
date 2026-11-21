@@ -81,6 +81,24 @@ pool.add_request_interceptor(Arc::new(|req: &mut Http2ClientRequest| -> Option<H
 }));
 ```
 
+### Transparent Content-Encoding Decompression (RFC 7230 / RFC 7694)
+
+The HTTP/2 client pool automatically advertises standard compression formats (`Accept-Encoding: gzip, deflate, br`) and transparently decodes compressed response payloads on both single requests and progressive streaming flows:
+
+```rust
+let pool = AsyncHttp2Pool::new("api.example.com", 443, 8)
+    .with_http_cache(true)
+    .with_auto_decompress(true)
+    .with_accept_encoding("gzip, deflate, br");
+
+// Executing a request transparently negotiates compression and decodes gzip, deflate, or br
+let resp = pool.execute_request("GET", "/data", &[], None)?;
+assert_eq!(resp.status.0, 200);
+// Content-Encoding header is stripped, Content-Length updated, body decompressed
+assert!(resp.headers.get("content-encoding").is_none());
+assert_eq!(pool.stats().decompressed_responses, 1);
+```
+
 ---
 
 ## 3. WebSocket Client & Pooled Multiplexing
