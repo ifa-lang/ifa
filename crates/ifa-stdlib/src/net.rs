@@ -3580,6 +3580,98 @@ impl AsyncHttp2Connection {
         Ok(resp)
     }
 
+    /// Receive a response on a stream with progressive chunked streaming decoding.
+    ///
+    /// Each incoming DATA frame chunk is progressively decoded (transparently decompressing
+    /// gzip streams on-the-fly) and delivered immediately to the provided `chunk_handler` callback.
+    /// Returns the completed `HttpResponse` once the stream has ended.
+    pub fn recv_streaming_response<F>(
+        &mut self,
+        target_stream_id: u32,
+        mut chunk_handler: F,
+    ) -> io::Result<crate::http::HttpResponse>
+    where
+        F: FnMut(&[u8]),
+    {
+        let mut decoder = Http2StreamingResponseDecoder::new(target_stream_id);
+
+        if let Some(stream) = self.session.streams.get(&target_stream_id) {
+            if !stream.received_headers.is_empty() {
+                decoder.feed_headers(&stream.received_headers);
+            }
+            if !stream.received_data.is_empty() {
+                let is_closed = stream.state
+                    == crate::simd_parser::Http2StreamState::HalfClosedRemote
+                    || stream.state == crate::simd_parser::Http2StreamState::Closed;
+                let chunk = decoder.feed_chunk(&stream.received_data, is_closed)?;
+                chunk_handler(&chunk);
+            }
+            if stream.state == crate::simd_parser::Http2StreamState::HalfClosedRemote
+                || stream.state == crate::simd_parser::Http2StreamState::Closed
+            {
+                decoder.mark_complete();
+                return decoder.assemble_response();
+            }
+        }
+
+        while !decoder.is_complete() {
+            let frame = self.recv_frame()?;
+            match frame {
+                crate::simd_parser::Http2Frame::Headers {
+                    stream_id,
+                    end_stream,
+                    ..
+                } => {
+                    if stream_id == target_stream_id {
+                        if let Some(stream) = self.session.streams.get(&target_stream_id) {
+                            if decoder.status.is_none() {
+                                decoder.feed_headers(&stream.received_headers);
+                            } else {
+                                decoder.feed_trailers(&stream.received_trailers);
+                            }
+                        }
+                        if end_stream {
+                            decoder.mark_complete();
+                        }
+                    }
+                }
+                crate::simd_parser::Http2Frame::Data {
+                    stream_id,
+                    data,
+                    end_stream,
+                } => {
+                    if stream_id == target_stream_id {
+                        let decoded = decoder.feed_chunk(&data, end_stream)?;
+                        chunk_handler(&decoded);
+                    }
+                }
+                crate::simd_parser::Http2Frame::WindowUpdate { .. } => {
+                    let _ = self.flush_scheduled_outbound_data(true);
+                }
+                crate::simd_parser::Http2Frame::RstStream {
+                    stream_id,
+                    error_code,
+                } => {
+                    if stream_id == target_stream_id {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            format!("Stream {} reset with error {:?}", stream_id, error_code),
+                        ));
+                    }
+                }
+                crate::simd_parser::Http2Frame::GoAway { error_code, .. } => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        format!("Connection closed by GOAWAY: {:?}", error_code),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        decoder.assemble_response()
+    }
+
     /// Server push: send a PUSH_PROMISE frame on an associated client stream to reserve a promised stream id,
     /// then send the promised response headers and optional body on the promised stream.
     pub fn push_promise(
@@ -3775,9 +3867,9 @@ impl AsyncHttp2Connection {
 
             let has_body = req.body.as_ref().is_some_and(|b| !b.is_empty());
             let stream_id = self.session.open_stream();
-            let headers_frame = self
-                .session
-                .create_headers_frame(stream_id, &pseudo_headers, !has_body);
+            let headers_frame =
+                self.session
+                    .create_headers_frame(stream_id, &pseudo_headers, !has_body);
             self.send_frame(&headers_frame)?;
 
             if let Some(data) = req.body.as_deref() {
@@ -3820,29 +3912,117 @@ impl AsyncHttp2Connection {
             }
         }
 
-        // 3. Receive responses in prioritized order
-        let mut results = Vec::new();
-        for sid in ordered_streams {
-            let res = self.recv_response_for(sid).map(|(raw_headers, raw_body)| {
-                let mut status_code = 200u16;
-                let mut resp_headers = crate::http::HttpHeaders::new();
-                for (k, v) in raw_headers {
-                    if k == ":status" {
-                        if let Ok(code) = v.parse::<u16>() {
-                            status_code = code;
+        // 3. Concurrently receive and progressively decode streaming chunked responses across all multiplexed streams
+        let mut stream_handlers: std::collections::HashMap<u32, Http2ResponseChunkHandler> =
+            std::collections::HashMap::new();
+        for (req, sid) in requests.iter().zip(stream_mappings.iter()) {
+            if let Some(ref h) = req.chunk_handler {
+                stream_handlers.insert(*sid, h.clone());
+            }
+        }
+
+        let mut decoders: std::collections::HashMap<u32, Http2StreamingResponseDecoder> =
+            ordered_streams
+                .iter()
+                .map(|&sid| (sid, Http2StreamingResponseDecoder::new(sid)))
+                .collect();
+
+        // Feed any headers or data already received in session (e.g. if arriving early)
+        for &sid in &ordered_streams {
+            if let Some(stream) = self.session.streams.get(&sid) {
+                if !stream.received_headers.is_empty() {
+                    let dec = decoders.get_mut(&sid).unwrap();
+                    dec.feed_headers(&stream.received_headers);
+                }
+                if !stream.received_data.is_empty() {
+                    let dec = decoders.get_mut(&sid).unwrap();
+                    let is_closed = stream.state
+                        == crate::simd_parser::Http2StreamState::HalfClosedRemote
+                        || stream.state == crate::simd_parser::Http2StreamState::Closed;
+                    if let Ok(chunk) = dec.feed_chunk(&stream.received_data, is_closed) {
+                        if let Some(h) = stream_handlers.get(&sid) {
+                            h(sid, &chunk);
                         }
-                    } else if !k.starts_with(':') {
-                        resp_headers.set(k, v);
                     }
                 }
-                let mut resp = crate::http::HttpResponse::new(crate::http::HttpStatus(status_code));
-                resp.headers = resp_headers;
-                resp.body = raw_body;
-                if let Ok(decompressed) = resp.decompress_body() {
-                    resp.body = decompressed;
+                if stream.state == crate::simd_parser::Http2StreamState::HalfClosedRemote
+                    || stream.state == crate::simd_parser::Http2StreamState::Closed
+                {
+                    decoders.get_mut(&sid).unwrap().mark_complete();
                 }
-                resp
-            });
+            }
+        }
+
+        while !decoders.values().all(|d| d.is_complete()) {
+            let frame = self.recv_frame()?;
+            match frame {
+                crate::simd_parser::Http2Frame::Headers {
+                    stream_id,
+                    end_stream,
+                    ..
+                } => {
+                    if let Some(dec) = decoders.get_mut(&stream_id) {
+                        if let Some(stream) = self.session.streams.get(&stream_id) {
+                            if dec.status.is_none() {
+                                dec.feed_headers(&stream.received_headers);
+                            } else {
+                                dec.feed_trailers(&stream.received_trailers);
+                            }
+                        }
+                        if end_stream {
+                            dec.mark_complete();
+                        }
+                    }
+                }
+                crate::simd_parser::Http2Frame::Data {
+                    stream_id,
+                    data,
+                    end_stream,
+                } => {
+                    if let Some(dec) = decoders.get_mut(&stream_id) {
+                        match dec.feed_chunk(&data, end_stream) {
+                            Ok(decoded_chunk) => {
+                                if let Some(handler) = stream_handlers.get(&stream_id) {
+                                    handler(stream_id, &decoded_chunk);
+                                }
+                            }
+                            Err(e) => {
+                                dec.mark_error(e);
+                            }
+                        }
+                    }
+                }
+                crate::simd_parser::Http2Frame::WindowUpdate { .. } => {
+                    let _ = self.flush_scheduled_outbound_data(true);
+                }
+                crate::simd_parser::Http2Frame::RstStream {
+                    stream_id,
+                    error_code,
+                } => {
+                    if let Some(dec) = decoders.get_mut(&stream_id) {
+                        dec.mark_reset(error_code);
+                    }
+                }
+                crate::simd_parser::Http2Frame::GoAway { error_code, .. } => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        format!("Connection closed by GOAWAY: {:?}", error_code),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        let mut results = Vec::with_capacity(ordered_streams.len());
+        for sid in ordered_streams {
+            let res = if let Some(dec) = decoders.remove(&sid) {
+                dec.assemble_response()
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Stream {} missing from batch decoders", sid),
+                ))
+            };
             results.push((sid, res));
         }
 
@@ -3883,8 +4063,191 @@ impl AsyncHttp2Connection {
     }
 }
 
+/// Callback invoked whenever a chunk of response payload is decoded for a stream.
+pub type Http2ResponseChunkHandler = std::sync::Arc<dyn Fn(u32, &[u8]) + Send + Sync>;
+
+/// Progressive streaming response decoder for HTTP/2 multiplexed streams.
+/// Handles fragmented DATA frames, progressive decompression (gzip),
+/// chunked payloads, trailers, and status code extraction.
+#[derive(Debug)]
+pub struct Http2StreamingResponseDecoder {
+    /// Stream ID being decoded.
+    pub stream_id: u32,
+    /// Decoded response HTTP status code once `:status` header is received.
+    pub status: Option<u16>,
+    /// Accumulated response headers.
+    pub headers: crate::http::HttpHeaders,
+    /// Trailing headers received in a final HEADERS frame, if any.
+    pub trailers: crate::http::HttpHeaders,
+    /// Progressive streaming gzip decoder if content-encoding is gzip.
+    gzip_decoder: Option<crate::http::GzipStreamDecoder>,
+    /// Accumulated decoded body chunks.
+    decoded_chunks: Vec<Vec<u8>>,
+    /// Total bytes decoded across all chunks.
+    total_bytes_decoded: usize,
+    /// Total raw DATA frame bytes received from peer.
+    total_raw_bytes: usize,
+    /// Number of chunked DATA frames processed.
+    chunk_count: usize,
+    /// Whether the stream has received the END_STREAM flag or was marked complete.
+    is_complete: bool,
+    /// Stream reset error if stream was terminated by RST_STREAM.
+    pub reset_error: Option<crate::simd_parser::Http2ErrorCode>,
+    /// Stream error if decoding chunk or decompression failed.
+    pub decode_error: Option<String>,
+}
+
+impl Http2StreamingResponseDecoder {
+    /// Create a new progressive streaming response decoder for a stream.
+    pub fn new(stream_id: u32) -> Self {
+        Self {
+            stream_id,
+            status: None,
+            headers: crate::http::HttpHeaders::new(),
+            trailers: crate::http::HttpHeaders::new(),
+            gzip_decoder: None,
+            decoded_chunks: Vec::new(),
+            total_bytes_decoded: 0,
+            total_raw_bytes: 0,
+            chunk_count: 0,
+            is_complete: false,
+            reset_error: None,
+            decode_error: None,
+        }
+    }
+
+    /// Feed decoded HTTP headers from a HEADERS frame.
+    pub fn feed_headers(&mut self, headers: &[(String, String)]) {
+        for (k, v) in headers {
+            if k == ":status" {
+                if let Ok(code) = v.parse::<u16>() {
+                    self.status = Some(code);
+                }
+            } else if !k.starts_with(':') {
+                self.headers.set(k.clone(), v.clone());
+            }
+        }
+        if self
+            .headers
+            .get("content-encoding")
+            .is_some_and(|e| e.eq_ignore_ascii_case("gzip"))
+        {
+            self.gzip_decoder = Some(crate::http::GzipStreamDecoder::new());
+        }
+    }
+
+    /// Feed trailing headers received in a subsequent HEADERS frame.
+    pub fn feed_trailers(&mut self, trailers: &[(String, String)]) {
+        for (k, v) in trailers {
+            if !k.starts_with(':') {
+                self.trailers.set(k.clone(), v.clone());
+                self.headers.append(k.clone(), v.clone());
+            }
+        }
+        self.is_complete = true;
+    }
+
+    /// Process a fragmented incoming DATA frame chunk.
+    /// Returns the newly decoded byte slice for this chunk.
+    pub fn feed_chunk(&mut self, raw_chunk: &[u8], end_stream: bool) -> io::Result<Vec<u8>> {
+        self.total_raw_bytes += raw_chunk.len();
+        self.chunk_count += 1;
+
+        let decoded = if let Some(ref mut gzip) = self.gzip_decoder {
+            gzip.feed(raw_chunk)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        } else {
+            raw_chunk.to_vec()
+        };
+
+        self.total_bytes_decoded += decoded.len();
+        self.decoded_chunks.push(decoded.clone());
+
+        if end_stream {
+            self.is_complete = true;
+        }
+
+        Ok(decoded)
+    }
+
+    /// Mark the stream as completed (e.g. END_STREAM received on empty frame or trailers).
+    pub fn mark_complete(&mut self) {
+        self.is_complete = true;
+    }
+
+    /// Mark the stream as reset by RST_STREAM.
+    pub fn mark_reset(&mut self, error: crate::simd_parser::Http2ErrorCode) {
+        self.reset_error = Some(error);
+        self.is_complete = true;
+    }
+
+    /// Mark a decoding error.
+    pub fn mark_error(&mut self, err: io::Error) {
+        self.decode_error = Some(err.to_string());
+        self.is_complete = true;
+    }
+
+    /// Whether this stream response has finished decoding.
+    #[inline]
+    pub fn is_complete(&self) -> bool {
+        self.is_complete
+    }
+
+    /// Number of chunked DATA frames processed.
+    #[inline]
+    pub fn chunk_count(&self) -> usize {
+        self.chunk_count
+    }
+
+    /// Total decoded payload size in bytes.
+    #[inline]
+    pub fn total_bytes_decoded(&self) -> usize {
+        self.total_bytes_decoded
+    }
+
+    /// Total raw DATA frame bytes received from peer before decompression.
+    #[inline]
+    pub fn total_raw_bytes(&self) -> usize {
+        self.total_raw_bytes
+    }
+
+    /// Assemble the accumulated chunks into a finalized `HttpResponse`.
+    pub fn assemble_response(&self) -> io::Result<crate::http::HttpResponse> {
+        if let Some(err) = self.reset_error {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                format!("Stream {} reset with error {:?}", self.stream_id, err),
+            ));
+        }
+        if let Some(ref err) = self.decode_error {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, err.clone()));
+        }
+
+        let status = self.status.unwrap_or(200);
+        let mut resp = crate::http::HttpResponse::new(crate::http::HttpStatus(status));
+        resp.headers = self.headers.clone();
+
+        let mut body = Vec::with_capacity(self.total_bytes_decoded);
+        for chunk in &self.decoded_chunks {
+            body.extend_from_slice(chunk);
+        }
+        resp.body = body;
+
+        // If not already decompressed via GzipStreamDecoder, attempt transparent decompression
+        if self.gzip_decoder.is_none() {
+            if let Ok(decompressed) = resp.decompress_body() {
+                resp.body = decompressed;
+            }
+        } else {
+            resp.headers.remove("content-encoding");
+        }
+
+        Ok(resp)
+    }
+}
+
 /// Parameters for configuring a prioritized HTTP/2 request in a multiplexed batch.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Http2PrioritizedRequest {
     /// HTTP Method (GET, POST, etc.)
     pub method: String,
@@ -3902,6 +4265,24 @@ pub struct Http2PrioritizedRequest {
     pub exclusive: bool,
     /// RFC 9218 Priority parameters (urgency 0..=7, incremental flag)
     pub rfc9218_priority: Option<crate::simd_parser::PriorityParameters>,
+    /// Optional chunk callback invoked progressively as response DATA chunks are received and decoded.
+    pub chunk_handler: Option<Http2ResponseChunkHandler>,
+}
+
+impl std::fmt::Debug for Http2PrioritizedRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Http2PrioritizedRequest")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("headers", &self.headers)
+            .field("body", &self.body)
+            .field("stream_dependency", &self.stream_dependency)
+            .field("weight", &self.weight)
+            .field("exclusive", &self.exclusive)
+            .field("rfc9218_priority", &self.rfc9218_priority)
+            .field("has_chunk_handler", &self.chunk_handler.is_some())
+            .finish()
+    }
 }
 
 impl Http2PrioritizedRequest {
@@ -3916,6 +4297,7 @@ impl Http2PrioritizedRequest {
             weight: 16,
             exclusive: false,
             rfc9218_priority: None,
+            chunk_handler: None,
         }
     }
 
@@ -3945,6 +4327,15 @@ impl Http2PrioritizedRequest {
             urgency,
             incremental,
         ));
+        self
+    }
+
+    /// Register a progressive response chunk callback invoked as DATA frame chunks arrive.
+    pub fn with_chunk_handler(
+        mut self,
+        handler: impl Fn(u32, &[u8]) + Send + Sync + 'static,
+    ) -> Self {
+        self.chunk_handler = Some(std::sync::Arc::new(handler));
         self
     }
 }
@@ -4412,6 +4803,82 @@ impl AsyncHttp2Pool {
             }
             Err(e) => {
                 // If connection failed, it is dropped and not released back to the pool
+                self.active_count
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
+    /// Execute an HTTP/2 request using a pooled connection with streaming response chunks
+    /// delivered to `chunk_handler` progressively as each chunked DATA frame arrives from the server.
+    pub fn execute_streaming_request<F>(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        chunk_handler: F,
+    ) -> io::Result<crate::http::HttpResponse>
+    where
+        F: FnMut(&[u8]),
+    {
+        let mut client_req = Http2ClientRequest::new(method, path);
+        for &(k, v) in headers {
+            client_req = client_req.with_header(k, v);
+        }
+        if let Some(b) = body {
+            client_req = client_req.with_body(b);
+        }
+
+        // Run request interceptors
+        for interceptor in &self.request_interceptors {
+            if let Some(mut short_circuit_resp) = interceptor(&mut client_req) {
+                for resp_interceptor in &self.response_interceptors {
+                    resp_interceptor(&client_req, &mut short_circuit_resp);
+                }
+                return Ok(short_circuit_resp);
+            }
+        }
+
+        let mut conn = self.acquire()?;
+        let header_refs: Vec<(&str, &str)> = client_req
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let body_ref = client_req.body.as_deref();
+
+        let mut pseudo_headers = vec![
+            (":method", client_req.method.as_str()),
+            (":path", client_req.path.as_str()),
+            (":scheme", "http"),
+        ];
+        pseudo_headers.extend_from_slice(&header_refs);
+
+        let stream_id = conn.send_request(&pseudo_headers, body_ref)?;
+        let result = conn.recv_streaming_response(stream_id, chunk_handler);
+
+        match result {
+            Ok(mut resp) => {
+                if let Some(alt_svc_val) = resp.headers.get("alt-svc") {
+                    let routes = crate::simd_parser::AltSvcRoute::parse_header_value(alt_svc_val);
+                    let origin = format!("{}:{}", self.host, self.port);
+                    if let Ok(mut pool_routes) = self.alt_svc_routes.lock() {
+                        if routes.is_empty() && alt_svc_val.trim().eq_ignore_ascii_case("clear") {
+                            pool_routes.remove(&origin);
+                        } else if !routes.is_empty() {
+                            pool_routes.insert(origin, routes);
+                        }
+                    }
+                }
+                self.release(conn);
+                for resp_interceptor in &self.response_interceptors {
+                    resp_interceptor(&client_req, &mut resp);
+                }
+                Ok(resp)
+            }
+            Err(e) => {
                 self.active_count
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 Err(e)
@@ -7690,19 +8157,25 @@ mod tests {
 
         // Open stream
         let stream_id = client.session.open_stream();
-        let headers_frame = client
-            .session
-            .create_headers_frame(stream_id, &[(":method", "POST"), (":path", "/upload")], false);
+        let headers_frame = client.session.create_headers_frame(
+            stream_id,
+            &[(":method", "POST"), (":path", "/upload")],
+            false,
+        );
         client.send_frame(&headers_frame).expect("send headers");
 
         // Send queued data using priority/flow-control scheduler
         let chunk1 = vec![b'A'; 2048];
-        let sent1 = client.send_queued_data(stream_id, &chunk1, false).expect("send queued 1");
+        let sent1 = client
+            .send_queued_data(stream_id, &chunk1, false)
+            .expect("send queued 1");
         assert!(sent1 >= 1);
 
         let chunk2 = vec![b'B'; 4096];
         client.session.queue_outbound_data(stream_id, &chunk2);
-        let sent2 = client.flush_scheduled_outbound_data(true).expect("flush queued 2");
+        let sent2 = client
+            .flush_scheduled_outbound_data(true)
+            .expect("flush queued 2");
         assert!(sent2 >= 1);
 
         client
@@ -8435,7 +8908,8 @@ mod tests {
                             .extend_from_slice(&data);
                         if end_stream {
                             let resp_headers = [(":status", "200")];
-                            let resp_body = format!("received-{}", received_bodies[&stream_id].len());
+                            let resp_body =
+                                format!("received-{}", received_bodies[&stream_id].len());
                             server
                                 .send_response(stream_id, &resp_headers, Some(resp_body.as_bytes()))
                                 .expect("send response");
@@ -8488,6 +8962,207 @@ mod tests {
 
         assert_eq!(pool.idle_count(), 1);
         assert_eq!(pool.active_count(), 0);
+
+        let mut conn = pool.acquire().expect("acquire to close");
+        let _ = conn.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        pool.release(conn);
+        pool.clear();
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_pool_prioritized_batch_chunked_streaming() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            };
+
+            // Wait for both requests to be initiated
+            let mut requests_received = 0;
+            while requests_received < 2 {
+                match server.recv_frame().expect("server recv frame") {
+                    crate::simd_parser::Http2Frame::Headers { end_stream, .. } => {
+                        if end_stream {
+                            requests_received += 1;
+                        }
+                    }
+                    crate::simd_parser::Http2Frame::PriorityUpdate { .. } => {}
+                    crate::simd_parser::Http2Frame::Priority { .. } => {}
+                    crate::simd_parser::Http2Frame::GoAway { .. } => return,
+                    _ => {}
+                }
+            }
+
+            // Stream responses in fragmented DATA chunks
+            // Stream 3 (higher priority u=1)
+            let h3 = server
+                .session
+                .create_headers_frame(3, &[(":status", "200")], false);
+            server.send_frame(&h3).expect("send headers 3");
+            server
+                .send_data(3, b"stream3-part1-", false)
+                .expect("send data 3.1");
+            server
+                .send_data(3, b"stream3-part2", true)
+                .expect("send data 3.2");
+
+            // Stream 1 (lower priority u=4)
+            let h1 = server
+                .session
+                .create_headers_frame(1, &[(":status", "200")], false);
+            server.send_frame(&h1).expect("send headers 1");
+            server
+                .send_data(1, b"chunk-A-", false)
+                .expect("send data 1.1");
+            server
+                .send_data(1, b"chunk-B-", false)
+                .expect("send data 1.2");
+            server
+                .send_data(1, b"chunk-C", true)
+                .expect("send data 1.3");
+
+            loop {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::GoAway { .. }) => break,
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+            let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
+
+        let stream1_chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stream1_chunks_cb = stream1_chunks.clone();
+
+        let batch = vec![
+            Http2PrioritizedRequest::new("GET", "/stream-1")
+                .with_rfc9218_priority(4, false)
+                .with_chunk_handler(move |_sid, chunk| {
+                    stream1_chunks_cb.lock().unwrap().push(chunk.to_vec());
+                }),
+            Http2PrioritizedRequest::new("GET", "/stream-3").with_rfc9218_priority(1, true),
+        ];
+
+        let results = pool
+            .execute_prioritized_batch(batch)
+            .expect("execute prioritized batch with streaming chunks");
+
+        assert_eq!(results.len(), 2);
+        // Higher priority stream (stream 3) is ordered first
+        assert_eq!(results[0].0, 3);
+        assert_eq!(
+            results[0].1.as_ref().unwrap().body,
+            b"stream3-part1-stream3-part2"
+        );
+
+        // Lower priority stream (stream 1) is ordered second
+        assert_eq!(results[1].0, 1);
+        assert_eq!(
+            results[1].1.as_ref().unwrap().body,
+            b"chunk-A-chunk-B-chunk-C"
+        );
+
+        // Verify progressive chunked callback captured each distinct chunk
+        let captured = stream1_chunks.lock().unwrap().clone();
+        assert_eq!(captured.len(), 3);
+        assert_eq!(captured[0], b"chunk-A-");
+        assert_eq!(captured[1], b"chunk-B-");
+        assert_eq!(captured[2], b"chunk-C");
+
+        assert_eq!(pool.idle_count(), 1);
+        assert_eq!(pool.active_count(), 0);
+
+        let mut conn = pool.acquire().expect("acquire to close");
+        let _ = conn.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        pool.release(conn);
+        pool.clear();
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_pool_execute_streaming_request() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            };
+
+            let stream_id = loop {
+                match server.recv_frame().expect("server recv frame") {
+                    crate::simd_parser::Http2Frame::Headers {
+                        stream_id: sid,
+                        end_stream,
+                        ..
+                    } => {
+                        if end_stream {
+                            break sid;
+                        }
+                    }
+                    crate::simd_parser::Http2Frame::GoAway { .. } => return,
+                    _ => {}
+                }
+            };
+
+            let h = server
+                .session
+                .create_headers_frame(stream_id, &[(":status", "200")], false);
+            server.send_frame(&h).expect("send headers");
+            server
+                .send_data(stream_id, b"alpha-", false)
+                .expect("send chunk 1");
+            server
+                .send_data(stream_id, b"beta-", false)
+                .expect("send chunk 2");
+            server
+                .send_data(stream_id, b"gamma", true)
+                .expect("send chunk 3");
+
+            let _ = server.recv_frame();
+            let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
+
+        let mut chunks_received = Vec::new();
+        let resp = pool
+            .execute_streaming_request("GET", "/progressive", &[], None, |chunk| {
+                chunks_received.push(chunk.to_vec());
+            })
+            .expect("execute streaming request");
+
+        assert_eq!(resp.status.0, 200);
+        assert_eq!(resp.body, b"alpha-beta-gamma");
+        assert_eq!(chunks_received.len(), 3);
+        assert_eq!(chunks_received[0], b"alpha-");
+        assert_eq!(chunks_received[1], b"beta-");
+        assert_eq!(chunks_received[2], b"gamma");
+
+        assert_eq!(pool.idle_count(), 1);
 
         let mut conn = pool.acquire().expect("acquire to close");
         let _ = conn.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
