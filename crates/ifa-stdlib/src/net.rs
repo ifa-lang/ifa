@@ -2902,6 +2902,7 @@ pub struct AsyncHttp2Connection {
     read_buf: Vec<u8>,
     ctrl_ring_buf: [u8; 1024],
     is_closed: bool,
+    is_draining: bool,
     /// Optional chunk buffer pool for recycling incoming DATA frames.
     pub chunk_buffer_pool: Option<Http2ChunkBufferPool>,
     /// Whether dynamic RFC 7540 flow control auto-tuning (BDP-based adaptive window scaling) is enabled.
@@ -2919,6 +2920,9 @@ pub struct AsyncHttp2Connection {
 }
 
 impl AsyncHttp2Connection {
+    /// Standard maximum stream identifier for initial anticipatory GOAWAY frame (RFC 7540/RFC 9113 §6.8: 2^31 - 1).
+    pub const MAX_STREAM_ID_GOAWAY: u32 = 0x7FFF_FFFF;
+
     /// Create a new `AsyncHttp2Connection` wrapping an active `AsyncTcpStream`.
     pub fn new(stream: AsyncTcpStream, is_server: bool) -> Self {
         Self {
@@ -2927,6 +2931,7 @@ impl AsyncHttp2Connection {
             read_buf: Vec::with_capacity(8192),
             ctrl_ring_buf: [0u8; 1024],
             is_closed: false,
+            is_draining: false,
             chunk_buffer_pool: None,
             auto_tune_flow_control: false,
             flow_control_last_observation: None,
@@ -2940,6 +2945,11 @@ impl AsyncHttp2Connection {
     /// Whether this HTTP/2 connection is closed.
     pub fn is_closed(&self) -> bool {
         self.is_closed
+    }
+
+    /// Whether this HTTP/2 connection is currently draining.
+    pub fn is_draining(&self) -> bool {
+        self.is_draining
     }
 
     /// Configure the DRR base quantum (bytes per weight unit per round, default 1024).
@@ -3162,6 +3172,7 @@ impl AsyncHttp2Connection {
             read_buf: Vec::with_capacity(8192),
             ctrl_ring_buf: [0u8; 1024],
             is_closed: false,
+            is_draining: false,
             chunk_buffer_pool: None,
             auto_tune_flow_control: false,
             flow_control_last_observation: None,
@@ -3226,6 +3237,7 @@ impl AsyncHttp2Connection {
             read_buf: Vec::with_capacity(8192),
             ctrl_ring_buf: [0u8; 1024],
             is_closed: false,
+            is_draining: false,
             chunk_buffer_pool: None,
             auto_tune_flow_control: false,
             flow_control_last_observation: None,
@@ -3728,6 +3740,38 @@ impl AsyncHttp2Connection {
             debug_data: debug_data.to_vec(),
         };
         let res = self.send_frame(&goaway);
+        self.is_draining = true;
+        self.is_closed = true;
+        res
+    }
+
+    /// Initiate graceful connection shutdown by sending an anticipatory GOAWAY frame with maximal stream ID (2^31 - 1).
+    /// This signals the remote peer to cease creating new streams while existing active streams continue processing.
+    pub fn send_anticipatory_goaway(&mut self, debug_data: &[u8]) -> io::Result<()> {
+        let goaway = crate::simd_parser::Http2Frame::GoAway {
+            last_stream_id: Self::MAX_STREAM_ID_GOAWAY,
+            error_code: crate::simd_parser::Http2ErrorCode::NoError,
+            debug_data: debug_data.to_vec(),
+        };
+        let res = self.send_frame(&goaway);
+        self.is_draining = true;
+        res
+    }
+
+    /// Send a final GOAWAY frame specifying the concrete last processed stream ID and close the connection.
+    pub fn send_final_goaway(
+        &mut self,
+        last_stream_id: u32,
+        error_code: crate::simd_parser::Http2ErrorCode,
+        debug_data: &[u8],
+    ) -> io::Result<()> {
+        let goaway = crate::simd_parser::Http2Frame::GoAway {
+            last_stream_id,
+            error_code,
+            debug_data: debug_data.to_vec(),
+        };
+        let res = self.send_frame(&goaway);
+        self.is_draining = true;
         self.is_closed = true;
         res
     }
@@ -6230,6 +6274,123 @@ pub struct TransportPacingTelemetry {
     pub bufferbloat_mitigation_count: usize,
 }
 
+/// Lifecycle state of a pooled transport session (HTTP/2 or HTTP/3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLifecycleState {
+    /// Fully active: accepts new streams and dispatches queued payloads.
+    Active,
+    /// Gracefully draining: rejects new incoming streams; actively finishing or migrating in-flight streams.
+    Draining,
+    /// Fully drained: all in-flight streams completed or migrated, no pending payloads.
+    Drained,
+    /// Terminated and closed.
+    Closed,
+}
+
+/// State of a multiplexed stream undergoing migration between transport sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamMigrationStatus {
+    /// Active on its current session.
+    Active,
+    /// Under migration to a target session.
+    Migrating,
+    /// Successfully migrated to a new healthy session.
+    Migrated,
+    /// Stream completed.
+    Completed,
+}
+
+/// Errors that can occur during stream migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamMigrationError {
+    /// Source session not found in arbitrator.
+    SourceSessionNotFound(u64),
+    /// Target session not found in arbitrator.
+    TargetSessionNotFound(u64),
+    /// Stream not found on source session.
+    StreamNotFound(u32),
+    /// Target session is not active (e.g. draining, drained, or closed).
+    TargetSessionNotActive(u64),
+    /// Stream cannot be migrated (e.g. non-idempotent in-flight with strict rules or already completed).
+    StreamNotMigratable(u32),
+    /// Target session belongs to a different origin than source session.
+    OriginMismatch {
+        source_origin: String,
+        target_origin: String,
+    },
+}
+
+/// Descriptor of a multiplexed stream managed across pooled transport sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PooledStreamDescriptor {
+    /// Unique stream ID on its transport session.
+    pub stream_id: u32,
+    /// Current session ID hosting this stream.
+    pub session_id: u64,
+    /// Associated origin.
+    pub origin: String,
+    /// Pending queued bytes for this stream.
+    pub pending_bytes: usize,
+    /// Priority weight for stream scheduling.
+    pub priority_weight: u16,
+    /// Whether this stream is idempotent and safe for transparent re-dispatch / migration.
+    pub is_idempotent: bool,
+    /// Current migration status of this stream.
+    pub migration_status: StreamMigrationStatus,
+    /// Original session ID if this stream was previously migrated.
+    pub original_session_id: Option<u64>,
+}
+
+/// Summary report of streams dynamically migrated away from a draining session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamMigrationReport {
+    /// Source session ID drained.
+    pub source_session_id: u64,
+    /// Origin of the drained session.
+    pub origin: String,
+    /// Count of streams successfully migrated.
+    pub migrated_streams_count: usize,
+    /// Aggregate bytes of pending data migrated across streams.
+    pub total_migrated_bytes: usize,
+    /// Target session IDs that received migrated streams.
+    pub target_session_ids: Vec<u64>,
+    /// Descriptors of the migrated streams.
+    pub migrated_streams: Vec<PooledStreamDescriptor>,
+    /// Whether the source session is now fully drained (zero active streams and zero pending bytes).
+    pub source_now_drained: bool,
+}
+
+/// Telemetry snapshot of a transport session's lifecycle, draining progress, and stream migration statistics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLifecycleTelemetry {
+    /// Session identifier.
+    pub session_id: u64,
+    /// Associated origin.
+    pub origin: String,
+    /// Transport protocol (HTTP/2 or HTTP/3).
+    pub protocol: TransportProtocol,
+    /// Current lifecycle state.
+    pub state: SessionLifecycleState,
+    /// Number of active streams currently assigned to this session.
+    pub active_streams_count: usize,
+    /// Total streams migrated out from this session to other sessions.
+    pub migrated_out_streams_count: usize,
+    /// Total streams migrated into this session from draining sessions.
+    pub migrated_in_streams_count: usize,
+    /// Aggregate pending payload bytes migrated out from this session.
+    pub total_migrated_out_bytes: usize,
+    /// Aggregate pending payload bytes migrated into this session.
+    pub total_migrated_in_bytes: usize,
+    /// Current queued pending payload bytes on this session.
+    pub pending_bytes: usize,
+    /// Whether an anticipatory GOAWAY (stream ID 2^31 - 1) has been transmitted.
+    pub anticipatory_goaway_sent: bool,
+    /// Whether a final GOAWAY frame has been transmitted.
+    pub final_goaway_sent: bool,
+    /// Last GOAWAY stream ID recorded, if any.
+    pub last_goaway_stream_id: Option<u32>,
+}
+
 /// Descriptor and runtime scheduling state of an active transport session (HTTP/2 or HTTP/3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportSessionDescriptor {
@@ -6251,6 +6412,24 @@ pub struct TransportSessionDescriptor {
     pub total_dispatched_bytes: usize,
     /// Cross-layer predictive pacing and congestion control model (BBR/CUBIC emulation).
     pub pacing_model: TransportPacingModel,
+    /// Lifecycle and draining state of this session.
+    pub lifecycle_state: SessionLifecycleState,
+    /// Whether an anticipatory GOAWAY frame with maximal stream ID was transmitted.
+    pub anticipatory_goaway_sent: bool,
+    /// Whether a final GOAWAY frame was transmitted.
+    pub final_goaway_sent: bool,
+    /// Last GOAWAY stream ID recorded on this session.
+    pub last_goaway_stream_id: Option<u32>,
+    /// Streams multiplexed on this session.
+    pub streams: std::collections::HashMap<u32, PooledStreamDescriptor>,
+    /// Total count of streams migrated out to other sessions.
+    pub total_migrated_out_streams: usize,
+    /// Total count of streams migrated into this session from draining sessions.
+    pub total_migrated_in_streams: usize,
+    /// Total payload bytes migrated out from this session.
+    pub total_migrated_out_bytes: usize,
+    /// Total payload bytes migrated into this session.
+    pub total_migrated_in_bytes: usize,
 }
 
 impl TransportSessionDescriptor {
@@ -6271,6 +6450,15 @@ impl TransportSessionDescriptor {
             consecutive_starved_rounds: 0,
             total_dispatched_bytes: 0,
             pacing_model: TransportPacingModel::new(CongestionControlAlgorithm::Bbr),
+            lifecycle_state: SessionLifecycleState::Active,
+            anticipatory_goaway_sent: false,
+            final_goaway_sent: false,
+            last_goaway_stream_id: None,
+            streams: std::collections::HashMap::new(),
+            total_migrated_out_streams: 0,
+            total_migrated_in_streams: 0,
+            total_migrated_out_bytes: 0,
+            total_migrated_in_bytes: 0,
         }
     }
 }
@@ -6446,6 +6634,12 @@ pub struct InterSessionDrrArbitrator {
     origin_order: Vec<String>,
     /// Rotation index for fair round-robin origin traversal.
     origin_round_index: usize,
+    /// Total sessions successfully drained.
+    total_drained_sessions: usize,
+    /// Total streams migrated between sessions.
+    total_migrated_streams: usize,
+    /// Total payload bytes migrated between sessions.
+    total_migrated_bytes: usize,
 }
 
 impl InterSessionDrrArbitrator {
@@ -6486,6 +6680,9 @@ impl InterSessionDrrArbitrator {
             sessions: std::collections::HashMap::new(),
             origin_order: Vec::new(),
             origin_round_index: 0,
+            total_drained_sessions: 0,
+            total_migrated_streams: 0,
+            total_migrated_bytes: 0,
         }
     }
 
@@ -6747,7 +6944,11 @@ impl InterSessionDrrArbitrator {
         let sessions_with_pending_at_start: std::collections::HashSet<u64> = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.pending_bytes > 0)
+            .filter(|(_, s)| {
+                s.pending_bytes > 0
+                    && s.lifecycle_state != SessionLifecycleState::Closed
+                    && s.lifecycle_state != SessionLifecycleState::Drained
+            })
             .map(|(&id, _)| id)
             .collect();
 
@@ -6973,7 +7174,12 @@ impl InterSessionDrrArbitrator {
                     let mut session_ids: Vec<u64> = self
                         .sessions
                         .iter()
-                        .filter(|(_, s)| s.origin == origin_name && s.pending_bytes > 0)
+                        .filter(|(_, s)| {
+                            s.origin == origin_name
+                                && s.pending_bytes > 0
+                                && s.lifecycle_state != SessionLifecycleState::Closed
+                                && s.lifecycle_state != SessionLifecycleState::Drained
+                        })
                         .map(|(&id, _)| id)
                         .collect();
                     session_ids.sort();
@@ -7121,6 +7327,17 @@ impl InterSessionDrrArbitrator {
 
         let residual_session_deficits = self.sessions.values().map(|s| s.deficit).sum();
         let residual_origin_deficits = self.origins.values().map(|q| q.deficit).sum();
+
+        // Check if any draining sessions have completed draining
+        for s in self.sessions.values_mut() {
+            if s.lifecycle_state == SessionLifecycleState::Draining
+                && s.pending_bytes == 0
+                && s.streams.is_empty()
+            {
+                s.lifecycle_state = SessionLifecycleState::Drained;
+                self.total_drained_sessions += 1;
+            }
+        }
 
         InterSessionFairnessReport {
             total_round_capacity: available_bandwidth,
@@ -7396,6 +7613,356 @@ impl InterSessionDrrArbitrator {
             total_active_sessions: self.sessions.len(),
             total_pending_bytes: self.total_pending_bytes(),
         }
+    }
+
+    /// Register a multiplexed stream on an active transport session with initial pending bytes and priority weight.
+    pub fn register_stream(
+        &mut self,
+        session_id: u64,
+        stream_id: u32,
+        pending_bytes: usize,
+        priority_weight: u16,
+        is_idempotent: bool,
+    ) -> bool {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            if sess.lifecycle_state != SessionLifecycleState::Active {
+                return false;
+            }
+            let desc = PooledStreamDescriptor {
+                stream_id,
+                session_id,
+                origin: sess.origin.clone(),
+                pending_bytes,
+                priority_weight: priority_weight.max(1),
+                is_idempotent,
+                migration_status: StreamMigrationStatus::Active,
+                original_session_id: None,
+            };
+            sess.pending_bytes += pending_bytes;
+            sess.streams.insert(stream_id, desc);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Unregister a completed stream from its transport session and update pending bytes.
+    pub fn unregister_stream(&mut self, session_id: u64, stream_id: u32) -> bool {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            if let Some(st) = sess.streams.remove(&stream_id) {
+                sess.pending_bytes = sess.pending_bytes.saturating_sub(st.pending_bytes);
+                if sess.lifecycle_state == SessionLifecycleState::Draining
+                    && sess.streams.is_empty()
+                    && sess.pending_bytes == 0
+                {
+                    sess.lifecycle_state = SessionLifecycleState::Drained;
+                    self.total_drained_sessions += 1;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Retrieve descriptor of a multiplexed stream on a given session.
+    pub fn get_stream(&self, session_id: u64, stream_id: u32) -> Option<&PooledStreamDescriptor> {
+        self.sessions.get(&session_id)?.streams.get(&stream_id)
+    }
+
+    /// Retrieve all multiplexed streams currently active or queued on a given session.
+    pub fn session_streams(&self, session_id: u64) -> Vec<PooledStreamDescriptor> {
+        self.sessions
+            .get(&session_id)
+            .map(|s| s.streams.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Count of multiplexed streams currently assigned to a given session.
+    pub fn active_stream_count(&self, session_id: u64) -> usize {
+        self.sessions
+            .get(&session_id)
+            .map(|s| s.streams.len())
+            .unwrap_or(0)
+    }
+
+    /// Initiate graceful session draining, rejecting new incoming streams.
+    pub fn start_session_drain(&mut self, session_id: u64) -> bool {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            if sess.lifecycle_state == SessionLifecycleState::Active {
+                sess.lifecycle_state = SessionLifecycleState::Draining;
+                if sess.streams.is_empty() && sess.pending_bytes == 0 {
+                    sess.lifecycle_state = SessionLifecycleState::Drained;
+                    self.total_drained_sessions += 1;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Record transmission of an anticipatory GOAWAY frame with maximal stream ID (2^31 - 1).
+    pub fn record_anticipatory_goaway(&mut self, session_id: u64) -> bool {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            sess.anticipatory_goaway_sent = true;
+            if sess.lifecycle_state == SessionLifecycleState::Active {
+                sess.lifecycle_state = SessionLifecycleState::Draining;
+            }
+            if sess.streams.is_empty() && sess.pending_bytes == 0 {
+                sess.lifecycle_state = SessionLifecycleState::Drained;
+                self.total_drained_sessions += 1;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record transmission of a final GOAWAY frame with concrete last processed stream ID.
+    pub fn record_final_goaway(&mut self, session_id: u64, last_stream_id: u32) -> bool {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            sess.final_goaway_sent = true;
+            sess.last_goaway_stream_id = Some(last_stream_id);
+            if sess.streams.is_empty() && sess.pending_bytes == 0 {
+                sess.lifecycle_state = SessionLifecycleState::Drained;
+                self.total_drained_sessions += 1;
+            } else {
+                sess.lifecycle_state = SessionLifecycleState::Draining;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Manually or programmatically mark a draining session as fully drained.
+    pub fn complete_session_drain(&mut self, session_id: u64) -> bool {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            if sess.lifecycle_state == SessionLifecycleState::Draining {
+                sess.lifecycle_state = SessionLifecycleState::Drained;
+                sess.pending_bytes = 0;
+                sess.deficit = 0;
+                self.total_drained_sessions += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Mark a session as closed and clear any remaining pending queues.
+    pub fn close_session(&mut self, session_id: u64) -> bool {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            sess.lifecycle_state = SessionLifecycleState::Closed;
+            sess.pending_bytes = 0;
+            sess.deficit = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Retrieve the current lifecycle state of a transport session.
+    pub fn session_lifecycle_state(&self, session_id: u64) -> Option<SessionLifecycleState> {
+        self.sessions.get(&session_id).map(|s| s.lifecycle_state)
+    }
+
+    /// Dynamically migrate a stream from a source session to a healthy target session.
+    pub fn migrate_stream(
+        &mut self,
+        stream_id: u32,
+        source_session_id: u64,
+        target_session_id: u64,
+    ) -> Result<usize, StreamMigrationError> {
+        if source_session_id == target_session_id {
+            return Ok(0);
+        }
+
+        let source_origin = self
+            .sessions
+            .get(&source_session_id)
+            .ok_or(StreamMigrationError::SourceSessionNotFound(source_session_id))?
+            .origin
+            .clone();
+
+        let target_sess = self
+            .sessions
+            .get(&target_session_id)
+            .ok_or(StreamMigrationError::TargetSessionNotFound(target_session_id))?;
+
+        if target_sess.origin != source_origin {
+            return Err(StreamMigrationError::OriginMismatch {
+                source_origin,
+                target_origin: target_sess.origin.clone(),
+            });
+        }
+
+        if target_sess.lifecycle_state != SessionLifecycleState::Active {
+            return Err(StreamMigrationError::TargetSessionNotActive(target_session_id));
+        }
+
+        let source_sess = self.sessions.get_mut(&source_session_id).unwrap();
+        let mut stream_desc = source_sess
+            .streams
+            .remove(&stream_id)
+            .ok_or(StreamMigrationError::StreamNotFound(stream_id))?;
+
+        let migrated_bytes = stream_desc.pending_bytes;
+        source_sess.pending_bytes = source_sess.pending_bytes.saturating_sub(migrated_bytes);
+        source_sess.total_migrated_out_bytes += migrated_bytes;
+        source_sess.total_migrated_out_streams += 1;
+
+        if source_sess.lifecycle_state == SessionLifecycleState::Draining
+            && source_sess.streams.is_empty()
+            && source_sess.pending_bytes == 0
+        {
+            source_sess.lifecycle_state = SessionLifecycleState::Drained;
+            self.total_drained_sessions += 1;
+        }
+
+        stream_desc.original_session_id =
+            stream_desc.original_session_id.or(Some(source_session_id));
+        stream_desc.session_id = target_session_id;
+        stream_desc.migration_status = StreamMigrationStatus::Migrated;
+
+        let target_sess_mut = self.sessions.get_mut(&target_session_id).unwrap();
+        target_sess_mut.pending_bytes += migrated_bytes;
+        target_sess_mut.total_migrated_in_bytes += migrated_bytes;
+        target_sess_mut.total_migrated_in_streams += 1;
+        target_sess_mut.streams.insert(stream_id, stream_desc);
+
+        self.total_migrated_streams += 1;
+        self.total_migrated_bytes += migrated_bytes;
+
+        Ok(migrated_bytes)
+    }
+
+    /// Automatically migrate all streams from a draining session to active healthy sessions under the same origin.
+    pub fn auto_migrate_draining_session(
+        &mut self,
+        source_session_id: u64,
+    ) -> Option<StreamMigrationReport> {
+        let (source_origin, stream_ids, is_draining) = {
+            let sess = self.sessions.get(&source_session_id)?;
+            let ids: Vec<u32> = sess.streams.keys().copied().collect();
+            (
+                sess.origin.clone(),
+                ids,
+                sess.lifecycle_state == SessionLifecycleState::Draining,
+            )
+        };
+
+        if !is_draining {
+            return None;
+        }
+
+        let mut candidates: Vec<u64> = self
+            .sessions
+            .iter()
+            .filter(|(&id, s)| {
+                id != source_session_id
+                    && s.origin == source_origin
+                    && s.lifecycle_state == SessionLifecycleState::Active
+            })
+            .map(|(&id, _)| id)
+            .collect();
+
+        if candidates.is_empty() {
+            return Some(StreamMigrationReport {
+                source_session_id,
+                origin: source_origin,
+                migrated_streams_count: 0,
+                total_migrated_bytes: 0,
+                target_session_ids: Vec::new(),
+                migrated_streams: Vec::new(),
+                source_now_drained: false,
+            });
+        }
+
+        candidates.sort_by_key(|&id| self.sessions[&id].pending_bytes);
+
+        let mut migrated_streams = Vec::new();
+        let mut target_session_ids = Vec::new();
+        let mut total_migrated_bytes = 0;
+
+        for (idx, stream_id) in stream_ids.into_iter().enumerate() {
+            let target_id = candidates[idx % candidates.len()];
+            if let Ok(bytes) = self.migrate_stream(stream_id, source_session_id, target_id) {
+                total_migrated_bytes += bytes;
+                if !target_session_ids.contains(&target_id) {
+                    target_session_ids.push(target_id);
+                }
+                if let Some(target_sess) = self.sessions.get(&target_id) {
+                    if let Some(st) = target_sess.streams.get(&stream_id) {
+                        migrated_streams.push(st.clone());
+                    }
+                }
+            }
+        }
+
+        let source_now_drained = self
+            .sessions
+            .get(&source_session_id)
+            .map(|s| s.lifecycle_state == SessionLifecycleState::Drained)
+            .unwrap_or(false);
+
+        Some(StreamMigrationReport {
+            source_session_id,
+            origin: source_origin,
+            migrated_streams_count: migrated_streams.len(),
+            total_migrated_bytes,
+            target_session_ids,
+            migrated_streams,
+            source_now_drained,
+        })
+    }
+
+    /// Retrieve lifecycle and migration telemetry for a specific transport session.
+    pub fn get_session_lifecycle_telemetry(
+        &self,
+        session_id: u64,
+    ) -> Option<SessionLifecycleTelemetry> {
+        let sess = self.sessions.get(&session_id)?;
+        Some(SessionLifecycleTelemetry {
+            session_id,
+            origin: sess.origin.clone(),
+            protocol: sess.protocol,
+            state: sess.lifecycle_state,
+            active_streams_count: sess.streams.len(),
+            migrated_out_streams_count: sess.total_migrated_out_streams,
+            migrated_in_streams_count: sess.total_migrated_in_streams,
+            total_migrated_out_bytes: sess.total_migrated_out_bytes,
+            total_migrated_in_bytes: sess.total_migrated_in_bytes,
+            pending_bytes: sess.pending_bytes,
+            anticipatory_goaway_sent: sess.anticipatory_goaway_sent,
+            final_goaway_sent: sess.final_goaway_sent,
+            last_goaway_stream_id: sess.last_goaway_stream_id,
+        })
+    }
+
+    /// Export lifecycle and migration telemetry across all registered transport sessions.
+    pub fn export_pool_lifecycle_telemetry(&self) -> Vec<SessionLifecycleTelemetry> {
+        let mut list: Vec<_> = self
+            .sessions
+            .keys()
+            .copied()
+            .filter_map(|sid| self.get_session_lifecycle_telemetry(sid))
+            .collect();
+        list.sort_by_key(|t| t.session_id);
+        list
+    }
+
+    /// Total count of transport sessions successfully drained.
+    pub fn total_drained_sessions(&self) -> usize {
+        self.total_drained_sessions
+    }
+
+    /// Total count of streams migrated across transport sessions.
+    pub fn total_migrated_streams(&self) -> usize {
+        self.total_migrated_streams
+    }
+
+    /// Total count of payload bytes migrated across transport sessions.
+    pub fn total_migrated_bytes(&self) -> usize {
+        self.total_migrated_bytes
     }
 }
 
@@ -7856,6 +8423,185 @@ impl AsyncHttp2Pool {
     pub fn next_session_id(&self) -> u64 {
         self.next_session_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Register a multiplexed stream on a pooled transport session.
+    pub fn register_pooled_stream(
+        &self,
+        session_id: u64,
+        stream_id: u32,
+        pending_bytes: usize,
+        priority_weight: u16,
+        is_idempotent: bool,
+    ) -> bool {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.register_stream(
+                session_id,
+                stream_id,
+                pending_bytes,
+                priority_weight,
+                is_idempotent,
+            )
+        } else {
+            false
+        }
+    }
+
+    /// Unregister a completed stream from a pooled transport session.
+    pub fn unregister_pooled_stream(&self, session_id: u64, stream_id: u32) -> bool {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.unregister_stream(session_id, stream_id)
+        } else {
+            false
+        }
+    }
+
+    /// Gracefully drain a transport session, with optional immediate automatic migration of active streams
+    /// to other healthy sessions under the same origin.
+    pub fn drain_session_graceful(
+        &self,
+        session_id: u64,
+        auto_migrate: bool,
+    ) -> Option<StreamMigrationReport> {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.record_anticipatory_goaway(session_id);
+            if auto_migrate {
+                arb.auto_migrate_draining_session(session_id)
+            } else {
+                Some(StreamMigrationReport {
+                    source_session_id: session_id,
+                    origin: arb
+                        .get_session(session_id)
+                        .map(|s| s.origin.clone())
+                        .unwrap_or_default(),
+                    migrated_streams_count: 0,
+                    total_migrated_bytes: 0,
+                    target_session_ids: Vec::new(),
+                    migrated_streams: Vec::new(),
+                    source_now_drained: arb
+                        .session_lifecycle_state(session_id)
+                        .map(|s| s == SessionLifecycleState::Drained)
+                        .unwrap_or(false),
+                })
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Record transmission of an anticipatory GOAWAY frame (maximal stream ID 2^31 - 1) on a session.
+    pub fn record_session_anticipatory_goaway(&self, session_id: u64) -> bool {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.record_anticipatory_goaway(session_id)
+        } else {
+            false
+        }
+    }
+
+    /// Record transmission of a final GOAWAY frame with concrete last stream ID on a session.
+    pub fn record_session_final_goaway(&self, session_id: u64, last_stream_id: u32) -> bool {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.record_final_goaway(session_id, last_stream_id)
+        } else {
+            false
+        }
+    }
+
+    /// Mark a draining session as fully drained.
+    pub fn complete_session_drain(&self, session_id: u64) -> bool {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.complete_session_drain(session_id)
+        } else {
+            false
+        }
+    }
+
+    /// Mark a session as closed.
+    pub fn close_session(&self, session_id: u64) -> bool {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.close_session(session_id)
+        } else {
+            false
+        }
+    }
+
+    /// Retrieve the current lifecycle state of a pooled transport session.
+    pub fn session_lifecycle_state(&self, session_id: u64) -> Option<SessionLifecycleState> {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.session_lifecycle_state(session_id)
+        } else {
+            None
+        }
+    }
+
+    /// Dynamically migrate a stream from a source session to a target session.
+    pub fn migrate_pooled_stream(
+        &self,
+        stream_id: u32,
+        source_session_id: u64,
+        target_session_id: u64,
+    ) -> Result<usize, StreamMigrationError> {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.migrate_stream(stream_id, source_session_id, target_session_id)
+        } else {
+            Err(StreamMigrationError::SourceSessionNotFound(
+                source_session_id,
+            ))
+        }
+    }
+
+    /// Automatically migrate all streams away from a draining session to active sessions.
+    pub fn auto_migrate_draining_session(&self, session_id: u64) -> Option<StreamMigrationReport> {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.auto_migrate_draining_session(session_id)
+        } else {
+            None
+        }
+    }
+
+    /// Retrieve lifecycle and migration telemetry for a specific session.
+    pub fn session_lifecycle_telemetry(&self, session_id: u64) -> Option<SessionLifecycleTelemetry> {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.get_session_lifecycle_telemetry(session_id)
+        } else {
+            None
+        }
+    }
+
+    /// Export lifecycle and migration telemetry across all pooled sessions.
+    pub fn pool_lifecycle_telemetry(&self) -> Vec<SessionLifecycleTelemetry> {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.export_pool_lifecycle_telemetry()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Total count of sessions drained in this pool.
+    pub fn total_drained_sessions(&self) -> usize {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.total_drained_sessions()
+        } else {
+            0
+        }
+    }
+
+    /// Total count of streams migrated in this pool.
+    pub fn total_migrated_streams(&self) -> usize {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.total_migrated_streams()
+        } else {
+            0
+        }
+    }
+
+    /// Total count of bytes migrated in this pool.
+    pub fn total_migrated_bytes(&self) -> usize {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.total_migrated_bytes()
+        } else {
+            0
+        }
     }
 
     /// Configure whether client push promise caching and automated absorption is enabled across connections in this pool.
@@ -21045,5 +21791,271 @@ mod tls_alpn_tests {
         let p101_updated = pool.session_pacing_telemetry(101).unwrap();
         assert_eq!(p101_updated.rtt_min, std::time::Duration::from_millis(12));
         assert!(p101_updated.btl_bw_bytes_per_sec >= 5_000_000);
+    }
+
+    #[test]
+    fn test_async_http2_connection_anticipatory_and_final_goaway() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_std = std::net::TcpStream::connect(addr).unwrap();
+        let (server_std, _) = listener.accept().unwrap();
+
+        let s1 = AsyncTcpStream::from_std(client_std).unwrap();
+        let s2 = AsyncTcpStream::from_std(server_std).unwrap();
+
+        let mut client = AsyncHttp2Connection::new(s1, false);
+        let mut server = AsyncHttp2Connection::new(s2, true);
+
+        assert!(!client.is_draining());
+        assert!(!client.is_closed());
+
+        // Step 1: Send anticipatory GOAWAY with maximal stream ID (2^31 - 1)
+        client
+            .send_anticipatory_goaway(b"draining_soon")
+            .unwrap();
+
+        assert!(client.is_draining());
+        assert!(!client.is_closed());
+
+        // Server receives the frame
+        let frame = server.try_recv_frame().unwrap().unwrap();
+        if let crate::simd_parser::Http2Frame::GoAway {
+            last_stream_id,
+            error_code,
+            debug_data,
+        } = frame
+        {
+            assert_eq!(last_stream_id, AsyncHttp2Connection::MAX_STREAM_ID_GOAWAY);
+            assert_eq!(last_stream_id, 0x7FFF_FFFF);
+            assert_eq!(error_code, crate::simd_parser::Http2ErrorCode::NoError);
+            assert_eq!(debug_data, b"draining_soon");
+        } else {
+            panic!("Expected GoAway frame, got {:?}", frame);
+        }
+
+        // Step 2: Send final GOAWAY with concrete last stream ID
+        client
+            .send_final_goaway(3, crate::simd_parser::Http2ErrorCode::NoError, b"shutdown")
+            .unwrap();
+
+        assert!(client.is_draining());
+        assert!(client.is_closed());
+
+        let frame2 = server.try_recv_frame().unwrap().unwrap();
+        if let crate::simd_parser::Http2Frame::GoAway {
+            last_stream_id,
+            error_code,
+            debug_data,
+        } = frame2
+        {
+            assert_eq!(last_stream_id, 3);
+            assert_eq!(error_code, crate::simd_parser::Http2ErrorCode::NoError);
+            assert_eq!(debug_data, b"shutdown");
+        } else {
+            panic!("Expected final GoAway frame, got {:?}", frame2);
+        }
+    }
+
+    #[test]
+    fn test_session_lifecycle_transitions_and_draining() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+
+        arb.register_session(1, "https://api.test.com", TransportProtocol::Http2, 1);
+        assert_eq!(
+            arb.session_lifecycle_state(1),
+            Some(SessionLifecycleState::Active)
+        );
+
+        // Register a stream so pending_bytes > 0
+        arb.register_stream(1, 101, 2048, 1, true);
+        assert_eq!(arb.active_stream_count(1), 1);
+
+        // Start drain -> state becomes Draining
+        assert!(arb.start_session_drain(1));
+        assert_eq!(
+            arb.session_lifecycle_state(1),
+            Some(SessionLifecycleState::Draining)
+        );
+
+        // Cannot register new streams on a draining session
+        assert!(!arb.register_stream(1, 103, 1024, 1, true));
+
+        // Record anticipatory goaway
+        assert!(arb.record_anticipatory_goaway(1));
+        let telem = arb.get_session_lifecycle_telemetry(1).unwrap();
+        assert!(telem.anticipatory_goaway_sent);
+        assert_eq!(telem.state, SessionLifecycleState::Draining);
+
+        // Record final goaway
+        assert!(arb.record_final_goaway(1, 101));
+        let telem2 = arb.get_session_lifecycle_telemetry(1).unwrap();
+        assert!(telem2.final_goaway_sent);
+        assert_eq!(telem2.last_goaway_stream_id, Some(101));
+
+        // Unregister stream -> session completes draining and transitions to Drained
+        assert!(arb.unregister_stream(1, 101));
+        assert_eq!(
+            arb.session_lifecycle_state(1),
+            Some(SessionLifecycleState::Drained)
+        );
+        assert_eq!(arb.total_drained_sessions(), 1);
+
+        // Close session
+        assert!(arb.close_session(1));
+        assert_eq!(
+            arb.session_lifecycle_state(1),
+            Some(SessionLifecycleState::Closed)
+        );
+    }
+
+    #[test]
+    fn test_stream_registration_and_manual_migration() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+
+        arb.register_session(10, "https://service.net", TransportProtocol::Http2, 1);
+        arb.register_session(20, "https://service.net", TransportProtocol::Http2, 1);
+        arb.register_session(30, "https://other.org", TransportProtocol::Http2, 1);
+
+        arb.register_stream(10, 1, 4096, 2, true);
+        arb.register_stream(10, 3, 2048, 1, true);
+
+        assert_eq!(arb.get_session(10).unwrap().pending_bytes, 6144);
+        assert_eq!(arb.get_session(20).unwrap().pending_bytes, 0);
+
+        // Migrate stream 1 from session 10 to session 20
+        let bytes = arb.migrate_stream(1, 10, 20).unwrap();
+        assert_eq!(bytes, 4096);
+
+        assert_eq!(arb.get_session(10).unwrap().pending_bytes, 2048);
+        assert_eq!(arb.get_session(20).unwrap().pending_bytes, 4096);
+
+        let stream1 = arb.get_stream(20, 1).unwrap();
+        assert_eq!(stream1.session_id, 20);
+        assert_eq!(stream1.original_session_id, Some(10));
+        assert_eq!(stream1.migration_status, StreamMigrationStatus::Migrated);
+
+        // Error checking: origin mismatch
+        let err = arb.migrate_stream(3, 10, 30).unwrap_err();
+        match err {
+            StreamMigrationError::OriginMismatch {
+                source_origin,
+                target_origin,
+            } => {
+                assert_eq!(source_origin, "https://service.net");
+                assert_eq!(target_origin, "https://other.org");
+            }
+            _ => panic!("Expected OriginMismatch, got {:?}", err),
+        }
+
+        // Error checking: target not active (draining/closed)
+        arb.start_session_drain(20);
+        let err2 = arb.migrate_stream(3, 10, 20).unwrap_err();
+        match err2 {
+            StreamMigrationError::TargetSessionNotActive(tid) => assert_eq!(tid, 20),
+            _ => panic!("Expected TargetSessionNotActive, got {:?}", err2),
+        }
+    }
+
+    #[test]
+    fn test_auto_migration_draining_session() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+
+        arb.register_session(100, "https://cluster.local", TransportProtocol::Http2, 1);
+        arb.register_session(200, "https://cluster.local", TransportProtocol::Http3, 2);
+
+        arb.register_stream(100, 1, 1024, 1, true);
+        arb.register_stream(100, 3, 2048, 1, true);
+        arb.register_stream(100, 5, 3072, 1, true);
+
+        assert_eq!(arb.get_session(100).unwrap().pending_bytes, 6144);
+        assert_eq!(arb.active_stream_count(100), 3);
+
+        // Put session 100 into draining
+        arb.start_session_drain(100);
+
+        // Auto-migrate all streams to healthy sessions
+        let report = arb.auto_migrate_draining_session(100).unwrap();
+        assert_eq!(report.source_session_id, 100);
+        assert_eq!(report.migrated_streams_count, 3);
+        assert_eq!(report.total_migrated_bytes, 6144);
+        assert_eq!(report.target_session_ids, vec![200]);
+        assert!(report.source_now_drained);
+
+        // Session 100 should now be Drained with 0 pending bytes
+        assert_eq!(
+            arb.session_lifecycle_state(100),
+            Some(SessionLifecycleState::Drained)
+        );
+        assert_eq!(arb.get_session(100).unwrap().pending_bytes, 0);
+
+        // Target session 200 should hold all 3 streams and all 6144 pending bytes
+        assert_eq!(arb.active_stream_count(200), 3);
+        assert_eq!(arb.get_session(200).unwrap().pending_bytes, 6144);
+        assert_eq!(arb.total_migrated_streams(), 3);
+        assert_eq!(arb.total_migrated_bytes(), 6144);
+    }
+
+    #[test]
+    fn test_async_http2_pool_graceful_draining_and_stream_migration_integration() {
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 443, 4);
+
+        pool.register_transport_session(
+            501,
+            "https://gateway.example.com",
+            TransportProtocol::Http2,
+            1,
+        );
+        pool.register_transport_session(
+            502,
+            "https://gateway.example.com",
+            TransportProtocol::Http3,
+            2,
+        );
+
+        pool.register_pooled_stream(501, 1, 2048, 1, true);
+        pool.register_pooled_stream(501, 3, 2048, 1, true);
+
+        assert_eq!(
+            pool.session_lifecycle_state(501),
+            Some(SessionLifecycleState::Active)
+        );
+
+        // Drain session 501 with auto-migration enabled
+        let report = pool.drain_session_graceful(501, true).unwrap();
+        assert_eq!(report.source_session_id, 501);
+        assert_eq!(report.migrated_streams_count, 2);
+        assert_eq!(report.total_migrated_bytes, 4096);
+        assert_eq!(report.target_session_ids, vec![502]);
+        assert!(report.source_now_drained);
+
+        // Verify lifecycle telemetry
+        let telem501 = pool.session_lifecycle_telemetry(501).unwrap();
+        assert_eq!(telem501.state, SessionLifecycleState::Drained);
+        assert_eq!(telem501.migrated_out_streams_count, 2);
+        assert_eq!(telem501.total_migrated_out_bytes, 4096);
+        assert!(telem501.anticipatory_goaway_sent);
+
+        let telem502 = pool.session_lifecycle_telemetry(502).unwrap();
+        assert_eq!(telem502.state, SessionLifecycleState::Active);
+        assert_eq!(telem502.migrated_in_streams_count, 2);
+        assert_eq!(telem502.total_migrated_in_bytes, 4096);
+        assert_eq!(telem502.pending_bytes, 4096);
+
+        let pool_telem = pool.pool_lifecycle_telemetry();
+        assert_eq!(pool_telem.len(), 2);
+        assert_eq!(pool.total_drained_sessions(), 1);
+        assert_eq!(pool.total_migrated_streams(), 2);
+        assert_eq!(pool.total_migrated_bytes(), 4096);
+
+        // Execute DRR round: target session 502 should be served seamlessly
+        let round_report = pool.schedule_inter_session_bandwidth(4096);
+        assert!(round_report.total_allocated_bytes > 0);
+        let s502_slice = round_report
+            .slices
+            .iter()
+            .find(|s| s.session_id == 502)
+            .unwrap();
+        assert!(s502_slice.allocated_bytes > 0);
+        assert!(s502_slice.remaining_pending_bytes < 4096);
     }
 }
