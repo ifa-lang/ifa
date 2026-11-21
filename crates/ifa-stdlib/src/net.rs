@@ -9142,7 +9142,13 @@ mod tests {
                 .send_data(stream_id, b"gamma", true)
                 .expect("send chunk 3");
 
-            let _ = server.recv_frame();
+            loop {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::GoAway { .. }) => break,
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
             let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
         });
 
@@ -9200,6 +9206,7 @@ mod tests {
             }
         });
 
+        std::thread::sleep(Duration::from_millis(15));
         let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
 
         // 1. Acquire connection and verify ping RTT round-trip
@@ -9328,6 +9335,7 @@ mod tests {
             }
         });
 
+        std::thread::sleep(Duration::from_millis(15));
         let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
         let mut conn = pool.acquire().expect("acquire connection from pool");
 
@@ -9645,6 +9653,7 @@ mod tests {
             }
         });
 
+        std::thread::sleep(Duration::from_millis(15));
         let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
         let resp = pool
             .execute_request_with_retry("GET", "/", &[], None, 2)
@@ -9692,6 +9701,7 @@ mod tests {
             }
         });
 
+        std::thread::sleep(Duration::from_millis(15));
         let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
 
         // 1. First request succeeds, seeding the fatal GOAWAY into the pool
@@ -10016,6 +10026,7 @@ mod tests {
             }
         });
 
+        std::thread::sleep(Duration::from_millis(15));
         let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
 
         // Before request: no Alt-Svc routes known
