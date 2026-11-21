@@ -6182,7 +6182,9 @@ impl InterSessionDrrArbitrator {
         self.adaptive_quantum_enabled = enabled;
         self.min_base_quantum = min_quantum.max(1);
         self.max_base_quantum = max_quantum.max(self.min_base_quantum);
-        self.base_quantum = self.base_quantum.clamp(self.min_base_quantum, self.max_base_quantum);
+        self.base_quantum = self
+            .base_quantum
+            .clamp(self.min_base_quantum, self.max_base_quantum);
         self.ewma_alpha = if ewma_alpha > 0.0 && ewma_alpha <= 1.0 {
             ewma_alpha
         } else {
@@ -6740,7 +6742,8 @@ impl InterSessionDrrArbitrator {
 
         let saturation_level = {
             let util_ratio = (total_allocated_bytes as f64) / (available_bandwidth as f64);
-            if util_ratio >= 0.90 || (initial_pending >= available_bandwidth && util_ratio >= 0.80) {
+            if util_ratio >= 0.90 || (initial_pending >= available_bandwidth && util_ratio >= 0.80)
+            {
                 NetworkSaturationLevel::Saturated
             } else if util_ratio >= 0.50 {
                 NetworkSaturationLevel::Optimal
@@ -6752,7 +6755,8 @@ impl InterSessionDrrArbitrator {
         self.last_saturation_level = saturation_level;
         self.update_ewma(available_bandwidth, total_allocated_bytes, initial_pending);
 
-        let jains_fairness_index = self.compute_jains_fairness_index(&origins_with_pending_at_start, &slices);
+        let jains_fairness_index =
+            self.compute_jains_fairness_index(&origins_with_pending_at_start, &slices);
         self.last_jains_fairness_index = jains_fairness_index;
 
         let effective_base_quantum = self.base_quantum;
@@ -6808,8 +6812,10 @@ impl InterSessionDrrArbitrator {
         match saturation_level {
             NetworkSaturationLevel::Saturated => {
                 let step = (self.base_quantum / 4).max(64);
-                self.base_quantum =
-                    self.base_quantum.saturating_sub(step).max(self.min_base_quantum);
+                self.base_quantum = self
+                    .base_quantum
+                    .saturating_sub(step)
+                    .max(self.min_base_quantum);
             }
             NetworkSaturationLevel::UnderUtilized => {
                 let step = (self.base_quantum / 4).max(64);
@@ -6880,18 +6886,18 @@ impl InterSessionDrrArbitrator {
             } else {
                 0.0
             };
-            let round_satisfaction_ratio =
-                if pending_bytes == 0 && quota.last_round_allocated_bytes == 0 {
-                    1.0
+            let round_satisfaction_ratio = if pending_bytes == 0
+                && quota.last_round_allocated_bytes == 0
+            {
+                1.0
+            } else {
+                let total_demand = quota.last_round_allocated_bytes + pending_bytes;
+                if total_demand > 0 {
+                    (quota.last_round_allocated_bytes as f64 / total_demand as f64).clamp(0.0, 1.0)
                 } else {
-                    let total_demand = quota.last_round_allocated_bytes + pending_bytes;
-                    if total_demand > 0 {
-                        (quota.last_round_allocated_bytes as f64 / total_demand as f64)
-                            .clamp(0.0, 1.0)
-                    } else {
-                        1.0
-                    }
-                };
+                    1.0
+                }
+            };
 
             origin_metrics.push(OriginFairnessTelemetry {
                 origin: origin_name.clone(),
@@ -20140,8 +20146,8 @@ mod tls_alpn_tests {
 
     #[test]
     fn test_inter_session_ewma_throughput_and_saturation_tracking() {
-        let mut arb = InterSessionDrrArbitrator::new(1024)
-            .with_adaptive_quantum(false, 256, 4096, 0.5);
+        let mut arb =
+            InterSessionDrrArbitrator::new(1024).with_adaptive_quantum(false, 256, 4096, 0.5);
 
         let origin = "https://metrics.example.com";
         arb.register_session(1, origin, TransportProtocol::Http2, 1);
@@ -20171,8 +20177,14 @@ mod tls_alpn_tests {
         arb.set_session_pending_bytes(1, 200);
         let report3 = arb.schedule_round(2000);
         assert_eq!(report3.total_allocated_bytes, 200);
-        assert_eq!(report3.saturation_level, NetworkSaturationLevel::UnderUtilized);
-        assert_eq!(arb.saturation_level(), NetworkSaturationLevel::UnderUtilized);
+        assert_eq!(
+            report3.saturation_level,
+            NetworkSaturationLevel::UnderUtilized
+        );
+        assert_eq!(
+            arb.saturation_level(),
+            NetworkSaturationLevel::UnderUtilized
+        );
         // EWMA: 0.5 * 1624 + 0.5 * 200 = 912
         assert!((arb.ewma_throughput() - 912.0).abs() < 1e-4);
     }
@@ -20180,8 +20192,8 @@ mod tls_alpn_tests {
     #[test]
     fn test_inter_session_adaptive_drr_quantum_regulation() {
         // Start with base quantum = 1024, min = 256, max = 2048, adaptive = true
-        let mut arb = InterSessionDrrArbitrator::new(1024)
-            .with_adaptive_quantum(true, 256, 2048, 0.2);
+        let mut arb =
+            InterSessionDrrArbitrator::new(1024).with_adaptive_quantum(true, 256, 2048, 0.2);
 
         let origin = "https://stream.example.com";
         arb.register_session(1, origin, TransportProtocol::Http2, 1);
@@ -20256,8 +20268,18 @@ mod tls_alpn_tests {
         pool.configure_origin_quota("https://api.domain1.com", 8192, 1024, 1);
         pool.configure_origin_quota("https://api.domain2.com", 8192, 1024, 1);
 
-        pool.register_transport_session(201, "https://api.domain1.com", TransportProtocol::Http2, 1);
-        pool.register_transport_session(202, "https://api.domain2.com", TransportProtocol::Http3, 1);
+        pool.register_transport_session(
+            201,
+            "https://api.domain1.com",
+            TransportProtocol::Http2,
+            1,
+        );
+        pool.register_transport_session(
+            202,
+            "https://api.domain2.com",
+            TransportProtocol::Http3,
+            1,
+        );
 
         pool.update_session_pending_data(201, 4096);
         pool.update_session_pending_data(202, 4096);
