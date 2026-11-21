@@ -1536,6 +1536,58 @@ impl Http2Frame {
     }
 }
 
+/// Borrowed zero-copy slice view of an incoming HTTP/2 DATA frame payload.
+/// Avoids heap allocations when decoding and inspecting DATA frames from wire buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Http2DataFrameSlice<'a> {
+    /// Stream identifier associated with this DATA frame.
+    pub stream_id: u32,
+    /// Indicates whether this DATA frame terminates the stream.
+    pub end_stream: bool,
+    /// Borrowed slice of the frame payload (excluding any padding).
+    pub data: &'a [u8],
+}
+
+impl<'a> Http2DataFrameSlice<'a> {
+    /// Decode a DATA frame into a borrowed payload slice without heap allocation.
+    pub fn decode(header: &Http2FrameHeader, payload: &'a [u8]) -> Result<Self, FastHttpError> {
+        if header.frame_type != Http2FrameType::Data {
+            return Err(FastHttpError::InvalidRequestLine);
+        }
+        if payload.len() < header.length as usize {
+            return Err(FastHttpError::Incomplete);
+        }
+        let payload = &payload[..header.length as usize];
+        let end_stream = (header.flags & Http2Frame::FLAG_END_STREAM) != 0;
+        let data = if (header.flags & Http2Frame::FLAG_PADDED) != 0 {
+            if payload.is_empty() {
+                return Err(FastHttpError::InvalidRequestLine);
+            }
+            let pad_len = payload[0] as usize;
+            if 1 + pad_len > payload.len() {
+                return Err(FastHttpError::InvalidRequestLine);
+            }
+            &payload[1..payload.len() - pad_len]
+        } else {
+            payload
+        };
+        Ok(Self {
+            stream_id: header.stream_id,
+            end_stream,
+            data,
+        })
+    }
+
+    /// Convert this zero-copy slice view into an owned `Http2Frame::Data`.
+    pub fn to_owned_frame(&self) -> Http2Frame {
+        Http2Frame::Data {
+            stream_id: self.stream_id,
+            end_stream: self.end_stream,
+            data: self.data.to_vec(),
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // HPACK Integer & String representation + Static Table (RFC 7541)
 // -----------------------------------------------------------------------------
@@ -3344,6 +3396,39 @@ impl Http2Session {
             _ => Ok(None),
         }
     }
+
+    /// Process an incoming zero-copy DATA frame slice without creating an intermediate frame enum,
+    /// updating flow control windows and stream state.
+    pub fn handle_data_slice(
+        &mut self,
+        slice: &Http2DataFrameSlice<'_>,
+    ) -> Result<Option<Http2Frame>, FastHttpError> {
+        let initial_win = self.initial_stream_window_size;
+        let stream = self
+            .streams
+            .entry(slice.stream_id)
+            .or_insert_with(|| Http2Stream::new(slice.stream_id, initial_win));
+        stream.received_data.extend_from_slice(slice.data);
+        stream.window_size -= slice.data.len() as i32;
+        stream.local_window_size -= slice.data.len() as i32;
+        self.connection_window_size -= slice.data.len() as i32;
+
+        if slice.end_stream {
+            match stream.state {
+                Http2StreamState::Open | Http2StreamState::HalfClosedLocal => {
+                    stream.state = if stream.state == Http2StreamState::HalfClosedLocal {
+                        Http2StreamState::Closed
+                    } else {
+                        Http2StreamState::HalfClosedRemote
+                    };
+                }
+                _ => {
+                    stream.state = Http2StreamState::Closed;
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -4371,5 +4456,44 @@ mod http2_tests {
             Http2StreamState::Closed
         );
         assert!(session.pending_outbound_data.is_empty());
+    }
+
+    #[test]
+    fn test_http2_data_frame_slice_zero_copy_and_session_handling() {
+        let raw_payload = b"high-frequency-streaming-chunk-data";
+        let header = Http2FrameHeader {
+            length: raw_payload.len() as u32,
+            frame_type: Http2FrameType::Data,
+            flags: Http2Frame::FLAG_END_STREAM,
+            stream_id: 3,
+        };
+
+        let slice = Http2DataFrameSlice::decode(&header, raw_payload)
+            .expect("decode data frame slice zero-copy");
+        assert_eq!(slice.stream_id, 3);
+        assert!(slice.end_stream);
+        assert_eq!(slice.data, raw_payload);
+
+        let owned_frame = slice.to_owned_frame();
+        match owned_frame {
+            Http2Frame::Data { stream_id, end_stream, data } => {
+                assert_eq!(stream_id, 3);
+                assert!(end_stream);
+                assert_eq!(data, raw_payload);
+            }
+            _ => panic!("expected Data frame"),
+        }
+
+        let mut session = Http2Session::new(true);
+        // Pre-open stream 3 so it transitions from Open to HalfClosedRemote upon end_stream
+        session.streams.insert(3, Http2Stream::new(3, 65535));
+        session.streams.get_mut(&3).unwrap().state = Http2StreamState::Open;
+
+        let reply = session.handle_data_slice(&slice).expect("handle data slice");
+        assert!(reply.is_none());
+
+        let stream = session.streams.get(&3).expect("stream 3 exists");
+        assert_eq!(stream.received_data, raw_payload);
+        assert_eq!(stream.state, Http2StreamState::HalfClosedRemote);
     }
 }

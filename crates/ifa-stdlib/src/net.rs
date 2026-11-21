@@ -3321,6 +3321,100 @@ impl AsyncHttp2Connection {
         }
     }
 
+    /// Read the next incoming frame, delivering DATA frames zero-copy via borrowed slices.
+    ///
+    /// If the next frame is a DATA frame, invokes `on_data` with a borrowed `Http2DataFrameSlice`
+    /// directly referencing the internal connection read buffer without any payload allocation.
+    /// Automatically updates internal session flow control and stream state.
+    /// Returns `Ok(None)` when a DATA frame was consumed, or `Ok(Some(frame))` for non-DATA frames
+    /// (such as HEADERS, SETTINGS, PING, or GOAWAY).
+    pub fn recv_frame_with_data_slice<F>(
+        &mut self,
+        mut on_data: F,
+    ) -> io::Result<Option<crate::simd_parser::Http2Frame>>
+    where
+        F: FnMut(&crate::simd_parser::Http2DataFrameSlice<'_>) -> io::Result<()>,
+    {
+        let mut spins = 0;
+        loop {
+            // First check if an already buffered frame can be delivered as a zero-copy DATA slice
+            if self.read_buf.len() >= crate::simd_parser::Http2FrameHeader::HEADER_SIZE {
+                if let Some(header) = crate::simd_parser::Http2FrameHeader::decode(&self.read_buf[..9]) {
+                    let total_frame_len = crate::simd_parser::Http2FrameHeader::HEADER_SIZE + header.length as usize;
+                    if self.read_buf.len() >= total_frame_len {
+                        if header.frame_type == crate::simd_parser::Http2FrameType::Data {
+                            let payload = &self.read_buf[9..total_frame_len];
+                            let slice = match crate::simd_parser::Http2DataFrameSlice::decode(&header, payload) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!("Failed to parse HTTP/2 DATA frame slice: {:?}", e),
+                                    ));
+                                }
+                            };
+                            let _ = self.session.handle_data_slice(&slice);
+                            let user_res = on_data(&slice);
+                            self.read_buf.drain(..total_frame_len);
+                            if self.read_buf.is_empty()
+                                && self.read_buf.capacity() > DEFAULT_MAX_RETAINED_BUFFER_CAPACITY
+                            {
+                                self.read_buf
+                                    .shrink_to(DEFAULT_MAX_RETAINED_BUFFER_CAPACITY);
+                            }
+
+                            // Replenish windows proactively
+                            let flow_updates = self.session.replenish_flow_control_windows();
+                            for update_frame in flow_updates {
+                                self.send_frame(&update_frame)?;
+                            }
+
+                            user_res?;
+                            return Ok(None);
+                        } else {
+                            // Non-DATA frame: process via standard recv_frame
+                            let frame = self.recv_frame()?;
+                            return Ok(Some(frame));
+                        }
+                    }
+                }
+            }
+
+            // Need to read more bytes from socket
+            let mut buf = [0u8; 4096];
+            match self.stream.try_read(&mut buf) {
+                Ok(Some(n)) if n > 0 => {
+                    self.read_buf.extend_from_slice(&buf[..n]);
+                }
+                Ok(Some(0)) => {
+                    self.is_closed = true;
+                    if self.read_buf.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "HTTP/2 connection closed by peer",
+                        ));
+                    }
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    if self.is_closed && self.read_buf.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "HTTP/2 connection is closed",
+                        ));
+                    }
+                    spins += 1;
+                    if spins < 16 {
+                        std::hint::spin_loop();
+                    } else {
+                        GLOBAL_SCHEDULER.yield_now();
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Gracefully close connection by sending a GOAWAY frame with optional debug diagnostic data.
     pub fn send_goaway_with_debug(
         &mut self,
@@ -3588,12 +3682,29 @@ impl AsyncHttp2Connection {
     pub fn recv_streaming_response<F>(
         &mut self,
         target_stream_id: u32,
+        chunk_handler: F,
+    ) -> io::Result<crate::http::HttpResponse>
+    where
+        F: FnMut(&[u8]),
+    {
+        self.recv_streaming_response_with_pool(target_stream_id, None, chunk_handler)
+    }
+
+    /// Receive a response on a stream with progressive chunked streaming decoding,
+    /// using an optional buffer pool to recycle internal chunk allocations and zero-copy chunk slices.
+    pub fn recv_streaming_response_with_pool<F>(
+        &mut self,
+        target_stream_id: u32,
+        buffer_pool: Option<Http2ChunkBufferPool>,
         mut chunk_handler: F,
     ) -> io::Result<crate::http::HttpResponse>
     where
         F: FnMut(&[u8]),
     {
         let mut decoder = Http2StreamingResponseDecoder::new(target_stream_id);
+        if let Some(pool) = buffer_pool {
+            decoder = decoder.with_buffer_pool(pool);
+        }
 
         if let Some(stream) = self.session.streams.get(&target_stream_id) {
             if !stream.received_headers.is_empty() {
@@ -3603,14 +3714,14 @@ impl AsyncHttp2Connection {
                 let is_closed = stream.state
                     == crate::simd_parser::Http2StreamState::HalfClosedRemote
                     || stream.state == crate::simd_parser::Http2StreamState::Closed;
-                let chunk = decoder.feed_chunk(&stream.received_data, is_closed)?;
-                chunk_handler(&chunk);
+                let chunk = decoder.feed_chunk_slice(&stream.received_data, is_closed)?;
+                chunk_handler(chunk);
             }
             if stream.state == crate::simd_parser::Http2StreamState::HalfClosedRemote
                 || stream.state == crate::simd_parser::Http2StreamState::Closed
             {
                 decoder.mark_complete();
-                return decoder.assemble_response();
+                return decoder.assemble_response_recycling();
             }
         }
 
@@ -3641,8 +3752,8 @@ impl AsyncHttp2Connection {
                     end_stream,
                 } => {
                     if stream_id == target_stream_id {
-                        let decoded = decoder.feed_chunk(&data, end_stream)?;
-                        chunk_handler(&decoded);
+                        let decoded = decoder.feed_chunk_owned(data, end_stream)?;
+                        chunk_handler(decoded);
                     }
                 }
                 crate::simd_parser::Http2Frame::WindowUpdate { .. } => {
@@ -3669,7 +3780,7 @@ impl AsyncHttp2Connection {
             }
         }
 
-        decoder.assemble_response()
+        decoder.assemble_response_recycling()
     }
 
     /// Server push: send a PUSH_PROMISE frame on an associated client stream to reserve a promised stream id,
@@ -3939,9 +4050,9 @@ impl AsyncHttp2Connection {
                     let is_closed = stream.state
                         == crate::simd_parser::Http2StreamState::HalfClosedRemote
                         || stream.state == crate::simd_parser::Http2StreamState::Closed;
-                    if let Ok(chunk) = dec.feed_chunk(&stream.received_data, is_closed) {
+                    if let Ok(chunk) = dec.feed_chunk_slice(&stream.received_data, is_closed) {
                         if let Some(h) = stream_handlers.get(&sid) {
-                            h(sid, &chunk);
+                            h(sid, chunk);
                         }
                     }
                 }
@@ -3980,10 +4091,10 @@ impl AsyncHttp2Connection {
                     end_stream,
                 } => {
                     if let Some(dec) = decoders.get_mut(&stream_id) {
-                        match dec.feed_chunk(&data, end_stream) {
+                        match dec.feed_chunk_owned(data, end_stream) {
                             Ok(decoded_chunk) => {
                                 if let Some(handler) = stream_handlers.get(&stream_id) {
-                                    handler(stream_id, &decoded_chunk);
+                                    handler(stream_id, decoded_chunk);
                                 }
                             }
                             Err(e) => {
@@ -4066,6 +4177,61 @@ impl AsyncHttp2Connection {
 /// Callback invoked whenever a chunk of response payload is decoded for a stream.
 pub type Http2ResponseChunkHandler = std::sync::Arc<dyn Fn(u32, &[u8]) + Send + Sync>;
 
+/// Recyclable buffer pool for high-frequency HTTP/2 chunk slices.
+///
+/// Reduces heap allocations and allocator thrashing by pooling pre-allocated
+/// byte buffers for high-throughput streaming workloads.
+#[derive(Debug, Clone)]
+pub struct Http2ChunkBufferPool {
+    pool: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    buffer_capacity: usize,
+    max_retained_buffers: usize,
+}
+
+impl Default for Http2ChunkBufferPool {
+    fn default() -> Self {
+        Self::new(16384, 64)
+    }
+}
+
+impl Http2ChunkBufferPool {
+    /// Create a new chunk buffer pool with the given buffer capacity and maximum retained buffers.
+    pub fn new(buffer_capacity: usize, max_retained_buffers: usize) -> Self {
+        Self {
+            pool: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            buffer_capacity: buffer_capacity.max(1024),
+            max_retained_buffers: max_retained_buffers.max(1),
+        }
+    }
+
+    /// Acquire a buffer from the pool, or allocate a new one if the pool is empty.
+    /// The returned vector has length 0 and capacity at least `self.buffer_capacity`.
+    pub fn acquire(&self) -> Vec<u8> {
+        if let Ok(mut pool) = self.pool.lock() {
+            if let Some(mut buf) = pool.pop() {
+                buf.clear();
+                return buf;
+            }
+        }
+        Vec::with_capacity(self.buffer_capacity)
+    }
+
+    /// Return a buffer to the pool for reuse if under the maximum retained buffer limit.
+    pub fn release(&self, mut buf: Vec<u8>) {
+        if let Ok(mut pool) = self.pool.lock() {
+            if pool.len() < self.max_retained_buffers {
+                buf.clear();
+                pool.push(buf);
+            }
+        }
+    }
+
+    /// Current count of idle pooled buffers available for immediate reuse.
+    pub fn idle_count(&self) -> usize {
+        self.pool.lock().map(|p| p.len()).unwrap_or(0)
+    }
+}
+
 /// Progressive streaming response decoder for HTTP/2 multiplexed streams.
 /// Handles fragmented DATA frames, progressive decompression (gzip),
 /// chunked payloads, trailers, and status code extraction.
@@ -4081,6 +4247,8 @@ pub struct Http2StreamingResponseDecoder {
     pub trailers: crate::http::HttpHeaders,
     /// Progressive streaming gzip decoder if content-encoding is gzip.
     gzip_decoder: Option<crate::http::GzipStreamDecoder>,
+    /// Optional chunk buffer pool for high-frequency allocation reuse.
+    pub buffer_pool: Option<Http2ChunkBufferPool>,
     /// Accumulated decoded body chunks.
     decoded_chunks: Vec<Vec<u8>>,
     /// Total bytes decoded across all chunks.
@@ -4106,6 +4274,7 @@ impl Http2StreamingResponseDecoder {
             headers: crate::http::HttpHeaders::new(),
             trailers: crate::http::HttpHeaders::new(),
             gzip_decoder: None,
+            buffer_pool: None,
             decoded_chunks: Vec::new(),
             total_bytes_decoded: 0,
             total_raw_bytes: 0,
@@ -4114,6 +4283,12 @@ impl Http2StreamingResponseDecoder {
             reset_error: None,
             decode_error: None,
         }
+    }
+
+    /// Configure a shared chunk buffer pool to reuse buffers across decoded chunks.
+    pub fn with_buffer_pool(mut self, pool: Http2ChunkBufferPool) -> Self {
+        self.buffer_pool = Some(pool);
+        self
     }
 
     /// Feed decoded HTTP headers from a HEADERS frame.
@@ -4147,27 +4322,64 @@ impl Http2StreamingResponseDecoder {
         self.is_complete = true;
     }
 
-    /// Process a fragmented incoming DATA frame chunk.
-    /// Returns the newly decoded byte slice for this chunk.
-    pub fn feed_chunk(&mut self, raw_chunk: &[u8], end_stream: bool) -> io::Result<Vec<u8>> {
+    /// Process a fragmented incoming DATA frame chunk slice without unnecessary cloning.
+    /// Returns a borrowed slice of the decoded chunk payload.
+    pub fn feed_chunk_slice(&mut self, raw_chunk: &[u8], end_stream: bool) -> io::Result<&[u8]> {
         self.total_raw_bytes += raw_chunk.len();
         self.chunk_count += 1;
 
-        let decoded = if let Some(ref mut gzip) = self.gzip_decoder {
-            gzip.feed(raw_chunk)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        if let Some(ref mut gzip) = self.gzip_decoder {
+            let decompressed = gzip
+                .feed(raw_chunk)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            self.total_bytes_decoded += decompressed.len();
+            self.decoded_chunks.push(decompressed);
+        } else if let Some(ref pool) = self.buffer_pool {
+            let mut buf = pool.acquire();
+            buf.extend_from_slice(raw_chunk);
+            self.total_bytes_decoded += buf.len();
+            self.decoded_chunks.push(buf);
         } else {
-            raw_chunk.to_vec()
-        };
-
-        self.total_bytes_decoded += decoded.len();
-        self.decoded_chunks.push(decoded.clone());
+            self.total_bytes_decoded += raw_chunk.len();
+            self.decoded_chunks.push(raw_chunk.to_vec());
+        }
 
         if end_stream {
             self.is_complete = true;
         }
 
-        Ok(decoded)
+        Ok(self.decoded_chunks.last().map(|c| c.as_slice()).unwrap_or(&[]))
+    }
+
+    /// Ingest an owned DATA frame payload without allocating a new buffer when uncompressed.
+    /// Returns a slice view of the newly decoded chunk.
+    pub fn feed_chunk_owned(&mut self, chunk: Vec<u8>, end_stream: bool) -> io::Result<&[u8]> {
+        self.total_raw_bytes += chunk.len();
+        self.chunk_count += 1;
+
+        if let Some(ref mut gzip) = self.gzip_decoder {
+            let decompressed = gzip
+                .feed(&chunk)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            self.total_bytes_decoded += decompressed.len();
+            self.decoded_chunks.push(decompressed);
+        } else {
+            self.total_bytes_decoded += chunk.len();
+            self.decoded_chunks.push(chunk);
+        }
+
+        if end_stream {
+            self.is_complete = true;
+        }
+
+        Ok(self.decoded_chunks.last().map(|c| c.as_slice()).unwrap_or(&[]))
+    }
+
+    /// Process a fragmented incoming DATA frame chunk.
+    /// Returns the newly decoded byte slice for this chunk.
+    pub fn feed_chunk(&mut self, raw_chunk: &[u8], end_stream: bool) -> io::Result<Vec<u8>> {
+        let slice = self.feed_chunk_slice(raw_chunk, end_stream)?;
+        Ok(slice.to_vec())
     }
 
     /// Mark the stream as completed (e.g. END_STREAM received on empty frame or trailers).
@@ -4234,6 +4446,43 @@ impl Http2StreamingResponseDecoder {
         resp.body = body;
 
         // If not already decompressed via GzipStreamDecoder, attempt transparent decompression
+        if self.gzip_decoder.is_none() {
+            if let Ok(decompressed) = resp.decompress_body() {
+                resp.body = decompressed;
+            }
+        } else {
+            resp.headers.remove("content-encoding");
+        }
+
+        Ok(resp)
+    }
+
+    /// Assemble the response, consuming the decoder and recycling internal chunk buffers
+    /// back into the configured `Http2ChunkBufferPool` to eliminate allocator churn.
+    pub fn assemble_response_recycling(mut self) -> io::Result<crate::http::HttpResponse> {
+        if let Some(err) = self.reset_error {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                format!("Stream {} reset with error {:?}", self.stream_id, err),
+            ));
+        }
+        if let Some(ref err) = self.decode_error {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, err.clone()));
+        }
+
+        let status = self.status.unwrap_or(200);
+        let mut resp = crate::http::HttpResponse::new(crate::http::HttpStatus(status));
+        resp.headers = self.headers.clone();
+
+        let mut body = Vec::with_capacity(self.total_bytes_decoded);
+        for chunk in self.decoded_chunks.drain(..) {
+            body.extend_from_slice(&chunk);
+            if let Some(ref pool) = self.buffer_pool {
+                pool.release(chunk);
+            }
+        }
+        resp.body = body;
+
         if self.gzip_decoder.is_none() {
             if let Ok(decompressed) = resp.decompress_body() {
                 resp.body = decompressed;
@@ -4450,6 +4699,7 @@ pub struct AsyncHttp2Pool {
     response_interceptors: Vec<Http2ResponseInterceptor>,
     alt_svc_routes:
         std::sync::Mutex<std::collections::HashMap<String, Vec<crate::simd_parser::AltSvcRoute>>>,
+    chunk_buffer_pool: Option<Http2ChunkBufferPool>,
 }
 
 impl AsyncHttp2Pool {
@@ -4476,7 +4726,19 @@ impl AsyncHttp2Pool {
             request_interceptors: Vec::new(),
             response_interceptors: Vec::new(),
             alt_svc_routes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            chunk_buffer_pool: None,
         }
+    }
+
+    /// Configure a shared chunk buffer pool to reuse byte allocations across high-frequency streaming requests.
+    pub fn with_chunk_buffer_pool(mut self, pool: Http2ChunkBufferPool) -> Self {
+        self.chunk_buffer_pool = Some(pool);
+        self
+    }
+
+    /// Retrieve the configured chunk buffer pool, if any.
+    pub fn chunk_buffer_pool(&self) -> Option<&Http2ChunkBufferPool> {
+        self.chunk_buffer_pool.as_ref()
     }
 
     /// Configure the default maximum number of adaptive retries for requests executed on this pool
@@ -4964,7 +5226,11 @@ impl AsyncHttp2Pool {
         pseudo_headers.extend_from_slice(&header_refs);
 
         let stream_id = conn.send_request(&pseudo_headers, body_ref)?;
-        let result = conn.recv_streaming_response(stream_id, chunk_handler);
+        let result = conn.recv_streaming_response_with_pool(
+            stream_id,
+            self.chunk_buffer_pool.clone(),
+            chunk_handler,
+        );
 
         match result {
             Ok(mut resp) => {
@@ -10032,6 +10298,231 @@ mod tests {
         assert_eq!(chunks_received[1], b"stream-2");
         assert_eq!(pool.retried_count(), 1);
         assert_eq!(pool.stats().retried_requests, 1);
+
+        pool.shutdown();
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_http2_chunk_buffer_pool_lifecycle() {
+        let pool = Http2ChunkBufferPool::new(4096, 2);
+        assert_eq!(pool.idle_count(), 0);
+
+        let mut buf1 = pool.acquire();
+        assert!(buf1.capacity() >= 4096);
+        assert!(buf1.is_empty());
+        buf1.extend_from_slice(b"sample payload 1");
+
+        let mut buf2 = pool.acquire();
+        assert!(buf2.capacity() >= 4096);
+        buf2.extend_from_slice(b"sample payload 2");
+
+        pool.release(buf1);
+        assert_eq!(pool.idle_count(), 1);
+
+        pool.release(buf2);
+        assert_eq!(pool.idle_count(), 2);
+
+        // Third buffer exceeds max_retained_buffers (2), should be discarded
+        let buf3 = Vec::with_capacity(4096);
+        pool.release(buf3);
+        assert_eq!(pool.idle_count(), 2);
+
+        let reused = pool.acquire();
+        assert_eq!(pool.idle_count(), 1);
+        assert!(reused.is_empty());
+        assert!(reused.capacity() >= 4096);
+    }
+
+    #[test]
+    fn test_http2_streaming_decoder_slice_and_owned_with_buffer_pool() {
+        let pool = Http2ChunkBufferPool::new(8192, 4);
+        let mut decoder = Http2StreamingResponseDecoder::new(1).with_buffer_pool(pool.clone());
+
+        decoder.feed_headers(&[
+            (":status".to_string(), "200".to_string()),
+            ("content-type".to_string(), "application/octet-stream".to_string()),
+        ]);
+        assert_eq!(decoder.status, Some(200));
+
+        // 1. feed_chunk_slice borrows directly and copies into pooled buffer
+        let slice_out = decoder
+            .feed_chunk_slice(b"chunk-alpha-", false)
+            .expect("feed slice");
+        assert_eq!(slice_out, b"chunk-alpha-");
+
+        // 2. feed_chunk_owned moves buffer without allocation
+        let owned_vec = b"chunk-beta".to_vec();
+        let owned_out = decoder.feed_chunk_owned(owned_vec, true).expect("feed owned");
+        assert_eq!(owned_out, b"chunk-beta");
+
+        assert!(decoder.is_complete());
+        assert_eq!(decoder.chunk_count(), 2);
+        assert_eq!(decoder.total_bytes_decoded(), 22);
+
+        // 3. assemble_response_recycling recycles internal chunk buffers back into pool
+        let resp = decoder
+            .assemble_response_recycling()
+            .expect("assemble response recycling");
+        assert_eq!(resp.status.0, 200);
+        assert_eq!(resp.body, b"chunk-alpha-chunk-beta");
+        assert!(pool.idle_count() > 0);
+    }
+
+    #[test]
+    fn test_async_http2_connection_zero_copy_data_slice() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let (tcp_stream, _) = listener.accept().expect("accept connection");
+            let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async stream");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
+
+            let stream_id = loop {
+                match server.recv_frame().expect("server recv frame") {
+                    crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    } => {
+                        if end_stream {
+                            break stream_id;
+                        }
+                    }
+                    _ => {}
+                }
+            };
+
+            let h = server
+                .session
+                .create_headers_frame(stream_id, &[(":status", "200")], false);
+            server.send_frame(&h).expect("send headers");
+            server
+                .send_data(stream_id, b"zero-copy-slice-1-", false)
+                .expect("send data 1");
+            server
+                .send_data(stream_id, b"zero-copy-slice-2", true)
+                .expect("send data 2");
+
+            loop {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::GoAway { .. }) | Err(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let tcp_client = std::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .expect("connect client");
+        let async_client = AsyncTcpStream::from_std(tcp_client).expect("async client stream");
+        let mut client = AsyncHttp2Connection::client_handshake(async_client)
+            .expect("client handshake");
+
+        let pseudo = vec![(":method", "GET"), (":path", "/zero-copy"), (":scheme", "http")];
+        let stream_id = client.send_request(&pseudo, None).expect("send request");
+
+        // 1. Drain any pre-stream control frames (e.g. SETTINGS) until HEADERS is received
+        let mut data_slices_captured = Vec::new();
+        loop {
+            let frame = client
+                .recv_frame_with_data_slice(|slice| {
+                    data_slices_captured.push((slice.stream_id, slice.end_stream, slice.data.to_vec()));
+                    Ok(())
+                })
+                .expect("recv frame");
+            if let Some(crate::simd_parser::Http2Frame::Headers { .. }) = frame {
+                break;
+            }
+        }
+        assert!(data_slices_captured.is_empty());
+
+        // 2. Consume DATA chunks zero-copy until end_stream is observed
+        while data_slices_captured.len() < 2 {
+            let res = client
+                .recv_frame_with_data_slice(|slice| {
+                    data_slices_captured.push((slice.stream_id, slice.end_stream, slice.data.to_vec()));
+                    Ok(())
+                })
+                .expect("recv data frame");
+            assert!(res.is_none() || matches!(res, Some(crate::simd_parser::Http2Frame::Settings { .. })));
+        }
+
+        assert_eq!(data_slices_captured.len(), 2);
+        assert_eq!(data_slices_captured[0].0, stream_id);
+        assert!(!data_slices_captured[0].1);
+        assert_eq!(data_slices_captured[0].2, b"zero-copy-slice-1-");
+        assert_eq!(data_slices_captured[1].0, stream_id);
+        assert!(data_slices_captured[1].1);
+        assert_eq!(data_slices_captured[1].2, b"zero-copy-slice-2");
+
+        let _ = client.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_pool_with_chunk_buffer_pool_streaming() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let (tcp_stream, _) = listener.accept().expect("accept connection");
+            let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async stream");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
+
+            let stream_id = loop {
+                match server.recv_frame().expect("server recv frame") {
+                    crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    } => {
+                        if end_stream {
+                            break stream_id;
+                        }
+                    }
+                    _ => {}
+                }
+            };
+
+            let h = server
+                .session
+                .create_headers_frame(stream_id, &[(":status", "200")], false);
+            server.send_frame(&h).expect("send headers");
+            server.send_data(stream_id, b"part-1-", false).expect("send 1");
+            server.send_data(stream_id, b"part-2-", false).expect("send 2");
+            server.send_data(stream_id, b"part-3", true).expect("send 3");
+
+            loop {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::GoAway { .. }) | Err(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let chunk_pool = Http2ChunkBufferPool::new(8192, 16);
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2)
+            .with_chunk_buffer_pool(chunk_pool.clone());
+
+        assert!(pool.chunk_buffer_pool().is_some());
+
+        let mut received = Vec::new();
+        let resp = pool
+            .execute_streaming_request("GET", "/pool-buffered-stream", &[], None, |chunk| {
+                received.push(chunk.to_vec());
+            })
+            .expect("execute streaming request with chunk buffer pool");
+
+        assert_eq!(resp.status.0, 200);
+        assert_eq!(resp.body, b"part-1-part-2-part-3");
+        assert_eq!(received.len(), 3);
+        assert_eq!(received[0], b"part-1-");
+        assert_eq!(received[1], b"part-2-");
+        assert_eq!(received[2], b"part-3");
+        assert!(chunk_pool.idle_count() > 0);
 
         pool.shutdown();
         let _ = handle.join();
