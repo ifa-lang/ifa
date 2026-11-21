@@ -13648,17 +13648,16 @@ mod tests {
     /// combining RFC 9218 urgency tiers (0..7) with RFC 7540 Deficit Round Robin (DRR) weighted fair queuing.
     ///
     /// 4 concurrent request streams are batched over a pooled connection with base_quantum=1024, max_frame_size=1024:
-    ///   - Stream A: Tier 0 (urgency 0), non-incremental, 1024 bytes (1 frame)
-    ///   - Stream B: Tier 1 (urgency 1), incremental, weight 32, 4096 bytes (4 frames)
-    ///   - Stream C: Tier 1 (urgency 1), incremental, weight 16, 2048 bytes (2 frames)
-    ///   - Stream D: Tier 2 (urgency 2), non-incremental, 1024 bytes (1 frame)
+    /// - Stream A: Tier 0 (urgency 0), non-incremental, 1024 bytes (1 frame)
+    /// - Stream B: Tier 1 (urgency 1), incremental, weight 32, 4096 bytes (4 frames)
+    /// - Stream C: Tier 1 (urgency 1), incremental, weight 16, 2048 bytes (2 frames)
+    /// - Stream D: Tier 2 (urgency 2), non-incremental, 1024 bytes (1 frame)
     ///
     /// Expected wire arrival order recorded by mock server:
-    ///   - Tier 0 served first: Stream A (1 frame)
-    ///   - Tier 1 streams arbitrated via DRR (2:1 ratio for weights 32 vs 16):
-    ///       Round 1: [Stream B, Stream B, Stream C]
-    ///       Round 2: [Stream B, Stream B, Stream C]
-    ///   - Tier 2 served last: Stream D (1 frame)
+    /// - Tier 0 served first: Stream A (1 frame)
+    /// - Tier 1 streams arbitrated via DRR (2:1 ratio for weights 32 vs 16): Round 1: [Stream B, Stream B, Stream C], Round 2: [Stream B, Stream B, Stream C]
+    /// - Tier 2 served last: Stream D (1 frame)
+    ///
     /// Complete wire sequence: [A, B, B, C, B, B, C, D]
     #[test]
     fn test_execute_prioritized_batch_hierarchical_drr_multi_tier_wire_interleaving() {
