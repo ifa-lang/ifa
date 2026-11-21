@@ -2912,6 +2912,10 @@ pub struct AsyncHttp2Connection {
     flow_control_bytes_observed: usize,
     /// Total count of response payloads transparently decompressed on this connection.
     pub decompressed_count: usize,
+    /// Base quantum for DRR weighted-fair bandwidth scheduling (bytes per weight unit per round, default 1024).
+    pub drr_base_quantum: usize,
+    /// Maximum frame payload size cap during DRR scheduling (default: 16384).
+    pub drr_max_frame_size: usize,
 }
 
 impl AsyncHttp2Connection {
@@ -2928,12 +2932,51 @@ impl AsyncHttp2Connection {
             flow_control_last_observation: None,
             flow_control_bytes_observed: 0,
             decompressed_count: 0,
+            drr_base_quantum: 1024,
+            drr_max_frame_size: 16384,
         }
     }
 
     /// Whether this HTTP/2 connection is closed.
     pub fn is_closed(&self) -> bool {
         self.is_closed
+    }
+
+    /// Configure the DRR base quantum (bytes per weight unit per round, default 1024).
+    pub fn with_drr_base_quantum(mut self, base_quantum: usize) -> Self {
+        self.drr_base_quantum = base_quantum.max(1);
+        self
+    }
+
+    /// Set the DRR base quantum on this connection.
+    pub fn set_drr_base_quantum(&mut self, base_quantum: usize) {
+        self.drr_base_quantum = base_quantum.max(1);
+    }
+
+    /// DRR base quantum configured on this connection.
+    pub fn drr_base_quantum(&self) -> usize {
+        self.drr_base_quantum
+    }
+
+    /// Configure the maximum frame payload size cap used during DRR scheduling (default 16384).
+    pub fn with_drr_max_frame_size(mut self, max_frame_size: usize) -> Self {
+        self.drr_max_frame_size = max_frame_size.max(1);
+        self
+    }
+
+    /// Set the maximum frame payload size cap used during DRR scheduling.
+    pub fn set_drr_max_frame_size(&mut self, max_frame_size: usize) {
+        self.drr_max_frame_size = max_frame_size.max(1);
+    }
+
+    /// Maximum frame payload size cap used during DRR scheduling.
+    pub fn drr_max_frame_size(&self) -> usize {
+        self.drr_max_frame_size
+    }
+
+    /// Read-only reference to the active DRR deficit counters for streams on this connection.
+    pub fn drr_deficits(&self) -> &std::collections::HashMap<u32, usize> {
+        &self.session.drr_deficits
     }
 
     /// Configure an optional chunk buffer pool for recycling incoming DATA frames.
@@ -3124,6 +3167,8 @@ impl AsyncHttp2Connection {
             flow_control_last_observation: None,
             flow_control_bytes_observed: 0,
             decompressed_count: 0,
+            drr_base_quantum: 1024,
+            drr_max_frame_size: 16384,
         })
     }
 
@@ -3186,6 +3231,8 @@ impl AsyncHttp2Connection {
             flow_control_last_observation: None,
             flow_control_bytes_observed: 0,
             decompressed_count: 0,
+            drr_base_quantum: 1024,
+            drr_max_frame_size: 16384,
         })
     }
 
@@ -4228,6 +4275,26 @@ impl AsyncHttp2Connection {
         Ok(count)
     }
 
+    /// Flush outbound DATA frames using DRR weighted-fair scheduling with persistent session deficits.
+    ///
+    /// Uses the connection's configured `drr_base_quantum` and `drr_max_frame_size`, maintaining
+    /// deficit counters across successive calls to guarantee long-term proportional throughput.
+    pub fn flush_drr_outbound_data_persistent(
+        &mut self,
+        end_stream: bool,
+    ) -> io::Result<usize> {
+        let quantum = self.drr_base_quantum;
+        let max_frame = self.drr_max_frame_size;
+        let frames = self
+            .session
+            .schedule_drr_outbound_data_persistent(quantum, max_frame, end_stream);
+        let count = frames.len();
+        for frame in &frames {
+            self.send_frame(frame)?;
+        }
+        Ok(count)
+    }
+
     /// Queue outbound body data for a stream and immediately schedule/flush as many DATA frames
     /// as permitted by the stream and connection flow control windows and RFC 9218 priority.
     ///
@@ -4288,8 +4355,8 @@ impl AsyncHttp2Connection {
             stream_mappings.push(stream_id);
         }
 
-        // Flush outbound data frames: use DRR weighted-fair scheduling for RFC 7540 priority
-        // streams; fall back to fixed-quantum scheduling for RFC 9218 urgency-only streams.
+        // Flush outbound data frames: use DRR weighted-fair scheduling with persistent session deficits
+        // for RFC 7540 priority streams; fall back to fixed-quantum scheduling for RFC 9218 urgency-only streams.
         if has_pending_scheduled_data {
             if !has_rfc9218 {
                 // Build per-stream weight map from requests (stream_id → weight).
@@ -4299,9 +4366,7 @@ impl AsyncHttp2Connection {
                         s.weight = req.weight;
                     }
                 }
-                let mut drr_deficit: std::collections::HashMap<u32, usize> =
-                    stream_mappings.iter().map(|&sid| (sid, 0)).collect();
-                self.flush_drr_outbound_data(&mut drr_deficit, 1024, 16384, true)?;
+                self.flush_drr_outbound_data_persistent(true)?;
             } else {
                 self.flush_scheduled_outbound_data(true)?;
             }
@@ -5781,6 +5846,8 @@ pub struct AsyncHttp2Pool {
     auto_decompress: std::sync::Arc<std::sync::atomic::AtomicBool>,
     accept_encoding: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     decompressed_responses: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    drr_base_quantum: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    drr_max_frame_size: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl AsyncHttp2Pool {
@@ -5855,6 +5922,8 @@ impl AsyncHttp2Pool {
                 "gzip, deflate, br".to_string(),
             ))),
             decompressed_responses: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            drr_base_quantum: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1024)),
+            drr_max_frame_size: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(16384)),
         }
     }
 
@@ -5873,6 +5942,53 @@ impl AsyncHttp2Pool {
     /// Whether dynamic RFC 7540 flow control auto-tuning is enabled on this pool.
     pub fn auto_tune_flow_control(&self) -> bool {
         self.auto_tune_flow_control
+    }
+
+    /// Configure the DRR base quantum applied to connections in this pool (default: 1024).
+    pub fn with_drr_base_quantum(self, quantum: usize) -> Self {
+        self.drr_base_quantum
+            .store(quantum.max(1), std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// Set the DRR base quantum for connections in this pool.
+    pub fn set_drr_base_quantum(&self, quantum: usize) {
+        self.drr_base_quantum
+            .store(quantum.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// DRR base quantum configured on this pool.
+    pub fn drr_base_quantum(&self) -> usize {
+        self.drr_base_quantum
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Configure the DRR maximum frame payload size cap applied to connections in this pool (default: 16384).
+    pub fn with_drr_max_frame_size(self, max_frame_size: usize) -> Self {
+        self.drr_max_frame_size
+            .store(max_frame_size.max(1), std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// Set the DRR maximum frame payload size cap for connections in this pool.
+    pub fn set_drr_max_frame_size(&self, max_frame_size: usize) {
+        self.drr_max_frame_size
+            .store(max_frame_size.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// DRR maximum frame payload size cap configured on this pool.
+    pub fn drr_max_frame_size(&self) -> usize {
+        self.drr_max_frame_size
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Retrieve snapshots of DRR deficit maps currently persisting on idle connections retained in this pool.
+    pub fn idle_connections_drr_deficits(&self) -> Vec<std::collections::HashMap<u32, usize>> {
+        if let Ok(pool) = self.idle_pool.lock() {
+            pool.iter().map(|entry| entry.conn.drr_deficits().clone()).collect()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Configure whether client push promise caching and automated absorption is enabled across connections in this pool.
@@ -6831,6 +6947,8 @@ impl AsyncHttp2Pool {
                         self.enable_push_promises
                             .load(std::sync::atomic::Ordering::Relaxed),
                     );
+                    conn.set_drr_base_quantum(self.drr_base_quantum());
+                    conn.set_drr_max_frame_size(self.drr_max_frame_size());
                     if let Some(ref pool) = self.chunk_buffer_pool {
                         conn.chunk_buffer_pool = Some(pool.clone());
                     }
@@ -6880,6 +6998,8 @@ impl AsyncHttp2Pool {
             self.enable_push_promises
                 .load(std::sync::atomic::Ordering::Relaxed),
         );
+        conn.set_drr_base_quantum(self.drr_base_quantum());
+        conn.set_drr_max_frame_size(self.drr_max_frame_size());
         if let Some(ref pool) = self.chunk_buffer_pool {
             conn.chunk_buffer_pool = Some(pool.clone());
         }
@@ -13265,6 +13385,179 @@ mod tests {
             total_echoed,
             8192 + 4096
         );
+    }
+
+    /// Integration test: network wire-order verification of DRR weighted-fair frame interleaving
+    /// across pooled HTTP/2 connections with persistent session deficits.
+    ///
+    /// Configures `AsyncHttp2Pool` with `drr_base_quantum = 1024` and `drr_max_frame_size = 1024`.
+    /// Client sends two concurrent POST streams via `execute_prioritized_batch`:
+    ///   - Stream A (weight 32, 2× quota): 4096 bytes body (4 frames of 1024)
+    ///   - Stream B (weight 16, 1× quota): 2048 bytes body (2 frames of 1024)
+    ///
+    /// The mock server records the arrival sequence of every HTTP/2 DATA frame on the TCP wire.
+    /// Mathematical verification:
+    ///   Round 1: Stream A transmits 2048 bytes (2 frames), Stream B transmits 1024 bytes (1 frame).
+    ///   Round 2: Stream A transmits 2048 bytes (2 frames), Stream B transmits 1024 bytes (1 frame).
+    /// Wire sequence MUST be: [Stream A, Stream A, Stream B, Stream A, Stream A, Stream B].
+    /// In addition, validates that deficits persist on the idle pooled connection after release.
+    #[test]
+    fn test_execute_prioritized_batch_drr_interleaved_wire_order() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().unwrap().port();
+
+        // Channel or thread join to transmit wire arrival frames to verification
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server_handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                }
+            };
+
+            let mut wire_data_sequence: Vec<(u32, usize)> = Vec::new();
+            let mut bodies: std::collections::HashMap<u32, Vec<u8>> =
+                std::collections::HashMap::new();
+            let mut streams_done = 0u32;
+
+            while streams_done < 2 {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    }) => {
+                        bodies.entry(stream_id).or_default();
+                        if end_stream {
+                            streams_done += 1;
+                        }
+                    }
+                    Ok(crate::simd_parser::Http2Frame::Data {
+                        stream_id,
+                        data,
+                        end_stream,
+                    }) => {
+                        wire_data_sequence.push((stream_id, data.len()));
+                        bodies.entry(stream_id).or_default().extend_from_slice(&data);
+                        if end_stream {
+                            streams_done += 1;
+                        }
+                    }
+                    Ok(crate::simd_parser::Http2Frame::WindowUpdate { .. }) => {}
+                    Ok(crate::simd_parser::Http2Frame::Settings { .. }) => {}
+                    _ => {}
+                }
+            }
+
+            // Reply to each stream with 200 OK
+            for (sid, _) in &bodies {
+                let headers = [(":status", "200")];
+                let _ = server.send_response(*sid, &headers, Some(b"OK"));
+            }
+
+            tx.send(wire_data_sequence).expect("send wire sequence");
+
+            // Keep connection alive for pool reusability and deficit preservation checks
+            loop {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::GoAway { .. }) => break,
+                    Ok(crate::simd_parser::Http2Frame::Ping { ack: false, opaque_data }) => {
+                        let _ = server.send_frame(&crate::simd_parser::Http2Frame::Ping {
+                            ack: true,
+                            opaque_data,
+                        });
+                    }
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(15));
+
+        // Create pool with DRR quantum 1024 and max frame size 1024
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2)
+            .with_drr_base_quantum(1024)
+            .with_drr_max_frame_size(1024);
+
+        let body_hi = vec![b'A'; 4096];
+        let body_lo = vec![b'B'; 2048];
+
+        let requests = vec![
+            Http2PrioritizedRequest::new("POST", "/data-hi")
+                .with_body(body_hi)
+                .with_priority(0, 32, false),
+            Http2PrioritizedRequest::new("POST", "/data-lo")
+                .with_body(body_lo)
+                .with_priority(0, 16, false),
+        ];
+
+        let results = pool
+            .execute_prioritized_batch(requests)
+            .expect("execute batch on pool");
+
+        let wire_sequence = rx.recv().expect("recv wire sequence");
+
+        // 1. Both streams succeeded
+        assert_eq!(results.len(), 2, "expected 2 responses from batch");
+        for (_sid, res) in &results {
+            assert!(res.is_ok(), "stream response error: {:?}", res);
+        }
+
+        let sid_hi = results[0].0;
+        let sid_lo = results[1].0;
+
+        // 2. Exact wire sequence verification:
+        // Must contain exactly 6 frames: 4 for sid_hi and 2 for sid_lo.
+        assert_eq!(
+            wire_sequence.len(),
+            6,
+            "expected 6 DATA frames on wire, got {:?}",
+            wire_sequence
+        );
+
+        // Every frame must be exactly 1024 bytes
+        for &(sid, len) in &wire_sequence {
+            assert_eq!(len, 1024, "frame for stream {} had size {} (expected 1024)", sid, len);
+        }
+
+        // Expected wire pattern according to DRR: [hi, hi, lo, hi, hi, lo]
+        let wire_sids: Vec<u32> = wire_sequence.iter().map(|&(sid, _)| sid).collect();
+        let expected_sids = vec![sid_hi, sid_hi, sid_lo, sid_hi, sid_hi, sid_lo];
+        assert_eq!(
+            wire_sids, expected_sids,
+            "DRR frame interleaving on wire mismatch! Got {:?}, expected {:?}",
+            wire_sids, expected_sids
+        );
+
+        // 3. Persistent deficit validation on pooled connection
+        let pool_deficits = pool.idle_connections_drr_deficits();
+        assert_eq!(
+            pool_deficits.len(),
+            1,
+            "expected 1 idle connection in pool with preserved deficits"
+        );
+        let conn_deficits = &pool_deficits[0];
+        assert!(
+            conn_deficits.contains_key(&sid_hi),
+            "expected deficit entry for stream hi"
+        );
+        assert!(
+            conn_deficits.contains_key(&sid_lo),
+            "expected deficit entry for stream lo"
+        );
+
+        // Clean up connection pool and wait for server to conclude
+        pool.clear();
+        let _ = server_handle.join();
     }
 
     #[test]

@@ -3546,6 +3546,8 @@ pub struct Http2Session {
     pub pending_outbound_data: std::collections::HashMap<u32, Vec<u8>>,
     /// Adaptive flow controller optimizing connection and stream windows based on RTT and bandwidth.
     pub adaptive_flow_controller: AdaptiveFlowController,
+    /// Persistent DRR deficit counters per stream ID (RFC 7540 weighted-fair scheduling).
+    pub drr_deficits: std::collections::HashMap<u32, usize>,
 }
 
 impl Http2Session {
@@ -3579,6 +3581,7 @@ impl Http2Session {
             alt_svc_routes: std::collections::HashMap::new(),
             pending_outbound_data: std::collections::HashMap::new(),
             adaptive_flow_controller: AdaptiveFlowController::default(),
+            drr_deficits: std::collections::HashMap::new(),
         }
     }
 
@@ -4519,6 +4522,27 @@ impl Http2Session {
             }
         }
 
+        frames
+    }
+
+    /// Schedule outbound data using DRR with persistent internal deficit counters (`self.drr_deficits`).
+    ///
+    /// Preserves accumulated unused quantum across successive schedule/flush calls, guaranteeing
+    /// long-term bandwidth proportions for long-running or multi-batch streams.
+    pub fn schedule_drr_outbound_data_persistent(
+        &mut self,
+        base_quantum: usize,
+        max_frame_size: usize,
+        end_stream: bool,
+    ) -> Vec<Http2Frame> {
+        let mut deficits = std::mem::take(&mut self.drr_deficits);
+        let frames = self.schedule_drr_outbound_data(
+            &mut deficits,
+            base_quantum,
+            max_frame_size,
+            end_stream,
+        );
+        self.drr_deficits = deficits;
         frames
     }
 
