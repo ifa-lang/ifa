@@ -14340,11 +14340,11 @@ mod tests {
             while let Ok((tcp_stream, _)) = listener.accept() {
                 let async_stream = match AsyncTcpStream::from_std(tcp_stream) {
                     Ok(s) => s,
-                    Err(_) => break,
+                    Err(_) => continue,
                 };
                 let mut server = match AsyncHttp2Connection::server_handshake(async_stream) {
                     Ok(s) => s,
-                    Err(_) => break,
+                    Err(_) => continue,
                 };
 
                 let mut completed = false;
