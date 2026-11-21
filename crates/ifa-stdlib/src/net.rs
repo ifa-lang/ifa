@@ -10399,17 +10399,13 @@ mod tests {
                 AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
 
             let stream_id = loop {
-                match server.recv_frame().expect("server recv frame") {
-                    crate::simd_parser::Http2Frame::Headers {
-                        stream_id,
-                        end_stream,
-                        ..
-                    } => {
-                        if end_stream {
-                            break stream_id;
-                        }
-                    }
-                    _ => {}
+                if let crate::simd_parser::Http2Frame::Headers {
+                    stream_id,
+                    end_stream: true,
+                    ..
+                } = server.recv_frame().expect("server recv frame")
+                {
+                    break stream_id;
                 }
             };
 
@@ -10506,17 +10502,13 @@ mod tests {
                 AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
 
             let stream_id = loop {
-                match server.recv_frame().expect("server recv frame") {
-                    crate::simd_parser::Http2Frame::Headers {
-                        stream_id,
-                        end_stream,
-                        ..
-                    } => {
-                        if end_stream {
-                            break stream_id;
-                        }
-                    }
-                    _ => {}
+                if let crate::simd_parser::Http2Frame::Headers {
+                    stream_id,
+                    end_stream: true,
+                    ..
+                } = server.recv_frame().expect("server recv frame")
+                {
+                    break stream_id;
                 }
             };
 
