@@ -5225,30 +5225,31 @@ impl Http2PoolCacheEntry {
             .get("vary")
             .map(crate::simd_parser::Http2Vary::parse);
 
-        let (directives, expires_at, is_heuristic) = if let Some(cc) = response.headers.get("cache-control") {
-            let d = crate::http::HttpCacheDirectives::parse(cc);
-            let exp = d
-                .max_age
-                .map(|sec| now + std::time::Duration::from_secs(sec));
-            (d, exp, false)
-        } else if let Some(exp_str) = response.headers.get("expires") {
-            let exp = crate::http::parse_http_date(exp_str);
-            (crate::http::HttpCacheDirectives::default(), exp, false)
-        } else if let Some(ref lm_str) = last_modified {
-            if let Some(lm_time) = crate::http::parse_http_date(lm_str) {
-                if let Ok(diff) = now.duration_since(lm_time) {
-                    let heuristic_secs = diff.as_secs() / 10;
-                    let exp = Some(now + std::time::Duration::from_secs(heuristic_secs));
-                    (crate::http::HttpCacheDirectives::default(), exp, true)
+        let (directives, expires_at, is_heuristic) =
+            if let Some(cc) = response.headers.get("cache-control") {
+                let d = crate::http::HttpCacheDirectives::parse(cc);
+                let exp = d
+                    .max_age
+                    .map(|sec| now + std::time::Duration::from_secs(sec));
+                (d, exp, false)
+            } else if let Some(exp_str) = response.headers.get("expires") {
+                let exp = crate::http::parse_http_date(exp_str);
+                (crate::http::HttpCacheDirectives::default(), exp, false)
+            } else if let Some(ref lm_str) = last_modified {
+                if let Some(lm_time) = crate::http::parse_http_date(lm_str) {
+                    if let Ok(diff) = now.duration_since(lm_time) {
+                        let heuristic_secs = diff.as_secs() / 10;
+                        let exp = Some(now + std::time::Duration::from_secs(heuristic_secs));
+                        (crate::http::HttpCacheDirectives::default(), exp, true)
+                    } else {
+                        (crate::http::HttpCacheDirectives::default(), None, false)
+                    }
                 } else {
                     (crate::http::HttpCacheDirectives::default(), None, false)
                 }
             } else {
                 (crate::http::HttpCacheDirectives::default(), None, false)
-            }
-        } else {
-            (crate::http::HttpCacheDirectives::default(), None, false)
-        };
+            };
 
         Self {
             method: method.into(),
@@ -5376,7 +5377,8 @@ impl Http2PoolCacheEntry {
     /// Calculate the heuristic freshness duration if this entry was derived heuristically.
     pub fn heuristic_freshness(&self) -> Option<std::time::Duration> {
         if self.is_heuristic {
-            self.expires_at.and_then(|exp| exp.duration_since(self.response_time).ok())
+            self.expires_at
+                .and_then(|exp| exp.duration_since(self.response_time).ok())
         } else {
             None
         }
@@ -5528,9 +5530,9 @@ impl AsyncHttp2Pool {
                 std::collections::HashMap::new(),
             )),
             enable_http_cache: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            max_http_cache_entries: std::sync::Arc::new(
-                std::sync::atomic::AtomicUsize::new(Self::DEFAULT_MAX_HTTP_CACHE_ENTRIES),
-            ),
+            max_http_cache_entries: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                Self::DEFAULT_MAX_HTTP_CACHE_ENTRIES,
+            )),
             http_cache_evictions: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             http_cache_invalidations: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             cache_revalidations: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -5720,7 +5722,10 @@ impl AsyncHttp2Pool {
         if let Ok(mut cache) = self.http_cache_entries.lock() {
             let max_entries = self.max_http_cache_entries();
             let entries = cache.entry(key).or_default();
-            if let Some(pos) = entries.iter().position(|e| e.matches_request(&entry.request_headers)) {
+            if let Some(pos) = entries
+                .iter()
+                .position(|e| e.matches_request(&entry.request_headers))
+            {
                 entries[pos] = entry;
             } else {
                 entries.push(entry);
@@ -5770,9 +5775,7 @@ impl AsyncHttp2Pool {
             let mut evicted = 0;
             for entries in cache.values_mut() {
                 let initial_len = entries.len();
-                entries.retain(|entry| {
-                    now.duration_since(entry.received_at) <= max_age
-                });
+                entries.retain(|entry| now.duration_since(entry.received_at) <= max_age);
                 evicted += initial_len - entries.len();
             }
             cache.retain(|_, v| !v.is_empty());
@@ -6643,7 +6646,8 @@ impl AsyncHttp2Pool {
                             if entry.is_heuristic {
                                 if let Ok(age) = now_sys.duration_since(entry.response_time) {
                                     if age.as_secs() > 86400 {
-                                        resp.headers.set("warning", "113 - \"Heuristic Expiration\"");
+                                        resp.headers
+                                            .set("warning", "113 - \"Heuristic Expiration\"");
                                     }
                                 }
                             }
@@ -7065,7 +7069,8 @@ impl AsyncHttp2Pool {
                             if entry.is_heuristic {
                                 if let Ok(age) = now_sys.duration_since(entry.response_time) {
                                     if age.as_secs() > 86400 {
-                                        resp.headers.set("warning", "113 - \"Heuristic Expiration\"");
+                                        resp.headers
+                                            .set("warning", "113 - \"Heuristic Expiration\"");
                                     }
                                 }
                             }
@@ -15817,9 +15822,15 @@ mod tls_alpn_tests {
         assert!(freshness.as_secs() >= 95 && freshness.as_secs() <= 105);
 
         // Within freshness window (e.g. at now + 50s): fresh
-        assert!(entry.is_fresh(now + std::time::Duration::from_secs(50), std::time::Duration::from_secs(10)));
+        assert!(entry.is_fresh(
+            now + std::time::Duration::from_secs(50),
+            std::time::Duration::from_secs(10)
+        ));
         // Past freshness window (e.g. at now + 150s): not fresh
-        assert!(!entry.is_fresh(now + std::time::Duration::from_secs(150), std::time::Duration::from_secs(10)));
+        assert!(!entry.is_fresh(
+            now + std::time::Duration::from_secs(150),
+            std::time::Duration::from_secs(10)
+        ));
     }
 
     #[test]
@@ -15882,10 +15893,22 @@ mod tls_alpn_tests {
 
         let mut r1 = crate::http::HttpResponse::new(crate::http::HttpStatus(200));
         r1.headers.set("cache-control", "public, max-age=60");
-        pool.insert_http_cache_entry("GET:/api/users/1".into(), Http2PoolCacheEntry::new("GET", "/api/users/1", r1.clone()));
-        pool.insert_http_cache_entry("GET:/api/users/2".into(), Http2PoolCacheEntry::new("GET", "/api/users/2", r1.clone()));
-        pool.insert_http_cache_entry("GET:/api/products/1".into(), Http2PoolCacheEntry::new("GET", "/api/products/1", r1.clone()));
-        pool.insert_http_cache_entry("GET:/api/orders/99".into(), Http2PoolCacheEntry::new("GET", "/api/orders/99", r1));
+        pool.insert_http_cache_entry(
+            "GET:/api/users/1".into(),
+            Http2PoolCacheEntry::new("GET", "/api/users/1", r1.clone()),
+        );
+        pool.insert_http_cache_entry(
+            "GET:/api/users/2".into(),
+            Http2PoolCacheEntry::new("GET", "/api/users/2", r1.clone()),
+        );
+        pool.insert_http_cache_entry(
+            "GET:/api/products/1".into(),
+            Http2PoolCacheEntry::new("GET", "/api/products/1", r1.clone()),
+        );
+        pool.insert_http_cache_entry(
+            "GET:/api/orders/99".into(),
+            Http2PoolCacheEntry::new("GET", "/api/orders/99", r1),
+        );
 
         assert_eq!(pool.http_cache_count(), 4);
         assert_eq!(pool.http_cache_invalidations(), 0);
@@ -15936,10 +15959,7 @@ mod tls_alpn_tests {
                 std::thread::sleep(Duration::from_millis(5));
             };
             assert_eq!(frame1.stream_id(), 1);
-            let h1 = [
-                (":status", "200"),
-                ("cache-control", "public, max-age=120"),
-            ];
+            let h1 = [(":status", "200"), ("cache-control", "public, max-age=120")];
             server
                 .send_response(1, &h1, Some(b"INITIAL_RECORD"))
                 .expect("send 200");
@@ -15967,10 +15987,7 @@ mod tls_alpn_tests {
                 std::thread::sleep(Duration::from_millis(5));
             };
             assert_eq!(frame3.stream_id(), 5);
-            let h3 = [
-                (":status", "200"),
-                ("cache-control", "public, max-age=120"),
-            ];
+            let h3 = [(":status", "200"), ("cache-control", "public, max-age=120")];
             server
                 .send_response(5, &h3, Some(b"UPDATED_RECORD"))
                 .expect("send 200 updated");
@@ -15984,18 +16001,24 @@ mod tls_alpn_tests {
         let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2).with_http_cache(true);
 
         // 1. GET /api/record -> Cached
-        let r1 = pool.execute_request("GET", "/api/record", &[], None).expect("get 1");
+        let r1 = pool
+            .execute_request("GET", "/api/record", &[], None)
+            .expect("get 1");
         assert_eq!(r1.body, b"INITIAL_RECORD");
         assert_eq!(pool.http_cache_count(), 1);
 
         // 2. POST /api/record -> Success (204 No Content), triggers RFC 7234 §4.4 invalidation
-        let r2 = pool.execute_request("POST", "/api/record", &[], Some(b"update")).expect("post 1");
+        let r2 = pool
+            .execute_request("POST", "/api/record", &[], Some(b"update"))
+            .expect("post 1");
         assert_eq!(r2.status.0, 204);
         assert_eq!(pool.http_cache_count(), 0);
         assert_eq!(pool.http_cache_invalidations(), 1);
 
         // 3. GET /api/record -> Fetched from origin because cache was invalidated
-        let r3 = pool.execute_request("GET", "/api/record", &[], None).expect("get 2");
+        let r3 = pool
+            .execute_request("GET", "/api/record", &[], None)
+            .expect("get 2");
         assert_eq!(r3.body, b"UPDATED_RECORD");
         assert_eq!(pool.http_cache_count(), 1);
 
