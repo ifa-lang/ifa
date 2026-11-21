@@ -8765,9 +8765,9 @@ impl InterSessionDrrArbitrator {
             .alt_svc_routes
             .get(&source_origin)
             .map(|routes| {
-                routes.iter().any(|r| {
-                    !r.host.is_empty() && target_sess.origin.contains(&r.host)
-                })
+                routes
+                    .iter()
+                    .any(|r| !r.host.is_empty() && target_sess.origin.contains(&r.host))
             })
             .unwrap_or(false);
 
@@ -9540,10 +9540,7 @@ impl InterSessionDrrArbitrator {
 
     /// Retrieve recorded alternative service routes for an origin.
     pub fn get_alt_svc_routes(&self, origin: &str) -> Vec<crate::simd_parser::AltSvcRoute> {
-        self.alt_svc_routes
-            .get(origin)
-            .cloned()
-            .unwrap_or_default()
+        self.alt_svc_routes.get(origin).cloned().unwrap_or_default()
     }
 
     /// Clear all alternative service route advertisements.
@@ -9670,10 +9667,7 @@ impl InterSessionDrrArbitrator {
                 && self
                     .alt_svc_routes
                     .get(&sess.origin)
-                    .map(|r| {
-                        r.iter()
-                            .any(|rt| rt.protocol_id.eq_ignore_ascii_case("h3"))
-                    })
+                    .map(|r| r.iter().any(|rt| rt.protocol_id.eq_ignore_ascii_case("h3")))
                     .unwrap_or(false));
 
         // Sub-scores normalized between 0.0 and 1.0
@@ -9884,7 +9878,8 @@ impl InterSessionDrrArbitrator {
                 self.bufferbloat_avoidance_reroutes += 1;
                 "Bufferbloat mitigation: shifting streams to non-bloated transport".to_string()
             } else if s_score.health_state == SessionHealthState::Degraded {
-                "Degradation mitigation: shifting streams away from elevated latency/jitter path".to_string()
+                "Degradation mitigation: shifting streams away from elevated latency/jitter path"
+                    .to_string()
             } else {
                 format!("Dynamic score improvement delta: +{:.4}", delta)
             };
@@ -25056,16 +25051,12 @@ mod tls_alpn_tests {
         let _ = arb.isolate_zombie_session(10);
         let _ = arb.close_session(11);
 
-        let candidates = arb.evaluate_candidate_routes(
-            "https://zombie-test.org",
-            StreamTransportIntent::Balanced,
-        );
+        let candidates = arb
+            .evaluate_candidate_routes("https://zombie-test.org", StreamTransportIntent::Balanced);
         assert!(candidates.is_empty() || candidates.iter().all(|c| c.composite_score == 0.0));
 
-        let opt = arb.select_optimal_session(
-            "https://zombie-test.org",
-            StreamTransportIntent::Balanced,
-        );
+        let opt =
+            arb.select_optimal_session("https://zombie-test.org", StreamTransportIntent::Balanced);
         assert!(opt.is_none());
 
         // Attempting to route stream returns Err
@@ -25099,10 +25090,8 @@ mod tls_alpn_tests {
         );
 
         // Under healthy conditions, both are candidates, HTTP/3 has Alt-Svc advertisement flag
-        let routes = arb.evaluate_candidate_routes(
-            "https://altsvc.org",
-            StreamTransportIntent::Balanced,
-        );
+        let routes =
+            arb.evaluate_candidate_routes("https://altsvc.org", StreamTransportIntent::Balanced);
         assert_eq!(routes.len(), 2);
         let h3_cand = routes.iter().find(|r| r.session_id == 22).unwrap();
         assert!(h3_cand.is_alt_svc_route);
@@ -25172,7 +25161,9 @@ mod tls_alpn_tests {
         assert_eq!(rebal.migrations[0].stream_id, 5);
         assert_eq!(rebal.migrations[0].source_session_id, 31);
         assert_eq!(rebal.migrations[0].target_session_id, 32);
-        assert!(rebal.migrations[0].reason.contains("Bufferbloat mitigation"));
+        assert!(rebal.migrations[0]
+            .reason
+            .contains("Bufferbloat mitigation"));
 
         // Verify stream 5 is now on session 32
         assert_eq!(arb.active_stream_count(31), 0);
