@@ -4288,9 +4288,23 @@ impl AsyncHttp2Connection {
             stream_mappings.push(stream_id);
         }
 
-        // Flush outbound data frames scheduled according to priority & flow control
+        // Flush outbound data frames: use DRR weighted-fair scheduling for RFC 7540 priority
+        // streams; fall back to fixed-quantum scheduling for RFC 9218 urgency-only streams.
         if has_pending_scheduled_data {
-            self.flush_scheduled_outbound_data(true)?;
+            if !has_rfc9218 {
+                // Build per-stream weight map from requests (stream_id → weight).
+                // Inject weights into the session so the DRR scheduler sees them.
+                for (req, &sid) in requests.iter().zip(stream_mappings.iter()) {
+                    if let Some(s) = self.session.streams.get_mut(&sid) {
+                        s.weight = req.weight;
+                    }
+                }
+                let mut drr_deficit: std::collections::HashMap<u32, usize> =
+                    stream_mappings.iter().map(|&sid| (sid, 0)).collect();
+                self.flush_drr_outbound_data(&mut drr_deficit, 1024, 16384, true)?;
+            } else {
+                self.flush_scheduled_outbound_data(true)?;
+            }
         }
 
         // 2. Order stream collection according to RFC 9218 urgency or RFC 7540 priority tree
@@ -13135,6 +13149,121 @@ mod tests {
         assert!(
             frames.iter().any(|f| matches!(f, crate::simd_parser::Http2Frame::Data { stream_id, .. } if *stream_id == sid_lo)),
             "no DATA frames for low-weight stream"
+        );
+    }
+
+    /// Integration test: `execute_prioritized_batch` routes outbound DATA frames through the DRR
+    /// scheduler when requests carry RFC 7540 weights (no RFC 9218 urgency).
+    ///
+    /// Two POST streams are opened with weights 32 (hi) and 16 (lo).
+    /// A mock server collects both request bodies, then replies with the total byte count received.
+    /// The test verifies:
+    ///   1. Both responses arrive without error.
+    ///   2. The server received all bytes from both streams (upload completeness).
+    #[test]
+    fn test_execute_prioritized_batch_drr_proportional_upload() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+
+        let server_handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                }
+            };
+
+            // Collect two request streams (each closes with END_STREAM on last DATA or HEADERS)
+            let mut bodies: std::collections::HashMap<u32, Vec<u8>> =
+                std::collections::HashMap::new();
+            let mut streams_done = 0u32;
+
+            while streams_done < 2 {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    }) => {
+                        bodies.entry(stream_id).or_default();
+                        if end_stream {
+                            streams_done += 1;
+                        }
+                    }
+                    Ok(crate::simd_parser::Http2Frame::Data {
+                        stream_id,
+                        data,
+                        end_stream,
+                    }) => {
+                        bodies.entry(stream_id).or_default().extend_from_slice(&data);
+                        if end_stream {
+                            streams_done += 1;
+                        }
+                    }
+                    Ok(crate::simd_parser::Http2Frame::WindowUpdate { .. }) => {}
+                    Ok(crate::simd_parser::Http2Frame::Settings { .. }) => {
+                        // settings already handled during handshake; ignore post-handshake extras
+                    }
+                    _ => {}
+                }
+            }
+
+            // Reply to each stream with its received byte count as a decimal body
+            for (sid, body) in &bodies {
+                let resp_body = format!("{}", body.len()).into_bytes();
+                let headers = [(":status", "200")];
+                let _ = server.send_response(*sid, &headers, Some(&resp_body));
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(10));
+        let raw = AsyncTcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect");
+        let mut client = AsyncHttp2Connection::client_handshake(raw).expect("client handshake");
+
+        // 8 KiB for the high-weight stream, 4 KiB for the low-weight stream
+        let body_hi = vec![b'H'; 8192];
+        let body_lo = vec![b'L'; 4096];
+
+        let requests = vec![
+            Http2PrioritizedRequest::new("POST", "/upload-hi")
+                .with_body(body_hi)
+                .with_priority(0, 32, false),
+            Http2PrioritizedRequest::new("POST", "/upload-lo")
+                .with_body(body_lo)
+                .with_priority(0, 16, false),
+        ];
+
+        let results = client
+            .execute_prioritized_batch(requests)
+            .expect("batch execute");
+
+        let _ = server_handle.join();
+
+        // Both streams must respond successfully
+        assert_eq!(results.len(), 2, "expected 2 responses");
+        for (_sid, res) in &results {
+            assert!(res.is_ok(), "stream response error");
+        }
+
+        // Each response body is the decimal byte count echoed by the server
+        let total_echoed: usize = results
+            .iter()
+            .filter_map(|(_, r)| r.as_ref().ok())
+            .filter_map(|r| String::from_utf8_lossy(&r.body).trim().parse::<usize>().ok())
+            .sum();
+
+        // Server must have received at least 12 KiB (8192 + 4096)
+        assert!(
+            total_echoed >= 8192 + 4096,
+            "server received only {} bytes total (expected ≥ {})",
+            total_echoed,
+            8192 + 4096
         );
     }
 
