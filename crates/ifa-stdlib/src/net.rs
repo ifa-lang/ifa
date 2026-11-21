@@ -5886,6 +5886,8 @@ pub struct OriginBandwidthQuota {
     pub consecutive_starved_rounds: usize,
     /// Cumulative total bytes dispatched for this origin across all sessions.
     pub total_dispatched_bytes: usize,
+    /// Bytes allocated to this origin in the most recent scheduling round.
+    pub last_round_allocated_bytes: usize,
 }
 
 impl OriginBandwidthQuota {
@@ -5904,6 +5906,7 @@ impl OriginBandwidthQuota {
             deficit: 0,
             consecutive_starved_rounds: 0,
             total_dispatched_bytes: 0,
+            last_round_allocated_bytes: 0,
         }
     }
 }
@@ -5969,8 +5972,78 @@ pub struct SessionDispatchSlice {
     pub anti_starvation_boost_applied: bool,
 }
 
+/// Network saturation level assessed during pool-level fair queueing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkSaturationLevel {
+    /// Available capacity was under-utilized (< 50% capacity consumed or no queue contention).
+    UnderUtilized,
+    /// Balanced operational zone (50% to 90% capacity consumed).
+    Optimal,
+    /// Network is saturated or congested (>= 90% capacity consumed or demand exceeds capacity).
+    Saturated,
+}
+
+/// Detailed bandwidth telemetry and fairness statistics for a specific origin/domain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OriginFairnessTelemetry {
+    /// Origin identifier (e.g. "https://api.example.com:443").
+    pub origin: String,
+    /// Total bytes dispatched to this origin across all rounds.
+    pub total_dispatched_bytes: usize,
+    /// Current pending bytes queued across all sessions under this origin.
+    pub pending_bytes: usize,
+    /// Number of active transport sessions associated with this origin.
+    pub active_sessions_count: usize,
+    /// Configured maximum bandwidth quota (cap).
+    pub max_bandwidth_bytes: usize,
+    /// Configured minimum guaranteed bandwidth.
+    pub min_guaranteed_bytes: usize,
+    /// Origin priority weight.
+    pub weight: u16,
+    /// Consecutive rounds where origin was starved (had pending bytes but received zero bytes).
+    pub consecutive_starved_rounds: usize,
+    /// Percentage share of total dispatched bytes across all origins (0.0 to 100.0).
+    pub bandwidth_share_percent: f64,
+    /// Current round satisfaction ratio: bytes allocated / demand (0.0 to 1.0).
+    pub round_satisfaction_ratio: f64,
+}
+
+/// Comprehensive telemetry export of pool-level bandwidth allocation, EWMA throughput,
+/// dynamic DRR quantum adaptation, and inter-domain fairness metrics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BandwidthFairnessTelemetry {
+    /// Total number of scheduling rounds executed.
+    pub total_rounds_count: u64,
+    /// Aggregate bytes allocated across all rounds.
+    pub total_dispatched_bytes: usize,
+    /// Exponentially Weighted Moving Average (EWMA) of allocated bytes per scheduling round.
+    pub ewma_throughput_bytes_per_round: f64,
+    /// Exponentially Weighted Moving Average (EWMA) of capacity utilization ratio (0.0 to 1.0).
+    pub ewma_saturation_ratio: f64,
+    /// Current base DRR quantum after dynamic adaptation.
+    pub current_base_quantum: usize,
+    /// Minimum allowed base DRR quantum.
+    pub min_base_quantum: usize,
+    /// Maximum allowed base DRR quantum.
+    pub max_base_quantum: usize,
+    /// Whether dynamic DRR quantum adaptation is active.
+    pub adaptive_quantum_enabled: bool,
+    /// EWMA smoothing factor alpha (between 0.0 and 1.0).
+    pub ewma_alpha: f64,
+    /// Current network saturation state assessed by the pool.
+    pub current_saturation_level: NetworkSaturationLevel,
+    /// Jain's Fairness Index across all active origins (between 1/N and 1.0, where 1.0 is ideal fairness).
+    pub jains_fairness_index: f64,
+    /// Origin-level telemetry snapshot.
+    pub origin_metrics: Vec<OriginFairnessTelemetry>,
+    /// Active transport sessions count.
+    pub total_active_sessions: usize,
+    /// Aggregate pending bytes queued across all sessions.
+    pub total_pending_bytes: usize,
+}
+
 /// Comprehensive report of an inter-session fair arbitration round.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InterSessionFairnessReport {
     /// Total bandwidth available for allocation in this round (in bytes).
     pub total_round_capacity: usize,
@@ -5986,6 +6059,12 @@ pub struct InterSessionFairnessReport {
     pub residual_session_deficits: usize,
     /// Aggregate residual DRR deficits remaining active across all origins.
     pub residual_origin_deficits: usize,
+    /// Network saturation state detected during this scheduling round.
+    pub saturation_level: NetworkSaturationLevel,
+    /// Current base DRR quantum effective for this round after dynamic adaptation.
+    pub effective_base_quantum: usize,
+    /// Instantaneous round Jain's fairness index across contending origins.
+    pub jains_fairness_index: f64,
 }
 
 /// Hierarchical Deficit Round Robin (DRR) arbitrator for multi-session HTTP/2 & HTTP/3 connection pools.
@@ -5997,10 +6076,32 @@ pub struct InterSessionFairnessReport {
 /// 4. Transport-Level DRR balancing between HTTP/2 and HTTP/3 sessions.
 /// 5. Starvation detection and anti-starvation boosting for unserved hosts.
 /// 6. Strict DRR credit conservation and deficit zeroing on empty queues.
+/// 7. Bandwidth allocation telemetry, EWMA throughput smoothing, and dynamic DRR quantum adaptation.
+/// 8. Inter-domain Jain's fairness index and detailed QoS metrics export.
 #[derive(Debug, Clone)]
 pub struct InterSessionDrrArbitrator {
     /// Transport DRR base quantum in bytes (default: 1024).
     base_quantum: usize,
+    /// Minimum allowed base quantum when adaptively scaled down under network saturation.
+    min_base_quantum: usize,
+    /// Maximum allowed base quantum when adaptively scaled up under light load.
+    max_base_quantum: usize,
+    /// Whether automatic dynamic adaptation of DRR quanta is enabled.
+    adaptive_quantum_enabled: bool,
+    /// Smoothing factor for Exponentially Weighted Moving Average (EWMA), 0.0 < alpha <= 1.0.
+    ewma_alpha: f64,
+    /// Smoothed historical allocated bytes per round.
+    ewma_throughput: f64,
+    /// Smoothed capacity utilization / saturation ratio.
+    ewma_saturation_ratio: f64,
+    /// Total rounds processed.
+    total_rounds_count: u64,
+    /// Total bytes dispatched across all rounds.
+    total_dispatched_bytes: usize,
+    /// Last assessed network saturation level.
+    last_saturation_level: NetworkSaturationLevel,
+    /// Last calculated Jain's fairness index across active origins.
+    last_jains_fairness_index: f64,
     /// Consecutive starved rounds required to trigger anti-starvation boost (default: 2).
     starvation_threshold_rounds: usize,
     /// Default maximum bandwidth quota for unconfigured origins.
@@ -6020,6 +6121,12 @@ pub struct InterSessionDrrArbitrator {
 impl InterSessionDrrArbitrator {
     /// Default transport DRR base quantum (1024 bytes).
     pub const DEFAULT_BASE_QUANTUM: usize = 1024;
+    /// Default minimum DRR base quantum (256 bytes).
+    pub const DEFAULT_MIN_BASE_QUANTUM: usize = 256;
+    /// Default maximum DRR base quantum (16384 bytes).
+    pub const DEFAULT_MAX_BASE_QUANTUM: usize = 16384;
+    /// Default EWMA smoothing factor alpha (0.2).
+    pub const DEFAULT_EWMA_ALPHA: f64 = 0.2;
     /// Default starvation threshold in scheduling rounds (2 rounds).
     pub const DEFAULT_STARVATION_THRESHOLD_ROUNDS: usize = 2;
     /// Default maximum bandwidth quota per origin (65536 bytes).
@@ -6029,8 +6136,19 @@ impl InterSessionDrrArbitrator {
 
     /// Create a new InterSessionDrrArbitrator with configured base quantum.
     pub fn new(base_quantum: usize) -> Self {
+        let bq = base_quantum.max(1);
         Self {
-            base_quantum: base_quantum.max(1),
+            base_quantum: bq,
+            min_base_quantum: Self::DEFAULT_MIN_BASE_QUANTUM.min(bq),
+            max_base_quantum: Self::DEFAULT_MAX_BASE_QUANTUM.max(bq),
+            adaptive_quantum_enabled: false,
+            ewma_alpha: Self::DEFAULT_EWMA_ALPHA,
+            ewma_throughput: 0.0,
+            ewma_saturation_ratio: 0.0,
+            total_rounds_count: 0,
+            total_dispatched_bytes: 0,
+            last_saturation_level: NetworkSaturationLevel::UnderUtilized,
+            last_jains_fairness_index: 1.0,
             starvation_threshold_rounds: Self::DEFAULT_STARVATION_THRESHOLD_ROUNDS,
             default_origin_max_quota: Self::DEFAULT_ORIGIN_MAX_QUOTA,
             default_origin_min_guaranteed: Self::DEFAULT_ORIGIN_MIN_GUARANTEED,
@@ -6039,6 +6157,87 @@ impl InterSessionDrrArbitrator {
             origin_order: Vec::new(),
             origin_round_index: 0,
         }
+    }
+
+    /// Enable or configure dynamic DRR quantum adaptation with bounds and EWMA smoothing factor.
+    pub fn with_adaptive_quantum(
+        mut self,
+        enabled: bool,
+        min_quantum: usize,
+        max_quantum: usize,
+        ewma_alpha: f64,
+    ) -> Self {
+        self.set_adaptive_quantum(enabled, min_quantum, max_quantum, ewma_alpha);
+        self
+    }
+
+    /// Set dynamic DRR quantum adaptation parameters.
+    pub fn set_adaptive_quantum(
+        &mut self,
+        enabled: bool,
+        min_quantum: usize,
+        max_quantum: usize,
+        ewma_alpha: f64,
+    ) {
+        self.adaptive_quantum_enabled = enabled;
+        self.min_base_quantum = min_quantum.max(1);
+        self.max_base_quantum = max_quantum.max(self.min_base_quantum);
+        self.base_quantum = self.base_quantum.clamp(self.min_base_quantum, self.max_base_quantum);
+        self.ewma_alpha = if ewma_alpha > 0.0 && ewma_alpha <= 1.0 {
+            ewma_alpha
+        } else {
+            Self::DEFAULT_EWMA_ALPHA
+        };
+    }
+
+    /// Whether adaptive DRR quantum regulation is enabled.
+    pub fn is_adaptive_quantum_enabled(&self) -> bool {
+        self.adaptive_quantum_enabled
+    }
+
+    /// Minimum allowed base quantum when adaptively scaled down.
+    pub fn min_base_quantum(&self) -> usize {
+        self.min_base_quantum
+    }
+
+    /// Maximum allowed base quantum when adaptively scaled up.
+    pub fn max_base_quantum(&self) -> usize {
+        self.max_base_quantum
+    }
+
+    /// EWMA alpha factor configured on this arbitrator.
+    pub fn ewma_alpha(&self) -> f64 {
+        self.ewma_alpha
+    }
+
+    /// Smoothed historical allocated bytes per round (EWMA).
+    pub fn ewma_throughput(&self) -> f64 {
+        self.ewma_throughput
+    }
+
+    /// Smoothed capacity saturation ratio (EWMA, 0.0 to 1.0).
+    pub fn ewma_saturation_ratio(&self) -> f64 {
+        self.ewma_saturation_ratio
+    }
+
+    /// Last assessed network saturation level.
+    pub fn saturation_level(&self) -> NetworkSaturationLevel {
+        self.last_saturation_level
+    }
+
+    /// Last computed Jain's fairness index across competing origins.
+    pub fn jains_fairness_index(&self) -> f64 {
+        self.last_jains_fairness_index
+    }
+
+    /// Total number of scheduling rounds executed.
+    pub fn total_rounds_count(&self) -> u64 {
+        self.total_rounds_count
+    }
+
+    /// Total bytes dispatched across all sessions and origins.
+    pub fn total_dispatched_bytes(&self) -> usize {
+        self.total_dispatched_bytes
     }
 
     /// Configure the starvation threshold in consecutive scheduling rounds.
@@ -6172,13 +6371,30 @@ impl InterSessionDrrArbitrator {
     /// Execute a hierarchical fair-queueing scheduling round across all registered sessions and origins
     /// with the specified global bandwidth capacity cap.
     pub fn schedule_round(&mut self, available_bandwidth: usize) -> InterSessionFairnessReport {
+        self.total_rounds_count += 1;
         let mut remaining_bandwidth = available_bandwidth;
         let mut total_allocated_bytes = 0;
         let mut slices = Vec::new();
         let mut starved_origins_boosted = Vec::new();
         let mut starved_sessions_boosted = Vec::new();
 
+        // Reset last_round_allocated_bytes for all registered origins
+        for q in self.origins.values_mut() {
+            q.last_round_allocated_bytes = 0;
+        }
+
+        let initial_pending: usize = self.sessions.values().map(|s| s.pending_bytes).sum();
+
         if available_bandwidth == 0 {
+            let sat = if initial_pending > 0 {
+                NetworkSaturationLevel::Saturated
+            } else {
+                NetworkSaturationLevel::UnderUtilized
+            };
+            self.last_saturation_level = sat;
+            self.update_ewma(0, 0, initial_pending);
+            let effective_base_quantum = self.base_quantum;
+            self.adapt_quantum(sat);
             let res_sess = self.sessions.values().map(|s| s.deficit).sum();
             let res_orig = self.origins.values().map(|q| q.deficit).sum();
             return InterSessionFairnessReport {
@@ -6189,6 +6405,9 @@ impl InterSessionDrrArbitrator {
                 starved_sessions_boosted,
                 residual_session_deficits: res_sess,
                 residual_origin_deficits: res_orig,
+                saturation_level: sat,
+                effective_base_quantum,
+                jains_fairness_index: 1.0,
             };
         }
 
@@ -6208,6 +6427,10 @@ impl InterSessionDrrArbitrator {
             .collect();
 
         if sessions_with_pending_at_start.is_empty() {
+            self.last_saturation_level = NetworkSaturationLevel::UnderUtilized;
+            self.update_ewma(available_bandwidth, 0, 0);
+            let effective_base_quantum = self.base_quantum;
+            self.adapt_quantum(NetworkSaturationLevel::UnderUtilized);
             let res_sess = self.sessions.values().map(|s| s.deficit).sum();
             let res_orig = self.origins.values().map(|q| q.deficit).sum();
             return InterSessionFairnessReport {
@@ -6218,6 +6441,9 @@ impl InterSessionDrrArbitrator {
                 starved_sessions_boosted,
                 residual_session_deficits: res_sess,
                 residual_origin_deficits: res_orig,
+                saturation_level: NetworkSaturationLevel::UnderUtilized,
+                effective_base_quantum,
+                jains_fairness_index: 1.0,
             };
         }
 
@@ -6318,6 +6544,7 @@ impl InterSessionDrrArbitrator {
                 if let Some(quota) = self.origins.get_mut(&origin_name) {
                     let allocated_for_origin = starved_budget - origin_remaining_starved;
                     quota.total_dispatched_bytes += allocated_for_origin;
+                    quota.last_round_allocated_bytes += allocated_for_origin;
                     quota.consecutive_starved_rounds = 0;
                 }
             }
@@ -6452,6 +6679,7 @@ impl InterSessionDrrArbitrator {
                             if let Some(q) = self.origins.get_mut(&origin_name) {
                                 q.deficit = q.deficit.saturating_sub(slice);
                                 q.total_dispatched_bytes += slice;
+                                q.last_round_allocated_bytes += slice;
                                 q.consecutive_starved_rounds = 0;
                             }
 
@@ -6508,6 +6736,28 @@ impl InterSessionDrrArbitrator {
             }
         }
 
+        self.total_dispatched_bytes += total_allocated_bytes;
+
+        let saturation_level = {
+            let util_ratio = (total_allocated_bytes as f64) / (available_bandwidth as f64);
+            if util_ratio >= 0.90 || (initial_pending >= available_bandwidth && util_ratio >= 0.80) {
+                NetworkSaturationLevel::Saturated
+            } else if util_ratio >= 0.50 {
+                NetworkSaturationLevel::Optimal
+            } else {
+                NetworkSaturationLevel::UnderUtilized
+            }
+        };
+
+        self.last_saturation_level = saturation_level;
+        self.update_ewma(available_bandwidth, total_allocated_bytes, initial_pending);
+
+        let jains_fairness_index = self.compute_jains_fairness_index(&origins_with_pending_at_start, &slices);
+        self.last_jains_fairness_index = jains_fairness_index;
+
+        let effective_base_quantum = self.base_quantum;
+        self.adapt_quantum(saturation_level);
+
         let residual_session_deficits = self.sessions.values().map(|s| s.deficit).sum();
         let residual_origin_deficits = self.origins.values().map(|q| q.deficit).sum();
 
@@ -6519,6 +6769,161 @@ impl InterSessionDrrArbitrator {
             starved_sessions_boosted,
             residual_session_deficits,
             residual_origin_deficits,
+            saturation_level,
+            effective_base_quantum,
+            jains_fairness_index,
+        }
+    }
+
+    fn update_ewma(
+        &mut self,
+        available_bandwidth: usize,
+        total_allocated_bytes: usize,
+        initial_pending: usize,
+    ) {
+        let util_ratio = if available_bandwidth > 0 {
+            ((total_allocated_bytes as f64) / (available_bandwidth as f64)).min(1.0)
+        } else if initial_pending > 0 {
+            1.0
+        } else {
+            0.0
+        };
+
+        if self.total_rounds_count == 1 {
+            self.ewma_throughput = total_allocated_bytes as f64;
+            self.ewma_saturation_ratio = util_ratio;
+        } else {
+            let alpha = self.ewma_alpha;
+            self.ewma_throughput =
+                (1.0 - alpha) * self.ewma_throughput + alpha * (total_allocated_bytes as f64);
+            self.ewma_saturation_ratio =
+                (1.0 - alpha) * self.ewma_saturation_ratio + alpha * util_ratio;
+        }
+    }
+
+    fn adapt_quantum(&mut self, saturation_level: NetworkSaturationLevel) {
+        if !self.adaptive_quantum_enabled {
+            return;
+        }
+        match saturation_level {
+            NetworkSaturationLevel::Saturated => {
+                let step = (self.base_quantum / 4).max(64);
+                self.base_quantum =
+                    self.base_quantum.saturating_sub(step).max(self.min_base_quantum);
+            }
+            NetworkSaturationLevel::UnderUtilized => {
+                let step = (self.base_quantum / 4).max(64);
+                self.base_quantum = (self.base_quantum + step).min(self.max_base_quantum);
+            }
+            NetworkSaturationLevel::Optimal => {
+                // Optimal operating zone: keep current quantum stable
+            }
+        }
+    }
+
+    fn compute_jains_fairness_index(
+        &self,
+        contending_origins: &std::collections::HashSet<String>,
+        slices: &[SessionDispatchSlice],
+    ) -> f64 {
+        if contending_origins.len() <= 1 {
+            return 1.0;
+        }
+
+        let mut sum_y = 0.0;
+        let mut sum_sq_y = 0.0;
+        for orig in contending_origins {
+            let alloc_bytes: usize = slices
+                .iter()
+                .filter(|s| &s.origin == orig)
+                .map(|s| s.allocated_bytes)
+                .sum();
+            let w = self
+                .origins
+                .get(orig)
+                .map(|q| q.weight as f64)
+                .unwrap_or(1.0)
+                .max(1.0);
+            let y = (alloc_bytes as f64) / w;
+            sum_y += y;
+            sum_sq_y += y * y;
+        }
+
+        let n = contending_origins.len() as f64;
+        if sum_sq_y > 0.0 && n > 0.0 {
+            let index = (sum_y * sum_y) / (n * sum_sq_y);
+            index.clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// Export comprehensive bandwidth allocation telemetry and inter-domain fairness metrics.
+    pub fn export_fairness_telemetry(&self) -> BandwidthFairnessTelemetry {
+        let mut origin_metrics = Vec::new();
+        let total_dispatched = self.total_dispatched_bytes;
+
+        for (origin_name, quota) in &self.origins {
+            let pending_bytes: usize = self
+                .sessions
+                .values()
+                .filter(|s| &s.origin == origin_name)
+                .map(|s| s.pending_bytes)
+                .sum();
+            let active_sessions_count = self
+                .sessions
+                .values()
+                .filter(|s| &s.origin == origin_name)
+                .count();
+            let bandwidth_share_percent = if total_dispatched > 0 {
+                (quota.total_dispatched_bytes as f64 / total_dispatched as f64) * 100.0
+            } else {
+                0.0
+            };
+            let round_satisfaction_ratio =
+                if pending_bytes == 0 && quota.last_round_allocated_bytes == 0 {
+                    1.0
+                } else {
+                    let total_demand = quota.last_round_allocated_bytes + pending_bytes;
+                    if total_demand > 0 {
+                        (quota.last_round_allocated_bytes as f64 / total_demand as f64)
+                            .clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    }
+                };
+
+            origin_metrics.push(OriginFairnessTelemetry {
+                origin: origin_name.clone(),
+                total_dispatched_bytes: quota.total_dispatched_bytes,
+                pending_bytes,
+                active_sessions_count,
+                max_bandwidth_bytes: quota.max_bandwidth_bytes,
+                min_guaranteed_bytes: quota.min_guaranteed_bytes,
+                weight: quota.weight,
+                consecutive_starved_rounds: quota.consecutive_starved_rounds,
+                bandwidth_share_percent,
+                round_satisfaction_ratio,
+            });
+        }
+
+        origin_metrics.sort_by(|a, b| a.origin.cmp(&b.origin));
+
+        BandwidthFairnessTelemetry {
+            total_rounds_count: self.total_rounds_count,
+            total_dispatched_bytes: self.total_dispatched_bytes,
+            ewma_throughput_bytes_per_round: self.ewma_throughput,
+            ewma_saturation_ratio: self.ewma_saturation_ratio,
+            current_base_quantum: self.base_quantum,
+            min_base_quantum: self.min_base_quantum,
+            max_base_quantum: self.max_base_quantum,
+            adaptive_quantum_enabled: self.adaptive_quantum_enabled,
+            ewma_alpha: self.ewma_alpha,
+            current_saturation_level: self.last_saturation_level,
+            jains_fairness_index: self.last_jains_fairness_index,
+            origin_metrics,
+            total_active_sessions: self.sessions.len(),
+            total_pending_bytes: self.total_pending_bytes(),
         }
     }
 }
@@ -6803,7 +7208,94 @@ impl AsyncHttp2Pool {
                 starved_sessions_boosted: Vec::new(),
                 residual_session_deficits: 0,
                 residual_origin_deficits: 0,
+                saturation_level: NetworkSaturationLevel::UnderUtilized,
+                effective_base_quantum: InterSessionDrrArbitrator::DEFAULT_BASE_QUANTUM,
+                jains_fairness_index: 1.0,
             }
+        }
+    }
+
+    /// Export comprehensive bandwidth allocation telemetry and inter-domain fairness metrics.
+    pub fn fairness_telemetry(&self) -> BandwidthFairnessTelemetry {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.export_fairness_telemetry()
+        } else {
+            BandwidthFairnessTelemetry {
+                total_rounds_count: 0,
+                total_dispatched_bytes: 0,
+                ewma_throughput_bytes_per_round: 0.0,
+                ewma_saturation_ratio: 0.0,
+                current_base_quantum: InterSessionDrrArbitrator::DEFAULT_BASE_QUANTUM,
+                min_base_quantum: InterSessionDrrArbitrator::DEFAULT_MIN_BASE_QUANTUM,
+                max_base_quantum: InterSessionDrrArbitrator::DEFAULT_MAX_BASE_QUANTUM,
+                adaptive_quantum_enabled: false,
+                ewma_alpha: InterSessionDrrArbitrator::DEFAULT_EWMA_ALPHA,
+                current_saturation_level: NetworkSaturationLevel::UnderUtilized,
+                jains_fairness_index: 1.0,
+                origin_metrics: Vec::new(),
+                total_active_sessions: 0,
+                total_pending_bytes: 0,
+            }
+        }
+    }
+
+    /// Enable adaptive DRR quantum regulation based on network saturation and EWMA smoothed throughput.
+    pub fn enable_adaptive_drr_quantum(
+        &self,
+        min_quantum: usize,
+        max_quantum: usize,
+        ewma_alpha: f64,
+    ) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.set_adaptive_quantum(true, min_quantum, max_quantum, ewma_alpha);
+        }
+    }
+
+    /// Disable adaptive DRR quantum regulation, locking to the explicit base quantum.
+    pub fn disable_adaptive_drr_quantum(&self) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.set_adaptive_quantum(
+                false,
+                InterSessionDrrArbitrator::DEFAULT_MIN_BASE_QUANTUM,
+                InterSessionDrrArbitrator::DEFAULT_MAX_BASE_QUANTUM,
+                InterSessionDrrArbitrator::DEFAULT_EWMA_ALPHA,
+            );
+        }
+    }
+
+    /// Returns whether dynamic adaptive DRR quantum regulation is active on the pool.
+    pub fn is_adaptive_drr_quantum_enabled(&self) -> bool {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.is_adaptive_quantum_enabled()
+        } else {
+            false
+        }
+    }
+
+    /// Retrieve the current EWMA smoothed throughput across inter-session arbitration rounds.
+    pub fn ewma_throughput(&self) -> f64 {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.ewma_throughput()
+        } else {
+            0.0
+        }
+    }
+
+    /// Retrieve the current network saturation level assessed by the pool.
+    pub fn network_saturation_level(&self) -> NetworkSaturationLevel {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.saturation_level()
+        } else {
+            NetworkSaturationLevel::UnderUtilized
+        }
+    }
+
+    /// Retrieve the latest Jain's fairness index across competing origins.
+    pub fn jains_fairness_index(&self) -> f64 {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.jains_fairness_index()
+        } else {
+            1.0
         }
     }
 
@@ -19644,5 +20136,154 @@ mod tls_alpn_tests {
         // Clean up session unregistration
         pool.unregister_transport_session(101);
         pool.unregister_transport_session(102);
+    }
+
+    #[test]
+    fn test_inter_session_ewma_throughput_and_saturation_tracking() {
+        let mut arb = InterSessionDrrArbitrator::new(1024)
+            .with_adaptive_quantum(false, 256, 4096, 0.5);
+
+        let origin = "https://metrics.example.com";
+        arb.register_session(1, origin, TransportProtocol::Http2, 1);
+
+        // Round 1: High saturation (100% capacity consumed)
+        arb.set_session_pending_bytes(1, 10000);
+        let report1 = arb.schedule_round(2048);
+        assert_eq!(report1.total_allocated_bytes, 2048);
+        assert_eq!(report1.saturation_level, NetworkSaturationLevel::Saturated);
+        assert_eq!(arb.saturation_level(), NetworkSaturationLevel::Saturated);
+        assert_eq!(arb.ewma_throughput(), 2048.0);
+        assert!((arb.ewma_saturation_ratio() - 1.0).abs() < 1e-4);
+
+        // Round 2: Optimal load (60% capacity consumed)
+        // 2000 capacity, session has 1200 pending bytes
+        arb.set_session_pending_bytes(1, 1200);
+        let report2 = arb.schedule_round(2000);
+        assert_eq!(report2.total_allocated_bytes, 1200);
+        assert_eq!(report2.saturation_level, NetworkSaturationLevel::Optimal);
+        assert_eq!(arb.saturation_level(), NetworkSaturationLevel::Optimal);
+        // EWMA with alpha = 0.5: 0.5 * 2048 + 0.5 * 1200 = 1624
+        assert!((arb.ewma_throughput() - 1624.0).abs() < 1e-4);
+        // EWMA saturation ratio: 0.5 * 1.0 + 0.5 * (1200/2000 = 0.6) = 0.8
+        assert!((arb.ewma_saturation_ratio() - 0.8).abs() < 1e-4);
+
+        // Round 3: Light load / Under-utilized (10% capacity consumed)
+        arb.set_session_pending_bytes(1, 200);
+        let report3 = arb.schedule_round(2000);
+        assert_eq!(report3.total_allocated_bytes, 200);
+        assert_eq!(report3.saturation_level, NetworkSaturationLevel::UnderUtilized);
+        assert_eq!(arb.saturation_level(), NetworkSaturationLevel::UnderUtilized);
+        // EWMA: 0.5 * 1624 + 0.5 * 200 = 912
+        assert!((arb.ewma_throughput() - 912.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_inter_session_adaptive_drr_quantum_regulation() {
+        // Start with base quantum = 1024, min = 256, max = 2048, adaptive = true
+        let mut arb = InterSessionDrrArbitrator::new(1024)
+            .with_adaptive_quantum(true, 256, 2048, 0.2);
+
+        let origin = "https://stream.example.com";
+        arb.register_session(1, origin, TransportProtocol::Http2, 1);
+        arb.set_session_pending_bytes(1, 100000);
+
+        // Round 1 under saturation: initial quantum is 1024.
+        // Under saturation, quantum must be dynamically reduced: step = max(1024/4, 64) = 256 -> new base = 768.
+        let report1 = arb.schedule_round(4096);
+        assert_eq!(report1.effective_base_quantum, 1024);
+        assert_eq!(arb.base_quantum(), 768);
+
+        // Round 2 under continued saturation: 768 - max(768/4, 64) = 768 - 192 = 576.
+        let report2 = arb.schedule_round(4096);
+        assert_eq!(report2.effective_base_quantum, 768);
+        assert_eq!(arb.base_quantum(), 576);
+
+        // Multiple saturated rounds drive quantum down to min_base_quantum (256)
+        for _ in 0..5 {
+            arb.schedule_round(4096);
+        }
+        assert_eq!(arb.base_quantum(), 256);
+
+        // Now drain pending data and test light load scaling up
+        arb.set_session_pending_bytes(1, 10);
+        // Round under light load (10 bytes out of 10000 -> UnderUtilized)
+        // Quantum scales up: 256 + 64 = 320
+        arb.schedule_round(10000);
+        assert!(arb.base_quantum() > 256);
+    }
+
+    #[test]
+    fn test_inter_session_jains_fairness_index_computation() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+        let origin_a = "https://host-a.com";
+        let origin_b = "https://host-b.com";
+
+        // Equal weights and equal quotas
+        arb.configure_origin_quota(origin_a, 4096, 1024, 1);
+        arb.configure_origin_quota(origin_b, 4096, 1024, 1);
+
+        arb.register_session(1, origin_a, TransportProtocol::Http2, 1);
+        arb.register_session(2, origin_b, TransportProtocol::Http3, 1);
+
+        arb.set_session_pending_bytes(1, 2048);
+        arb.set_session_pending_bytes(2, 2048);
+
+        // Schedule round with 2048 bytes capacity -> each gets 1024 bytes
+        let report = arb.schedule_round(2048);
+        assert_eq!(report.slices.len(), 2);
+        assert_eq!(report.slices[0].allocated_bytes, 1024);
+        assert_eq!(report.slices[1].allocated_bytes, 1024);
+
+        // Jain's fairness index for equal allocation across 2 equal-weighted origins must be exactly 1.0
+        assert!((report.jains_fairness_index - 1.0).abs() < 1e-4);
+        assert!((arb.jains_fairness_index() - 1.0).abs() < 1e-4);
+
+        // Telemetry export
+        let telem = arb.export_fairness_telemetry();
+        assert_eq!(telem.origin_metrics.len(), 2);
+        assert!((telem.jains_fairness_index - 1.0).abs() < 1e-4);
+        assert_eq!(telem.total_active_sessions, 2);
+    }
+
+    #[test]
+    fn test_async_http2_pool_telemetry_and_adaptive_drr_integration() {
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 8443, 4);
+
+        // Enable adaptive DRR quantum regulation
+        pool.enable_adaptive_drr_quantum(256, 8192, 0.25);
+        assert!(pool.is_adaptive_drr_quantum_enabled());
+
+        pool.configure_origin_quota("https://api.domain1.com", 8192, 1024, 1);
+        pool.configure_origin_quota("https://api.domain2.com", 8192, 1024, 1);
+
+        pool.register_transport_session(201, "https://api.domain1.com", TransportProtocol::Http2, 1);
+        pool.register_transport_session(202, "https://api.domain2.com", TransportProtocol::Http3, 1);
+
+        pool.update_session_pending_data(201, 4096);
+        pool.update_session_pending_data(202, 4096);
+
+        let report = pool.schedule_inter_session_bandwidth(4096);
+        assert_eq!(report.total_round_capacity, 4096);
+        assert!(report.total_allocated_bytes > 0);
+        assert!(report.jains_fairness_index > 0.0);
+
+        let telem = pool.fairness_telemetry();
+        assert_eq!(telem.total_rounds_count, 1);
+        assert_eq!(telem.total_active_sessions, 2);
+        assert!(telem.ewma_throughput_bytes_per_round > 0.0);
+        assert_eq!(telem.origin_metrics.len(), 2);
+
+        // Origin metrics check
+        for om in &telem.origin_metrics {
+            assert!(om.origin.starts_with("https://api.domain"));
+            assert_eq!(om.active_sessions_count, 1);
+            assert!(om.total_dispatched_bytes > 0);
+            assert!(om.bandwidth_share_percent > 0.0);
+            assert!(om.round_satisfaction_ratio > 0.0);
+        }
+
+        // Disable adaptive regulation
+        pool.disable_adaptive_drr_quantum();
+        assert!(!pool.is_adaptive_drr_quantum_enabled());
     }
 }
