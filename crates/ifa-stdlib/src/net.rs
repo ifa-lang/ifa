@@ -7271,6 +7271,132 @@ pub struct InterSessionFairnessReport {
     pub jains_fairness_index: f64,
 }
 
+/// Intent and QoS profile guiding multi-path composite transport routing across HTTP/2 and HTTP/3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamTransportIntent {
+    /// Prioritizes lowest Round-Trip Time and minimal jitter (e.g. interactive API, DNS, RPC).
+    LowLatencyInteractive,
+    /// Prioritizes maximum bottleneck bandwidth and CWND headroom (e.g. bulk downloads, uploads).
+    HighThroughputBulk,
+    /// Balanced multi-criteria optimization across latency, loss rate, and bandwidth.
+    Balanced,
+    /// Maximizes reliability, strictly preferring zero loss and healthy non-degraded sessions.
+    Resilient,
+    /// Strongly prefers HTTP/3 (QUIC) to bypass TCP head-of-line blocking under packet loss.
+    PreferHttp3,
+}
+
+/// Detailed multi-path routing score evaluating a candidate transport session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompositePathScore {
+    /// Candidate session identifier.
+    pub session_id: u64,
+    /// Transport protocol (HTTP/2 or HTTP/3).
+    pub protocol: TransportProtocol,
+    /// Origin domain or endpoint.
+    pub origin: String,
+    /// Health classification of this session.
+    pub health_state: SessionHealthState,
+    /// Synthetic health score (0.0 to 1.0) derived from probes and loss rate.
+    pub health_score: f64,
+    /// Smoothed Round-Trip Time.
+    pub smoothed_rtt: std::time::Duration,
+    /// Jitter / RTT variance.
+    pub rttvar: std::time::Duration,
+    /// Probe / packet loss rate (0.0 to 1.0).
+    pub loss_rate: f64,
+    /// Bottleneck bandwidth estimate in bytes per second.
+    pub btl_bw_bytes_per_sec: u64,
+    /// In-flight unacknowledged bytes.
+    pub in_flight_bytes: usize,
+    /// Congestion window headroom in bytes.
+    pub cwnd_headroom_bytes: usize,
+    /// Active congestion control algorithm (BBR / CUBIC).
+    pub congestion_algorithm: CongestionControlAlgorithm,
+    /// Whether bufferbloat has been detected on this path.
+    pub bufferbloat_detected: bool,
+    /// Whether this candidate matches an advertised alternative service (Alt-Svc).
+    pub is_alt_svc_route: bool,
+    /// Final composite multi-path routing score (0.0 to 1.0, higher is better).
+    pub composite_score: f64,
+    /// Explanatory justification for route scoring.
+    pub selection_reason: String,
+}
+
+/// Outcome of routing a stream through unified multi-path composite selection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteSelectionReport {
+    /// Stream identifier assigned or routed.
+    pub stream_id: u32,
+    /// Selected optimal transport session identifier.
+    pub selected_session_id: u64,
+    /// Transport protocol of the chosen session (HTTP/2 or HTTP/3).
+    pub protocol: TransportProtocol,
+    /// Target origin / domain.
+    pub origin: String,
+    /// Winning composite path score and details.
+    pub score: CompositePathScore,
+    /// Number of candidate sessions evaluated.
+    pub candidates_evaluated: usize,
+    /// Requested stream transport intent.
+    pub intent: StreamTransportIntent,
+}
+
+/// Record of a dynamic seamless stream migration between transport sessions during rebalancing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamMigrationEvent {
+    /// Migrated stream identifier.
+    pub stream_id: u32,
+    /// Source session ID from which stream was migrated.
+    pub source_session_id: u64,
+    /// Source transport protocol.
+    pub source_protocol: TransportProtocol,
+    /// Target session ID to which stream was migrated.
+    pub target_session_id: u64,
+    /// Target transport protocol.
+    pub target_protocol: TransportProtocol,
+    /// Payload bytes migrated.
+    pub migrated_bytes: usize,
+    /// Composite score improvement delta (target_score - source_score).
+    pub score_delta: f64,
+    /// Rationale for the migration (e.g. "Bufferbloat mitigation", "Score improvement").
+    pub reason: String,
+}
+
+/// Outcome of a multi-path rebalancing sweep across active transport sessions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultiPathRebalanceReport {
+    /// Evaluated origin domain.
+    pub origin: String,
+    /// Total sessions evaluated for rebalancing.
+    pub evaluated_sessions: usize,
+    /// Total streams migrated away from suboptimal paths.
+    pub migrated_streams_count: usize,
+    /// Total payload bytes migrated.
+    pub total_migrated_bytes: usize,
+    /// Individual migration events recorded during this sweep.
+    pub migrations: Vec<StreamMigrationEvent>,
+}
+
+/// Comprehensive telemetry export of multi-path composite routing operations.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompositeRoutingTelemetry {
+    /// Total streams routed across all origins.
+    pub total_routed_streams: usize,
+    /// Total streams routed onto HTTP/2 transports.
+    pub http2_routed_streams: usize,
+    /// Total streams routed onto HTTP/3 transports.
+    pub http3_routed_streams: usize,
+    /// Total seamless multi-path rebalancing migrations executed.
+    pub total_multipath_migrations: usize,
+    /// Total payload bytes migrated during multi-path rebalancing.
+    pub total_multipath_migrated_bytes: usize,
+    /// Total route selections influenced by Alt-Svc advertisements.
+    pub alt_svc_route_hits: usize,
+    /// Total re-routes triggered by bufferbloat detection or congestion spikes.
+    pub bufferbloat_avoidance_reroutes: usize,
+}
+
 /// Hierarchical Deficit Round Robin (DRR) arbitrator for multi-session HTTP/2 & HTTP/3 connection pools.
 ///
 /// Features:
@@ -7366,6 +7492,22 @@ pub struct InterSessionDrrArbitrator {
     total_probes_received_pool: usize,
     /// Pool-wide count of probes timed out / declared lost.
     total_probes_lost_pool: usize,
+    /// Alternative service route advertisements per origin.
+    alt_svc_routes: std::collections::HashMap<String, Vec<crate::simd_parser::AltSvcRoute>>,
+    /// Total streams routed via multi-path composite selection.
+    total_routed_streams: usize,
+    /// HTTP/2 streams routed.
+    http2_routed_streams: usize,
+    /// HTTP/3 streams routed.
+    http3_routed_streams: usize,
+    /// Total multi-path dynamic rebalancing migrations executed.
+    total_multipath_migrations: usize,
+    /// Total bytes migrated across multi-path rebalancing events.
+    total_multipath_migrated_bytes: usize,
+    /// Multi-path route selections influenced by Alt-Svc advertised routes.
+    alt_svc_route_hits: usize,
+    /// Multi-path migrations triggered by bufferbloat or congestion events.
+    bufferbloat_avoidance_reroutes: usize,
 }
 
 impl InterSessionDrrArbitrator {
@@ -7429,6 +7571,14 @@ impl InterSessionDrrArbitrator {
             total_probes_sent_pool: 0,
             total_probes_received_pool: 0,
             total_probes_lost_pool: 0,
+            alt_svc_routes: std::collections::HashMap::new(),
+            total_routed_streams: 0,
+            http2_routed_streams: 0,
+            http3_routed_streams: 0,
+            total_multipath_migrations: 0,
+            total_multipath_migrated_bytes: 0,
+            alt_svc_route_hits: 0,
+            bufferbloat_avoidance_reroutes: 0,
         }
     }
 
@@ -8301,6 +8451,12 @@ impl InterSessionDrrArbitrator {
                 .clone()
                 .with_initial_estimates(rtt_min, btl_bw_bytes_per_sec);
         }
+        if let Some(h) = self.session_health.get_mut(&session_id) {
+            if h.sample_count == 0 {
+                h.smoothed_rtt = rtt_min;
+                h.rttvar = rtt_min / 4;
+            }
+        }
     }
 
     /// Retrieve cross-layer predictive pacing telemetry for a specific session.
@@ -8605,7 +8761,17 @@ impl InterSessionDrrArbitrator {
             StreamMigrationError::TargetSessionNotFound(target_session_id),
         )?;
 
-        if target_sess.origin != source_origin {
+        let is_linked_by_alt_svc = self
+            .alt_svc_routes
+            .get(&source_origin)
+            .map(|routes| {
+                routes.iter().any(|r| {
+                    !r.host.is_empty() && target_sess.origin.contains(&r.host)
+                })
+            })
+            .unwrap_or(false);
+
+        if target_sess.origin != source_origin && !is_linked_by_alt_svc {
             return Err(StreamMigrationError::OriginMismatch {
                 source_origin,
                 target_origin: target_sess.origin.clone(),
@@ -9355,6 +9521,424 @@ impl InterSessionDrrArbitrator {
             average_smoothed_rtt,
             average_jitter,
             average_health_score,
+        }
+    }
+
+    /// Record alternative service route advertisements for an origin.
+    pub fn record_alt_svc_routes(
+        &mut self,
+        origin: impl Into<String>,
+        routes: Vec<crate::simd_parser::AltSvcRoute>,
+    ) {
+        let orig = origin.into();
+        if routes.is_empty() {
+            self.alt_svc_routes.remove(&orig);
+        } else {
+            self.alt_svc_routes.insert(orig, routes);
+        }
+    }
+
+    /// Retrieve recorded alternative service routes for an origin.
+    pub fn get_alt_svc_routes(&self, origin: &str) -> Vec<crate::simd_parser::AltSvcRoute> {
+        self.alt_svc_routes
+            .get(origin)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Clear all alternative service route advertisements.
+    pub fn clear_alt_svc_routes(&mut self) {
+        self.alt_svc_routes.clear();
+    }
+
+    /// Find all candidate session IDs serving an origin directly or via advertised alternative services.
+    pub fn find_candidate_session_ids_for_origin(&self, origin: &str) -> Vec<(u64, bool)> {
+        let mut candidates = Vec::new();
+        // 1. Direct sessions matching origin
+        for (&id, sess) in &self.sessions {
+            if sess.origin == origin
+                && sess.lifecycle_state == SessionLifecycleState::Active
+                && sess.health_state != SessionHealthState::Zombie
+                && sess.health_state != SessionHealthState::Dead
+            {
+                candidates.push((id, false));
+            }
+        }
+
+        // 2. Alt-Svc advertised routes matching origin
+        if let Some(routes) = self.alt_svc_routes.get(origin) {
+            for route in routes {
+                let target_protocol = match route.protocol_id.to_ascii_lowercase().as_str() {
+                    "h3" | "h3-29" | "h3-34" => TransportProtocol::Http3,
+                    _ => TransportProtocol::Http2,
+                };
+                for (&id, sess) in &self.sessions {
+                    if candidates.iter().any(|(cid, _)| *cid == id) {
+                        continue;
+                    }
+                    if sess.lifecycle_state != SessionLifecycleState::Active
+                        || sess.health_state == SessionHealthState::Zombie
+                        || sess.health_state == SessionHealthState::Dead
+                    {
+                        continue;
+                    }
+                    let origin_matches = if route.host.is_empty() {
+                        sess.origin == origin
+                    } else {
+                        sess.origin.contains(&route.host)
+                    };
+                    if origin_matches && sess.protocol == target_protocol {
+                        candidates.push((id, true));
+                    }
+                }
+            }
+        }
+        candidates
+    }
+
+    /// Compute the composite multi-path routing score for a specific session given a stream intent.
+    pub fn compute_composite_path_score(
+        &self,
+        session_id: u64,
+        intent: StreamTransportIntent,
+        is_alt_svc: bool,
+    ) -> Option<CompositePathScore> {
+        let sess = self.sessions.get(&session_id)?;
+        if sess.lifecycle_state != SessionLifecycleState::Active
+            || sess.health_state == SessionHealthState::Zombie
+            || sess.health_state == SessionHealthState::Dead
+        {
+            return Some(CompositePathScore {
+                session_id,
+                protocol: sess.protocol,
+                origin: sess.origin.clone(),
+                health_state: sess.health_state,
+                health_score: 0.0,
+                smoothed_rtt: std::time::Duration::from_millis(0),
+                rttvar: std::time::Duration::from_millis(0),
+                loss_rate: 1.0,
+                btl_bw_bytes_per_sec: 0,
+                in_flight_bytes: sess.pacing_model.in_flight_bytes,
+                cwnd_headroom_bytes: 0,
+                congestion_algorithm: sess.pacing_model.algorithm,
+                bufferbloat_detected: sess.pacing_model.bufferbloat_detected,
+                is_alt_svc_route: is_alt_svc,
+                composite_score: 0.0,
+                selection_reason: format!(
+                    "Session {} is ineligible ({:?})",
+                    session_id, sess.health_state
+                ),
+            });
+        }
+
+        let health_metrics = self.session_health.get(&session_id).map(|h| h.to_metrics());
+        let (health_score, smoothed_rtt, rttvar, loss_rate) = if let Some(m) = &health_metrics {
+            let srtt = if m.probes_received > 0 {
+                m.smoothed_rtt
+            } else {
+                sess.pacing_model.smoothed_rtt
+            };
+            let rvar = if m.probes_received > 0 {
+                m.rttvar
+            } else {
+                sess.pacing_model.rttvar
+            };
+            (m.health_score, srtt, rvar, m.loss_rate)
+        } else {
+            let base_h = if sess.health_state == SessionHealthState::Healthy {
+                1.0
+            } else {
+                0.5
+            };
+            (
+                base_h,
+                sess.pacing_model.smoothed_rtt,
+                sess.pacing_model.rttvar,
+                0.0,
+            )
+        };
+
+        let btl_bw = sess.pacing_model.btl_bw_bytes_per_sec;
+        let in_flight = sess.pacing_model.in_flight_bytes;
+        let cwnd = sess.pacing_model.congestion_window_bytes();
+        let headroom = cwnd.saturating_sub(in_flight);
+        let bufferbloat = sess.pacing_model.bufferbloat_detected;
+
+        // Check if an Alt-Svc advertisement exists recommending HTTP/3 for this origin
+        let has_alt_svc_announcement = is_alt_svc
+            || (sess.protocol == TransportProtocol::Http3
+                && self
+                    .alt_svc_routes
+                    .get(&sess.origin)
+                    .map(|r| {
+                        r.iter()
+                            .any(|rt| rt.protocol_id.eq_ignore_ascii_case("h3"))
+                    })
+                    .unwrap_or(false));
+
+        // Sub-scores normalized between 0.0 and 1.0
+        let s_health = (health_score * (1.0 - loss_rate)).clamp(0.0, 1.0);
+        let srtt_ms = smoothed_rtt.as_millis() as f64;
+        let s_rtt = (100.0 / (100.0 + srtt_ms)).clamp(0.0, 1.0);
+        let jitter_ms = rttvar.as_millis() as f64;
+        let s_jitter = (50.0 / (50.0 + jitter_ms)).clamp(0.0, 1.0);
+        let bw_mbps = btl_bw as f64 / 1_000_000.0;
+        let s_bw = (bw_mbps / (bw_mbps + 5.0)).clamp(0.0, 1.0);
+        let mut s_headroom = (headroom as f64 / cwnd.max(1) as f64).clamp(0.0, 1.0);
+        if bufferbloat {
+            s_headroom *= 0.5;
+        }
+
+        let mut raw = match intent {
+            StreamTransportIntent::LowLatencyInteractive => {
+                0.40 * s_rtt + 0.25 * s_jitter + 0.20 * s_health + 0.15 * s_headroom
+            }
+            StreamTransportIntent::HighThroughputBulk => {
+                0.40 * s_bw + 0.30 * s_headroom + 0.15 * s_health + 0.15 * s_rtt
+            }
+            StreamTransportIntent::Balanced => {
+                0.25 * s_health + 0.25 * s_rtt + 0.25 * s_bw + 0.25 * s_headroom
+            }
+            StreamTransportIntent::Resilient => {
+                0.45 * s_health + 0.25 * s_rtt + 0.15 * s_jitter + 0.15 * s_headroom
+            }
+            StreamTransportIntent::PreferHttp3 => {
+                let h3_factor = if sess.protocol == TransportProtocol::Http3 {
+                    1.0
+                } else {
+                    0.5
+                };
+                0.25 * s_health + 0.25 * s_rtt + 0.25 * s_headroom + 0.25 * h3_factor
+            }
+        };
+
+        if sess.protocol == TransportProtocol::Http3
+            && (loss_rate > 0.0 || rttvar > std::time::Duration::from_millis(15))
+        {
+            raw += 0.08;
+        }
+
+        if has_alt_svc_announcement {
+            raw += 0.05;
+        }
+
+        if bufferbloat {
+            raw *= 0.85;
+        }
+
+        let composite_score = ((raw.clamp(0.01, 1.0)) * 10000.0).round() / 10000.0;
+
+        let reason = format!(
+            "Session {} [{:?}] score: {:.4} (srtt: {}ms, loss: {:.1}%, bw: {:.2}MB/s, headroom: {}B, bufferbloat: {})",
+            session_id, sess.protocol, composite_score, smoothed_rtt.as_millis(), loss_rate * 100.0, bw_mbps, headroom, bufferbloat
+        );
+
+        Some(CompositePathScore {
+            session_id,
+            protocol: sess.protocol,
+            origin: sess.origin.clone(),
+            health_state: sess.health_state,
+            health_score,
+            smoothed_rtt,
+            rttvar,
+            loss_rate,
+            btl_bw_bytes_per_sec: btl_bw,
+            in_flight_bytes: in_flight,
+            cwnd_headroom_bytes: headroom,
+            congestion_algorithm: sess.pacing_model.algorithm,
+            bufferbloat_detected: bufferbloat,
+            is_alt_svc_route: has_alt_svc_announcement,
+            composite_score,
+            selection_reason: reason,
+        })
+    }
+
+    /// Evaluate and rank all candidate transport routes serving an origin under a stream intent.
+    pub fn evaluate_candidate_routes(
+        &self,
+        origin: &str,
+        intent: StreamTransportIntent,
+    ) -> Vec<CompositePathScore> {
+        let candidates = self.find_candidate_session_ids_for_origin(origin);
+        let mut scores = Vec::with_capacity(candidates.len());
+        for (id, is_alt_svc) in candidates {
+            if let Some(score) = self.compute_composite_path_score(id, intent, is_alt_svc) {
+                scores.push(score);
+            }
+        }
+        scores.sort_by(|a, b| {
+            b.composite_score
+                .partial_cmp(&a.composite_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        scores
+    }
+
+    /// Select the highest scoring optimal transport session for an origin under a stream intent.
+    pub fn select_optimal_session(
+        &self,
+        origin: &str,
+        intent: StreamTransportIntent,
+    ) -> Option<CompositePathScore> {
+        self.evaluate_candidate_routes(origin, intent)
+            .into_iter()
+            .find(|s| s.composite_score > 0.0)
+    }
+
+    /// Route a stream dynamically to the optimal transport session and register it for transmission.
+    pub fn route_stream_with_intent(
+        &mut self,
+        origin: &str,
+        stream_id: u32,
+        pending_bytes: usize,
+        priority_weight: u16,
+        is_idempotent: bool,
+        intent: StreamTransportIntent,
+    ) -> Result<RouteSelectionReport, String> {
+        let candidates = self.evaluate_candidate_routes(origin, intent);
+        let best = candidates
+            .iter()
+            .find(|s| s.composite_score > 0.0)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "No healthy active transport sessions available to route stream {} for origin {}",
+                    stream_id, origin
+                )
+            })?;
+
+        let registered = self.register_stream(
+            best.session_id,
+            stream_id,
+            pending_bytes,
+            priority_weight,
+            is_idempotent,
+        );
+
+        if !registered {
+            return Err(format!(
+                "Failed to register stream {} onto selected session {}",
+                stream_id, best.session_id
+            ));
+        }
+
+        self.total_routed_streams += 1;
+        match best.protocol {
+            TransportProtocol::Http2 => self.http2_routed_streams += 1,
+            TransportProtocol::Http3 => self.http3_routed_streams += 1,
+        }
+        if best.is_alt_svc_route {
+            self.alt_svc_route_hits += 1;
+        }
+
+        Ok(RouteSelectionReport {
+            stream_id,
+            selected_session_id: best.session_id,
+            protocol: best.protocol,
+            origin: origin.to_string(),
+            score: best,
+            candidates_evaluated: candidates.len(),
+            intent,
+        })
+    }
+
+    /// Dynamically rebalance active streams across transport paths, migrating away from degraded or bufferbloated sessions.
+    pub fn rebalance_suboptimal_streams(
+        &mut self,
+        origin: &str,
+        score_improvement_threshold: f64,
+    ) -> MultiPathRebalanceReport {
+        let scores = self.evaluate_candidate_routes(origin, StreamTransportIntent::Balanced);
+        let best = match scores.iter().find(|s| s.composite_score > 0.0) {
+            Some(b) => b.clone(),
+            None => {
+                return MultiPathRebalanceReport {
+                    origin: origin.to_string(),
+                    evaluated_sessions: 0,
+                    migrated_streams_count: 0,
+                    total_migrated_bytes: 0,
+                    migrations: Vec::new(),
+                };
+            }
+        };
+
+        let mut migrations = Vec::new();
+        let mut total_migrated_bytes = 0;
+
+        for s_score in &scores {
+            if s_score.session_id == best.session_id {
+                continue;
+            }
+
+            let delta = best.composite_score - s_score.composite_score;
+            let trigger_reroute = s_score.bufferbloat_detected
+                || s_score.health_state == SessionHealthState::Degraded
+                || delta >= score_improvement_threshold;
+
+            if !trigger_reroute {
+                continue;
+            }
+
+            let reason = if s_score.bufferbloat_detected {
+                self.bufferbloat_avoidance_reroutes += 1;
+                "Bufferbloat mitigation: shifting streams to non-bloated transport".to_string()
+            } else if s_score.health_state == SessionHealthState::Degraded {
+                "Degradation mitigation: shifting streams away from elevated latency/jitter path".to_string()
+            } else {
+                format!("Dynamic score improvement delta: +{:.4}", delta)
+            };
+
+            let stream_ids: Vec<u32> = if let Some(sess) = self.sessions.get(&s_score.session_id) {
+                sess.streams
+                    .iter()
+                    .filter(|(_, st)| st.is_idempotent || st.pending_bytes > 0)
+                    .map(|(&id, _)| id)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            for stream_id in stream_ids {
+                if let Ok(bytes) =
+                    self.migrate_stream(stream_id, s_score.session_id, best.session_id)
+                {
+                    total_migrated_bytes += bytes;
+                    self.total_multipath_migrations += 1;
+                    self.total_multipath_migrated_bytes += bytes;
+                    migrations.push(StreamMigrationEvent {
+                        stream_id,
+                        source_session_id: s_score.session_id,
+                        source_protocol: s_score.protocol,
+                        target_session_id: best.session_id,
+                        target_protocol: best.protocol,
+                        migrated_bytes: bytes,
+                        score_delta: delta,
+                        reason: reason.clone(),
+                    });
+                }
+            }
+        }
+
+        MultiPathRebalanceReport {
+            origin: origin.to_string(),
+            evaluated_sessions: scores.len(),
+            migrated_streams_count: migrations.len(),
+            total_migrated_bytes,
+            migrations,
+        }
+    }
+
+    /// Retrieve aggregate multi-path composite routing telemetry.
+    pub fn composite_routing_telemetry(&self) -> CompositeRoutingTelemetry {
+        CompositeRoutingTelemetry {
+            total_routed_streams: self.total_routed_streams,
+            http2_routed_streams: self.http2_routed_streams,
+            http3_routed_streams: self.http3_routed_streams,
+            total_multipath_migrations: self.total_multipath_migrations,
+            total_multipath_migrated_bytes: self.total_multipath_migrated_bytes,
+            alt_svc_route_hits: self.alt_svc_route_hits,
+            bufferbloat_avoidance_reroutes: self.bufferbloat_avoidance_reroutes,
         }
     }
 }
@@ -10224,6 +10808,92 @@ impl AsyncHttp2Pool {
                 average_smoothed_rtt: std::time::Duration::from_millis(0),
                 average_jitter: std::time::Duration::from_millis(0),
                 average_health_score: 1.0,
+            }
+        }
+    }
+
+    /// Evaluate candidate transport routes for an origin under a specific stream transport intent.
+    pub fn evaluate_candidate_routes(
+        &self,
+        origin: &str,
+        intent: StreamTransportIntent,
+    ) -> Vec<CompositePathScore> {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.evaluate_candidate_routes(origin, intent)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Select the optimal transport session for an origin under a specific stream transport intent.
+    pub fn select_optimal_transport_session(
+        &self,
+        origin: &str,
+        intent: StreamTransportIntent,
+    ) -> Option<CompositePathScore> {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.select_optimal_session(origin, intent)
+        } else {
+            None
+        }
+    }
+
+    /// Route a pooled stream with unified multi-path composite selection according to stream intent.
+    pub fn route_pooled_stream_with_intent(
+        &self,
+        origin: &str,
+        stream_id: u32,
+        pending_bytes: usize,
+        priority_weight: u16,
+        is_idempotent: bool,
+        intent: StreamTransportIntent,
+    ) -> Result<RouteSelectionReport, String> {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.route_stream_with_intent(
+                origin,
+                stream_id,
+                pending_bytes,
+                priority_weight,
+                is_idempotent,
+                intent,
+            )
+        } else {
+            Err("InterSessionDrrArbitrator lock poisoned".to_string())
+        }
+    }
+
+    /// Dynamically rebalance active streams across transport sessions based on composite scores and bufferbloat.
+    pub fn rebalance_multipath_routes(
+        &self,
+        origin: &str,
+        score_improvement_threshold: f64,
+    ) -> MultiPathRebalanceReport {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.rebalance_suboptimal_streams(origin, score_improvement_threshold)
+        } else {
+            MultiPathRebalanceReport {
+                origin: origin.to_string(),
+                evaluated_sessions: 0,
+                migrated_streams_count: 0,
+                total_migrated_bytes: 0,
+                migrations: Vec::new(),
+            }
+        }
+    }
+
+    /// Retrieve aggregate multi-path composite routing telemetry metrics.
+    pub fn composite_transport_routing_telemetry(&self) -> CompositeRoutingTelemetry {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.composite_routing_telemetry()
+        } else {
+            CompositeRoutingTelemetry {
+                total_routed_streams: 0,
+                http2_routed_streams: 0,
+                http3_routed_streams: 0,
+                total_multipath_migrations: 0,
+                total_multipath_migrated_bytes: 0,
+                alt_svc_route_hits: 0,
+                bufferbloat_avoidance_reroutes: 0,
             }
         }
     }
@@ -12876,17 +13546,24 @@ impl AsyncHttp2Pool {
         origin: impl Into<String>,
         routes: Vec<crate::simd_parser::AltSvcRoute>,
     ) {
+        let orig: String = origin.into();
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.record_alt_svc_routes(&orig, routes.clone());
+        }
         if let Ok(mut map) = self.alt_svc_routes.lock() {
             if routes.is_empty() {
-                map.remove(&origin.into());
+                map.remove(&orig);
             } else {
-                map.insert(origin.into(), routes);
+                map.insert(orig, routes);
             }
         }
     }
 
     /// Clear all alternative service routes registered on the pool.
     pub fn clear_alt_svc_routes(&self) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.clear_alt_svc_routes();
+        }
         if let Ok(mut map) = self.alt_svc_routes.lock() {
             map.clear();
         }
@@ -24325,5 +25002,257 @@ mod tls_alpn_tests {
         assert_eq!(round.slices[0].session_id, 901);
         assert_eq!(round.slices[0].allocated_bytes, 1024);
         assert!(round.slices.iter().all(|s| s.session_id != 902));
+    }
+
+    #[test]
+    fn test_multi_path_composite_route_scoring_by_intent() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+
+        // Session 1: HTTP/2 with BBR pacing, low latency (5ms), moderate bandwidth (2MB/s)
+        arb.register_session(1, "https://intent.io", TransportProtocol::Http2, 1);
+        arb.set_session_congestion_algorithm(1, CongestionControlAlgorithm::Bbr);
+        arb.configure_session_pacing(1, std::time::Duration::from_millis(5), 2_000_000);
+
+        // Session 2: HTTP/3 with CUBIC pacing, higher latency (40ms), very high bandwidth (50MB/s)
+        arb.register_session(2, "https://intent.io", TransportProtocol::Http3, 1);
+        arb.set_session_congestion_algorithm(2, CongestionControlAlgorithm::Cubic);
+        arb.configure_session_pacing(2, std::time::Duration::from_millis(40), 50_000_000);
+
+        // Test LowLatencyInteractive intent: Session 1 must win because RTT dominates
+        let low_lat_routes = arb.evaluate_candidate_routes(
+            "https://intent.io",
+            StreamTransportIntent::LowLatencyInteractive,
+        );
+        assert_eq!(low_lat_routes.len(), 2);
+        assert_eq!(low_lat_routes[0].session_id, 1);
+        assert_eq!(low_lat_routes[1].session_id, 2);
+        assert!(low_lat_routes[0].composite_score > low_lat_routes[1].composite_score);
+
+        // Test HighThroughputBulk intent: Session 2 must win because 50MB/s bandwidth dominates
+        let bulk_routes = arb.evaluate_candidate_routes(
+            "https://intent.io",
+            StreamTransportIntent::HighThroughputBulk,
+        );
+        assert_eq!(bulk_routes.len(), 2);
+        assert_eq!(bulk_routes[0].session_id, 2);
+        assert_eq!(bulk_routes[1].session_id, 1);
+        assert!(bulk_routes[0].composite_score > bulk_routes[1].composite_score);
+
+        // Test PreferHttp3 intent: Session 2 (HTTP/3) must win due to protocol bonus
+        let h3_routes =
+            arb.evaluate_candidate_routes("https://intent.io", StreamTransportIntent::PreferHttp3);
+        assert_eq!(h3_routes[0].session_id, 2);
+        assert_eq!(h3_routes[0].protocol, TransportProtocol::Http3);
+    }
+
+    #[test]
+    fn test_multi_path_ineligible_dead_and_zombie_sessions() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+
+        arb.register_session(10, "https://zombie-test.org", TransportProtocol::Http2, 1);
+        arb.register_session(11, "https://zombie-test.org", TransportProtocol::Http3, 1);
+
+        // Isolate session 10 as Zombie and mark session 11 as Dead
+        let _ = arb.isolate_zombie_session(10);
+        let _ = arb.close_session(11);
+
+        let candidates = arb.evaluate_candidate_routes(
+            "https://zombie-test.org",
+            StreamTransportIntent::Balanced,
+        );
+        assert!(candidates.is_empty() || candidates.iter().all(|c| c.composite_score == 0.0));
+
+        let opt = arb.select_optimal_session(
+            "https://zombie-test.org",
+            StreamTransportIntent::Balanced,
+        );
+        assert!(opt.is_none());
+
+        // Attempting to route stream returns Err
+        let res = arb.route_stream_with_intent(
+            "https://zombie-test.org",
+            100,
+            1024,
+            1,
+            true,
+            StreamTransportIntent::Balanced,
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_multi_path_alt_svc_route_integration_and_hol_blocking_resilience() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+
+        // Register HTTP/2 session
+        arb.register_session(21, "https://altsvc.org", TransportProtocol::Http2, 1);
+        arb.configure_session_pacing(21, std::time::Duration::from_millis(20), 10_000_000);
+
+        // Register HTTP/3 session
+        arb.register_session(22, "https://altsvc.org", TransportProtocol::Http3, 1);
+        arb.configure_session_pacing(22, std::time::Duration::from_millis(20), 10_000_000);
+
+        // Announce Alt-Svc for HTTP/3
+        arb.record_alt_svc_routes(
+            "https://altsvc.org",
+            vec![crate::simd_parser::AltSvcRoute::new("h3", "", 443)],
+        );
+
+        // Under healthy conditions, both are candidates, HTTP/3 has Alt-Svc advertisement flag
+        let routes = arb.evaluate_candidate_routes(
+            "https://altsvc.org",
+            StreamTransportIntent::Balanced,
+        );
+        assert_eq!(routes.len(), 2);
+        let h3_cand = routes.iter().find(|r| r.session_id == 22).unwrap();
+        assert!(h3_cand.is_alt_svc_route);
+
+        // Route a stream with PreferHttp3 intent
+        let report = arb
+            .route_stream_with_intent(
+                "https://altsvc.org",
+                1,
+                4096,
+                1,
+                true,
+                StreamTransportIntent::PreferHttp3,
+            )
+            .unwrap();
+
+        assert_eq!(report.selected_session_id, 22);
+        assert_eq!(report.protocol, TransportProtocol::Http3);
+        assert!(report.score.is_alt_svc_route);
+        assert_eq!(arb.active_stream_count(22), 1);
+
+        // Verify arbitrator telemetry
+        let telem = arb.composite_routing_telemetry();
+        assert_eq!(telem.total_routed_streams, 1);
+        assert_eq!(telem.http3_routed_streams, 1);
+        assert_eq!(telem.alt_svc_route_hits, 1);
+    }
+
+    #[test]
+    fn test_multi_path_dynamic_rebalance_and_bufferbloat_mitigation() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+
+        // Session 31: HTTP/2 initially healthy with low RTT (10ms)
+        arb.register_session(31, "https://bloat.io", TransportProtocol::Http2, 1);
+        arb.configure_session_pacing(31, std::time::Duration::from_millis(10), 10_000_000);
+
+        // Session 32: HTTP/3 alternative with 15ms RTT
+        arb.register_session(32, "https://bloat.io", TransportProtocol::Http3, 1);
+        arb.configure_session_pacing(32, std::time::Duration::from_millis(15), 10_000_000);
+
+        // Route stream 5 on session 31
+        let report = arb
+            .route_stream_with_intent(
+                "https://bloat.io",
+                5,
+                2048,
+                1,
+                true,
+                StreamTransportIntent::LowLatencyInteractive,
+            )
+            .unwrap();
+        assert_eq!(report.selected_session_id, 31);
+        assert_eq!(arb.active_stream_count(31), 1);
+
+        // Session 31 experiences severe bufferbloat: latency spikes to 100ms and in-flight exceeds BDP
+        if let Some(s) = arb.sessions.get_mut(&31) {
+            s.pacing_model.in_flight_bytes = 200_000;
+            s.pacing_model
+                .record_rtt_sample(std::time::Duration::from_millis(100));
+            assert!(s.pacing_model.bufferbloat_detected);
+        }
+
+        // Trigger dynamic rebalancing sweep
+        let rebal = arb.rebalance_suboptimal_streams("https://bloat.io", 0.05);
+        assert_eq!(rebal.migrated_streams_count, 1);
+        assert_eq!(rebal.total_migrated_bytes, 2048);
+        assert_eq!(rebal.migrations[0].stream_id, 5);
+        assert_eq!(rebal.migrations[0].source_session_id, 31);
+        assert_eq!(rebal.migrations[0].target_session_id, 32);
+        assert!(rebal.migrations[0].reason.contains("Bufferbloat mitigation"));
+
+        // Verify stream 5 is now on session 32
+        assert_eq!(arb.active_stream_count(31), 0);
+        assert_eq!(arb.active_stream_count(32), 1);
+
+        let telem = arb.composite_routing_telemetry();
+        assert_eq!(telem.total_multipath_migrations, 1);
+        assert_eq!(telem.total_multipath_migrated_bytes, 2048);
+        assert_eq!(telem.bufferbloat_avoidance_reroutes, 1);
+    }
+
+    #[test]
+    fn test_async_http2_pool_multi_path_composite_routing_end_to_end() {
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 443, 4);
+
+        // Register HTTP/2 session 101 and HTTP/3 session 102
+        pool.register_transport_session(
+            101,
+            "https://pool-multipath.com",
+            TransportProtocol::Http2,
+            1,
+        );
+        pool.register_transport_session(
+            102,
+            "https://pool-multipath.com",
+            TransportProtocol::Http3,
+            2,
+        );
+
+        // Record Alt-Svc advertisement for HTTP/3
+        pool.record_alt_svc_routes(
+            "https://pool-multipath.com",
+            vec![crate::simd_parser::AltSvcRoute::new("h3", "", 443)],
+        );
+
+        // Configure pacing metrics: 101 has 5ms RTT / 5MB/s, 102 has 30ms RTT / 50MB/s
+        pool.configure_session_pacing(101, std::time::Duration::from_millis(5), 5_000_000);
+        pool.configure_session_pacing(102, std::time::Duration::from_millis(30), 50_000_000);
+
+        // Route a bulk stream: session 102 wins due to high bandwidth
+        let bulk_rep = pool
+            .route_pooled_stream_with_intent(
+                "https://pool-multipath.com",
+                1,
+                8192,
+                1,
+                true,
+                StreamTransportIntent::HighThroughputBulk,
+            )
+            .unwrap();
+        assert_eq!(bulk_rep.selected_session_id, 102);
+        assert_eq!(bulk_rep.protocol, TransportProtocol::Http3);
+        assert!(bulk_rep.score.is_alt_svc_route);
+
+        // Route an interactive stream: session 101 wins due to lowest RTT (5ms < 30ms)
+        let inter_rep = pool
+            .route_pooled_stream_with_intent(
+                "https://pool-multipath.com",
+                2,
+                1024,
+                1,
+                true,
+                StreamTransportIntent::LowLatencyInteractive,
+            )
+            .unwrap();
+        assert_eq!(inter_rep.selected_session_id, 101);
+        assert_eq!(inter_rep.protocol, TransportProtocol::Http2);
+
+        // Verify candidate evaluation
+        let candidates = pool.evaluate_candidate_routes(
+            "https://pool-multipath.com",
+            StreamTransportIntent::Balanced,
+        );
+        assert_eq!(candidates.len(), 2);
+
+        // Verify telemetry
+        let telem = pool.composite_transport_routing_telemetry();
+        assert_eq!(telem.total_routed_streams, 2);
+        assert_eq!(telem.http2_routed_streams, 1);
+        assert_eq!(telem.http3_routed_streams, 1);
+        assert_eq!(telem.alt_svc_route_hits, 1);
     }
 }
