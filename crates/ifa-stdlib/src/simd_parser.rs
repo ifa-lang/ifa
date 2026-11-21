@@ -4476,7 +4476,11 @@ mod http2_tests {
 
         let owned_frame = slice.to_owned_frame();
         match owned_frame {
-            Http2Frame::Data { stream_id, end_stream, data } => {
+            Http2Frame::Data {
+                stream_id,
+                end_stream,
+                data,
+            } => {
                 assert_eq!(stream_id, 3);
                 assert!(end_stream);
                 assert_eq!(data, raw_payload);
@@ -4489,7 +4493,9 @@ mod http2_tests {
         session.streams.insert(3, Http2Stream::new(3, 65535));
         session.streams.get_mut(&3).unwrap().state = Http2StreamState::Open;
 
-        let reply = session.handle_data_slice(&slice).expect("handle data slice");
+        let reply = session
+            .handle_data_slice(&slice)
+            .expect("handle data slice");
         assert!(reply.is_none());
 
         let stream = session.streams.get(&3).expect("stream 3 exists");

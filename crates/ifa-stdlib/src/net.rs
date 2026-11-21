@@ -3339,12 +3339,17 @@ impl AsyncHttp2Connection {
         loop {
             // First check if an already buffered frame can be delivered as a zero-copy DATA slice
             if self.read_buf.len() >= crate::simd_parser::Http2FrameHeader::HEADER_SIZE {
-                if let Some(header) = crate::simd_parser::Http2FrameHeader::decode(&self.read_buf[..9]) {
-                    let total_frame_len = crate::simd_parser::Http2FrameHeader::HEADER_SIZE + header.length as usize;
+                if let Some(header) =
+                    crate::simd_parser::Http2FrameHeader::decode(&self.read_buf[..9])
+                {
+                    let total_frame_len =
+                        crate::simd_parser::Http2FrameHeader::HEADER_SIZE + header.length as usize;
                     if self.read_buf.len() >= total_frame_len {
                         if header.frame_type == crate::simd_parser::Http2FrameType::Data {
                             let payload = &self.read_buf[9..total_frame_len];
-                            let slice = match crate::simd_parser::Http2DataFrameSlice::decode(&header, payload) {
+                            let slice = match crate::simd_parser::Http2DataFrameSlice::decode(
+                                &header, payload,
+                            ) {
                                 Ok(s) => s,
                                 Err(e) => {
                                     return Err(io::Error::new(
@@ -4348,7 +4353,11 @@ impl Http2StreamingResponseDecoder {
             self.is_complete = true;
         }
 
-        Ok(self.decoded_chunks.last().map(|c| c.as_slice()).unwrap_or(&[]))
+        Ok(self
+            .decoded_chunks
+            .last()
+            .map(|c| c.as_slice())
+            .unwrap_or(&[]))
     }
 
     /// Ingest an owned DATA frame payload without allocating a new buffer when uncompressed.
@@ -4372,7 +4381,11 @@ impl Http2StreamingResponseDecoder {
             self.is_complete = true;
         }
 
-        Ok(self.decoded_chunks.last().map(|c| c.as_slice()).unwrap_or(&[]))
+        Ok(self
+            .decoded_chunks
+            .last()
+            .map(|c| c.as_slice())
+            .unwrap_or(&[]))
     }
 
     /// Process a fragmented incoming DATA frame chunk.
@@ -10341,7 +10354,10 @@ mod tests {
 
         decoder.feed_headers(&[
             (":status".to_string(), "200".to_string()),
-            ("content-type".to_string(), "application/octet-stream".to_string()),
+            (
+                "content-type".to_string(),
+                "application/octet-stream".to_string(),
+            ),
         ]);
         assert_eq!(decoder.status, Some(200));
 
@@ -10353,7 +10369,9 @@ mod tests {
 
         // 2. feed_chunk_owned moves buffer without allocation
         let owned_vec = b"chunk-beta".to_vec();
-        let owned_out = decoder.feed_chunk_owned(owned_vec, true).expect("feed owned");
+        let owned_out = decoder
+            .feed_chunk_owned(owned_vec, true)
+            .expect("feed owned");
         assert_eq!(owned_out, b"chunk-beta");
 
         assert!(decoder.is_complete());
@@ -10414,13 +10432,17 @@ mod tests {
             }
         });
 
-        let tcp_client = std::net::TcpStream::connect(format!("127.0.0.1:{}", port))
-            .expect("connect client");
+        let tcp_client =
+            std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect client");
         let async_client = AsyncTcpStream::from_std(tcp_client).expect("async client stream");
-        let mut client = AsyncHttp2Connection::client_handshake(async_client)
-            .expect("client handshake");
+        let mut client =
+            AsyncHttp2Connection::client_handshake(async_client).expect("client handshake");
 
-        let pseudo = vec![(":method", "GET"), (":path", "/zero-copy"), (":scheme", "http")];
+        let pseudo = vec![
+            (":method", "GET"),
+            (":path", "/zero-copy"),
+            (":scheme", "http"),
+        ];
         let stream_id = client.send_request(&pseudo, None).expect("send request");
 
         // 1. Drain any pre-stream control frames (e.g. SETTINGS) until HEADERS is received
@@ -10428,7 +10450,11 @@ mod tests {
         loop {
             let frame = client
                 .recv_frame_with_data_slice(|slice| {
-                    data_slices_captured.push((slice.stream_id, slice.end_stream, slice.data.to_vec()));
+                    data_slices_captured.push((
+                        slice.stream_id,
+                        slice.end_stream,
+                        slice.data.to_vec(),
+                    ));
                     Ok(())
                 })
                 .expect("recv frame");
@@ -10442,11 +10468,18 @@ mod tests {
         while data_slices_captured.len() < 2 {
             let res = client
                 .recv_frame_with_data_slice(|slice| {
-                    data_slices_captured.push((slice.stream_id, slice.end_stream, slice.data.to_vec()));
+                    data_slices_captured.push((
+                        slice.stream_id,
+                        slice.end_stream,
+                        slice.data.to_vec(),
+                    ));
                     Ok(())
                 })
                 .expect("recv data frame");
-            assert!(res.is_none() || matches!(res, Some(crate::simd_parser::Http2Frame::Settings { .. })));
+            assert!(
+                res.is_none()
+                    || matches!(res, Some(crate::simd_parser::Http2Frame::Settings { .. }))
+            );
         }
 
         assert_eq!(data_slices_captured.len(), 2);
@@ -10491,9 +10524,15 @@ mod tests {
                 .session
                 .create_headers_frame(stream_id, &[(":status", "200")], false);
             server.send_frame(&h).expect("send headers");
-            server.send_data(stream_id, b"part-1-", false).expect("send 1");
-            server.send_data(stream_id, b"part-2-", false).expect("send 2");
-            server.send_data(stream_id, b"part-3", true).expect("send 3");
+            server
+                .send_data(stream_id, b"part-1-", false)
+                .expect("send 1");
+            server
+                .send_data(stream_id, b"part-2-", false)
+                .expect("send 2");
+            server
+                .send_data(stream_id, b"part-3", true)
+                .expect("send 3");
 
             loop {
                 match server.recv_frame() {
@@ -10504,8 +10543,8 @@ mod tests {
         });
 
         let chunk_pool = Http2ChunkBufferPool::new(8192, 16);
-        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2)
-            .with_chunk_buffer_pool(chunk_pool.clone());
+        let pool =
+            AsyncHttp2Pool::new("127.0.0.1", port, 2).with_chunk_buffer_pool(chunk_pool.clone());
 
         assert!(pool.chunk_buffer_pool().is_some());
 
