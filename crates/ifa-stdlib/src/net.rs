@@ -13486,7 +13486,7 @@ mod tests {
             }
 
             // Reply to each stream with 200 OK
-            for (sid, _) in &bodies {
+            for sid in bodies.keys() {
                 let headers = [(":status", "200")];
                 let _ = server.send_response(*sid, &headers, Some(b"OK"));
             }
