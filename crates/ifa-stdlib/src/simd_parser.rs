@@ -610,6 +610,28 @@ impl PriorityParameters {
     }
 }
 
+/// Detailed report of bandwidth reallocation and DRR deficit adjustments performed during
+/// dynamic mid-stream reprioritization (RFC 9218 §3.2) under network contention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BandwidthReallocationReport {
+    /// Stream ID that was reprioritized.
+    pub stream_id: u32,
+    /// Priority parameters before update.
+    pub old_priority: PriorityParameters,
+    /// Priority parameters after update.
+    pub new_priority: PriorityParameters,
+    /// Total bytes of DRR deficit transferred or stolen into the reprioritized stream.
+    pub stolen_bytes: usize,
+    /// Donor streams that contributed deficit and the exact amount contributed: (stream_id, bytes).
+    pub donors: Vec<(u32, usize)>,
+    /// Whether the connection was detected to be under network contention (window saturation or pending queue backlog).
+    pub connection_under_contention: bool,
+    /// Total aggregate DRR deficits across all streams before reallocation.
+    pub total_deficits_before: usize,
+    /// Total aggregate DRR deficits across all streams after reallocation (guarantees zero credit loss).
+    pub total_deficits_after: usize,
+}
+
 /// HTTP/2 Settings Frame Parameter pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Http2Setting {
@@ -3548,6 +3570,8 @@ pub struct Http2Session {
     pub adaptive_flow_controller: AdaptiveFlowController,
     /// Persistent DRR deficit counters per stream ID (RFC 7540 weighted-fair scheduling).
     pub drr_deficits: std::collections::HashMap<u32, usize>,
+    /// Most recent dynamic bandwidth reallocation report from mid-stream reprioritization.
+    pub last_reallocation_report: Option<BandwidthReallocationReport>,
 }
 
 impl Http2Session {
@@ -3582,6 +3606,7 @@ impl Http2Session {
             pending_outbound_data: std::collections::HashMap::new(),
             adaptive_flow_controller: AdaptiveFlowController::default(),
             drr_deficits: std::collections::HashMap::new(),
+            last_reallocation_report: None,
         }
     }
 
@@ -3955,6 +3980,306 @@ impl Http2Session {
             .entry(stream_id)
             .or_insert_with(|| Http2Stream::new(stream_id, initial_win));
         stream.priority_params = priority;
+    }
+
+    /// Reprioritize an active stream dynamically mid-stream (RFC 9218 §3.2).
+    ///
+    /// When priority parameters change in-flight under network contention (global connection
+    /// window saturation or pending queue backpressure):
+    /// - If the stream is **promoted** (lower numerical urgency, e.g. 5 -> 1): steals accumulated
+    ///   DRR deficit credits from lower-urgency streams with active deficits, transferring them
+    ///   directly into the promoted stream's deficit counter. This allows immediate in-flight
+    ///   bandwidth preemption without priority inversion.
+    /// - If the stream is **demoted** (higher numerical urgency, e.g. 1 -> 5): relinquishes any
+    ///   excess DRR deficit to active higher-urgency streams requiring credit.
+    /// - If transitioning from **incremental to non-incremental**: redistributes any accumulated
+    ///   DRR deficit to other active incremental streams.
+    ///
+    /// **Network Credit Conservation Invariant:**
+    /// The aggregate sum of DRR deficits across all streams is strictly preserved
+    /// (`total_deficits_before == total_deficits_after`), guaranteeing zero loss or synthetic
+    /// creation of network transmission credit.
+    pub fn reprioritize_stream(
+        &mut self,
+        stream_id: u32,
+        new_params: PriorityParameters,
+    ) -> BandwidthReallocationReport {
+        let total_deficits_before: usize = self.drr_deficits.values().sum();
+        let total_pending: usize = self.pending_outbound_data.values().map(|b| b.len()).sum();
+        let connection_under_contention = self.connection_window_size <= 0
+            || (self.connection_window_size as usize) <= total_pending;
+
+        let old_priority = self
+            .streams
+            .get(&stream_id)
+            .map(|s| s.priority_params)
+            .unwrap_or_default();
+
+        // Ensure stream exists and update its priority parameters
+        let initial_win = self.initial_stream_window_size;
+        let stream = self
+            .streams
+            .entry(stream_id)
+            .or_insert_with(|| Http2Stream::new(stream_id, initial_win));
+        stream.priority_params = new_params;
+
+        let mut stolen_bytes = 0;
+        let mut donors = Vec::new();
+
+        let new_urgency = new_params.urgency.min(7);
+        let old_urgency = old_priority.urgency.min(7);
+
+        // Case 1: Stream Promotion (urgency increased: new_urgency < old_urgency)
+        if new_urgency < old_urgency {
+            let pending_len = self
+                .pending_outbound_data
+                .get(&stream_id)
+                .map(|b| b.len())
+                .unwrap_or(0);
+            let cur_deficit = self.drr_deficits.get(&stream_id).copied().unwrap_or(0);
+            // Needs credit to cover pending backlog (or at least base quantum 1024 if backlog is zero)
+            let needed = if pending_len > 0 {
+                pending_len.saturating_sub(cur_deficit)
+            } else {
+                0
+            };
+
+            if needed > 0 {
+                // Potential donors are active streams with strictly lower urgency (higher numerical value)
+                // that have accumulated DRR deficits.
+                let mut candidate_donors: Vec<(u32, u8, usize)> = self
+                    .drr_deficits
+                    .iter()
+                    .filter(|(&sid, &def)| sid != stream_id && def > 0)
+                    .filter_map(|(&sid, &def)| {
+                        let u = self
+                            .streams
+                            .get(&sid)
+                            .map(|s| s.priority_params.urgency.min(7))
+                            .unwrap_or(7);
+                        if u > new_urgency {
+                            Some((sid, u, def))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                // Sort candidate donors: lowest urgency (highest u) first, then highest deficit, then stream_id
+                candidate_donors.sort_by(|a, b| {
+                    b.1.cmp(&a.1)
+                        .then_with(|| b.2.cmp(&a.2))
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+
+                let mut remaining_needed = needed;
+                for (donor_id, _u, donor_def) in candidate_donors {
+                    if remaining_needed == 0 {
+                        break;
+                    }
+                    let steal = donor_def.min(remaining_needed);
+                    if steal > 0 {
+                        if let Some(d) = self.drr_deficits.get_mut(&donor_id) {
+                            *d -= steal;
+                        }
+                        donors.push((donor_id, steal));
+                        stolen_bytes += steal;
+                        remaining_needed -= steal;
+                    }
+                }
+
+                if stolen_bytes > 0 {
+                    *self.drr_deficits.entry(stream_id).or_insert(0) += stolen_bytes;
+                }
+            }
+        }
+        // Case 2: Stream Demotion (urgency decreased: new_urgency > old_urgency)
+        else if new_urgency > old_urgency {
+            let cur_deficit = self.drr_deficits.get(&stream_id).copied().unwrap_or(0);
+            if cur_deficit > 0 {
+                // Find higher-urgency streams (u < new_urgency) that have pending data and need credit
+                let mut candidate_recipients: Vec<(u32, u8, usize)> = self
+                    .pending_outbound_data
+                    .iter()
+                    .filter(|(&sid, buf)| sid != stream_id && !buf.is_empty())
+                    .filter_map(|(&sid, buf)| {
+                        let u = self
+                            .streams
+                            .get(&sid)
+                            .map(|s| s.priority_params.urgency.min(7))
+                            .unwrap_or(3);
+                        if u < new_urgency {
+                            let d = self.drr_deficits.get(&sid).copied().unwrap_or(0);
+                            let need = buf.len().saturating_sub(d);
+                            if need > 0 {
+                                Some((sid, u, need))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                // Highest urgency (lowest u) first
+                candidate_recipients.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+                let mut remaining_surplus = cur_deficit;
+                for (recipient_id, _u, need) in candidate_recipients {
+                    if remaining_surplus == 0 {
+                        break;
+                    }
+                    let transfer = remaining_surplus.min(need);
+                    if transfer > 0 {
+                        *self.drr_deficits.entry(recipient_id).or_insert(0) += transfer;
+                        remaining_surplus -= transfer;
+                    }
+                }
+                // Update demoted stream deficit
+                self.drr_deficits.insert(stream_id, remaining_surplus);
+            }
+        }
+
+        // Case 3: Transition from Incremental to Non-Incremental
+        // Non-incremental streams are processed sequentially; transfer any accumulated DRR deficit
+        // to remaining active incremental streams in the session.
+        if old_priority.incremental && !new_params.incremental {
+            let cur_deficit = self.drr_deficits.remove(&stream_id).unwrap_or(0);
+            if cur_deficit > 0 {
+                let mut incremental_recipients: Vec<u32> = self
+                    .streams
+                    .iter()
+                    .filter(|(&sid, s)| {
+                        sid != stream_id
+                            && s.priority_params.incremental
+                            && (s.state == Http2StreamState::Open
+                                || s.state == Http2StreamState::HalfClosedRemote)
+                    })
+                    .map(|(&sid, _)| sid)
+                    .collect();
+                incremental_recipients.sort_unstable();
+
+                if !incremental_recipients.is_empty() {
+                    let share = cur_deficit / incremental_recipients.len();
+                    let remainder = cur_deficit % incremental_recipients.len();
+                    for (idx, &sid) in incremental_recipients.iter().enumerate() {
+                        let extra = if idx < remainder { 1 } else { 0 };
+                        *self.drr_deficits.entry(sid).or_insert(0) += share + extra;
+                    }
+                } else {
+                    // No incremental streams; restore deficit so credit is not lost
+                    self.drr_deficits.insert(stream_id, cur_deficit);
+                }
+            }
+        } else if !old_priority.incremental && new_params.incremental {
+            self.drr_deficits.entry(stream_id).or_insert(0);
+        }
+
+        let total_deficits_after: usize = self.drr_deficits.values().sum();
+        debug_assert_eq!(
+            total_deficits_before, total_deficits_after,
+            "Network credit conservation invariant violated during reprioritize_stream: before={} after={}",
+            total_deficits_before, total_deficits_after
+        );
+
+        let report = BandwidthReallocationReport {
+            stream_id,
+            old_priority,
+            new_priority: new_params,
+            stolen_bytes,
+            donors,
+            connection_under_contention,
+            total_deficits_before,
+            total_deficits_after,
+        };
+
+        self.last_reallocation_report = Some(report.clone());
+        report
+    }
+
+    /// Steal up to `max_bytes` of accumulated DRR deficit from lower-urgency streams
+    /// under network contention, transferring it to `recipient_stream_id` with zero network credit loss.
+    pub fn steal_bandwidth_under_contention(
+        &mut self,
+        recipient_stream_id: u32,
+        max_bytes: usize,
+    ) -> BandwidthReallocationReport {
+        let total_deficits_before: usize = self.drr_deficits.values().sum();
+        let total_pending: usize = self.pending_outbound_data.values().map(|b| b.len()).sum();
+        let connection_under_contention = self.connection_window_size <= 0
+            || (self.connection_window_size as usize) <= total_pending;
+
+        let priority = self
+            .streams
+            .get(&recipient_stream_id)
+            .map(|s| s.priority_params)
+            .unwrap_or_default();
+        let recipient_urgency = priority.urgency.min(7);
+
+        let mut candidate_donors: Vec<(u32, u8, usize)> = self
+            .drr_deficits
+            .iter()
+            .filter(|(&sid, &def)| sid != recipient_stream_id && def > 0)
+            .filter_map(|(&sid, &def)| {
+                let u = self
+                    .streams
+                    .get(&sid)
+                    .map(|s| s.priority_params.urgency.min(7))
+                    .unwrap_or(7);
+                if u > recipient_urgency {
+                    Some((sid, u, def))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        candidate_donors.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        let mut remaining_needed = max_bytes;
+        let mut stolen_bytes = 0;
+        let mut donors = Vec::new();
+
+        for (donor_id, _u, donor_def) in candidate_donors {
+            if remaining_needed == 0 {
+                break;
+            }
+            let steal = donor_def.min(remaining_needed);
+            if steal > 0 {
+                if let Some(d) = self.drr_deficits.get_mut(&donor_id) {
+                    *d -= steal;
+                }
+                donors.push((donor_id, steal));
+                stolen_bytes += steal;
+                remaining_needed -= steal;
+            }
+        }
+
+        if stolen_bytes > 0 {
+            *self.drr_deficits.entry(recipient_stream_id).or_insert(0) += stolen_bytes;
+        }
+
+        let total_deficits_after: usize = self.drr_deficits.values().sum();
+        debug_assert_eq!(total_deficits_before, total_deficits_after);
+
+        let report = BandwidthReallocationReport {
+            stream_id: recipient_stream_id,
+            old_priority: priority,
+            new_priority: priority,
+            stolen_bytes,
+            donors,
+            connection_under_contention,
+            total_deficits_before,
+            total_deficits_after,
+        };
+
+        self.last_reallocation_report = Some(report.clone());
+        report
     }
 
     /// Compute streams prioritized under RFC 9218 Extensible Prioritization Scheme.
@@ -4898,7 +5223,7 @@ impl Http2Session {
                 priority_field_value,
             } => {
                 let params = PriorityParameters::parse(priority_field_value);
-                self.set_stream_priority_parameters(*prioritized_stream_id, params);
+                self.reprioritize_stream(*prioritized_stream_id, params);
                 Ok(None)
             }
             Http2Frame::AltSvc {
@@ -6576,5 +6901,135 @@ mod http2_tests {
         let (dec_settings, c3) = Http3Frame::decode(&encoded_settings).expect("decode h3 settings");
         assert_eq!(c3, encoded_settings.len());
         assert_eq!(dec_settings, f_settings);
+    }
+
+    #[test]
+    fn test_dynamic_reprioritization_bandwidth_stealing_under_contention() {
+        let mut session = Http2Session::new(false);
+        // Connection window is saturated / small compared to backlog (contention)
+        session.connection_window_size = 4096;
+
+        // Setup 3 streams:
+        // Stream 1: initial urgency 6, incremental = true, has 2048 bytes pending
+        // Stream 3: urgency 4, incremental = true, has 2048 bytes deficit accumulated
+        // Stream 5: urgency 3, incremental = true, has 1024 bytes deficit accumulated
+        for &sid in &[1, 3, 5] {
+            let mut s = Http2Stream::new(sid, 65535);
+            s.state = Http2StreamState::Open;
+            session.streams.insert(sid, s);
+        }
+
+        session.set_stream_priority_parameters(1, PriorityParameters::new(6, true));
+        session.set_stream_priority_parameters(3, PriorityParameters::new(4, true));
+        session.set_stream_priority_parameters(5, PriorityParameters::new(3, true));
+
+        session.drr_deficits.insert(1, 0);
+        session.drr_deficits.insert(3, 2048);
+        session.drr_deficits.insert(5, 1024);
+
+        session.pending_outbound_data.insert(1, vec![1u8; 2048]);
+        session.pending_outbound_data.insert(3, vec![3u8; 2048]);
+        session.pending_outbound_data.insert(5, vec![5u8; 1024]);
+
+        let total_before = session.drr_deficits.values().sum::<usize>();
+        assert_eq!(total_before, 3072);
+
+        // Dynamically promote Stream 1 to Urgency 1 via PRIORITY_UPDATE mid-stream
+        let pu_frame = Http2Frame::PriorityUpdate {
+            prioritized_stream_id: 1,
+            priority_field_value: "u=1, i".to_string(),
+        };
+        session.handle_frame(&pu_frame).expect("handle priority update");
+
+        let report = session.last_reallocation_report.as_ref().expect("reallocation report");
+        assert_eq!(report.stream_id, 1);
+        assert_eq!(report.old_priority.urgency, 6);
+        assert_eq!(report.new_priority.urgency, 1);
+        assert!(report.connection_under_contention);
+        assert_eq!(report.stolen_bytes, 2048);
+        // Donors should be Stream 3 (urgency 4 > 1)
+        assert_eq!(report.donors, vec![(3, 2048)]);
+        assert_eq!(report.total_deficits_before, report.total_deficits_after);
+        assert_eq!(session.drr_deficits.get(&1), Some(&2048));
+        assert_eq!(session.drr_deficits.get(&3), Some(&0));
+        assert_eq!(session.drr_deficits.get(&5), Some(&1024));
+
+        // When scheduling frames, Stream 1 must now be scheduled in Tier 1 ahead of Tier 3 and 4
+        let frames = session.schedule_hierarchical_drr_outbound_data_persistent(1024, 1024, true);
+        let sids: Vec<u32> = frames
+            .iter()
+            .map(|f| match f {
+                Http2Frame::Data { stream_id, .. } => *stream_id,
+                _ => panic!("Expected Data"),
+            })
+            .collect();
+
+        // Stream 1 was promoted to Tier 1, so it transmits its 2 frames first!
+        assert_eq!(sids[0], 1);
+        assert_eq!(sids[1], 1);
+    }
+
+    #[test]
+    fn test_dynamic_reprioritization_demotion_credit_redistribution() {
+        let mut session = Http2Session::new(false);
+        session.connection_window_size = 4096;
+
+        for &sid in &[1, 3] {
+            let mut s = Http2Stream::new(sid, 65535);
+            s.state = Http2StreamState::Open;
+            session.streams.insert(sid, s);
+        }
+
+        // Stream 1 starts at urgency 0 with 2048 deficit
+        session.set_stream_priority_parameters(1, PriorityParameters::new(0, true));
+        session.drr_deficits.insert(1, 2048);
+
+        // Stream 3 is at urgency 2 with 2048 pending data and 0 deficit
+        session.set_stream_priority_parameters(3, PriorityParameters::new(2, true));
+        session.drr_deficits.insert(3, 0);
+        session.pending_outbound_data.insert(3, vec![3u8; 2048]);
+
+        let total_before = session.drr_deficits.values().sum::<usize>();
+        assert_eq!(total_before, 2048);
+
+        // Stream 1 is demoted from urgency 0 to urgency 5
+        let report = session.reprioritize_stream(1, PriorityParameters::new(5, true));
+        assert_eq!(report.old_priority.urgency, 0);
+        assert_eq!(report.new_priority.urgency, 5);
+        assert_eq!(report.total_deficits_before, report.total_deficits_after);
+
+        // Its surplus deficit was transferred to higher-urgency Stream 3 (urgency 2 < 5)
+        assert_eq!(session.drr_deficits.get(&1), Some(&0));
+        assert_eq!(session.drr_deficits.get(&3), Some(&2048));
+    }
+
+    #[test]
+    fn test_dynamic_reprioritization_incremental_to_non_incremental_transfer() {
+        let mut session = Http2Session::new(false);
+        session.connection_window_size = 4096;
+
+        for &sid in &[1, 3] {
+            let mut s = Http2Stream::new(sid, 65535);
+            s.state = Http2StreamState::Open;
+            session.streams.insert(sid, s);
+        }
+
+        session.set_stream_priority_parameters(1, PriorityParameters::new(2, true));
+        session.set_stream_priority_parameters(3, PriorityParameters::new(2, true));
+        session.drr_deficits.insert(1, 1500);
+        session.drr_deficits.insert(3, 500);
+
+        let total_before = session.drr_deficits.values().sum::<usize>();
+        assert_eq!(total_before, 2000);
+
+        // Stream 1 switches from incremental to non-incremental
+        let report = session.reprioritize_stream(1, PriorityParameters::new(2, false));
+        assert_eq!(report.old_priority.incremental, true);
+        assert_eq!(report.new_priority.incremental, false);
+        assert_eq!(report.total_deficits_before, report.total_deficits_after);
+
+        // Stream 1's deficit was redistributed to remaining incremental stream 3
+        assert_eq!(session.drr_deficits.get(&1), None);
+        assert_eq!(session.drr_deficits.get(&3), Some(&2000));
     }
 }

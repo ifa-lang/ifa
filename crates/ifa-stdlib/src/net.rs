@@ -4148,19 +4148,38 @@ impl AsyncHttp2Connection {
     }
 
     /// Set stream RFC 9218 priority parameters and transmit a `PRIORITY_UPDATE` frame (RFC 9218).
+    /// Performs in-flight bandwidth reallocation and deficit adjustment with zero credit loss.
     pub fn set_priority_update(
         &mut self,
         stream_id: u32,
         priority: crate::simd_parser::PriorityParameters,
     ) -> io::Result<()> {
+        let _ = self.reprioritize_stream(stream_id, priority)?;
+        Ok(())
+    }
+
+    /// Reprioritize an active stream dynamically mid-stream under network contention (RFC 9218 §3.2).
+    /// Transmits a `PRIORITY_UPDATE` frame to the peer and executes immediate in-flight bandwidth reallocation
+    /// and DRR deficit stealing with zero network credit loss.
+    pub fn reprioritize_stream(
+        &mut self,
+        stream_id: u32,
+        priority: crate::simd_parser::PriorityParameters,
+    ) -> io::Result<crate::simd_parser::BandwidthReallocationReport> {
         let frame = crate::simd_parser::Http2Frame::PriorityUpdate {
             prioritized_stream_id: stream_id,
             priority_field_value: priority.serialize(),
         };
         self.send_frame(&frame)?;
-        self.session
-            .set_stream_priority_parameters(stream_id, priority);
-        Ok(())
+        let report = self.session.reprioritize_stream(stream_id, priority);
+        Ok(report)
+    }
+
+    /// Retrieve the most recent dynamic bandwidth reallocation report, if any.
+    pub fn last_reallocation_report(
+        &self,
+    ) -> Option<&crate::simd_parser::BandwidthReallocationReport> {
+        self.session.last_reallocation_report.as_ref()
     }
 
     /// Transmit an RFC 7838 `ALTSVC` frame to announce alternative service routes to peer.
@@ -18541,5 +18560,108 @@ mod tls_alpn_tests {
         assert!(got_resp_data);
 
         let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_midstream_priority_update_bandwidth_stealing() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server_handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                }
+            };
+
+            // Setup internal state on server:
+            // Stream 3 has accumulated DRR deficit and pending data
+            server.session.drr_deficits.insert(3, 4096);
+            server.session.set_stream_priority_parameters(
+                3,
+                crate::simd_parser::PriorityParameters::new(4, true),
+            );
+            server.session.pending_outbound_data.insert(3, vec![3u8; 40960]);
+
+            // Stream 1 has pending data and is at low priority (urgency 5)
+            server.session.drr_deficits.insert(1, 0);
+            server.session.set_stream_priority_parameters(
+                1,
+                crate::simd_parser::PriorityParameters::new(5, true),
+            );
+            // Total pending across streams: 32768 + 40960 = 73728 bytes, which exceeds
+            // the HTTP/2 default connection window (65535 bytes), establishing true network contention.
+            server.session.pending_outbound_data.insert(1, vec![1u8; 32768]);
+
+            // Wait for PRIORITY_UPDATE from client
+            let mut got_pu = false;
+            while !got_pu {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::PriorityUpdate {
+                        prioritized_stream_id,
+                        ..
+                    }) => {
+                        assert_eq!(prioritized_stream_id, 1);
+                        got_pu = true;
+                    }
+                    Ok(crate::simd_parser::Http2Frame::GoAway { .. }) => break,
+                    _ => {}
+                }
+            }
+
+            // Verify server dynamic bandwidth reallocation report
+            let report = server
+                .last_reallocation_report()
+                .cloned()
+                .expect("reallocation report");
+            let _ = tx.send(report);
+
+            // Send response back
+            let _ = server.send_frame(&crate::simd_parser::Http2Frame::GoAway {
+                last_stream_id: 1,
+                error_code: crate::simd_parser::Http2ErrorCode::NoError,
+                debug_data: b"done".to_vec(),
+            });
+        });
+
+        std::thread::sleep(Duration::from_millis(15));
+
+        let client_stream = AsyncTcpStream::connect(&format!("127.0.0.1:{}", port))
+            .expect("connect client");
+        let mut client = AsyncHttp2Connection::client_handshake(client_stream)
+            .expect("client handshake");
+
+        // Client sends mid-stream PRIORITY_UPDATE for stream 1 promoting to urgency 0
+        let reprioritize_report = client
+            .reprioritize_stream(1, crate::simd_parser::PriorityParameters::new(0, true))
+            .expect("send priority update");
+        assert_eq!(reprioritize_report.stream_id, 1);
+        assert_eq!(reprioritize_report.new_priority.urgency, 0);
+
+        // Receive report recorded on server
+        let server_report = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("receive server report");
+        assert_eq!(server_report.stream_id, 1);
+        assert_eq!(server_report.old_priority.urgency, 5);
+        assert_eq!(server_report.new_priority.urgency, 0);
+        assert!(server_report.connection_under_contention);
+        assert_eq!(server_report.stolen_bytes, 4096);
+        assert_eq!(server_report.donors, vec![(3, 4096)]);
+        assert_eq!(
+            server_report.total_deficits_before,
+            server_report.total_deficits_after
+        );
+
+        let _ = server_handle.join();
     }
 }
