@@ -15150,11 +15150,13 @@ mod tests {
                                 .expect("send response");
                             let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
                             completed = true;
+                            std::thread::sleep(Duration::from_millis(60));
                             break;
                         }
                     }
                 }
                 if completed {
+                    std::thread::sleep(Duration::from_millis(60));
                     break;
                 }
             }
