@@ -4265,9 +4265,12 @@ impl AsyncHttp2Connection {
         max_frame_size: usize,
         end_stream: bool,
     ) -> io::Result<usize> {
-        let frames =
-            self.session
-                .schedule_drr_outbound_data(deficit_counters, base_quantum, max_frame_size, end_stream);
+        let frames = self.session.schedule_drr_outbound_data(
+            deficit_counters,
+            base_quantum,
+            max_frame_size,
+            end_stream,
+        );
         let count = frames.len();
         for frame in &frames {
             self.send_frame(frame)?;
@@ -4279,10 +4282,7 @@ impl AsyncHttp2Connection {
     ///
     /// Uses the connection's configured `drr_base_quantum` and `drr_max_frame_size`, maintaining
     /// deficit counters across successive calls to guarantee long-term proportional throughput.
-    pub fn flush_drr_outbound_data_persistent(
-        &mut self,
-        end_stream: bool,
-    ) -> io::Result<usize> {
+    pub fn flush_drr_outbound_data_persistent(&mut self, end_stream: bool) -> io::Result<usize> {
         let quantum = self.drr_base_quantum;
         let max_frame = self.drr_max_frame_size;
         let frames = self
@@ -5985,7 +5985,9 @@ impl AsyncHttp2Pool {
     /// Retrieve snapshots of DRR deficit maps currently persisting on idle connections retained in this pool.
     pub fn idle_connections_drr_deficits(&self) -> Vec<std::collections::HashMap<u32, usize>> {
         if let Ok(pool) = self.idle_pool.lock() {
-            pool.iter().map(|entry| entry.conn.drr_deficits().clone()).collect()
+            pool.iter()
+                .map(|entry| entry.conn.drr_deficits().clone())
+                .collect()
         } else {
             Vec::new()
         }
@@ -13236,8 +13238,12 @@ mod tests {
 
         // Queue 64 KiB on each stream
         let payload = vec![0u8; 65536];
-        session.pending_outbound_data.insert(sid_hi, payload.clone());
-        session.pending_outbound_data.insert(sid_lo, payload.clone());
+        session
+            .pending_outbound_data
+            .insert(sid_hi, payload.clone());
+        session
+            .pending_outbound_data
+            .insert(sid_lo, payload.clone());
 
         // Run DRR with base_quantum=1024, max_frame=4096
         let mut deficit: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
@@ -13247,7 +13253,10 @@ mod tests {
         let mut bytes_hi: usize = 0;
         let mut bytes_lo: usize = 0;
         for f in &frames {
-            if let crate::simd_parser::Http2Frame::Data { stream_id, data, .. } = f {
+            if let crate::simd_parser::Http2Frame::Data {
+                stream_id, data, ..
+            } = f
+            {
                 if *stream_id == sid_hi {
                     bytes_hi += data.len();
                 } else if *stream_id == sid_lo {
@@ -13257,8 +13266,16 @@ mod tests {
         }
 
         // Both streams must have drained all data
-        assert_eq!(bytes_hi, 65536, "hi-weight stream bytes mismatch: got {}", bytes_hi);
-        assert_eq!(bytes_lo, 65536, "lo-weight stream bytes mismatch: got {}", bytes_lo);
+        assert_eq!(
+            bytes_hi, 65536,
+            "hi-weight stream bytes mismatch: got {}",
+            bytes_hi
+        );
+        assert_eq!(
+            bytes_lo, 65536,
+            "lo-weight stream bytes mismatch: got {}",
+            bytes_lo
+        );
 
         // High-weight stream should have exhausted first (more quota per round).
         // Verify at least 1 frame was emitted for each stream.
@@ -13321,7 +13338,10 @@ mod tests {
                         data,
                         end_stream,
                     }) => {
-                        bodies.entry(stream_id).or_default().extend_from_slice(&data);
+                        bodies
+                            .entry(stream_id)
+                            .or_default()
+                            .extend_from_slice(&data);
                         if end_stream {
                             streams_done += 1;
                         }
@@ -13375,7 +13395,12 @@ mod tests {
         let total_echoed: usize = results
             .iter()
             .filter_map(|(_, r)| r.as_ref().ok())
-            .filter_map(|r| String::from_utf8_lossy(&r.body).trim().parse::<usize>().ok())
+            .filter_map(|r| {
+                String::from_utf8_lossy(&r.body)
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+            })
             .sum();
 
         // Server must have received at least 12 KiB (8192 + 4096)
@@ -13446,7 +13471,10 @@ mod tests {
                         end_stream,
                     }) => {
                         wire_data_sequence.push((stream_id, data.len()));
-                        bodies.entry(stream_id).or_default().extend_from_slice(&data);
+                        bodies
+                            .entry(stream_id)
+                            .or_default()
+                            .extend_from_slice(&data);
                         if end_stream {
                             streams_done += 1;
                         }
@@ -13469,7 +13497,10 @@ mod tests {
             loop {
                 match server.recv_frame() {
                     Ok(crate::simd_parser::Http2Frame::GoAway { .. }) => break,
-                    Ok(crate::simd_parser::Http2Frame::Ping { ack: false, opaque_data }) => {
+                    Ok(crate::simd_parser::Http2Frame::Ping {
+                        ack: false,
+                        opaque_data,
+                    }) => {
                         let _ = server.send_frame(&crate::simd_parser::Http2Frame::Ping {
                             ack: true,
                             opaque_data,
@@ -13526,7 +13557,11 @@ mod tests {
 
         // Every frame must be exactly 1024 bytes
         for &(sid, len) in &wire_sequence {
-            assert_eq!(len, 1024, "frame for stream {} had size {} (expected 1024)", sid, len);
+            assert_eq!(
+                len, 1024,
+                "frame for stream {} had size {} (expected 1024)",
+                sid, len
+            );
         }
 
         // Expected wire pattern according to DRR: [hi, hi, lo, hi, hi, lo]
