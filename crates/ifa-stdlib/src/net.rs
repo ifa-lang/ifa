@@ -7779,14 +7779,15 @@ impl InterSessionDrrArbitrator {
         let source_origin = self
             .sessions
             .get(&source_session_id)
-            .ok_or(StreamMigrationError::SourceSessionNotFound(source_session_id))?
+            .ok_or(StreamMigrationError::SourceSessionNotFound(
+                source_session_id,
+            ))?
             .origin
             .clone();
 
-        let target_sess = self
-            .sessions
-            .get(&target_session_id)
-            .ok_or(StreamMigrationError::TargetSessionNotFound(target_session_id))?;
+        let target_sess = self.sessions.get(&target_session_id).ok_or(
+            StreamMigrationError::TargetSessionNotFound(target_session_id),
+        )?;
 
         if target_sess.origin != source_origin {
             return Err(StreamMigrationError::OriginMismatch {
@@ -7796,7 +7797,9 @@ impl InterSessionDrrArbitrator {
         }
 
         if target_sess.lifecycle_state != SessionLifecycleState::Active {
-            return Err(StreamMigrationError::TargetSessionNotActive(target_session_id));
+            return Err(StreamMigrationError::TargetSessionNotActive(
+                target_session_id,
+            ));
         }
 
         let source_sess = self.sessions.get_mut(&source_session_id).unwrap();
@@ -8560,7 +8563,10 @@ impl AsyncHttp2Pool {
     }
 
     /// Retrieve lifecycle and migration telemetry for a specific session.
-    pub fn session_lifecycle_telemetry(&self, session_id: u64) -> Option<SessionLifecycleTelemetry> {
+    pub fn session_lifecycle_telemetry(
+        &self,
+        session_id: u64,
+    ) -> Option<SessionLifecycleTelemetry> {
         if let Ok(arb) = self.inter_session_arbitrator.lock() {
             arb.get_session_lifecycle_telemetry(session_id)
         } else {
@@ -21810,9 +21816,7 @@ mod tls_alpn_tests {
         assert!(!client.is_closed());
 
         // Step 1: Send anticipatory GOAWAY with maximal stream ID (2^31 - 1)
-        client
-            .send_anticipatory_goaway(b"draining_soon")
-            .unwrap();
+        client.send_anticipatory_goaway(b"draining_soon").unwrap();
 
         assert!(client.is_draining());
         assert!(!client.is_closed());
