@@ -2978,6 +2978,125 @@ impl AsyncHttp2Connection {
         }
     }
 
+    /// Configure whether push promises are accepted on this connection.
+    pub fn with_enable_push(mut self, enabled: bool) -> Self {
+        self.session.enable_push = enabled;
+        self
+    }
+
+    /// Set whether push promises are accepted on this connection.
+    pub fn set_enable_push(&mut self, enabled: bool) {
+        self.session.enable_push = enabled;
+    }
+
+    /// Whether push promises are accepted on this connection.
+    pub fn is_push_enabled(&self) -> bool {
+        self.session.enable_push
+    }
+
+    /// Reference to all registered promised requests received on this connection.
+    pub fn promised_requests(
+        &self,
+    ) -> &std::collections::HashMap<u32, crate::simd_parser::Http2PromisedRequest> {
+        &self.session.promised_requests
+    }
+
+    /// Harvest and consume all completed server push promise responses received on this connection.
+    /// Returns the promised request metadata along with the synthesized [`crate::http::HttpResponse`].
+    pub fn drain_completed_push_responses(
+        &mut self,
+    ) -> Vec<(
+        crate::simd_parser::Http2PromisedRequest,
+        crate::http::HttpResponse,
+    )> {
+        let mut completed = Vec::new();
+        let mut to_remove = Vec::new();
+
+        for (&promised_id, promised_req) in &self.session.promised_requests {
+            if let Some(stream) = self.session.streams.get(&promised_id) {
+                if (stream.state == crate::simd_parser::Http2StreamState::HalfClosedRemote
+                    || stream.state == crate::simd_parser::Http2StreamState::Closed)
+                    && !stream.received_headers.is_empty()
+                {
+                    let mut status_code = 200u16;
+                    let mut resp_headers = crate::http::HttpHeaders::new();
+                    for (k, v) in &stream.received_headers {
+                        if k == ":status" {
+                            if let Ok(code) = v.parse::<u16>() {
+                                status_code = code;
+                            }
+                        } else if !k.starts_with(':') {
+                            resp_headers.set(k.clone(), v.clone());
+                        }
+                    }
+                    for (k, v) in &stream.received_trailers {
+                        if !k.starts_with(':') {
+                            resp_headers.append(k.clone(), v.clone());
+                        }
+                    }
+                    let mut resp =
+                        crate::http::HttpResponse::new(crate::http::HttpStatus(status_code));
+                    resp.headers = resp_headers;
+                    resp.body = stream.received_data.clone();
+                    if let Ok(decompressed) = resp.decompress_body() {
+                        resp.body = decompressed;
+                    }
+                    completed.push((promised_req.clone(), resp));
+                    to_remove.push(promised_id);
+                }
+            }
+        }
+
+        for id in to_remove {
+            self.session.promised_requests.remove(&id);
+            self.session.push_promises.remove(&id);
+            self.session.streams.remove(&id);
+        }
+
+        completed
+    }
+
+    /// Await the completion of a specific promised push stream, returning its full HTTP response.
+    pub fn await_push_response(
+        &mut self,
+        promised_stream_id: u32,
+    ) -> io::Result<crate::http::HttpResponse> {
+        let (raw_headers, raw_body) = self.recv_response_for(promised_stream_id)?;
+        let mut status_code = 200u16;
+        let mut resp_headers = crate::http::HttpHeaders::new();
+
+        for (k, v) in raw_headers {
+            if k == ":status" {
+                if let Ok(code) = v.parse::<u16>() {
+                    status_code = code;
+                }
+            } else if !k.starts_with(':') {
+                resp_headers.set(k, v);
+            }
+        }
+
+        if let Some(trailers) = self.get_trailers(promised_stream_id) {
+            for (k, v) in trailers {
+                if !k.starts_with(':') {
+                    resp_headers.append(k, v);
+                }
+            }
+        }
+
+        let mut resp = crate::http::HttpResponse::new(crate::http::HttpStatus(status_code));
+        resp.headers = resp_headers;
+        resp.body = raw_body;
+        if let Ok(decompressed) = resp.decompress_body() {
+            resp.body = decompressed;
+        }
+
+        self.session.promised_requests.remove(&promised_stream_id);
+        self.session.push_promises.remove(&promised_stream_id);
+        self.session.streams.remove(&promised_stream_id);
+
+        Ok(resp)
+    }
+
     /// Perform HTTP/2 client handshake: sends client connection preface and initial SETTINGS frame.
     pub fn client_handshake(mut stream: AsyncTcpStream) -> io::Result<Self> {
         // 1. Send client preface
@@ -4815,6 +4934,10 @@ pub struct Http2PoolStats {
     pub evicted_connections: usize,
     /// Total number of requests successfully retried after transient failure or GOAWAY.
     pub retried_requests: usize,
+    /// Total number of unconsumed push promise responses currently held in pool cache.
+    pub cached_push_promises: usize,
+    /// Total number of requests satisfied directly from proactive push promise cache without network I/O.
+    pub push_cache_hits: usize,
 }
 
 impl Http2PoolStats {
@@ -4829,6 +4952,17 @@ impl Http2PoolStats {
     pub fn total_connections(&self) -> usize {
         self.idle_connections + self.active_connections
     }
+}
+
+/// A cached HTTP/2 push promise response retained in an [`AsyncHttp2Pool`].
+#[derive(Debug, Clone)]
+pub struct Http2PushPromiseCacheEntry {
+    /// Metadata of the promised push request.
+    pub promised_request: crate::simd_parser::Http2PromisedRequest,
+    /// The pushed HTTP response.
+    pub response: crate::http::HttpResponse,
+    /// Timestamp when this push promise response was ingested.
+    pub received_at: std::time::Instant,
 }
 
 /// An idle pooled HTTP/2 connection paired with the timestamp at which it became idle.
@@ -4860,6 +4994,11 @@ pub struct AsyncHttp2Pool {
         std::sync::Mutex<std::collections::HashMap<String, Vec<crate::simd_parser::AltSvcRoute>>>,
     chunk_buffer_pool: Option<Http2ChunkBufferPool>,
     auto_tune_flow_control: bool,
+    push_promise_cache:
+        std::sync::Mutex<std::collections::HashMap<String, Vec<Http2PushPromiseCacheEntry>>>,
+    enable_push_promises: bool,
+    push_promises_received: std::sync::atomic::AtomicUsize,
+    push_cache_hits: std::sync::atomic::AtomicUsize,
 }
 
 impl AsyncHttp2Pool {
@@ -4888,6 +5027,10 @@ impl AsyncHttp2Pool {
             alt_svc_routes: std::sync::Mutex::new(std::collections::HashMap::new()),
             chunk_buffer_pool: None,
             auto_tune_flow_control: false,
+            push_promise_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            enable_push_promises: true,
+            push_promises_received: std::sync::atomic::AtomicUsize::new(0),
+            push_cache_hits: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -4906,6 +5049,131 @@ impl AsyncHttp2Pool {
     /// Whether dynamic RFC 7540 flow control auto-tuning is enabled on this pool.
     pub fn auto_tune_flow_control(&self) -> bool {
         self.auto_tune_flow_control
+    }
+
+    /// Configure whether client push promise caching and automated absorption is enabled across connections in this pool.
+    pub fn with_push_promises(mut self, enabled: bool) -> Self {
+        self.enable_push_promises = enabled;
+        self
+    }
+
+    /// Set whether client push promise caching and automated absorption is enabled.
+    pub fn set_enable_push_promises(&mut self, enabled: bool) {
+        self.enable_push_promises = enabled;
+    }
+
+    /// Whether client push promise caching and automated absorption is enabled on this pool.
+    pub fn push_promises_enabled(&self) -> bool {
+        self.enable_push_promises
+    }
+
+    /// Total count of push promises ingested and stored in cache.
+    pub fn push_promises_received(&self) -> usize {
+        self.push_promises_received
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total count of requests satisfied directly from proactive push promise cache without network I/O.
+    pub fn push_cache_hits(&self) -> usize {
+        self.push_cache_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of distinct push promise responses currently held in pool cache.
+    pub fn push_promise_cache_count(&self) -> usize {
+        if let Ok(cache) = self.push_promise_cache.lock() {
+            cache.values().map(|v| v.len()).sum()
+        } else {
+            0
+        }
+    }
+
+    /// Clear all cached push promise responses.
+    pub fn clear_push_promise_cache(&self) {
+        if let Ok(mut cache) = self.push_promise_cache.lock() {
+            cache.clear();
+        }
+    }
+
+    /// Ingest and validate all completed push promises received on an active connection into the pool cache.
+    pub fn absorb_push_promises(&self, conn: &mut AsyncHttp2Connection) {
+        if !self.enable_push_promises {
+            return;
+        }
+        let completed = conn.drain_completed_push_responses();
+        if completed.is_empty() {
+            return;
+        }
+
+        if let Ok(mut cache) = self.push_promise_cache.lock() {
+            let now = std::time::Instant::now();
+            for (promised_req, response) in completed {
+                if !promised_req.is_valid {
+                    continue;
+                }
+                let key = format!(
+                    "{}:{}",
+                    promised_req.method.to_ascii_uppercase(),
+                    promised_req.path
+                );
+                self.push_promises_received
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                cache
+                    .entry(key)
+                    .or_insert_with(Vec::new)
+                    .push(Http2PushPromiseCacheEntry {
+                        promised_request: promised_req,
+                        response,
+                        received_at: now,
+                    });
+            }
+        }
+    }
+
+    /// Take and remove a matching cached push promise response, if available and unexpired.
+    pub fn take_cached_push_response(
+        &self,
+        method: &str,
+        path: &str,
+    ) -> Option<crate::http::HttpResponse> {
+        if !self.enable_push_promises {
+            return None;
+        }
+        let key = format!("{}:{}", method.to_ascii_uppercase(), path);
+        let now = std::time::Instant::now();
+        let max_age = self.idle_ttl.unwrap_or(std::time::Duration::from_secs(60));
+
+        if let Ok(mut cache) = self.push_promise_cache.lock() {
+            if let Some(entries) = cache.get_mut(&key) {
+                while let Some(entry) = entries.pop() {
+                    if now.duration_since(entry.received_at) <= max_age {
+                        self.push_cache_hits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if entries.is_empty() {
+                            cache.remove(&key);
+                        }
+                        return Some(entry.response);
+                    }
+                }
+                if entries.is_empty() {
+                    cache.remove(&key);
+                }
+            }
+        }
+        None
+    }
+
+    /// Check whether a matching cached push promise response currently exists in the pool cache.
+    pub fn has_cached_push_response(&self, method: &str, path: &str) -> bool {
+        if !self.enable_push_promises {
+            return false;
+        }
+        let key = format!("{}:{}", method.to_ascii_uppercase(), path);
+        if let Ok(cache) = self.push_promise_cache.lock() {
+            cache.get(&key).map(|v| !v.is_empty()).unwrap_or(false)
+        } else {
+            false
+        }
     }
 
     /// Retrieve the configured chunk buffer pool, if any.
@@ -5070,6 +5338,8 @@ impl AsyncHttp2Pool {
             last_alpn_negotiated: self.last_alpn_negotiated(),
             evicted_connections: self.evicted_count(),
             retried_requests: self.retried_count(),
+            cached_push_promises: self.push_promise_cache_count(),
+            push_cache_hits: self.push_cache_hits(),
         }
     }
 
@@ -5114,6 +5384,7 @@ impl AsyncHttp2Pool {
                 // Quick health check ping
                 if conn.send_ping(*b"h2_probe").is_ok() {
                     conn.set_auto_tune_flow_control(self.auto_tune_flow_control);
+                    conn.set_enable_push(self.enable_push_promises);
                     if let Some(ref pool) = self.chunk_buffer_pool {
                         conn.chunk_buffer_pool = Some(pool.clone());
                     }
@@ -5159,6 +5430,7 @@ impl AsyncHttp2Pool {
 
         let mut conn = AsyncHttp2Connection::client_handshake(stream)?;
         conn.set_auto_tune_flow_control(self.auto_tune_flow_control);
+        conn.set_enable_push(self.enable_push_promises);
         if let Some(ref pool) = self.chunk_buffer_pool {
             conn.chunk_buffer_pool = Some(pool.clone());
         }
@@ -5186,6 +5458,9 @@ impl AsyncHttp2Pool {
                 }
             }
         }
+
+        // Proactively absorb and cache any push promises completed on this connection
+        self.absorb_push_promises(&mut conn);
 
         if let Some((_, err, _)) = conn.last_received_goaway() {
             if let Ok(mut last_err) = self.last_goaway_error.lock() {
@@ -5222,6 +5497,7 @@ impl AsyncHttp2Pool {
 
         let mut conn = self.acquire()?;
         let result = conn.execute_prioritized_batch(requests);
+        self.absorb_push_promises(&mut conn);
         match result {
             Ok(responses) => {
                 self.release(conn);
@@ -5288,6 +5564,19 @@ impl AsyncHttp2Pool {
             }
         }
 
+        // Check proactive push promise cache first: if the server previously pushed this resource
+        // during multiplexing, satisfy the request directly from cache without network round-trip!
+        if self.enable_push_promises {
+            if let Some(mut cached_resp) =
+                self.take_cached_push_response(&client_req.method, &client_req.path)
+            {
+                for resp_interceptor in &self.response_interceptors {
+                    resp_interceptor(&client_req, &mut cached_resp);
+                }
+                return Ok(cached_resp);
+            }
+        }
+
         let mut conn = self.acquire()?;
         let header_refs: Vec<(&str, &str)> = client_req
             .headers
@@ -5318,6 +5607,7 @@ impl AsyncHttp2Pool {
                 Ok(resp)
             }
             Err(e) => {
+                self.absorb_push_promises(&mut conn);
                 if let Some((_, err, _)) = conn.last_received_goaway() {
                     if let Ok(mut last_err) = self.last_goaway_error.lock() {
                         *last_err = Some(err);
@@ -5367,7 +5657,7 @@ impl AsyncHttp2Pool {
         path: &str,
         headers: &[(&str, &str)],
         body: Option<&[u8]>,
-        chunk_handler: F,
+        mut chunk_handler: F,
     ) -> io::Result<crate::http::HttpResponse>
     where
         F: FnMut(&[u8]),
@@ -5387,6 +5677,21 @@ impl AsyncHttp2Pool {
                     resp_interceptor(&client_req, &mut short_circuit_resp);
                 }
                 return Ok(short_circuit_resp);
+            }
+        }
+
+        // Check proactive push promise cache first
+        if self.enable_push_promises {
+            if let Some(mut cached_resp) =
+                self.take_cached_push_response(&client_req.method, &client_req.path)
+            {
+                if !cached_resp.body.is_empty() {
+                    chunk_handler(&cached_resp.body);
+                }
+                for resp_interceptor in &self.response_interceptors {
+                    resp_interceptor(&client_req, &mut cached_resp);
+                }
+                return Ok(cached_resp);
             }
         }
 
@@ -5432,6 +5737,7 @@ impl AsyncHttp2Pool {
                 Ok(resp)
             }
             Err(e) => {
+                self.absorb_push_promises(&mut conn);
                 if let Some((_, err, _)) = conn.last_received_goaway() {
                     if let Ok(mut last_err) = self.last_goaway_error.lock() {
                         *last_err = Some(err);
@@ -13202,5 +13508,111 @@ mod tls_alpn_tests {
             "Zero-Copy Recycled Pool + Auto-Tuned Flow Control"
         );
         assert!(res.pooled_buffers_recycled > 0);
+    }
+
+    #[test]
+    fn test_http2_push_promise_automated_caching_and_cache_hit() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server_handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            };
+
+            // Await initial client request on stream 1
+            let mut req_stream_id = 0;
+            for _ in 0..30 {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::Headers { stream_id, .. }) => {
+                        req_stream_id = stream_id;
+                        break;
+                    }
+                    _ => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+            assert_eq!(req_stream_id, 1);
+
+            // 1. Send PUSH_PROMISE frame on stream 1 reserving stream 2 for /style.css
+            let push_promise = server.session.create_push_promise(
+                1,
+                2,
+                &[
+                    (":method", "GET"),
+                    (":path", "/style.css"),
+                    (":scheme", "http"),
+                ],
+            );
+            server.send_frame(&push_promise).expect("send push promise");
+
+            // 2. Transmit promised response on stream 2
+            let push_headers = [(":status", "200"), ("content-type", "text/css")];
+            server
+                .send_response(2, &push_headers, Some(b"body { background: #fff; }"))
+                .expect("send promised response");
+
+            // 3. Transmit response for original request stream 1
+            let html_headers = [(":status", "200"), ("content-type", "text/html")];
+            server
+                .send_response(1, &html_headers, Some(b"<html>hello push</html>"))
+                .expect("send stream 1 response");
+
+            // Keep connection open while client consumes and performs checks
+            for _ in 0..10 {
+                let _ = server.try_recv_frame();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2).with_push_promises(true);
+        assert!(pool.push_promises_enabled());
+        assert_eq!(pool.push_promises_received(), 0);
+        assert_eq!(pool.push_cache_hits(), 0);
+
+        // 1. Execute initial request for /index.html
+        let resp_html = pool
+            .execute_request("GET", "/index.html", &[], None)
+            .expect("execute request index.html");
+        assert_eq!(resp_html.status.0, 200);
+        assert_eq!(resp_html.body, b"<html>hello push</html>");
+
+        // The push promise for /style.css must have been automatically absorbed and cached in the pool
+        assert!(pool.has_cached_push_response("GET", "/style.css"));
+        assert_eq!(pool.push_promises_received(), 1);
+        assert_eq!(pool.push_promise_cache_count(), 1);
+        assert_eq!(pool.stats().cached_push_promises, 1);
+
+        // 2. Execute subsequent request for /style.css -> MUST be a proactive Cache Hit without network round-trip!
+        let resp_css = pool
+            .execute_request("GET", "/style.css", &[], None)
+            .expect("execute request style.css from push cache");
+        assert_eq!(resp_css.status.0, 200);
+        assert_eq!(resp_css.body, b"body { background: #fff; }");
+
+        // Cache hit counter incremented and cache entry consumed
+        assert_eq!(pool.push_cache_hits(), 1);
+        assert_eq!(pool.push_promise_cache_count(), 0);
+        assert_eq!(pool.stats().push_cache_hits, 1);
+        assert!(!pool.has_cached_push_response("GET", "/style.css"));
+
+        server_handle.join().expect("server join");
+    }
+
+    #[test]
+    fn test_http2_push_promise_disabled_pool_configuration() {
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 8080, 2).with_push_promises(false);
+        assert!(!pool.push_promises_enabled());
+        assert_eq!(pool.push_promise_cache_count(), 0);
+        assert_eq!(pool.push_promises_received(), 0);
+        assert_eq!(pool.push_cache_hits(), 0);
+
+        pool.clear_push_promise_cache();
+        assert_eq!(pool.push_promise_cache_count(), 0);
     }
 }

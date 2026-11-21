@@ -2354,6 +2354,109 @@ impl Http2Stream {
     }
 }
 
+/// Represents an HTTP/2 server push promise request initiated via PUSH_PROMISE (RFC 7540 Section 8.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Http2PromisedRequest {
+    /// Stream ID on which the PUSH_PROMISE was received (the associated client request).
+    pub associated_stream_id: u32,
+    /// New reserved stream ID on which the server will push the promised response.
+    pub promised_stream_id: u32,
+    /// HTTP method (e.g., "GET", "HEAD"). MUST be safe according to RFC 7540 §8.2.
+    pub method: String,
+    /// Promised request path (e.g., "/style.css").
+    pub path: String,
+    /// Promised URI scheme (e.g., "https", "http").
+    pub scheme: String,
+    /// Promised authority (e.g., "example.com:443").
+    pub authority: String,
+    /// All raw promised request headers.
+    pub headers: Vec<(String, String)>,
+    /// Whether this push promise passes RFC 7540 validation requirements.
+    pub is_valid: bool,
+    /// Reason string if validation failed.
+    pub validation_error: Option<String>,
+}
+
+impl Http2PromisedRequest {
+    /// Construct and validate an HTTP/2 promised request from raw decoded header block.
+    pub fn new(
+        associated_stream_id: u32,
+        promised_stream_id: u32,
+        raw_headers: Vec<(String, String)>,
+    ) -> Self {
+        let mut method = String::new();
+        let mut path = String::new();
+        let mut scheme = String::new();
+        let mut authority = String::new();
+        let mut regular_header_seen = false;
+        let mut pseudo_order_valid = true;
+
+        for (k, v) in &raw_headers {
+            if k.starts_with(':') {
+                if regular_header_seen {
+                    pseudo_order_valid = false;
+                }
+                match k.as_str() {
+                    ":method" => method = v.clone(),
+                    ":path" => path = v.clone(),
+                    ":scheme" => scheme = v.clone(),
+                    ":authority" => authority = v.clone(),
+                    _ => {}
+                }
+            } else {
+                regular_header_seen = true;
+                if k.eq_ignore_ascii_case("host") && authority.is_empty() {
+                    authority = v.clone();
+                }
+            }
+        }
+
+        // RFC 7540 §8.2.1:
+        // 1. The request method MUST be safe (RFC 7231 Section 4.2.1: GET or HEAD).
+        // 2. Mandatory pseudo-headers: :method, :path, :scheme.
+        // 3. Pseudo-headers MUST appear before standard header fields (Section 8.1.2.1).
+        let mut is_valid = true;
+        let mut validation_error = None;
+
+        if !pseudo_order_valid {
+            is_valid = false;
+            validation_error = Some(
+                "Pseudo-headers must appear before regular headers (RFC 7540 §8.1.2.1)".to_string(),
+            );
+        } else if method.is_empty() {
+            is_valid = false;
+            validation_error =
+                Some("Missing mandatory :method pseudo-header in PUSH_PROMISE".to_string());
+        } else if !method.eq_ignore_ascii_case("GET") && !method.eq_ignore_ascii_case("HEAD") {
+            is_valid = false;
+            validation_error = Some(format!(
+                "Unsafe HTTP method '{}' prohibited in PUSH_PROMISE (RFC 7540 §8.2: must be GET or HEAD)",
+                method
+            ));
+        } else if path.is_empty() {
+            is_valid = false;
+            validation_error =
+                Some("Missing mandatory :path pseudo-header in PUSH_PROMISE".to_string());
+        } else if scheme.is_empty() {
+            is_valid = false;
+            validation_error =
+                Some("Missing mandatory :scheme pseudo-header in PUSH_PROMISE".to_string());
+        }
+
+        Self {
+            associated_stream_id,
+            promised_stream_id,
+            method,
+            path,
+            scheme,
+            authority,
+            headers: raw_headers,
+            is_valid,
+            validation_error,
+        }
+    }
+}
+
 /// Multiplexed HTTP/2 Session Manager handling streams, flow control, and HPACK.
 #[derive(Debug)]
 pub struct Http2Session {
@@ -2363,6 +2466,10 @@ pub struct Http2Session {
     pub local_settings: Vec<Http2Setting>,
     pub streams: std::collections::HashMap<u32, Http2Stream>,
     pub push_promises: std::collections::HashMap<u32, Vec<(String, String)>>,
+    /// Structured promised requests mapped by promised stream ID.
+    pub promised_requests: std::collections::HashMap<u32, Http2PromisedRequest>,
+    /// Whether server push promises are enabled and accepted (RFC 7540 Section 6.5.2).
+    pub enable_push: bool,
     pub hpack_encoder: HpackContext,
     pub hpack_decoder: HpackContext,
     pub connection_window_size: i32,
@@ -2398,6 +2505,8 @@ impl Http2Session {
             ],
             streams: std::collections::HashMap::new(),
             push_promises: std::collections::HashMap::new(),
+            promised_requests: std::collections::HashMap::new(),
+            enable_push: true,
             hpack_encoder: HpackContext::default(),
             hpack_decoder: HpackContext::default(),
             connection_window_size: Self::DEFAULT_INITIAL_WINDOW_SIZE,
@@ -2724,7 +2833,12 @@ impl Http2Session {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        self.push_promises.insert(promised_stream_id, owned_headers);
+        self.push_promises
+            .insert(promised_stream_id, owned_headers.clone());
+        let promised_req =
+            Http2PromisedRequest::new(associated_stream_id, promised_stream_id, owned_headers);
+        self.promised_requests
+            .insert(promised_stream_id, promised_req);
 
         Http2Frame::PushPromise {
             stream_id: associated_stream_id,
@@ -3196,6 +3310,8 @@ impl Http2Session {
                                     stream.window_size += delta;
                                 }
                             }
+                        } else if s.id == Http2SettingId::EnablePush {
+                            self.enable_push = s.value != 0;
                         }
                     }
                     self.peer_settings = settings.clone();
@@ -3340,12 +3456,42 @@ impl Http2Session {
                 Ok(None)
             }
             Http2Frame::PushPromise {
-                stream_id: _,
+                stream_id,
                 promised_stream_id,
                 end_headers: _,
                 header_block,
             } => {
+                if !self.enable_push {
+                    return Ok(Some(Http2Frame::RstStream {
+                        stream_id: *promised_stream_id,
+                        error_code: Http2ErrorCode::RefusedStream,
+                    }));
+                }
+
                 let decoded_headers = self.hpack_decoder.decode_headers(header_block)?;
+                let promised_req = Http2PromisedRequest::new(
+                    *stream_id,
+                    *promised_stream_id,
+                    decoded_headers.clone(),
+                );
+
+                if !promised_req.is_valid {
+                    let mut stream =
+                        Http2Stream::new(*promised_stream_id, self.initial_stream_window_size);
+                    stream.state = Http2StreamState::Closed;
+                    stream.reset_error = Some(Http2ErrorCode::ProtocolError);
+                    self.streams.insert(*promised_stream_id, stream);
+                    self.push_promises
+                        .insert(*promised_stream_id, decoded_headers);
+                    self.promised_requests
+                        .insert(*promised_stream_id, promised_req);
+
+                    return Ok(Some(Http2Frame::RstStream {
+                        stream_id: *promised_stream_id,
+                        error_code: Http2ErrorCode::ProtocolError,
+                    }));
+                }
+
                 let mut stream =
                     Http2Stream::new(*promised_stream_id, self.initial_stream_window_size);
                 stream.state = Http2StreamState::ReservedRemote;
@@ -3353,6 +3499,8 @@ impl Http2Session {
                 self.streams.insert(*promised_stream_id, stream);
                 self.push_promises
                     .insert(*promised_stream_id, decoded_headers);
+                self.promised_requests
+                    .insert(*promised_stream_id, promised_req);
                 Ok(None)
             }
             Http2Frame::Priority {
@@ -4509,5 +4657,119 @@ mod http2_tests {
         let stream = session.streams.get(&3).expect("stream 3 exists");
         assert_eq!(stream.received_data, raw_payload);
         assert_eq!(stream.state, Http2StreamState::HalfClosedRemote);
+    }
+
+    #[test]
+    fn test_rfc7540_push_promise_validation() {
+        let valid_headers = vec![
+            (":method".to_string(), "GET".to_string()),
+            (":path".to_string(), "/assets/app.js".to_string()),
+            (":scheme".to_string(), "https".to_string()),
+            (":authority".to_string(), "example.com".to_string()),
+        ];
+        let req = Http2PromisedRequest::new(1, 2, valid_headers);
+        assert!(req.is_valid);
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path, "/assets/app.js");
+        assert_eq!(req.scheme, "https");
+        assert_eq!(req.authority, "example.com");
+
+        // Unsafe method POST
+        let unsafe_headers = vec![
+            (":method".to_string(), "POST".to_string()),
+            (":path".to_string(), "/api/upload".to_string()),
+            (":scheme".to_string(), "https".to_string()),
+        ];
+        let req_unsafe = Http2PromisedRequest::new(1, 4, unsafe_headers);
+        assert!(!req_unsafe.is_valid);
+        assert!(req_unsafe
+            .validation_error
+            .as_ref()
+            .unwrap()
+            .contains("Unsafe HTTP method"));
+
+        // Missing :path
+        let missing_path_headers = vec![
+            (":method".to_string(), "GET".to_string()),
+            (":scheme".to_string(), "https".to_string()),
+        ];
+        let req_missing_path = Http2PromisedRequest::new(1, 6, missing_path_headers);
+        assert!(!req_missing_path.is_valid);
+        assert!(req_missing_path
+            .validation_error
+            .as_ref()
+            .unwrap()
+            .contains("Missing mandatory :path"));
+    }
+
+    #[test]
+    fn test_rfc7540_push_promise_session_handling_and_auto_reset() {
+        let mut client = Http2Session::new(false);
+        let mut enc = HpackContext::default();
+
+        // 1. Unsafe push promise received by client: must trigger automatic RST_STREAM(ProtocolError)
+        let unsafe_block = enc.encode_headers(&[
+            (":method", "POST"),
+            (":path", "/api/trigger"),
+            (":scheme", "https"),
+        ]);
+        let unsafe_frame = Http2Frame::PushPromise {
+            stream_id: 1,
+            promised_stream_id: 2,
+            end_headers: true,
+            header_block: unsafe_block,
+        };
+        let reply = client
+            .handle_frame(&unsafe_frame)
+            .expect("handle unsafe push promise");
+        match reply {
+            Some(Http2Frame::RstStream {
+                stream_id,
+                error_code,
+            }) => {
+                assert_eq!(stream_id, 2);
+                assert_eq!(error_code, Http2ErrorCode::ProtocolError);
+            }
+            _ => panic!("Expected RST_STREAM(ProtocolError) reply"),
+        }
+
+        // 2. Client with disabled push promises: must trigger automatic RST_STREAM(RefusedStream)
+        client.enable_push = false;
+        let valid_block = enc.encode_headers(&[
+            (":method", "GET"),
+            (":path", "/styles/site.css"),
+            (":scheme", "https"),
+        ]);
+        let push_frame = Http2Frame::PushPromise {
+            stream_id: 1,
+            promised_stream_id: 4,
+            end_headers: true,
+            header_block: valid_block.clone(),
+        };
+        let reply_disabled = client
+            .handle_frame(&push_frame)
+            .expect("handle push promise when disabled");
+        match reply_disabled {
+            Some(Http2Frame::RstStream {
+                stream_id,
+                error_code,
+            }) => {
+                assert_eq!(stream_id, 4);
+                assert_eq!(error_code, Http2ErrorCode::RefusedStream);
+            }
+            _ => panic!("Expected RST_STREAM(RefusedStream) reply"),
+        }
+
+        // 3. Re-enable push promises: valid promise accepted into ReservedRemote state
+        client.enable_push = true;
+        let reply_valid = client
+            .handle_frame(&push_frame)
+            .expect("handle valid push promise");
+        assert!(reply_valid.is_none());
+        assert!(client.promised_requests.contains_key(&4));
+        assert_eq!(
+            client.streams.get(&4).unwrap().state,
+            Http2StreamState::ReservedRemote
+        );
     }
 }
