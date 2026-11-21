@@ -5264,8 +5264,7 @@ pub struct AsyncHttp2Pool {
     enable_push_promises: bool,
     push_promises_received: std::sync::atomic::AtomicUsize,
     push_cache_hits: std::sync::atomic::AtomicUsize,
-    http_cache_entries:
-        std::sync::Mutex<std::collections::HashMap<String, Http2PoolCacheEntry>>,
+    http_cache_entries: std::sync::Mutex<std::collections::HashMap<String, Http2PoolCacheEntry>>,
     enable_http_cache: bool,
     cache_revalidations: std::sync::atomic::AtomicUsize,
 }
@@ -5873,7 +5872,11 @@ impl AsyncHttp2Pool {
             }
         }
 
-        let key = format!("{}:{}", client_req.method.to_ascii_uppercase(), client_req.path);
+        let key = format!(
+            "{}:{}",
+            client_req.method.to_ascii_uppercase(),
+            client_req.path
+        );
         let now_sys = std::time::SystemTime::now();
         let default_ttl = self.idle_ttl.unwrap_or(std::time::Duration::from_secs(60));
 
@@ -6135,7 +6138,11 @@ impl AsyncHttp2Pool {
             }
         }
 
-        let key = format!("{}:{}", client_req.method.to_ascii_uppercase(), client_req.path);
+        let key = format!(
+            "{}:{}",
+            client_req.method.to_ascii_uppercase(),
+            client_req.path
+        );
         let now_sys = std::time::SystemTime::now();
         let default_ttl = self.idle_ttl.unwrap_or(std::time::Duration::from_secs(60));
 
@@ -14249,13 +14256,15 @@ mod tls_alpn_tests {
             let p_no_store = server.session.create_push_promise(
                 1,
                 2,
-                &[(":method", "GET"), (":path", "/sensitive.json"), (":scheme", "http")],
+                &[
+                    (":method", "GET"),
+                    (":path", "/sensitive.json"),
+                    (":scheme", "http"),
+                ],
             );
             server.send_frame(&p_no_store).expect("send p_no_store");
-            let resp_headers_no_store = [
-                (":status", "200"),
-                ("cache-control", "no-store, private"),
-            ];
+            let resp_headers_no_store =
+                [(":status", "200"), ("cache-control", "no-store, private")];
             server
                 .send_response(2, &resp_headers_no_store, Some(b"{\"secret\": 123}"))
                 .expect("send 2");
@@ -14264,7 +14273,11 @@ mod tls_alpn_tests {
             let p_fresh = server.session.create_push_promise(
                 1,
                 4,
-                &[(":method", "GET"), (":path", "/bundle.js"), (":scheme", "http")],
+                &[
+                    (":method", "GET"),
+                    (":path", "/bundle.js"),
+                    (":scheme", "http"),
+                ],
             );
             server.send_frame(&p_fresh).expect("send p_fresh");
             let resp_headers_fresh = [
@@ -14355,10 +14368,7 @@ mod tls_alpn_tests {
             let mut s2 = 0;
             for _ in 0..30 {
                 match server.recv_frame() {
-                    Ok(crate::simd_parser::Http2Frame::Headers {
-                        stream_id,
-                        ..
-                    }) => {
+                    Ok(crate::simd_parser::Http2Frame::Headers { stream_id, .. }) => {
                         s2 = stream_id;
                         break;
                     }
@@ -14366,11 +14376,19 @@ mod tls_alpn_tests {
                 }
             }
             assert_eq!(s2, 3);
-            let s2_stream = server.session.streams.get(&3).expect("stream 3 exists in session");
-            let if_none_match_found = s2_stream.received_headers.iter().any(|(k, v)| {
-                k.eq_ignore_ascii_case("if-none-match") && v == "\"v1-hash-abc\""
-            });
-            assert!(if_none_match_found, "Server must have received If-None-Match header!");
+            let s2_stream = server
+                .session
+                .streams
+                .get(&3)
+                .expect("stream 3 exists in session");
+            let if_none_match_found = s2_stream
+                .received_headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("if-none-match") && v == "\"v1-hash-abc\"");
+            assert!(
+                if_none_match_found,
+                "Server must have received If-None-Match header!"
+            );
 
             // Server replies 304 Not Modified with refreshed Cache-Control
             let h2 = [
@@ -14378,7 +14396,9 @@ mod tls_alpn_tests {
                 ("etag", "\"v1-hash-abc\""),
                 ("cache-control", "public, max-age=120"),
             ];
-            server.send_response(3, &h2, None).expect("send 304 response");
+            server
+                .send_response(3, &h2, None)
+                .expect("send 304 response");
 
             for _ in 0..10 {
                 let _ = server.try_recv_frame();
@@ -14400,12 +14420,7 @@ mod tls_alpn_tests {
 
         // 2. Second request forced with Cache-Control: no-cache to trigger conditional revalidation
         let resp2 = pool
-            .execute_request(
-                "GET",
-                "/api/data",
-                &[("Cache-Control", "no-cache")],
-                None,
-            )
+            .execute_request("GET", "/api/data", &[("Cache-Control", "no-cache")], None)
             .expect("request 2 with revalidation");
 
         // Transparent resolution: client sees 200 OK with cached body and revalidation count incremented!

@@ -4917,7 +4917,10 @@ mod http2_tests {
 
         let headers = vec![
             ("content-type".to_string(), "application/json".to_string()),
-            ("cache-control".to_string(), "max-age=120, s-maxage=600".to_string()),
+            (
+                "cache-control".to_string(),
+                "max-age=120, s-maxage=600".to_string(),
+            ),
             ("etag".to_string(), "\"33a64df551425fcc\"".to_string()),
             (
                 "last-modified".to_string(),
@@ -4936,12 +4939,16 @@ mod http2_tests {
         let extracted_lm = extract_http2_last_modified(&headers).expect("extracted lm");
         assert_eq!(extracted_lm, "Wed, 21 Oct 2015 07:28:00 GMT");
 
-        let cond_headers = build_http2_conditional_headers(
-            Some(&extracted_etag),
-            Some(&extracted_lm),
-        );
+        let cond_headers =
+            build_http2_conditional_headers(Some(&extracted_etag), Some(&extracted_lm));
         assert_eq!(cond_headers.len(), 2);
-        assert_eq!(cond_headers[0], ("if-none-match".to_string(), "\"33a64df551425fcc\"".to_string()));
+        assert_eq!(
+            cond_headers[0],
+            (
+                "if-none-match".to_string(),
+                "\"33a64df551425fcc\"".to_string()
+            )
+        );
         assert_eq!(
             cond_headers[1],
             (
