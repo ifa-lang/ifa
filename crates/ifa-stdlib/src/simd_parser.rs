@@ -6939,9 +6939,14 @@ mod http2_tests {
             prioritized_stream_id: 1,
             priority_field_value: "u=1, i".to_string(),
         };
-        session.handle_frame(&pu_frame).expect("handle priority update");
+        session
+            .handle_frame(&pu_frame)
+            .expect("handle priority update");
 
-        let report = session.last_reallocation_report.as_ref().expect("reallocation report");
+        let report = session
+            .last_reallocation_report
+            .as_ref()
+            .expect("reallocation report");
         assert_eq!(report.stream_id, 1);
         assert_eq!(report.old_priority.urgency, 6);
         assert_eq!(report.new_priority.urgency, 1);

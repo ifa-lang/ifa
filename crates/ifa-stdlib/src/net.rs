@@ -18590,7 +18590,10 @@ mod tls_alpn_tests {
                 3,
                 crate::simd_parser::PriorityParameters::new(4, true),
             );
-            server.session.pending_outbound_data.insert(3, vec![3u8; 40960]);
+            server
+                .session
+                .pending_outbound_data
+                .insert(3, vec![3u8; 40960]);
 
             // Stream 1 has pending data and is at low priority (urgency 5)
             server.session.drr_deficits.insert(1, 0);
@@ -18600,7 +18603,10 @@ mod tls_alpn_tests {
             );
             // Total pending across streams: 32768 + 40960 = 73728 bytes, which exceeds
             // the HTTP/2 default connection window (65535 bytes), establishing true network contention.
-            server.session.pending_outbound_data.insert(1, vec![1u8; 32768]);
+            server
+                .session
+                .pending_outbound_data
+                .insert(1, vec![1u8; 32768]);
 
             // Wait for PRIORITY_UPDATE from client
             let mut got_pu = false;
@@ -18635,10 +18641,10 @@ mod tls_alpn_tests {
 
         std::thread::sleep(Duration::from_millis(15));
 
-        let client_stream = AsyncTcpStream::connect(&format!("127.0.0.1:{}", port))
-            .expect("connect client");
-        let mut client = AsyncHttp2Connection::client_handshake(client_stream)
-            .expect("client handshake");
+        let client_stream =
+            AsyncTcpStream::connect(&format!("127.0.0.1:{}", port)).expect("connect client");
+        let mut client =
+            AsyncHttp2Connection::client_handshake(client_stream).expect("client handshake");
 
         // Client sends mid-stream PRIORITY_UPDATE for stream 1 promoting to urgency 0
         let reprioritize_report = client
