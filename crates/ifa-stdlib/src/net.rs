@@ -4233,9 +4233,56 @@ impl AsyncHttp2Connection {
     /// If `end_stream` is true, the final transmitted DATA frame for fully-drained streams marks `end_stream`.
     /// Returns the number of DATA frames transmitted.
     pub fn flush_scheduled_outbound_data(&mut self, end_stream: bool) -> io::Result<usize> {
+        let max_frame = self.drr_max_frame_size;
         let frames = self
             .session
-            .schedule_pending_outbound_data(16384, end_stream);
+            .schedule_pending_outbound_data(max_frame, end_stream);
+        let count = frames.len();
+        for frame in &frames {
+            self.send_frame(frame)?;
+        }
+        Ok(count)
+    }
+
+    /// Flush queued outbound DATA frames using the combined **hierarchical RFC 9218 & RFC 7540 DRR scheduler**.
+    ///
+    /// Streams are scheduled strictly by RFC 9218 urgency tier (0 highest .. 7 lowest).
+    /// Within each urgency tier:
+    /// - Non-incremental streams (`incremental == false`) are transmitted sequentially without interleaving.
+    /// - Incremental streams (`incremental == true`) are interleaved using Deficit Round Robin (DRR)
+    ///   with per-round quantum proportional to RFC 7540 weight.
+    pub fn flush_hierarchical_drr_outbound_data(
+        &mut self,
+        deficit_counters: &mut std::collections::HashMap<u32, usize>,
+        base_quantum: usize,
+        max_frame_size: usize,
+        end_stream: bool,
+    ) -> io::Result<usize> {
+        let frames = self.session.schedule_hierarchical_drr_outbound_data(
+            deficit_counters,
+            base_quantum,
+            max_frame_size,
+            end_stream,
+        );
+        let count = frames.len();
+        for frame in &frames {
+            self.send_frame(frame)?;
+        }
+        Ok(count)
+    }
+
+    /// Flush outbound DATA frames using hierarchical RFC 9218 & RFC 7540 DRR scheduling with persistent session deficits.
+    ///
+    /// Uses the connection's configured `drr_base_quantum` and `drr_max_frame_size`.
+    pub fn flush_hierarchical_drr_outbound_data_persistent(
+        &mut self,
+        end_stream: bool,
+    ) -> io::Result<usize> {
+        let quantum = self.drr_base_quantum;
+        let max_frame = self.drr_max_frame_size;
+        let frames = self
+            .session
+            .schedule_hierarchical_drr_outbound_data_persistent(quantum, max_frame, end_stream);
         let count = frames.len();
         for frame in &frames {
             self.send_frame(frame)?;
@@ -4348,27 +4395,29 @@ impl AsyncHttp2Connection {
             if let Some(p) = req.rfc9218_priority {
                 has_rfc9218 = true;
                 self.set_priority_update(stream_id, p)?;
-            } else if req.stream_dependency != 0 || req.weight != 16 || req.exclusive {
+            }
+            if req.stream_dependency != 0 || req.weight != 16 || req.exclusive {
                 self.set_priority(stream_id, req.stream_dependency, req.weight, req.exclusive)?;
             }
 
             stream_mappings.push(stream_id);
         }
 
-        // Flush outbound data frames: use DRR weighted-fair scheduling with persistent session deficits
-        // for RFC 7540 priority streams; fall back to fixed-quantum scheduling for RFC 9218 urgency-only streams.
+        // Flush outbound data frames: use hierarchical RFC 9218 & RFC 7540 DRR scheduler
+        // with persistent session deficits for RFC 9218 prioritized batches; fall back to
+        // pure DRR for RFC 7540-only batches.
         if has_pending_scheduled_data {
-            if !has_rfc9218 {
-                // Build per-stream weight map from requests (stream_id → weight).
-                // Inject weights into the session so the DRR scheduler sees them.
-                for (req, &sid) in requests.iter().zip(stream_mappings.iter()) {
-                    if let Some(s) = self.session.streams.get_mut(&sid) {
-                        s.weight = req.weight;
-                    }
+            // Build per-stream weight map from requests (stream_id → weight).
+            // Inject weights into the session so the DRR scheduler sees them.
+            for (req, &sid) in requests.iter().zip(stream_mappings.iter()) {
+                if let Some(s) = self.session.streams.get_mut(&sid) {
+                    s.weight = req.weight;
                 }
+            }
+            if !has_rfc9218 {
                 self.flush_drr_outbound_data_persistent(true)?;
             } else {
-                self.flush_scheduled_outbound_data(true)?;
+                self.flush_hierarchical_drr_outbound_data_persistent(true)?;
             }
         }
 
@@ -13591,6 +13640,165 @@ mod tests {
         );
 
         // Clean up connection pool and wait for server to conclude
+        pool.clear();
+        let _ = server_handle.join();
+    }
+
+    /// Integration test: multi-tier network wire verification of the hierarchical hybrid scheduler
+    /// combining RFC 9218 urgency tiers (0..7) with RFC 7540 Deficit Round Robin (DRR) weighted fair queuing.
+    ///
+    /// 4 concurrent request streams are batched over a pooled connection with base_quantum=1024, max_frame_size=1024:
+    ///   - Stream A: Tier 0 (urgency 0), non-incremental, 1024 bytes (1 frame)
+    ///   - Stream B: Tier 1 (urgency 1), incremental, weight 32, 4096 bytes (4 frames)
+    ///   - Stream C: Tier 1 (urgency 1), incremental, weight 16, 2048 bytes (2 frames)
+    ///   - Stream D: Tier 2 (urgency 2), non-incremental, 1024 bytes (1 frame)
+    ///
+    /// Expected wire arrival order recorded by mock server:
+    ///   - Tier 0 served first: Stream A (1 frame)
+    ///   - Tier 1 streams arbitrated via DRR (2:1 ratio for weights 32 vs 16):
+    ///       Round 1: [Stream B, Stream B, Stream C]
+    ///       Round 2: [Stream B, Stream B, Stream C]
+    ///   - Tier 2 served last: Stream D (1 frame)
+    /// Complete wire sequence: [A, B, B, C, B, B, C, D]
+    #[test]
+    fn test_execute_prioritized_batch_hierarchical_drr_multi_tier_wire_interleaving() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().unwrap().port();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server_handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                }
+            };
+
+            let mut wire_data_sequence: Vec<(u32, usize)> = Vec::new();
+            let mut bodies: std::collections::HashMap<u32, Vec<u8>> =
+                std::collections::HashMap::new();
+            let mut streams_done = 0u32;
+
+            while streams_done < 4 {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    }) => {
+                        bodies.entry(stream_id).or_default();
+                        if end_stream {
+                            streams_done += 1;
+                        }
+                    }
+                    Ok(crate::simd_parser::Http2Frame::Data {
+                        stream_id,
+                        data,
+                        end_stream,
+                    }) => {
+                        wire_data_sequence.push((stream_id, data.len()));
+                        bodies
+                            .entry(stream_id)
+                            .or_default()
+                            .extend_from_slice(&data);
+                        if end_stream {
+                            streams_done += 1;
+                        }
+                    }
+                    Ok(crate::simd_parser::Http2Frame::WindowUpdate { .. }) => {}
+                    Ok(crate::simd_parser::Http2Frame::Settings { .. }) => {}
+                    _ => {}
+                }
+            }
+
+            // Send recorded sequence back through channel
+            let _ = tx.send(wire_data_sequence);
+
+            // Respond to each of the 4 streams with its received byte count
+            for (sid, body) in &bodies {
+                let resp_body = format!("{}", body.len()).into_bytes();
+                let headers = [(":status", "200")];
+                let _ = server.send_response(*sid, &headers, Some(&resp_body));
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(15));
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2)
+            .with_drr_base_quantum(1024)
+            .with_drr_max_frame_size(1024);
+
+        let requests = vec![
+            Http2PrioritizedRequest::new("POST", "/tier0")
+                .with_body(vec![b'A'; 1024])
+                .with_rfc9218_priority(0, false),
+            Http2PrioritizedRequest::new("POST", "/tier1-hi")
+                .with_body(vec![b'B'; 4096])
+                .with_rfc9218_priority(1, true)
+                .with_priority(0, 32, false),
+            Http2PrioritizedRequest::new("POST", "/tier1-lo")
+                .with_body(vec![b'C'; 2048])
+                .with_rfc9218_priority(1, true)
+                .with_priority(0, 16, false),
+            Http2PrioritizedRequest::new("POST", "/tier2")
+                .with_body(vec![b'D'; 1024])
+                .with_rfc9218_priority(2, false),
+        ];
+
+        let results = pool
+            .execute_prioritized_batch(requests)
+            .expect("batch execute");
+
+        let wire_sequence = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("receive wire sequence from server");
+
+        // 1. All 4 streams must succeed
+        assert_eq!(results.len(), 4, "expected 4 responses from batch");
+        for (_sid, res) in &results {
+            assert!(res.is_ok(), "stream response error: {:?}", res);
+        }
+
+        let sid_t0 = results[0].0;
+        let sid_t1_hi = results[1].0;
+        let sid_t1_lo = results[2].0;
+        let sid_t2 = results[3].0;
+
+        // 2. Exact wire sequence verification: 8 DATA frames total
+        assert_eq!(
+            wire_sequence.len(),
+            8,
+            "expected 8 DATA frames on wire, got {:?}",
+            wire_sequence
+        );
+
+        for &(sid, len) in &wire_sequence {
+            assert_eq!(
+                len, 1024,
+                "frame for stream {} had size {} (expected 1024)",
+                sid, len
+            );
+        }
+
+        // Expected wire pattern: Tier 0 [t0], Tier 1 DRR [hi, hi, lo, hi, hi, lo], Tier 2 [t2]
+        let wire_sids: Vec<u32> = wire_sequence.iter().map(|&(sid, _)| sid).collect();
+        let expected_sids = vec![
+            sid_t0, sid_t1_hi, sid_t1_hi, sid_t1_lo, sid_t1_hi, sid_t1_hi, sid_t1_lo, sid_t2,
+        ];
+        assert_eq!(
+            wire_sids, expected_sids,
+            "Hierarchical DRR multi-tier frame interleaving on wire mismatch! Got {:?}, expected {:?}",
+            wire_sids, expected_sids
+        );
+
+        // Clean up connection pool and wait for server
         pool.clear();
         let _ = server_handle.join();
     }
