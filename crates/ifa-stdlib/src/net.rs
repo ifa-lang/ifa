@@ -18642,7 +18642,7 @@ mod tls_alpn_tests {
         std::thread::sleep(Duration::from_millis(15));
 
         let client_stream =
-            AsyncTcpStream::connect(&format!("127.0.0.1:{}", port)).expect("connect client");
+            AsyncTcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect client");
         let mut client =
             AsyncHttp2Connection::client_handshake(client_stream).expect("client handshake");
 

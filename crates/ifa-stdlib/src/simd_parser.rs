@@ -7029,8 +7029,8 @@ mod http2_tests {
 
         // Stream 1 switches from incremental to non-incremental
         let report = session.reprioritize_stream(1, PriorityParameters::new(2, false));
-        assert_eq!(report.old_priority.incremental, true);
-        assert_eq!(report.new_priority.incremental, false);
+        assert!(report.old_priority.incremental);
+        assert!(!report.new_priority.incremental);
         assert_eq!(report.total_deficits_before, report.total_deficits_after);
 
         // Stream 1's deficit was redistributed to remaining incremental stream 3
