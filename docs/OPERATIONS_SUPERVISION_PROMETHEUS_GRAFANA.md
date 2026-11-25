@@ -352,3 +352,75 @@ spec:
   1. Verify if the interface is undergoing planned maintenance.
   2. Check whether path entered flapping probation (`ifa net session probation`).
   3. Wait for probation probe cycles to restore link confidence before manually intervening.
+
+### 5.4 Alert: `IfaIsspHighJitterSurge` (Severity: Warning)
+
+- **Symptom**: Interface round-trip time variance (jitter) exceeds 15ms (`ifa_issp_subpath_rtt_variance_us > 15000`).
+- **Operational Impact**: Alertmanager triggers automated webhook POST to `/webhook/alerts`. The impacted interface is demoted to `Standby`, active sessions are rerouted to lower-jitter alternatives (e.g. `wwan0-5g`), and cutover latency is recorded.
+- **Diagnostic Commands**:
+  ```bash
+  ifa net session failovers
+  ifa net session route
+  curl -s http://localhost:9100/api/v1/failovers | jq .
+  ```
+- **Remediation**:
+  1. Inspect physical link bufferbloat and wireless signal quality on the jittery interface.
+  2. When the alert resolves (`status: "resolved"`), IFA automatically restores the interface back to `Active` or `Probation`.
+
+### 5.5 Alert: `IfaIsspRetransmissionSpike` (Severity: Warning)
+
+- **Symptom**: Interface TCP or ISSP retransmission ratio exceeds 5% (`ifa_issp_interface_tcp_retrans_ratio > 0.05`).
+- **Operational Impact**: Alertmanager triggers automated webhook POST to `/webhook/alerts`. The impacted link is immediately demoted to `Standby` or `Degraded`, steering user sessions onto healthy bonded interfaces.
+- **Diagnostic Commands**:
+  ```bash
+  ifa net session failovers --json
+  curl -s http://localhost:9100/metrics | grep ifa_issp_interface
+  ```
+- **Remediation**:
+  1. Check interface packet drops or duplex mismatch: `ethtool -S <interface>`.
+  2. When retransmissions normalize and Alertmanager sends resolved notification, the link is reintegrated.
+
+---
+
+## 6. Alertmanager Webhook Automation & Failover API
+
+### 6.1 Alertmanager Receiver Configuration
+
+Configure Prometheus Alertmanager (`alertmanager.yml`) to dispatch firing and resolved alerts directly to the IFA telemetry server:
+
+```yaml
+route:
+  receiver: 'ifa-multipath-webhook'
+  group_wait: 5s
+  group_interval: 10s
+  repeat_interval: 1m
+
+receivers:
+  - name: 'ifa-multipath-webhook'
+    webhook_configs:
+      - url: 'http://127.0.0.1:9100/webhook/alerts'
+        send_resolved: true
+        max_alerts: 10
+```
+
+### 6.2 Supported Webhook Endpoints & Actions
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/webhook/alerts` | `POST` | Receives Alertmanager v4 JSON payloads. Executes automated failover or restoration. |
+| `/alerts` | `POST` | Alias endpoint for Alertmanager notifications. |
+| `/api/v1/alerts` | `POST` | RESTful webhook receiver endpoint. |
+| `/api/v1/failovers` | `GET` | Audit trail of all automated and manual failover events in JSON. |
+| `/metrics` | `GET` | Prometheus metrics including `ifa_issp_multipath_total_failovers`. |
+
+### 6.3 Failover Audit Inspection via CLI
+
+Inspect failover history directly from the terminal:
+
+```bash
+# Tabular audit overview
+ifa net session failovers
+
+# Machine-readable JSON output
+ifa net session failovers --json
+```

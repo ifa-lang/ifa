@@ -196,6 +196,15 @@ pub enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// View automatic and webhook-triggered failover audit history
+    Failovers {
+        /// Path to persistent cluster state dump (.issp or binary dump)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+        /// Output formatted as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Locate or default the ISSP registry state file.
@@ -1615,7 +1624,7 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 .unwrap_or_else(|_| addr.clone());
 
             eprintln!(
-                "Telemetry server listening on http://{} — Prometheus: /metrics | OTLP JSON: /v1/metrics | WebSocket: /ws/metrics | Probes: /livez, /readyz",
+                "Telemetry server listening on http://{} — Prometheus: /metrics | OTLP JSON: /v1/metrics | WebSocket: /ws/metrics | Probes: /livez, /readyz | Webhook: /webhook/alerts | Failovers: /api/v1/failovers",
                 local_addr
             );
 
@@ -1702,6 +1711,53 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 println!("{}", report.to_json());
             } else {
                 println!("{}", report.to_markdown_table());
+            }
+            ExitCode::SUCCESS
+        }
+        SessionCommand::Failovers { file, json } => {
+            let registry = match resolve_state_file(file.as_ref()) {
+                Some(p) if p.exists() => match SessionRegistry::load_from_file(&p) {
+                    Ok(reg) => reg,
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: failed loading state from {:?} ({}), starting with empty registry",
+                            p, e
+                        );
+                        SessionRegistry::new(1)
+                    }
+                },
+                _ => SessionRegistry::new(1),
+            };
+
+            let events = registry.multipath_failover_history().unwrap_or_default();
+
+            if json {
+                let items: Vec<String> = events.iter().map(|e| e.to_json()).collect();
+                println!("[\n{}\n]", items.join(",\n"));
+            } else if events.is_empty() {
+                println!("No failover events recorded. All multipath subpaths nominal.");
+            } else {
+                println!(
+                    "{:<20} {:<12} {:<12} {:<24} {:<10} {:<15}",
+                    "Timestamp (ms)",
+                    "Failed Path",
+                    "Target Path",
+                    "Reason",
+                    "Rerouted",
+                    "Cutover Latency"
+                );
+                println!("{:-<95}", "");
+                for ev in &events {
+                    println!(
+                        "{:<20} {:<12} {:<12} {:<24} {:<10} {:<15.2} µs",
+                        ev.timestamp_unix_ms,
+                        ev.failed_path_id,
+                        ev.target_path_id,
+                        ev.reason.as_str(),
+                        ev.sessions_rerouted,
+                        ev.cutover_latency_us
+                    );
+                }
             }
             ExitCode::SUCCESS
         }
@@ -2022,6 +2078,23 @@ mod tests {
         let cmd_json = SessionCommand::TelemetryBench {
             sessions: 100_000,
             iterations: 50,
+            json: true,
+        };
+        let code_json = execute_session_command(cmd_json);
+        assert_eq!(code_json, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_session_command_failovers_execution() {
+        let cmd = SessionCommand::Failovers {
+            file: None,
+            json: false,
+        };
+        let code = execute_session_command(cmd);
+        assert_eq!(code, ExitCode::SUCCESS);
+
+        let cmd_json = SessionCommand::Failovers {
+            file: None,
             json: true,
         };
         let code_json = execute_session_command(cmd_json);

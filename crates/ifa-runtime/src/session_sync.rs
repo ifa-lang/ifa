@@ -1699,6 +1699,70 @@ pub enum IsspFailoverReason {
     Administrative,
     /// Elevated packet loss or latency jitter degradation.
     QualityDegradation,
+    /// Jitter surge alert received via Alertmanager webhook.
+    AlertmanagerJitterSurge,
+    /// Retransmission spike alert received via Alertmanager webhook.
+    AlertmanagerRetransmissionSpike,
+    /// Bufferbloat queuing delay gradient surge alert received via Alertmanager webhook.
+    AlertmanagerQueuingDelayGradient,
+}
+
+impl IsspFailoverReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::HeartbeatTimeout => "HeartbeatTimeout",
+            Self::ConsecutiveHeartbeatsExceeded => "ConsecutiveHeartbeatsExceeded",
+            Self::Administrative => "Administrative",
+            Self::QualityDegradation => "QualityDegradation",
+            Self::AlertmanagerJitterSurge => "AlertmanagerJitterSurge",
+            Self::AlertmanagerRetransmissionSpike => "AlertmanagerRetransmissionSpike",
+            Self::AlertmanagerQueuingDelayGradient => "AlertmanagerQueuingDelayGradient",
+        }
+    }
+}
+
+/// Action applied to paths during an interface failover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FailoverAction {
+    /// Demote paths to Standby (forcing active sessions to migrate).
+    #[default]
+    SwitchToStandby,
+    /// Demote paths to Degraded (cuts effective weight in half).
+    DemoteToDegraded,
+    /// Mark paths as Failed (0% capacity, total exclusion).
+    MarkFailed,
+}
+
+impl FailoverAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SwitchToStandby => "SwitchToStandby",
+            Self::DemoteToDegraded => "DemoteToDegraded",
+            Self::MarkFailed => "MarkFailed",
+        }
+    }
+}
+
+/// Result report from an automated or manual interface failover operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspInterfaceFailoverReport {
+    pub interface_name: String,
+    pub impacted_path_ids: Vec<u32>,
+    pub action: FailoverAction,
+    pub reason: IsspFailoverReason,
+    pub total_sessions_rerouted: usize,
+    pub target_path_ids: Vec<u32>,
+    pub target_interfaces: Vec<String>,
+    pub timestamp_unix_ms: u64,
+}
+
+/// Result report from an automated or manual interface restoration operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspInterfaceRestoreReport {
+    pub interface_name: String,
+    pub restored_path_ids: Vec<u32>,
+    pub restored_state: IsspPathState,
+    pub timestamp_unix_ms: u64,
 }
 
 /// Detailed record of an automatic failover event caused by path degradation or heartbeat expiration.
@@ -1718,6 +1782,37 @@ pub struct IsspFailoverEvent {
     pub cutover_latency_us: f64,
     /// Session IDs that were migrated during this cutover.
     pub rerouted_session_ids: Vec<SessionId>,
+}
+
+impl IsspFailoverEvent {
+    pub fn to_json(&self) -> String {
+        let session_ids_json = self
+            .rerouted_session_ids
+            .iter()
+            .map(|s| format!("\"{}\"", s.to_canonical_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            concat!(
+                "{{\n",
+                "  \"timestamp_unix_ms\": {},\n",
+                "  \"failed_path_id\": {},\n",
+                "  \"target_path_id\": {},\n",
+                "  \"reason\": \"{}\",\n",
+                "  \"sessions_rerouted\": {},\n",
+                "  \"cutover_latency_us\": {:.2},\n",
+                "  \"rerouted_session_ids\": [{}]\n",
+                "}}"
+            ),
+            self.timestamp_unix_ms,
+            self.failed_path_id,
+            self.target_path_id,
+            self.reason.as_str(),
+            self.sessions_rerouted,
+            self.cutover_latency_us,
+            session_ids_json
+        )
+    }
 }
 
 /// Traffic steering and load-balancing strategy across dynamic multipath links.
@@ -2473,6 +2568,162 @@ impl IsspDynamicMultipathRouter {
     /// Retrieve failover events history.
     pub fn failover_history(&self) -> &[IsspFailoverEvent] {
         &self.failover_history
+    }
+
+    /// Automatically failover all paths belonging to a specified network interface,
+    /// updating their operational state and rerouting all active sessions to alternative healthy paths.
+    pub fn failover_interface(
+        &mut self,
+        interface_name: &str,
+        action: FailoverAction,
+        reason: IsspFailoverReason,
+        now_ms: u64,
+    ) -> Result<IsspInterfaceFailoverReport, SyncError> {
+        let matching_paths: Vec<u32> = self
+            .paths
+            .values()
+            .filter(|r| r.interface_name == interface_name)
+            .map(|r| r.path_id)
+            .collect();
+
+        if matching_paths.is_empty() {
+            return Err(SyncError::PathNotFound(0));
+        }
+
+        let new_state = match action {
+            FailoverAction::SwitchToStandby => IsspPathState::Standby,
+            FailoverAction::DemoteToDegraded => IsspPathState::Degraded,
+            FailoverAction::MarkFailed => IsspPathState::Failed,
+        };
+
+        for &pid in &matching_paths {
+            if let Some(r) = self.paths.get_mut(&pid) {
+                r.state = new_state;
+                if new_state == IsspPathState::Failed {
+                    r.probation_state.reset();
+                }
+            }
+        }
+
+        let mut total_rerouted = 0;
+        let mut target_paths = Vec::new();
+        let mut target_ifaces = Vec::new();
+
+        // If paths are no longer Active, reroute bound sessions
+        if new_state != IsspPathState::Active {
+            for &pid in &matching_paths {
+                let cutover_start = Instant::now();
+                let bound_sessions: Vec<SessionId> = self
+                    .session_bindings
+                    .iter()
+                    .filter(|(_, &p)| p == pid)
+                    .map(|(s, _)| *s)
+                    .collect();
+
+                if !bound_sessions.is_empty() {
+                    // Try selecting candidate path that is NOT on the failing interface
+                    let best_candidate = self
+                        .paths
+                        .values()
+                        .filter(|r| r.interface_name != interface_name && r.state.is_usable())
+                        .min_by_key(|r| r.priority)
+                        .map(|r| r.path_id)
+                        .or_else(|| {
+                            // Or promote Standby from another interface
+                            self.paths
+                                .values()
+                                .filter(|r| {
+                                    r.interface_name != interface_name
+                                        && r.state == IsspPathState::Standby
+                                })
+                                .min_by_key(|r| r.priority)
+                                .map(|r| r.path_id)
+                        })
+                        .or_else(|| self.select_best_candidate_path(Some(pid)).ok());
+
+                    if let Some(target_id) = best_candidate {
+                        if let Some(target) = self.paths.get_mut(&target_id) {
+                            if target.state == IsspPathState::Standby {
+                                target.state = IsspPathState::Active;
+                            }
+                            if !target_ifaces.contains(&target.interface_name) {
+                                target_ifaces.push(target.interface_name.clone());
+                            }
+                        }
+                        if !target_paths.contains(&target_id) {
+                            target_paths.push(target_id);
+                        }
+
+                        for s_id in &bound_sessions {
+                            self.session_bindings.insert(*s_id, target_id);
+                        }
+
+                        let cutover_us = cutover_start.elapsed().as_secs_f64() * 1_000_000.0;
+                        let event = IsspFailoverEvent {
+                            timestamp_unix_ms: now_ms,
+                            failed_path_id: pid,
+                            target_path_id: target_id,
+                            reason,
+                            sessions_rerouted: bound_sessions.len(),
+                            cutover_latency_us: cutover_us,
+                            rerouted_session_ids: bound_sessions.clone(),
+                        };
+                        self.total_failovers += 1;
+                        self.failover_history.push(event);
+                        total_rerouted += bound_sessions.len();
+                    }
+                }
+            }
+        }
+
+        Ok(IsspInterfaceFailoverReport {
+            interface_name: interface_name.to_string(),
+            impacted_path_ids: matching_paths,
+            action,
+            reason,
+            total_sessions_rerouted: total_rerouted,
+            target_path_ids: target_paths,
+            target_interfaces: target_ifaces,
+            timestamp_unix_ms: now_ms,
+        })
+    }
+
+    /// Restore and reintegrate all paths belonging to a specified network interface
+    /// following an alert resolution, transitioning them back to Active (or Probation).
+    pub fn restore_interface(
+        &mut self,
+        interface_name: &str,
+        target_state: IsspPathState,
+        now_ms: u64,
+    ) -> Result<IsspInterfaceRestoreReport, SyncError> {
+        let matching_paths: Vec<u32> = self
+            .paths
+            .values()
+            .filter(|r| r.interface_name == interface_name)
+            .map(|r| r.path_id)
+            .collect();
+
+        if matching_paths.is_empty() {
+            return Err(SyncError::PathNotFound(0));
+        }
+
+        for &pid in &matching_paths {
+            if let Some(r) = self.paths.get_mut(&pid) {
+                r.state = target_state;
+                r.metrics.consecutive_missed_heartbeats = 0;
+                if target_state == IsspPathState::Probation {
+                    r.probation_state
+                        .start(now_ms, self.probation_config.initial_weight_ratio);
+                }
+            }
+        }
+
+        Ok(IsspInterfaceRestoreReport {
+            interface_name: interface_name.to_string(),
+            restored_path_ids: matching_paths,
+            restored_state: target_state,
+            timestamp_unix_ms: now_ms,
+        })
     }
 
     /// Retrieve flap events history.
@@ -3849,6 +4100,44 @@ impl SessionRegistry {
             .lock()
             .map_err(|_| SyncError::LockPoisoned)?;
         Ok(router.reintegration_history().to_vec())
+    }
+
+    /// Automatically failover all paths on an interface due to Alertmanager webhook alert or manual command.
+    pub fn failover_interface(
+        &self,
+        interface_name: &str,
+        action: FailoverAction,
+        reason: IsspFailoverReason,
+        now_ms: u64,
+    ) -> Result<IsspInterfaceFailoverReport, SyncError> {
+        let mut router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        router.failover_interface(interface_name, action, reason, now_ms)
+    }
+
+    /// Restore and reintegrate all paths on an interface following alert resolution.
+    pub fn restore_interface(
+        &self,
+        interface_name: &str,
+        target_state: IsspPathState,
+        now_ms: u64,
+    ) -> Result<IsspInterfaceRestoreReport, SyncError> {
+        let mut router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        router.restore_interface(interface_name, target_state, now_ms)
+    }
+
+    /// Retrieve failover events history.
+    pub fn multipath_failover_history(&self) -> Result<Vec<IsspFailoverEvent>, SyncError> {
+        let router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        Ok(router.failover_history().to_vec())
     }
 
     /// Configure the active multipath routing and load-balancing policy.

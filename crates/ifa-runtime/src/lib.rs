@@ -65,11 +65,12 @@ pub use reactor::{
     KernelTimespec, GLOBAL_REACTOR,
 };
 pub use session_sync::{
-    ClusterPsk, GossipFrame, GossipResult, IsspAdaptiveHeaderCompressor, IsspBandwidthEstimate,
-    IsspBbrState, IsspCapsule, IsspCongestionPhase, IsspCongestionState, IsspDeliveredPacket,
-    IsspDynamicMultipathRouter, IsspFailoverEvent, IsspFailoverReason, IsspFlapDampingConfig,
-    IsspFlapEvent, IsspHeaderCompressionTelemetry, IsspHeaderContextEntry, IsspHeartbeatProbe,
-    IsspLedbatState, IsspMultipathRoute, IsspMultipathTelemetry, IsspPathMetrics, IsspPathState,
+    ClusterPsk, FailoverAction, GossipFrame, GossipResult, IsspAdaptiveHeaderCompressor,
+    IsspBandwidthEstimate, IsspBbrState, IsspCapsule, IsspCongestionPhase, IsspCongestionState,
+    IsspDeliveredPacket, IsspDynamicMultipathRouter, IsspFailoverEvent, IsspFailoverReason,
+    IsspFlapDampingConfig, IsspFlapEvent, IsspHeaderCompressionTelemetry, IsspHeaderContextEntry,
+    IsspHeartbeatProbe, IsspInterfaceFailoverReport, IsspInterfaceRestoreReport, IsspLedbatState,
+    IsspMultipathRoute, IsspMultipathTelemetry, IsspPathMetrics, IsspPathState,
     IsspProbationConfig, IsspProbationState, IsspReintegrationEvent, IsspResequenceStatus,
     IsspResequencingBuffer, IsspResequencingTelemetry, IsspRouteFlapState, IsspRoutingPolicy,
     IsspScheduledPacket, IsspSessionHeader, IsspSubpathCryptoTunnel, IsspSubpathKey,
@@ -86,9 +87,10 @@ pub use session_sync::{
 pub use string::IfaString;
 pub use telemetry::{
     snapshot_to_compact_json, supervise_command, ws_build_close_frame, ws_build_text_frame,
+    AlertFailoverPolicy, AlertmanagerWebhookAlert, AlertmanagerWebhookPayload,
     IsspClusterQuorumConfig, IsspMultipathBalancingSnapshot, IsspQuorumStatus,
     IsspSubpathBalancingMetrics, IsspTelemetryHttpHandler, IsspTelemetryServer, LatencyHistogram,
-    OtelMultipathBalancingExporter, PrometheusMultipathBalancingExporter, ResourceAuditScope,
-    ResourceUsage, DEFAULT_LATENCY_BUCKETS_SECONDS,
+    MiniJsonValue, OtelMultipathBalancingExporter, PrometheusMultipathBalancingExporter,
+    ResourceAuditScope, ResourceUsage, DEFAULT_LATENCY_BUCKETS_SECONDS,
 };
 pub use wasi::*;

@@ -50,3 +50,23 @@ groups:
         annotations:
           summary: "BBR bottleneck bandwidth below 1 Mbps on active subpath {{ $labels.interface }}"
           description: "Estimated bottleneck bandwidth on {{ $labels.interface }} (node {{ $labels.node_id }}) collapsed to {{ $value }} bps."
+
+      - alert: IfaIsspHighJitterSurge
+        expr: ifa_issp_subpath_rtt_variance_us > 15000
+        for: 15s
+        labels:
+          severity: warning
+          tier: networking
+        annotations:
+          summary: "High latency jitter surge detected on {{ $labels.interface }} (node {{ $labels.node_id }})"
+          description: "Subpath {{ $labels.interface }} has RTT variance exceeding 15ms ({{ $value }} µs), triggering automated Alertmanager webhook failover."
+
+      - alert: IfaIsspRetransmissionSpike
+        expr: ifa_issp_interface_tcp_retrans_ratio > 0.05 or ifa_issp_interface_issp_retrans_ratio > 0.05
+        for: 15s
+        labels:
+          severity: warning
+          tier: networking
+        annotations:
+          summary: "Retransmission spike detected on {{ $labels.interface }} (node {{ $labels.node_id }})"
+          description: "Retransmission ratio exceeded 5% on {{ $labels.interface }} (TCP / ISSP retransmissions), triggering automated Alertmanager webhook failover."

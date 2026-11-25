@@ -278,6 +278,8 @@ pub struct IsspMultipathBalancingSnapshot {
     pub aggregate_tcp_retrans_ratio: f64,
     /// Aggregate ISSP retransmission ratio across all operational subpaths.
     pub aggregate_issp_retrans_ratio: f64,
+    /// Total automatic interface and subpath failovers recorded.
+    pub total_failovers: u64,
 }
 
 impl IsspMultipathBalancingSnapshot {
@@ -445,6 +447,7 @@ impl IsspMultipathBalancingSnapshot {
             total_issp_retransmissions: total_issp_retrans,
             aggregate_tcp_retrans_ratio: agg_tcp_ratio,
             aggregate_issp_retrans_ratio: agg_issp_ratio,
+            total_failovers: router.total_failovers,
         }
     }
 
@@ -635,6 +638,13 @@ impl PrometheusMultipathBalancingExporter {
         out.push_str(&format!(
             "ifa_session_standby_sessions{} {}\n",
             base_lbl, s.standby_sessions
+        ));
+
+        out.push_str("# HELP ifa_issp_multipath_total_failovers Total automatic interface and subpath failover events recorded.\n");
+        out.push_str("# TYPE ifa_issp_multipath_total_failovers counter\n");
+        out.push_str(&format!(
+            "ifa_issp_multipath_total_failovers{} {}\n",
+            base_lbl, s.total_failovers
         ));
 
         // 2. Per-subpath metrics
@@ -1777,6 +1787,475 @@ impl IsspQuorumStatus {
     }
 }
 
+// ─── Lightweight Zero-Dependency JSON Parser (Alertmanager & Webhooks) ─────
+
+/// Lightweight recursive-descent JSON value representation without external dependencies.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MiniJsonValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<MiniJsonValue>),
+    Object(BTreeMap<String, MiniJsonValue>),
+}
+
+impl MiniJsonValue {
+    /// Parse a JSON string into a structured `MiniJsonValue`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let chars: Vec<char> = s.chars().collect();
+        let mut idx = 0;
+        skip_json_ws(&chars, &mut idx);
+        let val = parse_json_val(&chars, &mut idx)?;
+        Ok(val)
+    }
+
+    /// Access child field if this value is an object.
+    pub fn get(&self, key: &str) -> Option<&MiniJsonValue> {
+        match self {
+            Self::Object(map) => map.get(key),
+            _ => None,
+        }
+    }
+
+    /// Access string reference if this value is a string.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Access array slice if this value is an array.
+    pub fn as_array(&self) -> Option<&Vec<MiniJsonValue>> {
+        match self {
+            Self::Array(arr) => Some(arr),
+            _ => None,
+        }
+    }
+
+    /// Access object map if this value is an object.
+    pub fn as_object(&self) -> Option<&BTreeMap<String, MiniJsonValue>> {
+        match self {
+            Self::Object(map) => Some(map),
+            _ => None,
+        }
+    }
+
+    /// Access f64 number if this value is numeric.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Access bool if this value is boolean.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+}
+
+fn skip_json_ws(chars: &[char], idx: &mut usize) {
+    while *idx < chars.len() && chars[*idx].is_whitespace() {
+        *idx += 1;
+    }
+}
+
+fn parse_json_val(chars: &[char], idx: &mut usize) -> Result<MiniJsonValue, String> {
+    skip_json_ws(chars, idx);
+    if *idx >= chars.len() {
+        return Err("Unexpected end of JSON input".to_string());
+    }
+
+    match chars[*idx] {
+        '{' => parse_json_obj(chars, idx),
+        '[' => parse_json_arr(chars, idx),
+        '"' => parse_json_str(chars, idx).map(MiniJsonValue::String),
+        't' | 'f' => parse_json_boolean(chars, idx),
+        'n' => parse_json_nil(chars, idx),
+        '-' | '0'..='9' => parse_json_num(chars, idx),
+        c => Err(format!("Unexpected character '{}' at index {}", c, idx)),
+    }
+}
+
+fn parse_json_str(chars: &[char], idx: &mut usize) -> Result<String, String> {
+    if *idx >= chars.len() || chars[*idx] != '"' {
+        return Err("Expected '\"'".to_string());
+    }
+    *idx += 1;
+    let mut out = String::new();
+    while *idx < chars.len() {
+        let c = chars[*idx];
+        *idx += 1;
+        if c == '"' {
+            return Ok(out);
+        } else if c == '\\' {
+            if *idx >= chars.len() {
+                return Err("Dangling backslash in string".to_string());
+            }
+            let esc = chars[*idx];
+            *idx += 1;
+            match esc {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'b' => out.push('\u{0008}'),
+                'f' => out.push('\u{000c}'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    if *idx + 4 > chars.len() {
+                        return Err("Invalid unicode escape".to_string());
+                    }
+                    let hex_s: String = chars[*idx..*idx + 4].iter().collect();
+                    *idx += 4;
+                    if let Ok(code) = u32::from_str_radix(&hex_s, 16) {
+                        if let Some(ch) = std::char::from_u32(code) {
+                            out.push(ch);
+                        }
+                    }
+                }
+                _ => out.push(esc),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Err("Unterminated string".to_string())
+}
+
+fn parse_json_num(chars: &[char], idx: &mut usize) -> Result<MiniJsonValue, String> {
+    let start = *idx;
+    if *idx < chars.len() && chars[*idx] == '-' {
+        *idx += 1;
+    }
+    while *idx < chars.len() && chars[*idx].is_ascii_digit() {
+        *idx += 1;
+    }
+    if *idx < chars.len() && chars[*idx] == '.' {
+        *idx += 1;
+        while *idx < chars.len() && chars[*idx].is_ascii_digit() {
+            *idx += 1;
+        }
+    }
+    if *idx < chars.len() && (chars[*idx] == 'e' || chars[*idx] == 'E') {
+        *idx += 1;
+        if *idx < chars.len() && (chars[*idx] == '+' || chars[*idx] == '-') {
+            *idx += 1;
+        }
+        while *idx < chars.len() && chars[*idx].is_ascii_digit() {
+            *idx += 1;
+        }
+    }
+    let s: String = chars[start..*idx].iter().collect();
+    s.parse::<f64>()
+        .map(MiniJsonValue::Number)
+        .map_err(|e| format!("Invalid number '{}': {}", s, e))
+}
+
+fn parse_json_boolean(chars: &[char], idx: &mut usize) -> Result<MiniJsonValue, String> {
+    if chars[*idx..].starts_with(&['t', 'r', 'u', 'e']) {
+        *idx += 4;
+        Ok(MiniJsonValue::Bool(true))
+    } else if chars[*idx..].starts_with(&['f', 'a', 'l', 's', 'e']) {
+        *idx += 5;
+        Ok(MiniJsonValue::Bool(false))
+    } else {
+        Err("Expected boolean".to_string())
+    }
+}
+
+fn parse_json_nil(chars: &[char], idx: &mut usize) -> Result<MiniJsonValue, String> {
+    if chars[*idx..].starts_with(&['n', 'u', 'l', 'l']) {
+        *idx += 4;
+        Ok(MiniJsonValue::Null)
+    } else {
+        Err("Expected null".to_string())
+    }
+}
+
+fn parse_json_arr(chars: &[char], idx: &mut usize) -> Result<MiniJsonValue, String> {
+    if *idx >= chars.len() || chars[*idx] != '[' {
+        return Err("Expected '['".to_string());
+    }
+    *idx += 1;
+    let mut arr = Vec::new();
+    skip_json_ws(chars, idx);
+    if *idx < chars.len() && chars[*idx] == ']' {
+        *idx += 1;
+        return Ok(MiniJsonValue::Array(arr));
+    }
+    loop {
+        let val = parse_json_val(chars, idx)?;
+        arr.push(val);
+        skip_json_ws(chars, idx);
+        if *idx >= chars.len() {
+            return Err("Unterminated array".to_string());
+        }
+        if chars[*idx] == ']' {
+            *idx += 1;
+            break;
+        } else if chars[*idx] == ',' {
+            *idx += 1;
+        } else {
+            return Err(format!("Expected ',' or ']' at {}", idx));
+        }
+    }
+    Ok(MiniJsonValue::Array(arr))
+}
+
+fn parse_json_obj(chars: &[char], idx: &mut usize) -> Result<MiniJsonValue, String> {
+    if *idx >= chars.len() || chars[*idx] != '{' {
+        return Err("Expected '{'".to_string());
+    }
+    *idx += 1;
+    let mut map = BTreeMap::new();
+    skip_json_ws(chars, idx);
+    if *idx < chars.len() && chars[*idx] == '}' {
+        *idx += 1;
+        return Ok(MiniJsonValue::Object(map));
+    }
+    loop {
+        skip_json_ws(chars, idx);
+        let key = parse_json_str(chars, idx)?;
+        skip_json_ws(chars, idx);
+        if *idx >= chars.len() || chars[*idx] != ':' {
+            return Err(format!("Expected ':' after object key '{}'", key));
+        }
+        *idx += 1;
+        let val = parse_json_val(chars, idx)?;
+        map.insert(key, val);
+        skip_json_ws(chars, idx);
+        if *idx >= chars.len() {
+            return Err("Unterminated object".to_string());
+        }
+        if chars[*idx] == '}' {
+            *idx += 1;
+            break;
+        } else if chars[*idx] == ',' {
+            *idx += 1;
+        } else {
+            return Err(format!("Expected ',' or '}}' at {}", idx));
+        }
+    }
+    Ok(MiniJsonValue::Object(map))
+}
+
+// ─── Prometheus Alertmanager Webhook Models ───────────────────────────────
+
+/// A single alert payload from Prometheus Alertmanager.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AlertmanagerWebhookAlert {
+    /// Alert status: "firing" or "resolved".
+    pub status: String,
+    /// Alert name (e.g. "IfaIsspHighJitterSurge", "IfaIsspRetransmissionSpike").
+    pub alertname: String,
+    /// Targeted network interface name (e.g. "eth0-wan", "wwan0-5g").
+    pub interface: String,
+    /// Alert severity ("critical", "warning", "info").
+    pub severity: String,
+    /// All labels extracted from the alert.
+    pub labels: BTreeMap<String, String>,
+    /// All annotations extracted from the alert.
+    pub annotations: BTreeMap<String, String>,
+}
+
+/// Structured Alertmanager webhook notification payload (compatible with Alertmanager v4 format).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AlertmanagerWebhookPayload {
+    /// Schema version (typically "4").
+    pub version: Option<String>,
+    /// Global notification status ("firing" or "resolved").
+    pub status: String,
+    /// Configured Alertmanager receiver name.
+    pub receiver: Option<String>,
+    /// List of alerts contained in this webhook notification.
+    pub alerts: Vec<AlertmanagerWebhookAlert>,
+}
+
+impl AlertmanagerWebhookPayload {
+    /// Parse raw JSON string received from Alertmanager webhook POST into `AlertmanagerWebhookPayload`.
+    pub fn parse_json(raw: &str) -> Result<Self, String> {
+        let val = MiniJsonValue::parse(raw)?;
+        let obj = val.as_object().ok_or("Root JSON must be an object")?;
+
+        let version = obj
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let top_status = obj
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("firing")
+            .to_string();
+        let receiver = obj
+            .get("receiver")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let common_labels: BTreeMap<String, String> = obj
+            .get("commonLabels")
+            .and_then(|v| v.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut alerts = Vec::new();
+        if let Some(alerts_arr) = obj.get("alerts").and_then(|v| v.as_array()) {
+            for a_val in alerts_arr {
+                if let Some(a_obj) = a_val.as_object() {
+                    let a_status = a_obj
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&top_status)
+                        .to_string();
+
+                    let mut labels = common_labels.clone();
+                    if let Some(lbl_obj) = a_obj.get("labels").and_then(|v| v.as_object()) {
+                        for (k, v) in lbl_obj {
+                            if let Some(s) = v.as_str() {
+                                labels.insert(k.clone(), s.to_string());
+                            }
+                        }
+                    }
+
+                    let mut annotations = BTreeMap::new();
+                    if let Some(ann_obj) = a_obj.get("annotations").and_then(|v| v.as_object()) {
+                        for (k, v) in ann_obj {
+                            if let Some(s) = v.as_str() {
+                                annotations.insert(k.clone(), s.to_string());
+                            }
+                        }
+                    }
+
+                    let alertname = labels
+                        .get("alertname")
+                        .cloned()
+                        .unwrap_or_else(|| "UnknownAlert".to_string());
+
+                    let interface = labels
+                        .get("interface")
+                        .or_else(|| labels.get("interface_name"))
+                        .or_else(|| labels.get("subpath"))
+                        .or_else(|| labels.get("link"))
+                        .cloned()
+                        .unwrap_or_default();
+
+                    let severity = labels
+                        .get("severity")
+                        .cloned()
+                        .unwrap_or_else(|| "warning".to_string());
+
+                    alerts.push(AlertmanagerWebhookAlert {
+                        status: a_status,
+                        alertname,
+                        interface,
+                        severity,
+                        labels,
+                        annotations,
+                    });
+                }
+            }
+        }
+
+        // Fallback if alerts array was empty but top-level commonLabels specifies interface
+        if alerts.is_empty() && common_labels.contains_key("interface") {
+            let alertname = common_labels
+                .get("alertname")
+                .cloned()
+                .unwrap_or_else(|| "UnknownAlert".to_string());
+            let interface = common_labels.get("interface").cloned().unwrap_or_default();
+            alerts.push(AlertmanagerWebhookAlert {
+                status: top_status.clone(),
+                alertname,
+                interface,
+                severity: "warning".to_string(),
+                labels: common_labels.clone(),
+                annotations: BTreeMap::new(),
+            });
+        }
+
+        Ok(AlertmanagerWebhookPayload {
+            version,
+            status: top_status,
+            receiver,
+            alerts,
+        })
+    }
+}
+
+/// Configurable policy mapping Alertmanager alert signals to automated interface failover actions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlertFailoverPolicy {
+    /// Action taken when a jitter surge alert fires on an interface.
+    pub jitter_action: crate::session_sync::FailoverAction,
+    /// Action taken when a retransmission spike alert fires on an interface.
+    pub retransmission_action: crate::session_sync::FailoverAction,
+    /// Action taken when a queuing delay / bufferbloat alert fires on an interface.
+    pub queuing_delay_action: crate::session_sync::FailoverAction,
+    /// Action taken when a generic quality degradation alert fires on an interface.
+    pub default_action: crate::session_sync::FailoverAction,
+    /// Target operational state when an alert resolves (Active or Probation).
+    pub restore_target_state: crate::session_sync::IsspPathState,
+}
+
+impl Default for AlertFailoverPolicy {
+    fn default() -> Self {
+        Self {
+            jitter_action: crate::session_sync::FailoverAction::SwitchToStandby,
+            retransmission_action: crate::session_sync::FailoverAction::SwitchToStandby,
+            queuing_delay_action: crate::session_sync::FailoverAction::DemoteToDegraded,
+            default_action: crate::session_sync::FailoverAction::SwitchToStandby,
+            restore_target_state: crate::session_sync::IsspPathState::Active,
+        }
+    }
+}
+
+impl AlertFailoverPolicy {
+    /// Classify an alert into the corresponding failover action and trigger reason.
+    pub fn classify_alert(
+        &self,
+        alert: &AlertmanagerWebhookAlert,
+    ) -> (
+        crate::session_sync::FailoverAction,
+        crate::session_sync::IsspFailoverReason,
+    ) {
+        let name_lower = alert.alertname.to_ascii_lowercase();
+        if name_lower.contains("jitter") {
+            (
+                self.jitter_action,
+                crate::session_sync::IsspFailoverReason::AlertmanagerJitterSurge,
+            )
+        } else if name_lower.contains("retrans") {
+            (
+                self.retransmission_action,
+                crate::session_sync::IsspFailoverReason::AlertmanagerRetransmissionSpike,
+            )
+        } else if name_lower.contains("gradient")
+            || name_lower.contains("delay")
+            || name_lower.contains("bufferbloat")
+        {
+            (
+                self.queuing_delay_action,
+                crate::session_sync::IsspFailoverReason::AlertmanagerQueuingDelayGradient,
+            )
+        } else {
+            (
+                self.default_action,
+                crate::session_sync::IsspFailoverReason::QualityDegradation,
+            )
+        }
+    }
+}
+
 // ─── HTTP Telemetry Handlers & Exposition Server ──────────────────────────
 
 /// HTTP request dispatcher for dynamic ISSP multipath balancing telemetry.
@@ -1964,6 +2443,7 @@ pub struct IsspTelemetryServer {
     service_name: String,
     registry: Arc<crate::session_sync::SessionRegistry>,
     quorum_config: RwLock<IsspClusterQuorumConfig>,
+    failover_policy: RwLock<AlertFailoverPolicy>,
 }
 
 impl IsspTelemetryServer {
@@ -1979,6 +2459,7 @@ impl IsspTelemetryServer {
             service_name: service_name.to_string(),
             registry,
             quorum_config: RwLock::new(IsspClusterQuorumConfig::default()),
+            failover_policy: RwLock::new(AlertFailoverPolicy::default()),
         })
     }
 
@@ -2002,6 +2483,197 @@ impl IsspTelemetryServer {
     pub fn set_quorum_config(&self, config: IsspClusterQuorumConfig) {
         if let Ok(mut w) = self.quorum_config.write() {
             *w = config;
+        }
+    }
+
+    /// Configure the automated alert failover policy.
+    pub fn with_failover_policy(self, policy: AlertFailoverPolicy) -> Self {
+        if let Ok(mut w) = self.failover_policy.write() {
+            *w = policy;
+        }
+        self
+    }
+
+    /// Retrieve a copy of the current alert failover policy.
+    pub fn failover_policy(&self) -> AlertFailoverPolicy {
+        self.failover_policy
+            .read()
+            .map(|r| r.clone())
+            .unwrap_or_default()
+    }
+
+    /// Update the alert failover policy at runtime.
+    pub fn set_failover_policy(&self, policy: AlertFailoverPolicy) {
+        if let Ok(mut w) = self.failover_policy.write() {
+            *w = policy;
+        }
+    }
+
+    /// Process an Alertmanager webhook payload and execute automated interface failover/restore actions.
+    pub fn handle_alert_webhook(&self, raw_body: &str) -> (u16, &'static str, String) {
+        let payload = match AlertmanagerWebhookPayload::parse_json(raw_body) {
+            Ok(p) => p,
+            Err(e) => {
+                let err_json = format!(
+                    "{{\n  \"status\": \"error\",\n  \"message\": \"Invalid JSON: {}\"\n}}",
+                    escape_json_str(&e)
+                );
+                return (400, "application/json", err_json);
+            }
+        };
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let policy = self.failover_policy();
+        let mut failovers_applied = 0;
+        let mut restores_applied = 0;
+        let mut total_sessions_rerouted = 0;
+        let mut details = Vec::new();
+
+        for alert in &payload.alerts {
+            if alert.interface.is_empty() {
+                continue;
+            }
+
+            let is_resolved = alert.status.eq_ignore_ascii_case("resolved")
+                || payload.status.eq_ignore_ascii_case("resolved");
+
+            if is_resolved {
+                match self.registry.restore_interface(
+                    &alert.interface,
+                    policy.restore_target_state,
+                    now_ms,
+                ) {
+                    Ok(rep) => {
+                        restores_applied += 1;
+                        let detail = format!(
+                            concat!(
+                                "    {{\n",
+                                "      \"alertname\": \"{}\",\n",
+                                "      \"interface\": \"{}\",\n",
+                                "      \"status\": \"resolved\",\n",
+                                "      \"action\": \"Restored{:?}\",\n",
+                                "      \"restored_paths\": {:?},\n",
+                                "      \"sessions_rerouted\": 0\n",
+                                "    }}"
+                            ),
+                            escape_json_str(&alert.alertname),
+                            escape_json_str(&alert.interface),
+                            rep.restored_state,
+                            rep.restored_path_ids
+                        );
+                        details.push(detail);
+                    }
+                    Err(e) => {
+                        let detail = format!(
+                            concat!(
+                                "    {{\n",
+                                "      \"alertname\": \"{}\",\n",
+                                "      \"interface\": \"{}\",\n",
+                                "      \"status\": \"error\",\n",
+                                "      \"error\": \"{}\"\n",
+                                "    }}"
+                            ),
+                            escape_json_str(&alert.alertname),
+                            escape_json_str(&alert.interface),
+                            e
+                        );
+                        details.push(detail);
+                    }
+                }
+            } else {
+                let (action, reason) = policy.classify_alert(alert);
+                match self
+                    .registry
+                    .failover_interface(&alert.interface, action, reason, now_ms)
+                {
+                    Ok(rep) => {
+                        failovers_applied += 1;
+                        total_sessions_rerouted += rep.total_sessions_rerouted;
+                        let target_ifaces_json = rep
+                            .target_interfaces
+                            .iter()
+                            .map(|s| format!("\"{}\"", escape_json_str(s)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let detail = format!(
+                            concat!(
+                                "    {{\n",
+                                "      \"alertname\": \"{}\",\n",
+                                "      \"interface\": \"{}\",\n",
+                                "      \"status\": \"firing\",\n",
+                                "      \"action\": \"{}\",\n",
+                                "      \"reason\": \"{}\",\n",
+                                "      \"impacted_paths\": {:?},\n",
+                                "      \"target_paths\": {:?},\n",
+                                "      \"target_interfaces\": [{}],\n",
+                                "      \"sessions_rerouted\": {}\n",
+                                "    }}"
+                            ),
+                            escape_json_str(&alert.alertname),
+                            escape_json_str(&alert.interface),
+                            action.as_str(),
+                            reason.as_str(),
+                            rep.impacted_path_ids,
+                            rep.target_path_ids,
+                            target_ifaces_json,
+                            rep.total_sessions_rerouted
+                        );
+                        details.push(detail);
+                    }
+                    Err(e) => {
+                        let detail = format!(
+                            concat!(
+                                "    {{\n",
+                                "      \"alertname\": \"{}\",\n",
+                                "      \"interface\": \"{}\",\n",
+                                "      \"status\": \"error\",\n",
+                                "      \"error\": \"{}\"\n",
+                                "    }}"
+                            ),
+                            escape_json_str(&alert.alertname),
+                            escape_json_str(&alert.interface),
+                            e
+                        );
+                        details.push(detail);
+                    }
+                }
+            }
+        }
+
+        let resp_json = format!(
+            concat!(
+                "{{\n",
+                "  \"status\": \"success\",\n",
+                "  \"alerts_processed\": {},\n",
+                "  \"failovers_applied\": {},\n",
+                "  \"restores_applied\": {},\n",
+                "  \"total_sessions_rerouted\": {},\n",
+                "  \"details\": [\n{}\n  ]\n",
+                "}}"
+            ),
+            payload.alerts.len(),
+            failovers_applied,
+            restores_applied,
+            total_sessions_rerouted,
+            details.join(",\n")
+        );
+
+        (200, "application/json", resp_json)
+    }
+
+    /// Retrieve failover audit history in JSON format.
+    pub fn handle_failover_history_json(&self) -> (u16, &'static str, String) {
+        match self.registry.multipath_failover_history() {
+            Ok(events) => {
+                let items: Vec<String> = events.iter().map(|e| e.to_json()).collect();
+                let json = format!("[\n{}\n]", items.join(",\n"));
+                (200, "application/json", json)
+            }
+            Err(e) => (500, "application/json", format!("{{\"error\":\"{}\"}}", e)),
         }
     }
 
@@ -2035,59 +2707,94 @@ impl IsspTelemetryServer {
         reader: &mut R,
         writer: &mut W,
     ) -> std::io::Result<(u16, String)> {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; 8192];
         let n = reader.read(&mut buf)?;
         if n == 0 {
             return Ok((400, String::new()));
         }
         let req_str = String::from_utf8_lossy(&buf[..n]);
 
+        let mut method = "GET";
         let mut path = "/metrics";
         let mut accept = "*/*";
+        let mut content_length: usize = 0;
+
         for line in req_str.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("GET ") {
+            if trimmed.starts_with("GET ") || trimmed.starts_with("POST ") {
                 let parts: Vec<&str> = trimmed.split_whitespace().collect();
                 if parts.len() >= 2 {
+                    method = if trimmed.starts_with("POST ") {
+                        "POST"
+                    } else {
+                        "GET"
+                    };
                     path = parts[1];
                 }
             } else if trimmed.to_ascii_lowercase().starts_with("accept:") {
                 accept = trimmed.split(':').nth(1).unwrap_or("").trim();
+            } else if trimmed.to_ascii_lowercase().starts_with("content-length:") {
+                content_length = trimmed
+                    .split(':')
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
             }
         }
 
-        let timestamp_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        let clean_path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
 
-        let snap_res = self.registry.multipath_balancing_snapshot(timestamp_ns);
-        let cluster_nodes = self.registry.cluster_nodes_count().unwrap_or(1);
-        let q_cfg = self.quorum_config();
-        let handler = IsspTelemetryHttpHandler::new(&self.service_name).with_quorum_config(q_cfg);
+        let (code, ctype, body) = if method == "POST" {
+            if clean_path == "/webhook/alerts"
+                || clean_path == "/alerts"
+                || clean_path == "/api/v1/alerts"
+            {
+                let body_str =
+                    extract_http_body(&buf[..n], req_str.as_ref(), reader, content_length)?;
+                self.handle_alert_webhook(&body_str)
+            } else {
+                (404, "text/plain; charset=utf-8", "Not Found\n".to_string())
+            }
+        } else if clean_path == "/api/v1/failovers" || clean_path == "/failovers" {
+            self.handle_failover_history_json()
+        } else {
+            let timestamp_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
 
-        let (code, ctype, body) = match snap_res {
-            Ok(ref snap) => handler.handle_snapshot_with_quorum(path, accept, snap, cluster_nodes),
-            Err(_) => {
-                let clean = path.split('?').next().unwrap_or(path).trim_end_matches('/');
-                if clean == "/livez" || clean == "/healthz" {
-                    (
-                        500,
-                        "text/plain; charset=utf-8",
-                        "DEAD: registry or router lock poisoned\n".to_string(),
-                    )
-                } else if clean == "/readyz" {
-                    (
-                        503,
-                        "text/plain; charset=utf-8",
-                        "DEGRADED: cluster state inaccessible\n".to_string(),
-                    )
-                } else {
-                    (
-                        500,
-                        "text/plain; charset=utf-8",
-                        "Error collecting multipath balancing telemetry\n".to_string(),
-                    )
+            let snap_res = self.registry.multipath_balancing_snapshot(timestamp_ns);
+            let cluster_nodes = self.registry.cluster_nodes_count().unwrap_or(1);
+            let q_cfg = self.quorum_config();
+            let handler =
+                IsspTelemetryHttpHandler::new(&self.service_name).with_quorum_config(q_cfg);
+
+            match snap_res {
+                Ok(ref snap) => {
+                    handler.handle_snapshot_with_quorum(path, accept, snap, cluster_nodes)
+                }
+                Err(_) => {
+                    if clean_path == "/livez" || clean_path == "/healthz" {
+                        (
+                            500,
+                            "text/plain; charset=utf-8",
+                            "DEAD: registry or router lock poisoned\n".to_string(),
+                        )
+                    } else if clean_path == "/readyz" {
+                        (
+                            503,
+                            "text/plain; charset=utf-8",
+                            "DEGRADED: cluster state inaccessible\n".to_string(),
+                        )
+                    } else {
+                        (
+                            500,
+                            "text/plain; charset=utf-8",
+                            "Error collecting multipath balancing telemetry\n".to_string(),
+                        )
+                    }
                 }
             }
         };
@@ -2299,6 +3006,41 @@ impl IsspTelemetryServer {
     }
 }
 
+/// Extract request body bytes following HTTP header delimiters (`\r\n\r\n` or `\n\n`) up to content_length.
+fn extract_http_body<R: Read>(
+    initial_buf: &[u8],
+    req_str: &str,
+    reader: &mut R,
+    content_length: usize,
+) -> std::io::Result<String> {
+    let header_end = req_str
+        .find("\r\n\r\n")
+        .map(|p| p + 4)
+        .or_else(|| req_str.find("\n\n").map(|p| p + 2));
+
+    let mut body_bytes = if let Some(start) = header_end {
+        if start <= initial_buf.len() {
+            initial_buf[start..].to_vec()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    while body_bytes.len() < content_length {
+        let mut chunk = [0u8; 4096];
+        let needed = (content_length - body_bytes.len()).min(4096);
+        let n = reader.read(&mut chunk[..needed])?;
+        if n == 0 {
+            break;
+        }
+        body_bytes.extend_from_slice(&chunk[..n]);
+    }
+
+    Ok(String::from_utf8_lossy(&body_bytes).to_string())
+}
+
 // ─── RFC 6455 WebSocket helpers (std::net only, no external crates) ──────────
 
 /// Extract the value of a named HTTP header from a raw request string.
@@ -2448,6 +3190,8 @@ pub fn snapshot_to_compact_json(s: &IsspMultipathBalancingSnapshot) -> String {
     out.push_str(&s.total_effective_weight.to_string());
     out.push_str(",\"sessions\":");
     out.push_str(&s.total_sessions.to_string());
+    out.push_str(",\"failovers\":");
+    out.push_str(&s.total_failovers.to_string());
     out.push_str(",\"subpaths\":[");
     for (i, sp) in s.subpaths.iter().enumerate() {
         if i > 0 {
@@ -3295,5 +4039,305 @@ mod tests {
         let (stream, _) = server.listener.accept().unwrap();
         server.serve_one_connection(stream).unwrap();
         client_deg.join().unwrap();
+    }
+
+    #[test]
+    fn test_mini_json_parser_primitives_and_objects() {
+        let raw = r#"{
+            "status": "firing",
+            "version": "4",
+            "count": 42.5,
+            "active": true,
+            "data": null,
+            "items": ["eth0", "wwan0"],
+            "meta": {"sub": "test"}
+        }"#;
+
+        let val = MiniJsonValue::parse(raw).expect("parse valid JSON");
+        assert_eq!(val.get("status").and_then(|v| v.as_str()), Some("firing"));
+        assert_eq!(val.get("version").and_then(|v| v.as_str()), Some("4"));
+        assert_eq!(val.get("count").and_then(|v| v.as_f64()), Some(42.5));
+        assert_eq!(val.get("active").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(val.get("data"), Some(&MiniJsonValue::Null));
+
+        let items = val.get("items").and_then(|v| v.as_array()).expect("array");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].as_str(), Some("eth0"));
+        assert_eq!(items[1].as_str(), Some("wwan0"));
+
+        let meta = val.get("meta").expect("meta object");
+        assert_eq!(meta.get("sub").and_then(|v| v.as_str()), Some("test"));
+    }
+
+    #[test]
+    fn test_alertmanager_webhook_payload_parsing() {
+        let payload_json = r#"{
+            "version": "4",
+            "status": "firing",
+            "receiver": "ifa-webhook",
+            "commonLabels": {
+                "instance": "node-1"
+            },
+            "alerts": [
+                {
+                    "status": "firing",
+                    "labels": {
+                        "alertname": "IfaIsspHighJitterSurge",
+                        "interface": "eth0-wan",
+                        "severity": "warning"
+                    },
+                    "annotations": {
+                        "summary": "High jitter surge detected on eth0-wan"
+                    }
+                },
+                {
+                    "status": "firing",
+                    "labels": {
+                        "alertname": "IfaIsspRetransmissionSpike",
+                        "interface": "eth0-wan",
+                        "severity": "critical"
+                    },
+                    "annotations": {
+                        "summary": "Retransmission spike on eth0-wan"
+                    }
+                }
+            ]
+        }"#;
+
+        let payload = AlertmanagerWebhookPayload::parse_json(payload_json).unwrap();
+        assert_eq!(payload.version.as_deref(), Some("4"));
+        assert_eq!(payload.status, "firing");
+        assert_eq!(payload.receiver.as_deref(), Some("ifa-webhook"));
+        assert_eq!(payload.alerts.len(), 2);
+
+        let a1 = &payload.alerts[0];
+        assert_eq!(a1.alertname, "IfaIsspHighJitterSurge");
+        assert_eq!(a1.interface, "eth0-wan");
+        assert_eq!(a1.severity, "warning");
+        assert_eq!(
+            a1.labels.get("instance").map(|s| s.as_str()),
+            Some("node-1")
+        );
+
+        let a2 = &payload.alerts[1];
+        assert_eq!(a2.alertname, "IfaIsspRetransmissionSpike");
+        assert_eq!(a2.interface, "eth0-wan");
+        assert_eq!(a2.severity, "critical");
+
+        let policy = AlertFailoverPolicy::default();
+        let (action1, reason1) = policy.classify_alert(a1);
+        assert_eq!(
+            action1,
+            crate::session_sync::FailoverAction::SwitchToStandby
+        );
+        assert_eq!(
+            reason1,
+            crate::session_sync::IsspFailoverReason::AlertmanagerJitterSurge
+        );
+
+        let (action2, reason2) = policy.classify_alert(a2);
+        assert_eq!(
+            action2,
+            crate::session_sync::FailoverAction::SwitchToStandby
+        );
+        assert_eq!(
+            reason2,
+            crate::session_sync::IsspFailoverReason::AlertmanagerRetransmissionSpike
+        );
+    }
+
+    #[test]
+    fn test_telemetry_server_alertmanager_webhook_jitter_failover_and_restore() {
+        use crate::session_sync::{
+            IsspMultipathRoute, IsspPathState, IsspRoutingPolicy, SessionId, SessionRegistry,
+        };
+
+        let reg = SessionRegistry::new(42);
+        reg.set_multipath_routing_policy(IsspRoutingPolicy::ActiveStandby)
+            .unwrap();
+
+        // Route 1 on eth0-wan (Active, Priority 1)
+        let r1 =
+            IsspMultipathRoute::new(1, 10, "eth0-wan", 1, 100).with_state(IsspPathState::Active);
+        reg.add_multipath_route(r1).unwrap();
+
+        // Route 2 on wwan0-5g (Standby backup, Priority 2)
+        let r2 =
+            IsspMultipathRoute::new(2, 10, "wwan0-5g", 2, 50).with_state(IsspPathState::Standby);
+        reg.add_multipath_route(r2).unwrap();
+
+        // Bind a session to path 1
+        let s_id = SessionId::new(0x1122334455667788, 42, 1);
+        let resolved = reg.resolve_session_path(&s_id, 1000).unwrap();
+        assert_eq!(resolved, 1);
+
+        let server = IsspTelemetryServer::bind("127.0.0.1:0", "node-42", reg.clone()).unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let client = std::thread::spawn(move || {
+            // 1. Post Alertmanager firing webhook for High Jitter on eth0-wan
+            let webhook_body = r#"{
+                "version": "4",
+                "status": "firing",
+                "receiver": "ifa-webhook",
+                "alerts": [
+                    {
+                        "status": "firing",
+                        "labels": {
+                            "alertname": "IfaIsspHighJitterSurge",
+                            "interface": "eth0-wan",
+                            "severity": "warning"
+                        },
+                        "annotations": {
+                            "summary": "Jitter spike > 15ms"
+                        }
+                    }
+                ]
+            }"#;
+
+            let mut s = TcpStream::connect(addr).unwrap();
+            let req = format!(
+                "POST /webhook/alerts HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                webhook_body.len(),
+                webhook_body
+            );
+            s.write_all(req.as_bytes()).unwrap();
+            let mut resp = String::new();
+            s.read_to_string(&mut resp).unwrap();
+
+            assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(resp.contains("\"status\": \"success\""));
+            assert!(resp.contains("\"failovers_applied\": 1"));
+            assert!(resp.contains("\"total_sessions_rerouted\": 1"));
+            assert!(resp.contains("\"action\": \"SwitchToStandby\""));
+            assert!(resp.contains("\"reason\": \"AlertmanagerJitterSurge\""));
+
+            // 2. Query failover audit history GET /api/v1/failovers
+            let mut s_hist = TcpStream::connect(addr).unwrap();
+            s_hist
+                .write_all(b"GET /api/v1/failovers HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            let mut resp_hist = String::new();
+            s_hist.read_to_string(&mut resp_hist).unwrap();
+            assert!(resp_hist.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(resp_hist.contains("\"failed_path_id\": 1"));
+            assert!(resp_hist.contains("\"target_path_id\": 2"));
+            assert!(resp_hist.contains("\"reason\": \"AlertmanagerJitterSurge\""));
+
+            // 3. Post resolved webhook for eth0-wan
+            let resolved_body = r#"{
+                "version": "4",
+                "status": "resolved",
+                "receiver": "ifa-webhook",
+                "alerts": [
+                    {
+                        "status": "resolved",
+                        "labels": {
+                            "alertname": "IfaIsspHighJitterSurge",
+                            "interface": "eth0-wan"
+                        }
+                    }
+                ]
+            }"#;
+
+            let mut s_res = TcpStream::connect(addr).unwrap();
+            let req_res = format!(
+                "POST /webhook/alerts HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                resolved_body.len(),
+                resolved_body
+            );
+            s_res.write_all(req_res.as_bytes()).unwrap();
+            let mut resp_res = String::new();
+            s_res.read_to_string(&mut resp_res).unwrap();
+            assert!(resp_res.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(resp_res.contains("\"restores_applied\": 1"));
+            assert!(resp_res.contains("\"action\": \"RestoredActive\""));
+        });
+
+        // Serve the 3 client connections
+        for _ in 0..3 {
+            let (stream, _) = server.listener.accept().unwrap();
+            server.serve_one_connection(stream).unwrap();
+        }
+
+        client.join().unwrap();
+
+        // Verify registry post-failover and restore state
+        let routes = reg.list_multipath_routes().unwrap();
+        let r1_state = routes.iter().find(|r| r.path_id == 1).unwrap().state;
+        assert_eq!(r1_state, IsspPathState::Active); // Restored back to Active
+    }
+
+    #[test]
+    fn test_telemetry_server_retransmission_spike_failover() {
+        use crate::session_sync::{
+            IsspMultipathRoute, IsspPathState, IsspRoutingPolicy, SessionId, SessionRegistry,
+        };
+
+        let reg = SessionRegistry::new(88);
+        reg.set_multipath_routing_policy(IsspRoutingPolicy::ActiveStandby)
+            .unwrap();
+        reg.add_multipath_route(
+            IsspMultipathRoute::new(10, 1, "eth0-primary", 1, 100)
+                .with_state(IsspPathState::Active),
+        )
+        .unwrap();
+        reg.add_multipath_route(
+            IsspMultipathRoute::new(20, 1, "wwan0-secondary", 2, 50)
+                .with_state(IsspPathState::Standby),
+        )
+        .unwrap();
+
+        let s1 = SessionId::new(0xabcdef, 88, 1);
+        let s2 = SessionId::new(0xabcdef, 88, 2);
+        assert_eq!(reg.resolve_session_path(&s1, 100).unwrap(), 10);
+        assert_eq!(reg.resolve_session_path(&s2, 100).unwrap(), 10);
+
+        let server = IsspTelemetryServer::bind("127.0.0.1:0", "node-88", reg.clone()).unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let client = std::thread::spawn(move || {
+            let webhook_body = r#"{
+                "version": "4",
+                "status": "firing",
+                "receiver": "ifa-webhook",
+                "alerts": [
+                    {
+                        "status": "firing",
+                        "labels": {
+                            "alertname": "IfaIsspRetransmissionSpike",
+                            "interface": "eth0-primary",
+                            "severity": "critical"
+                        },
+                        "annotations": {
+                            "summary": "Retransmissions > 5%"
+                        }
+                    }
+                ]
+            }"#;
+
+            let mut s = TcpStream::connect(addr).unwrap();
+            let req = format!(
+                "POST /alerts HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                webhook_body.len(),
+                webhook_body
+            );
+            s.write_all(req.as_bytes()).unwrap();
+            let mut resp = String::new();
+            s.read_to_string(&mut resp).unwrap();
+
+            assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(resp.contains("\"failovers_applied\": 1"));
+            assert!(resp.contains("\"total_sessions_rerouted\": 2"));
+            assert!(resp.contains("\"reason\": \"AlertmanagerRetransmissionSpike\""));
+        });
+
+        let (stream, _) = server.listener.accept().unwrap();
+        server.serve_one_connection(stream).unwrap();
+        client.join().unwrap();
+
+        // Confirm sessions are now routed to path 20
+        assert_eq!(reg.resolve_session_path(&s1, 200).unwrap(), 20);
+        assert_eq!(reg.resolve_session_path(&s2, 200).unwrap(), 20);
     }
 }
