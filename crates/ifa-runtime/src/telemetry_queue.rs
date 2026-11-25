@@ -489,7 +489,7 @@ mod tests {
         // Drain from the main thread until all producers finish and ring is empty.
         let mut drained = 0u64;
         loop {
-            while let Some(_) = ring.drain_next() {
+            while ring.drain_next().is_some() {
                 drained += 1;
             }
             // Check if all producer threads have finished.
@@ -500,7 +500,7 @@ mod tests {
             std::hint::spin_loop();
         }
         // Drain any residual.
-        while let Some(_) = ring.drain_next() {
+        while ring.drain_next().is_some() {
             drained += 1;
         }
 
