@@ -5,7 +5,8 @@ use ifa_runtime::{
     run_issp_failover_benchmark_suite, run_issp_scenario, IsspBandwidthEstimate, IsspCapsule,
     IsspCongestionPhase, IsspFailoverBenchmarkSuiteReport, IsspFlapDampingConfig,
     IsspHeartbeatProbe, IsspMultipathRoute, IsspNetworkProfile, IsspPathState, IsspProbationConfig,
-    IsspRoutingPolicy, SecurityPolicy, SessionId, SessionRecord, SessionRegistry, SessionSnapshot,
+    IsspRoutingPolicy, IsspTelemetryServer, SecurityPolicy, SessionId, SessionRecord,
+    SessionRegistry, SessionSnapshot,
 };
 use serde_json::json;
 use std::fs;
@@ -150,6 +151,21 @@ pub enum SessionCommand {
         /// Output formatted as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Expose live multipath balancing telemetry over HTTP (Prometheus `/metrics` and OTLP `/v1/metrics`)
+    TelemetryServe {
+        /// TCP address to bind the telemetry HTTP server (e.g. 127.0.0.1:9100)
+        #[arg(short, long, default_value = "127.0.0.1:9100")]
+        addr: String,
+        /// Path to persistent cluster state dump (.issp or binary dump)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+        /// Maximum number of requests to serve before exiting (0 = unlimited)
+        #[arg(short, long, default_value = "0")]
+        max_requests: usize,
+        /// Node identifier included in exported metrics labels
+        #[arg(long, default_value = "ifa-issp-node")]
+        node_id: String,
     },
 }
 
@@ -1511,6 +1527,90 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+
+        SessionCommand::TelemetryServe {
+            addr,
+            file,
+            max_requests,
+            node_id,
+        } => {
+            let registry = match resolve_state_file(file.as_ref()) {
+                Some(p) if p.exists() => match SessionRegistry::load_from_file(&p) {
+                    Ok(reg) => reg,
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: failed loading state from {:?} ({}), starting with empty registry",
+                            p, e
+                        );
+                        SessionRegistry::new(1)
+                    }
+                },
+                _ => SessionRegistry::new(1),
+            };
+
+            let server = match IsspTelemetryServer::bind(&addr, &node_id, registry) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: cannot bind telemetry server on {}: {}", addr, e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let local_addr = server
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| addr.clone());
+
+            eprintln!(
+                "Telemetry server listening on http://{} — Prometheus: /metrics | OTLP JSON: /v1/metrics",
+                local_addr
+            );
+
+            if max_requests == 0 {
+                // Unlimited: serve until SIGINT / process termination
+                loop {
+                    match server.try_serve_one() {
+                        Ok(Some((status, path))) => {
+                            eprintln!("[{}] {} -> HTTP {}", current_unix_secs(), path, status);
+                        }
+                        Ok(None) => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(e) => {
+                            eprintln!("error: accept failed: {}", e);
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+            } else {
+                // Bounded: serve exactly `max_requests` connections then exit
+                let mut served = 0usize;
+                server.set_nonblocking(false).ok();
+                while served < max_requests {
+                    match server.try_serve_one() {
+                        Ok(Some((status, path))) => {
+                            eprintln!("[{}] {} -> HTTP {}", current_unix_secs(), path, status);
+                            served += 1;
+                        }
+                        Ok(None) => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(e) => {
+                            eprintln!("error: accept failed: {}", e);
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+                eprintln!("Served {} request(s). Exiting.", served);
+                ExitCode::SUCCESS
+            }
+        }
     }
 }
 
@@ -1540,5 +1640,142 @@ mod tests {
             json: false,
         });
         assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_telemetry_serve_binds_and_serves_one_prometheus_request() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let registry = SessionRegistry::new(1);
+        let server = IsspTelemetryServer::bind("127.0.0.1:0", "test-node-651", registry)
+            .expect("bind failed");
+        server.set_nonblocking(true).unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut buf = String::new();
+            stream.read_to_string(&mut buf).unwrap();
+            buf
+        });
+
+        let mut served = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !served && std::time::Instant::now() < deadline {
+            match server.try_serve_one() {
+                Ok(Some((status, path))) => {
+                    assert_eq!(status, 200);
+                    assert_eq!(path, "/metrics");
+                    served = true;
+                }
+                Ok(None) | Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+        assert!(
+            served,
+            "did not serve the Prometheus /metrics request in time"
+        );
+
+        let response = handle.join().unwrap();
+        assert!(
+            response.contains("HTTP/1.1 200"),
+            "unexpected response: {}",
+            &response[..response.len().min(200)]
+        );
+        assert!(
+            response.contains("ifa_issp_multipath"),
+            "Prometheus metrics missing from response"
+        );
+    }
+
+    #[test]
+    fn test_telemetry_serve_binds_and_serves_one_otlp_request() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let registry = SessionRegistry::new(1);
+        let server = IsspTelemetryServer::bind("127.0.0.1:0", "test-node-651-otlp", registry)
+            .expect("bind failed");
+        server.set_nonblocking(true).unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .write_all(
+                    b"GET /v1/metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            let mut buf = String::new();
+            stream.read_to_string(&mut buf).unwrap();
+            buf
+        });
+
+        let mut served = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !served && std::time::Instant::now() < deadline {
+            match server.try_serve_one() {
+                Ok(Some((status, path))) => {
+                    assert_eq!(status, 200);
+                    assert_eq!(path, "/v1/metrics");
+                    served = true;
+                }
+                Ok(None) | Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+        assert!(served, "did not serve the OTLP /v1/metrics request in time");
+
+        let response = handle.join().unwrap();
+        assert!(
+            response.contains("HTTP/1.1 200"),
+            "unexpected OTLP response: {}",
+            &response[..response.len().min(200)]
+        );
+        assert!(
+            response.contains("resourceMetrics") || response.contains("scopeMetrics"),
+            "OTLP JSON payload missing from response"
+        );
+    }
+
+    #[test]
+    fn test_telemetry_serve_max_requests_bounded() {
+        use std::io::Write;
+        use std::net::TcpStream;
+
+        let registry = SessionRegistry::new(1);
+        let probe_server =
+            IsspTelemetryServer::bind("127.0.0.1:0", "test-bounded", registry).unwrap();
+        probe_server.set_nonblocking(true).unwrap();
+        let addr = probe_server.local_addr().unwrap();
+
+        let client = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            if let Ok(mut s) = TcpStream::connect(addr) {
+                let _ = s.write_all(
+                    b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+
+        let mut served = 0usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while served < 1 && std::time::Instant::now() < deadline {
+            match probe_server.try_serve_one() {
+                Ok(Some(_)) => served += 1,
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        client.join().ok();
+        assert_eq!(served, 1, "expected exactly 1 served request");
     }
 }
