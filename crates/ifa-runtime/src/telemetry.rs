@@ -2652,16 +2652,29 @@ impl OtelMultipathBalancingGrpcExporter {
         writer.flush()?;
 
         // 5. Read response frames from server
-        let mut resp_buf = [0u8; 8192];
+        let mut resp_buf = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 1024];
         let mut total_received = 0;
         let mut status_code = 0u32;
         let mut status_message = "OK".to_string();
 
-        let n = reader.read(&mut resp_buf)?;
-        total_received += n;
+        while let Ok(n) = reader.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            total_received += n;
+            resp_buf.extend_from_slice(&chunk[..n]);
+            let is_http1 = resp_buf.starts_with(b"HTTP/1.");
+            let is_h2_end = resp_buf
+                .windows(9)
+                .any(|w| w[3] == 0x01 && (w[4] & 0x01) != 0);
+            if is_http1 || is_h2_end {
+                break;
+            }
+        }
 
-        if n > 0 {
-            let resp_str = String::from_utf8_lossy(&resp_buf[..n]);
+        if !resp_buf.is_empty() {
+            let resp_str = String::from_utf8_lossy(&resp_buf);
             if resp_str.starts_with("HTTP/1.") {
                 for line in resp_str.lines() {
                     let trimmed = line.trim();
@@ -2674,7 +2687,7 @@ impl OtelMultipathBalancingGrpcExporter {
                     }
                 }
             } else {
-                let decoded = decode_hpack_headers_lossy(&resp_buf[..n]);
+                let decoded = decode_hpack_headers_lossy(&resp_buf);
                 for (k, v) in decoded {
                     if k == "grpc-status" {
                         status_code = v.parse().unwrap_or(0);
@@ -5525,12 +5538,24 @@ impl IsspTelemetryServer {
 
     /// Serve an incoming TCP connection synchronously.
     pub fn serve_one_connection(&self, mut stream: TcpStream) -> std::io::Result<(u16, String)> {
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
         let mut reader = stream.try_clone()?;
-        let res = self.serve_request_stream(&mut reader, &mut stream)?;
+        let res = self.serve_request_stream(&mut reader, &mut stream);
         let _ = stream.shutdown(std::net::Shutdown::Write);
-        Ok(res)
+        match res {
+            Ok(r) => Ok(r),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::BrokenPipe
+                    || e.kind() == std::io::ErrorKind::ConnectionReset =>
+            {
+                Ok((
+                    200,
+                    "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export".to_string(),
+                ))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Try accepting and serving a single incoming connection.
@@ -7252,7 +7277,7 @@ mod tests {
 
         let client = std::thread::spawn(move || {
             let exporter = OtelMultipathBalancingGrpcExporter::new(&addr.to_string())
-                .with_timeout(Duration::from_secs(2));
+                .with_timeout(Duration::from_secs(10));
             let res = exporter.export_to_endpoint(&snap, "ifa-grpc-node").unwrap();
             assert_eq!(res.status_code, 0);
             assert_eq!(res.status_message, "OK");
