@@ -5674,6 +5674,329 @@ impl ExtendedConnectRequest {
     }
 }
 
+// ── RFC 8899 / RFC 9000 DPLPMTUD Probe Framing ────────────────────────────
+
+/// Magic tag identifying a Path MTU Discovery (PMTUD) probe packet: "PMTU".
+pub const PMTU_PROBE_MAGIC: [u8; 4] = [0x50, 0x4D, 0x54, 0x55];
+
+/// Magic tag identifying a Path MTU Discovery probe response packet: "PMTR".
+pub const PMTU_RESPONSE_MAGIC: [u8; 4] = [0x50, 0x4D, 0x54, 0x52];
+
+/// Wire probe packet used to discover Path MTU according to RFC 8899 / RFC 9000 §14.
+/// The probe is padded so that its total serialized length exactly matches `target_size`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmtuProbeFrame {
+    /// Monotonically increasing probe sequence identifier.
+    pub probe_id: u64,
+    /// Target total wire byte length of this probe packet.
+    pub target_size: u16,
+    /// Random or cryptographic verification challenge token.
+    pub token: [u8; 8],
+    /// Zero-filled padding bytes ensuring total packet size equals `target_size`.
+    pub padding: Vec<u8>,
+}
+
+impl PmtuProbeFrame {
+    /// Fixed header length before padding: magic (4) + probe_id (8) + target_size (2) + token (8) = 22 bytes.
+    pub const HEADER_LEN: usize = 22;
+
+    /// Create a new PMTU probe frame targeting `target_size` bytes.
+    pub fn new(probe_id: u64, target_size: u16, token: [u8; 8]) -> Self {
+        let padding_len = (target_size as usize).saturating_sub(Self::HEADER_LEN);
+        Self {
+            probe_id,
+            target_size,
+            token,
+            padding: vec![0u8; padding_len],
+        }
+    }
+
+    /// Encode probe packet into raw wire format.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&PMTU_PROBE_MAGIC);
+        out.extend_from_slice(&self.probe_id.to_be_bytes());
+        out.extend_from_slice(&self.target_size.to_be_bytes());
+        out.extend_from_slice(&self.token);
+        out.extend_from_slice(&self.padding);
+    }
+
+    /// Encode probe packet into an allocated byte vector.
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.target_size as usize);
+        self.encode(&mut out);
+        out
+    }
+
+    /// Decode a PMTU probe frame from wire bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, FastHttpError> {
+        if bytes.len() < Self::HEADER_LEN {
+            return Err(FastHttpError::Incomplete);
+        }
+        if bytes[0..4] != PMTU_PROBE_MAGIC {
+            return Err(FastHttpError::InvalidFrame);
+        }
+        let probe_id = u64::from_be_bytes(
+            bytes[4..12]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let target_size = u16::from_be_bytes(
+            bytes[12..14]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let mut token = [0u8; 8];
+        token.copy_from_slice(&bytes[14..22]);
+
+        let padding = bytes[22..].to_vec();
+        Ok(Self {
+            probe_id,
+            target_size,
+            token,
+            padding,
+        })
+    }
+
+    /// Construct the corresponding response echoing probe ID, target size, and challenge token.
+    pub fn to_response(&self) -> PmtuProbeResponseFrame {
+        PmtuProbeResponseFrame::new(self.probe_id, self.target_size, self.token)
+    }
+}
+
+/// Acknowledgement / response echoing a successfully received PMTU probe packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmtuProbeResponseFrame {
+    /// Probe sequence identifier being acknowledged.
+    pub probe_id: u64,
+    /// Verified target wire size that traversed the network path.
+    pub target_size: u16,
+    /// Reflected verification challenge token.
+    pub token: [u8; 8],
+}
+
+impl PmtuProbeResponseFrame {
+    /// Wire length of response frame: magic (4) + probe_id (8) + target_size (2) + token (8) = 22 bytes.
+    pub const WIRE_LEN: usize = 22;
+
+    /// Create a new PMTU probe response frame.
+    pub fn new(probe_id: u64, target_size: u16, token: [u8; 8]) -> Self {
+        Self {
+            probe_id,
+            target_size,
+            token,
+        }
+    }
+
+    /// Encode response packet into raw wire format.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&PMTU_RESPONSE_MAGIC);
+        out.extend_from_slice(&self.probe_id.to_be_bytes());
+        out.extend_from_slice(&self.target_size.to_be_bytes());
+        out.extend_from_slice(&self.token);
+    }
+
+    /// Encode response packet into an allocated byte vector.
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::WIRE_LEN);
+        self.encode(&mut out);
+        out
+    }
+
+    /// Decode a PMTU probe response frame from wire bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, FastHttpError> {
+        if bytes.len() < Self::WIRE_LEN {
+            return Err(FastHttpError::Incomplete);
+        }
+        if bytes[0..4] != PMTU_RESPONSE_MAGIC {
+            return Err(FastHttpError::InvalidFrame);
+        }
+        let probe_id = u64::from_be_bytes(
+            bytes[4..12]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let target_size = u16::from_be_bytes(
+            bytes[12..14]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let mut token = [0u8; 8];
+        token.copy_from_slice(&bytes[14..22]);
+
+        Ok(Self {
+            probe_id,
+            target_size,
+            token,
+        })
+    }
+
+    /// Verify whether this response corresponds to an outstanding probe.
+    pub fn matches_probe(&self, probe: &PmtuProbeFrame) -> bool {
+        self.probe_id == probe.probe_id
+            && self.target_size == probe.target_size
+            && self.token == probe.token
+    }
+}
+
+// ── RFC 9297 / RFC 9298 Adaptive Datagram Fragmentation ───────────────────
+
+/// Magic byte prefix identifying a fragmented datagram frame: 0xFD ('Fragmented Datagram').
+pub const DATAGRAM_FRAGMENT_MAGIC: u8 = 0xFD;
+
+/// Format version identifier: 0x01.
+pub const DATAGRAM_FRAGMENT_VERSION: u8 = 0x01;
+
+/// Fixed-size header preceding each chunk of a fragmented datagram.
+///
+/// Wire layout (22 bytes total):
+/// - `magic` (1 byte, 0xFD)
+/// - `version` (1 byte, 0x01)
+/// - `datagram_id` (8 bytes, Big-Endian u64)
+/// - `fragment_index` (2 bytes, Big-Endian u16)
+/// - `total_fragments` (2 bytes, Big-Endian u16)
+/// - `original_length` (4 bytes, Big-Endian u32)
+/// - `checksum` (4 bytes, Big-Endian u32 CRC32)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatagramFragmentHeader {
+    /// Unique identifier for the parent datagram.
+    pub datagram_id: u64,
+    /// 0-based chunk index of this fragment.
+    pub fragment_index: u16,
+    /// Total number of fragments comprising the original datagram.
+    pub total_fragments: u16,
+    /// Full unfragmented payload byte length.
+    pub original_length: u32,
+    /// IEEE 802.3 CRC32 checksum computed over the complete unfragmented payload.
+    pub checksum: u32,
+}
+
+impl DatagramFragmentHeader {
+    /// Header size in serialized wire bytes.
+    pub const HEADER_LEN: usize = 22;
+
+    /// Create a new datagram fragment header.
+    pub fn new(
+        datagram_id: u64,
+        fragment_index: u16,
+        total_fragments: u16,
+        original_length: u32,
+        checksum: u32,
+    ) -> Self {
+        Self {
+            datagram_id,
+            fragment_index,
+            total_fragments,
+            original_length,
+            checksum,
+        }
+    }
+
+    /// Check whether a buffer begins with the fragmented datagram magic and version.
+    pub fn is_fragment_header(bytes: &[u8]) -> bool {
+        bytes.len() >= 2
+            && bytes[0] == DATAGRAM_FRAGMENT_MAGIC
+            && bytes[1] == DATAGRAM_FRAGMENT_VERSION
+    }
+
+    /// Encode fragment header into wire bytes.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.push(DATAGRAM_FRAGMENT_MAGIC);
+        out.push(DATAGRAM_FRAGMENT_VERSION);
+        out.extend_from_slice(&self.datagram_id.to_be_bytes());
+        out.extend_from_slice(&self.fragment_index.to_be_bytes());
+        out.extend_from_slice(&self.total_fragments.to_be_bytes());
+        out.extend_from_slice(&self.original_length.to_be_bytes());
+        out.extend_from_slice(&self.checksum.to_be_bytes());
+    }
+
+    /// Decode fragment header from wire bytes. Returns `(header, bytes_consumed)`.
+    pub fn decode(bytes: &[u8]) -> Result<(Self, usize), FastHttpError> {
+        if bytes.len() < Self::HEADER_LEN {
+            return Err(FastHttpError::Incomplete);
+        }
+        if bytes[0] != DATAGRAM_FRAGMENT_MAGIC || bytes[1] != DATAGRAM_FRAGMENT_VERSION {
+            return Err(FastHttpError::InvalidFrame);
+        }
+
+        let datagram_id = u64::from_be_bytes(
+            bytes[2..10]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let fragment_index = u16::from_be_bytes(
+            bytes[10..12]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let total_fragments = u16::from_be_bytes(
+            bytes[12..14]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let original_length = u32::from_be_bytes(
+            bytes[14..18]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let checksum = u32::from_be_bytes(
+            bytes[18..22]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+
+        if total_fragments == 0 || fragment_index >= total_fragments {
+            return Err(FastHttpError::InvalidFrame);
+        }
+
+        Ok((
+            Self {
+                datagram_id,
+                fragment_index,
+                total_fragments,
+                original_length,
+                checksum,
+            },
+            Self::HEADER_LEN,
+        ))
+    }
+}
+
+/// A serialized or in-flight datagram fragment carrying a slice of a larger datagram payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatagramFragment {
+    /// Fragment routing and reassembly metadata.
+    pub header: DatagramFragmentHeader,
+    /// Slice of payload bytes.
+    pub payload: Vec<u8>,
+}
+
+impl DatagramFragment {
+    /// Create a new datagram fragment.
+    pub fn new(header: DatagramFragmentHeader, payload: Vec<u8>) -> Self {
+        Self { header, payload }
+    }
+
+    /// Wire byte size of this fragment (header + payload).
+    pub fn wire_size(&self) -> usize {
+        DatagramFragmentHeader::HEADER_LEN + self.payload.len()
+    }
+
+    /// Encode this fragment into an allocated byte vector.
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.wire_size());
+        self.header.encode(&mut out);
+        out.extend_from_slice(&self.payload);
+        out
+    }
+
+    /// Decode a datagram fragment from wire bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, FastHttpError> {
+        let (header, header_len) = DatagramFragmentHeader::decode(bytes)?;
+        let payload = bytes[header_len..].to_vec();
+        Ok(Self { header, payload })
+    }
+}
+
 #[cfg(test)]
 mod http2_tests {
     use super::*;
@@ -7517,5 +7840,60 @@ mod http2_tests {
         let setting_id = Http2SettingId::from(id_u16);
         assert_eq!(setting_id, Http2SettingId::EnableConnectProtocol);
         assert_eq!(u16::from(setting_id), 0x8);
+    }
+
+    #[test]
+    fn test_pmtu_probe_and_response_framing() {
+        let token = [1, 2, 3, 4, 5, 6, 7, 8];
+        let probe = PmtuProbeFrame::new(101, 1420, token);
+        assert_eq!(probe.target_size, 1420);
+        assert_eq!(probe.probe_id, 101);
+        assert_eq!(probe.token, token);
+        assert_eq!(probe.padding.len(), 1420 - PmtuProbeFrame::HEADER_LEN);
+
+        let wire = probe.encode_to_vec();
+        assert_eq!(wire.len(), 1420);
+
+        let decoded = PmtuProbeFrame::decode(&wire).expect("decode probe frame");
+        assert_eq!(decoded.probe_id, 101);
+        assert_eq!(decoded.target_size, 1420);
+        assert_eq!(decoded.token, token);
+        assert_eq!(decoded.padding.len(), probe.padding.len());
+
+        let resp = decoded.to_response();
+        assert!(resp.matches_probe(&probe));
+        let resp_wire = resp.encode_to_vec();
+        assert_eq!(resp_wire.len(), PmtuProbeResponseFrame::WIRE_LEN);
+
+        let decoded_resp = PmtuProbeResponseFrame::decode(&resp_wire).expect("decode response");
+        assert_eq!(decoded_resp, resp);
+        assert!(decoded_resp.matches_probe(&probe));
+    }
+
+    #[test]
+    fn test_datagram_fragment_header_and_wire_framing() {
+        let header = DatagramFragmentHeader::new(42, 1, 3, 3500, 0x12345678);
+        assert_eq!(header.datagram_id, 42);
+        assert_eq!(header.fragment_index, 1);
+        assert_eq!(header.total_fragments, 3);
+        assert_eq!(header.original_length, 3500);
+        assert_eq!(header.checksum, 0x12345678);
+
+        let fragment = DatagramFragment::new(header, vec![10, 20, 30, 40]);
+        assert_eq!(
+            fragment.wire_size(),
+            DatagramFragmentHeader::HEADER_LEN + 4
+        );
+
+        let wire = fragment.encode_to_vec();
+        assert!(DatagramFragmentHeader::is_fragment_header(&wire));
+
+        let decoded = DatagramFragment::decode(&wire).expect("decode fragment");
+        assert_eq!(decoded, fragment);
+
+        // Corrupted magic should fail
+        let mut corrupted = wire.clone();
+        corrupted[0] = 0xAA;
+        assert!(DatagramFragment::decode(&corrupted).is_err());
     }
 }

@@ -7151,6 +7151,629 @@ pub enum PathValidationState {
     },
 }
 
+// ── RFC 8899 / RFC 9000 Path MTU Discovery (PMTUD & DPLPMTUD) ─────────────
+
+/// Operational state of Path MTU Discovery according to RFC 8899 (DPLPMTUD).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmtudState {
+    /// PMTU discovery is disabled; the configured base MTU is used unconditionally.
+    Disabled,
+    /// Confirmed operating at base MTU; search probing is initialized.
+    Base,
+    /// Actively probing candidate MTU sizes using bracketed search.
+    Searching,
+    /// Path MTU search converged; operating at confirmed maximum MTU.
+    SearchComplete,
+    /// Black hole loss detected; operating under emergency fallback to base MTU.
+    BlackHoleRecovery,
+}
+
+/// Configuration parameters for RFC 8899 Datagram Packetization Layer PMTUD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmtudConfig {
+    /// Base guaranteed minimum Path MTU (default: 1200 bytes per RFC 9000).
+    pub base_mtu: usize,
+    /// Maximum allowed MTU boundary to probe (default: 1500 bytes for standard Ethernet).
+    pub max_mtu: usize,
+    /// Ordered list of candidate MTU probe target sizes.
+    pub probe_candidates: Vec<usize>,
+    /// Maximum probe retransmission attempts per candidate size before declaring failure.
+    pub max_probes: usize,
+    /// Probe timeout duration before declaring a probe packet lost.
+    pub probe_timeout: Duration,
+    /// Consecutive packet losses triggering black hole recovery fallback.
+    pub blackhole_loss_threshold: usize,
+}
+
+impl Default for PmtudConfig {
+    fn default() -> Self {
+        Self {
+            base_mtu: 1200,
+            max_mtu: 1500,
+            probe_candidates: vec![1200, 1280, 1350, 1420, 1472, 1500],
+            max_probes: 3,
+            probe_timeout: Duration::from_millis(1000),
+            blackhole_loss_threshold: 3,
+        }
+    }
+}
+
+/// Telemetry metrics for PMTU Discovery and adaptive datagram fragmentation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PmtudTelemetry {
+    /// Total PMTU probe packets transmitted.
+    pub probes_sent: usize,
+    /// Total PMTU probe response packets successfully received.
+    pub probes_acknowledged: usize,
+    /// Total probe packets lost due to timeout or dropping.
+    pub probes_lost: usize,
+    /// Number of times the confirmed operational PMTU was successfully increased.
+    pub pmtu_raised_count: usize,
+    /// Number of black hole detection events triggering fallback to base MTU.
+    pub blackhole_recoveries: usize,
+    /// Total datagrams requiring fragmentation.
+    pub datagrams_fragmented: usize,
+    /// Total individual datagram fragment chunks transmitted.
+    pub total_fragments_sent: usize,
+    /// Total datagrams successfully reassembled from chunks.
+    pub datagrams_reassembled: usize,
+    /// Total individual datagram fragment chunks received.
+    pub total_fragments_received: usize,
+    /// Fragments or datagrams dropped due to checksum mismatch.
+    pub checksum_errors: usize,
+    /// Incomplete fragmented datagrams pruned due to TTL timeout.
+    pub stale_fragments_pruned: usize,
+}
+
+/// RFC 8899 / RFC 9000 DPLPMTUD state machine managing Path MTU Discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathMtuDiscovery {
+    pub config: PmtudConfig,
+    pub state: PmtudState,
+    pub current_pmtu: usize,
+    candidate_index: usize,
+    active_probe: Option<(u64, usize, [u8; 8], std::time::Instant)>,
+    probe_attempts: usize,
+    consecutive_losses: usize,
+    pub telemetry: PmtudTelemetry,
+    next_probe_id: u64,
+}
+
+impl Default for PathMtuDiscovery {
+    fn default() -> Self {
+        Self::new(PmtudConfig::default())
+    }
+}
+
+impl PathMtuDiscovery {
+    /// Initialize PMTU discovery with the provided configuration.
+    pub fn new(config: PmtudConfig) -> Self {
+        let base = config.base_mtu;
+        Self {
+            config,
+            state: PmtudState::Base,
+            current_pmtu: base,
+            candidate_index: 0,
+            active_probe: None,
+            probe_attempts: 0,
+            consecutive_losses: 0,
+            telemetry: PmtudTelemetry::default(),
+            next_probe_id: 1,
+        }
+    }
+
+    /// Construct a disabled PMTU discovery instance using fixed base MTU.
+    pub fn disabled(base_mtu: usize) -> Self {
+        let mut p = Self::new(PmtudConfig {
+            base_mtu,
+            max_mtu: base_mtu,
+            probe_candidates: vec![base_mtu],
+            ..Default::default()
+        });
+        p.state = PmtudState::Disabled;
+        p
+    }
+
+    /// Return the current confirmed operational Path MTU in bytes.
+    pub fn current_pmtu(&self) -> usize {
+        self.current_pmtu
+    }
+
+    /// Return the current discovery state.
+    pub fn state(&self) -> PmtudState {
+        self.state
+    }
+
+    /// Calculate effective maximum payload capacity given transport header overhead.
+    pub fn effective_max_payload(&self, transport_overhead: usize) -> usize {
+        self.current_pmtu.saturating_sub(transport_overhead).max(64)
+    }
+
+    /// Generate the next DPLPMTUD probe frame targeting candidate MTU, if ready.
+    pub fn generate_next_probe(&mut self, now: std::time::Instant) -> Option<crate::simd_parser::PmtuProbeFrame> {
+        if matches!(self.state, PmtudState::Disabled | PmtudState::SearchComplete) {
+            return None;
+        }
+
+        // Check if previous active probe has timed out
+        if let Some((_, _, _, sent_at)) = self.active_probe {
+            if now.duration_since(sent_at) >= self.config.probe_timeout {
+                self.handle_probe_timeout(now);
+            } else {
+                return None; // Probe currently in-flight
+            }
+        }
+
+        // Advance to a candidate size strictly greater than current PMTU
+        while self.candidate_index < self.config.probe_candidates.len() {
+            let candidate = self.config.probe_candidates[self.candidate_index];
+            if candidate > self.current_pmtu && candidate <= self.config.max_mtu {
+                break;
+            }
+            self.candidate_index += 1;
+        }
+
+        if self.candidate_index >= self.config.probe_candidates.len() {
+            self.state = PmtudState::SearchComplete;
+            return None;
+        }
+
+        let target_size = self.config.probe_candidates[self.candidate_index] as u16;
+        let probe_id = self.next_probe_id;
+        self.next_probe_id = self.next_probe_id.wrapping_add(1);
+
+        // Generate challenge token from probe ID and target size
+        let mut token = [0u8; 8];
+        token[0..4].copy_from_slice(&(probe_id as u32).to_le_bytes());
+        token[4..8].copy_from_slice(&(target_size as u32 ^ 0xA5A5A5A5).to_le_bytes());
+
+        let probe = crate::simd_parser::PmtuProbeFrame::new(probe_id, target_size, token);
+        self.active_probe = Some((probe_id, target_size as usize, token, now));
+        self.telemetry.probes_sent += 1;
+        self.state = PmtudState::Searching;
+
+        Some(probe)
+    }
+
+    /// Handle probe acknowledgement from peer reflecting verified probe packet reception.
+    pub fn handle_probe_ack(
+        &mut self,
+        probe_id: u64,
+        token: [u8; 8],
+        confirmed_size: usize,
+        _now: std::time::Instant,
+    ) -> bool {
+        if let Some((active_id, active_size, active_token, _)) = self.active_probe {
+            if active_id == probe_id && active_token == token && active_size == confirmed_size {
+                self.telemetry.probes_acknowledged += 1;
+                if confirmed_size > self.current_pmtu {
+                    self.current_pmtu = confirmed_size;
+                    self.telemetry.pmtu_raised_count += 1;
+                }
+                self.active_probe = None;
+                self.probe_attempts = 0;
+                self.consecutive_losses = 0;
+                self.candidate_index += 1;
+
+                if self.candidate_index >= self.config.probe_candidates.len() {
+                    self.state = PmtudState::SearchComplete;
+                } else {
+                    self.state = PmtudState::Searching;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Record probe timeout or dropped probe packet.
+    pub fn handle_probe_timeout(&mut self, _now: std::time::Instant) -> bool {
+        if self.active_probe.is_some() {
+            self.telemetry.probes_lost += 1;
+            self.probe_attempts += 1;
+            self.active_probe = None;
+
+            if self.probe_attempts >= self.config.max_probes {
+                // Ceiling discovered; stop searching higher
+                self.state = PmtudState::SearchComplete;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Report packet loss on the path. When consecutive losses exceed threshold, triggers black hole recovery.
+    pub fn report_packet_loss(&mut self, _now: std::time::Instant) -> bool {
+        self.consecutive_losses += 1;
+        if self.consecutive_losses >= self.config.blackhole_loss_threshold
+            && self.current_pmtu > self.config.base_mtu
+        {
+            self.current_pmtu = self.config.base_mtu;
+            self.state = PmtudState::BlackHoleRecovery;
+            self.telemetry.blackhole_recoveries += 1;
+            self.candidate_index = 0;
+            self.active_probe = None;
+            self.probe_attempts = 0;
+            return true; // Fallback triggered
+        }
+        false
+    }
+
+    /// Retrieve cumulative PMTUD telemetry.
+    pub fn telemetry(&self) -> PmtudTelemetry {
+        self.telemetry
+    }
+}
+
+// ── Adaptive Datagram Fragmentation & Reassembly (RFC 9297 / 9298) ────────
+
+/// Errors encountered during datagram reassembly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatagramReassemblyError {
+    /// Waiting for remaining fragments.
+    Incomplete {
+        datagram_id: u64,
+        received_fragments: usize,
+        total_fragments: usize,
+    },
+    /// Computed CRC32 checksum does not match expected header checksum.
+    ChecksumMismatch {
+        datagram_id: u64,
+        expected: u32,
+        computed: u32,
+    },
+    /// Reconstructed payload byte length does not match header specification.
+    LengthMismatch {
+        datagram_id: u64,
+        expected: usize,
+        computed: usize,
+    },
+    /// Fragment payload or header is malformed.
+    InvalidFragment(String),
+    /// Reassembly context timed out.
+    Expired { datagram_id: u64 },
+    /// Reassembly queue capacity exceeded.
+    BufferCapacityExceeded,
+}
+
+impl std::fmt::Display for DatagramReassemblyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Incomplete { datagram_id, received_fragments, total_fragments } => {
+                write!(f, "Datagram {} incomplete: {}/{} fragments", datagram_id, received_fragments, total_fragments)
+            }
+            Self::ChecksumMismatch { datagram_id, expected, computed } => {
+                write!(f, "Datagram {} checksum mismatch: expected {:#010X}, computed {:#010X}", datagram_id, expected, computed)
+            }
+            Self::LengthMismatch { datagram_id, expected, computed } => {
+                write!(f, "Datagram {} length mismatch: expected {}, computed {}", datagram_id, expected, computed)
+            }
+            Self::InvalidFragment(msg) => write!(f, "Invalid fragment: {}", msg),
+            Self::Expired { datagram_id } => write!(f, "Datagram {} reassembly expired", datagram_id),
+            Self::BufferCapacityExceeded => write!(f, "Datagram reassembly buffer capacity exceeded"),
+        }
+    }
+}
+
+impl std::error::Error for DatagramReassemblyError {}
+
+/// Utility for adaptively splitting large datagram payloads into MTU-sized fragments.
+pub struct AdaptiveDatagramFragmenter;
+
+impl AdaptiveDatagramFragmenter {
+    /// Split a datagram payload into fragments sized <= `max_fragment_size`.
+    /// Each fragment is prefixed with a 22-byte `DatagramFragmentHeader`.
+    pub fn fragment(
+        datagram_id: u64,
+        payload: &[u8],
+        max_fragment_size: usize,
+    ) -> Vec<crate::simd_parser::DatagramFragment> {
+        let max_payload_per_fragment = max_fragment_size
+            .saturating_sub(crate::simd_parser::DatagramFragmentHeader::HEADER_LEN)
+            .max(1);
+        let total_fragments = payload.len().div_ceil(max_payload_per_fragment).max(1);
+        let checksum = crate::io::crc32_digest(payload);
+
+        let mut fragments = Vec::with_capacity(total_fragments);
+        for index in 0..total_fragments {
+            let start = index * max_payload_per_fragment;
+            let end = (start + max_payload_per_fragment).min(payload.len());
+            let chunk = payload[start..end].to_vec();
+            let header = crate::simd_parser::DatagramFragmentHeader::new(
+                datagram_id,
+                index as u16,
+                total_fragments as u16,
+                payload.len() as u32,
+                checksum,
+            );
+            fragments.push(crate::simd_parser::DatagramFragment::new(header, chunk));
+        }
+        fragments
+    }
+
+    /// Split and encode a datagram payload directly into serialized wire byte packets.
+    pub fn fragment_to_wire(
+        datagram_id: u64,
+        payload: &[u8],
+        max_fragment_size: usize,
+    ) -> Vec<Vec<u8>> {
+        Self::fragment(datagram_id, payload, max_fragment_size)
+            .into_iter()
+            .map(|f| f.encode_to_vec())
+            .collect()
+    }
+}
+
+/// In-flight state of a fragmented datagram being reassembled.
+#[derive(Debug, Clone)]
+struct IncompleteDatagram {
+    #[allow(dead_code)]
+    datagram_id: u64,
+    total_fragments: u16,
+    original_length: u32,
+    checksum: u32,
+    fragments: std::collections::BTreeMap<u16, Vec<u8>>,
+    #[allow(dead_code)]
+    first_seen: std::time::Instant,
+    last_seen: std::time::Instant,
+}
+
+/// Reassembles in-flight datagram fragments into complete original payloads.
+#[derive(Debug, Clone)]
+pub struct AdaptiveDatagramReassembler {
+    pending: HashMap<u64, IncompleteDatagram>,
+    max_pending: usize,
+    ttl: Duration,
+    telemetry: PmtudTelemetry,
+}
+
+impl Default for AdaptiveDatagramReassembler {
+    fn default() -> Self {
+        Self::new(256, Duration::from_secs(5))
+    }
+}
+
+impl AdaptiveDatagramReassembler {
+    /// Create a new datagram reassembler with maximum queue capacity and fragment TTL.
+    pub fn new(max_pending: usize, ttl: Duration) -> Self {
+        Self {
+            pending: HashMap::new(),
+            max_pending: max_pending.max(1),
+            ttl,
+            telemetry: PmtudTelemetry::default(),
+        }
+    }
+
+    /// Ingest a parsed datagram fragment.
+    /// Returns `Some(Ok(payload))` when the fragment completes reassembly,
+    /// `None` when awaiting further fragments, or `Some(Err(e))` on validation failure.
+    pub fn ingest_fragment(
+        &mut self,
+        fragment: crate::simd_parser::DatagramFragment,
+        now: std::time::Instant,
+    ) -> Option<Result<Vec<u8>, DatagramReassemblyError>> {
+        self.telemetry.total_fragments_received += 1;
+        let d_id = fragment.header.datagram_id;
+        let total = fragment.header.total_fragments;
+        let idx = fragment.header.fragment_index;
+
+        if idx >= total {
+            return Some(Err(DatagramReassemblyError::InvalidFragment(
+                format!("Fragment index {} >= total {}", idx, total),
+            )));
+        }
+
+        if !self.pending.contains_key(&d_id) && self.pending.len() >= self.max_pending {
+            self.prune_stale(now);
+            if self.pending.len() >= self.max_pending {
+                return Some(Err(DatagramReassemblyError::BufferCapacityExceeded));
+            }
+        }
+
+        let entry = self.pending.entry(d_id).or_insert_with(|| IncompleteDatagram {
+            datagram_id: d_id,
+            total_fragments: total,
+            original_length: fragment.header.original_length,
+            checksum: fragment.header.checksum,
+            fragments: std::collections::BTreeMap::new(),
+            first_seen: now,
+            last_seen: now,
+        });
+
+        entry.last_seen = now;
+        entry.fragments.insert(idx, fragment.payload);
+
+        if entry.fragments.len() == entry.total_fragments as usize {
+            let incomplete = self.pending.remove(&d_id).expect("entry exists");
+            let mut assembled = Vec::with_capacity(incomplete.original_length as usize);
+            for i in 0..incomplete.total_fragments {
+                if let Some(chunk) = incomplete.fragments.get(&i) {
+                    assembled.extend_from_slice(chunk);
+                } else {
+                    return Some(Err(DatagramReassemblyError::Incomplete {
+                        datagram_id: d_id,
+                        received_fragments: incomplete.fragments.len(),
+                        total_fragments: incomplete.total_fragments as usize,
+                    }));
+                }
+            }
+
+            if assembled.len() != incomplete.original_length as usize {
+                return Some(Err(DatagramReassemblyError::LengthMismatch {
+                    datagram_id: d_id,
+                    expected: incomplete.original_length as usize,
+                    computed: assembled.len(),
+                }));
+            }
+
+            let computed_crc = crate::io::crc32_digest(&assembled);
+            if computed_crc != incomplete.checksum {
+                self.telemetry.checksum_errors += 1;
+                return Some(Err(DatagramReassemblyError::ChecksumMismatch {
+                    datagram_id: d_id,
+                    expected: incomplete.checksum,
+                    computed: computed_crc,
+                }));
+            }
+
+            self.telemetry.datagrams_reassembled += 1;
+            Some(Ok(assembled))
+        } else {
+            None
+        }
+    }
+
+    /// Ingest a raw wire packet. Unfragmented packets are passed through directly as `Ok(Some(raw))`.
+    /// Fragmented packets are parsed and fed to `ingest_fragment`.
+    pub fn ingest_wire(
+        &mut self,
+        bytes: &[u8],
+        now: std::time::Instant,
+    ) -> Result<Option<Vec<u8>>, DatagramReassemblyError> {
+        if !crate::simd_parser::DatagramFragmentHeader::is_fragment_header(bytes) {
+            return Ok(Some(bytes.to_vec()));
+        }
+        let fragment = crate::simd_parser::DatagramFragment::decode(bytes)
+            .map_err(|e| DatagramReassemblyError::InvalidFragment(format!("{:?}", e)))?;
+        match self.ingest_fragment(fragment, now) {
+            Some(res) => res.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Prune stale incomplete fragments exceeding the configured TTL.
+    pub fn prune_stale(&mut self, now: std::time::Instant) -> usize {
+        let ttl = self.ttl;
+        let mut pruned = 0;
+        self.pending.retain(|_, entry| {
+            if now.duration_since(entry.last_seen) > ttl {
+                pruned += 1;
+                false
+            } else {
+                true
+            }
+        });
+        self.telemetry.stale_fragments_pruned += pruned;
+        pruned
+    }
+
+    /// Number of incomplete datagrams currently held in the reassembly buffer.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Telemetry statistics.
+    pub fn telemetry(&self) -> PmtudTelemetry {
+        self.telemetry
+    }
+}
+
+/// Manages Path MTU Discovery (PMTUD) and adaptive datagram fragmentation/reassembly
+/// across hybrid UDP / QUIC network paths.
+#[derive(Debug, Clone)]
+pub struct HybridDatagramTransport {
+    pub pmtud: PathMtuDiscovery,
+    pub reassembler: AdaptiveDatagramReassembler,
+    next_datagram_id: u64,
+    transport_overhead: usize,
+}
+
+impl Default for HybridDatagramTransport {
+    fn default() -> Self {
+        Self::new(PmtudConfig::default())
+    }
+}
+
+impl HybridDatagramTransport {
+    /// Create a new hybrid datagram transport engine.
+    pub fn new(config: PmtudConfig) -> Self {
+        Self {
+            pmtud: PathMtuDiscovery::new(config),
+            reassembler: AdaptiveDatagramReassembler::new(256, Duration::from_secs(5)),
+            next_datagram_id: 1,
+            transport_overhead: 28, // IP (20) + UDP (8) headers
+        }
+    }
+
+    /// Current discovered Path MTU.
+    pub fn current_pmtu(&self) -> usize {
+        self.pmtud.current_pmtu()
+    }
+
+    /// Set transport overhead (e.g. 28 bytes for plain UDP, 48 bytes for QUIC/IP).
+    pub fn with_overhead(mut self, overhead: usize) -> Self {
+        self.transport_overhead = overhead;
+        self
+    }
+
+    /// Effective maximum payload per datagram packet before fragmentation is required.
+    pub fn max_payload_size(&self) -> usize {
+        self.pmtud.effective_max_payload(self.transport_overhead)
+    }
+
+    /// Adaptively fragment an outbound datagram payload to fit current PMTU.
+    /// Returns 1 wire packet if payload <= max_payload_size, or N fragment wire packets if exceeded.
+    pub fn send_adaptive(&mut self, payload: &[u8]) -> Vec<Vec<u8>> {
+        let max_payload = self.max_payload_size();
+        if payload.len() <= max_payload {
+            vec![payload.to_vec()]
+        } else {
+            let d_id = self.next_datagram_id;
+            self.next_datagram_id = self.next_datagram_id.wrapping_add(1);
+            let chunks = AdaptiveDatagramFragmenter::fragment_to_wire(d_id, payload, max_payload);
+            self.pmtud.telemetry.datagrams_fragmented += 1;
+            self.pmtud.telemetry.total_fragments_sent += chunks.len();
+            chunks
+        }
+    }
+
+    /// Ingest an incoming wire datagram packet. Returns `Ok(Some(payload))` if the packet
+    /// is complete (either unfragmented or final fragment completing reassembly),
+    /// `Ok(None)` if waiting for more fragments, or `Err(DatagramReassemblyError)`.
+    pub fn recv_adaptive(
+        &mut self,
+        packet: &[u8],
+        now: std::time::Instant,
+    ) -> Result<Option<Vec<u8>>, DatagramReassemblyError> {
+        self.reassembler.ingest_wire(packet, now)
+    }
+
+    /// Generate the next DPLPMTUD probe packet if probing is active.
+    pub fn generate_probe(&mut self, now: std::time::Instant) -> Option<crate::simd_parser::PmtuProbeFrame> {
+        self.pmtud.generate_next_probe(now)
+    }
+
+    /// Process a received PMTU probe response from remote peer.
+    pub fn handle_probe_response(
+        &mut self,
+        response: &crate::simd_parser::PmtuProbeResponseFrame,
+        now: std::time::Instant,
+    ) -> bool {
+        self.pmtud.handle_probe_ack(response.probe_id, response.token, response.target_size as usize, now)
+    }
+
+    /// Report packet loss on path, potentially triggering black hole recovery.
+    pub fn report_loss(&mut self, now: std::time::Instant) -> bool {
+        self.pmtud.report_packet_loss(now)
+    }
+
+    /// Prune stale incomplete reassembly buffers.
+    pub fn prune_stale(&mut self, now: std::time::Instant) -> usize {
+        self.reassembler.prune_stale(now)
+    }
+
+    /// Retrieve combined telemetry.
+    pub fn telemetry(&self) -> PmtudTelemetry {
+        let mut telem = self.pmtud.telemetry();
+        let reasm = self.reassembler.telemetry();
+        telem.datagrams_reassembled = reasm.datagrams_reassembled;
+        telem.total_fragments_received = reasm.total_fragments_received;
+        telem.checksum_errors = reasm.checksum_errors;
+        telem.stale_fragments_pruned = reasm.stale_fragments_pruned;
+        telem
+    }
+}
+
 /// Network path associating a local network interface with a remote peer endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPath {
@@ -7172,6 +7795,8 @@ pub struct NetworkPath {
     pub is_primary: bool,
     /// Path creation timestamp.
     pub created_at: std::time::Instant,
+    /// Confirmed Path MTU discovered via DPLPMTUD (RFC 8899 / RFC 9000).
+    pub pmtu: usize,
 }
 
 impl NetworkPath {
@@ -7193,7 +7818,18 @@ impl NetworkPath {
             bytes_received: 0,
             is_primary: false,
             created_at: now,
+            pmtu: 1200,
         }
+    }
+
+    /// Discovered operational Path MTU in bytes.
+    pub fn pmtu(&self) -> usize {
+        self.pmtu
+    }
+
+    /// Update operational Path MTU in bytes.
+    pub fn set_pmtu(&mut self, pmtu: usize) {
+        self.pmtu = pmtu;
     }
 
     /// Whether this network path has been successfully validated.
@@ -7290,6 +7926,8 @@ pub struct TransportSessionDescriptor {
     pub primary_path: Option<NetworkPath>,
     /// Candidate secondary network paths for QUIC migration or multi-homing.
     pub candidate_paths: Vec<NetworkPath>,
+    /// Discovered operational Path MTU and DPLPMTUD state machine.
+    pub pmtud: PathMtuDiscovery,
 }
 
 impl TransportSessionDescriptor {
@@ -7323,6 +7961,7 @@ impl TransportSessionDescriptor {
             assigned_interface: None,
             primary_path: None,
             candidate_paths: Vec::new(),
+            pmtud: PathMtuDiscovery::new(PmtudConfig::default()),
         }
     }
 }
@@ -8338,6 +8977,8 @@ pub struct ExtendedConnectTunnel {
     websocket_frames: std::collections::VecDeque<WsFrame>,
     total_bytes_sent: usize,
     total_bytes_received: usize,
+    datagram_reassembler: AdaptiveDatagramReassembler,
+    next_datagram_id: u64,
 }
 
 impl ExtendedConnectTunnel {
@@ -8354,6 +8995,8 @@ impl ExtendedConnectTunnel {
             websocket_frames: std::collections::VecDeque::new(),
             total_bytes_sent: 0,
             total_bytes_received: 0,
+            datagram_reassembler: AdaptiveDatagramReassembler::new(256, Duration::from_secs(5)),
+            next_datagram_id: 1,
         }
     }
 
@@ -8433,6 +9076,56 @@ impl ExtendedConnectTunnel {
     /// Poll and dequeue the next incoming RFC 9297 capsule.
     pub fn recv_capsule(&mut self) -> Option<crate::simd_parser::HttpCapsule> {
         self.capsule_queue.pop_front()
+    }
+
+    /// Send a UDP datagram adaptively: if payload fits within path PMTU (accounting for RFC 9297
+    /// Capsule & Context ID overhead), it is transmitted directly as a single DATAGRAM capsule.
+    /// If payload exceeds PMTU, it is fragmented into RFC 9297/9298 compatible chunks.
+    pub fn send_datagram_adaptive(&mut self, packet: &[u8], pmtu: usize) -> usize {
+        let max_chunk = pmtu.saturating_sub(16).max(64);
+        if packet.len() <= max_chunk {
+            self.send_udp_packet(packet);
+            1
+        } else {
+            let d_id = self.next_datagram_id;
+            self.next_datagram_id = self.next_datagram_id.wrapping_add(1);
+            let chunks = AdaptiveDatagramFragmenter::fragment_to_wire(d_id, packet, max_chunk);
+            let count = chunks.len();
+            for chunk in chunks {
+                self.send_udp_packet(&chunk);
+            }
+            count
+        }
+    }
+
+    /// Receive the next datagram, automatically reassembling incoming fragmented chunks.
+    /// Unfragmented UDP packets are returned immediately as `Some(Ok(payload))`.
+    /// Incomplete fragments return `None` until all chunks have arrived.
+    pub fn recv_datagram_adaptive(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<Result<Vec<u8>, DatagramReassemblyError>> {
+        while let Some(raw) = self.recv_udp_packet() {
+            if !crate::simd_parser::DatagramFragmentHeader::is_fragment_header(&raw) {
+                return Some(Ok(raw));
+            }
+            match self.datagram_reassembler.ingest_wire(&raw, now) {
+                Ok(Some(reassembled)) => return Some(Ok(reassembled)),
+                Ok(None) => continue,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        None
+    }
+
+    /// Prune stale incomplete datagram fragments that exceeded TTL.
+    pub fn prune_stale_datagrams(&mut self, now: std::time::Instant) -> usize {
+        self.datagram_reassembler.prune_stale(now)
+    }
+
+    /// Retrieve fragmentation and reassembly telemetry for this tunnel.
+    pub fn datagram_telemetry(&self) -> PmtudTelemetry {
+        self.datagram_reassembler.telemetry()
     }
 
     // ── Ingress & Egress Processing ──────────────────────────────────────────
@@ -11712,6 +12405,88 @@ impl InterSessionDrrArbitrator {
             total_failover_migrated_bytes: self.total_failover_migrated_bytes,
         }
     }
+
+    /// Retrieve current confirmed PMTU for a transport session.
+    pub fn session_pmtu(&self, session_id: u64) -> Option<usize> {
+        self.sessions.get(&session_id).map(|s| s.pmtud.current_pmtu())
+    }
+
+    /// Manually or programmatically update the operational PMTU for a transport session.
+    pub fn update_session_pmtu(&mut self, session_id: u64, pmtu: usize) -> bool {
+        if let Some(s) = self.sessions.get_mut(&session_id) {
+            s.pmtud.current_pmtu = pmtu;
+            if let Some(ref mut path) = s.primary_path {
+                path.pmtu = pmtu;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Trigger generation of the next DPLPMTUD probe packet for a transport session.
+    pub fn session_pmtud_probe(
+        &mut self,
+        session_id: u64,
+        now: std::time::Instant,
+    ) -> Option<crate::simd_parser::PmtuProbeFrame> {
+        self.sessions.get_mut(&session_id).and_then(|s| s.pmtud.generate_next_probe(now))
+    }
+
+    /// Process a received PMTU probe acknowledgement for a transport session.
+    pub fn validate_session_pmtud_ack(
+        &mut self,
+        session_id: u64,
+        ack: crate::simd_parser::PmtuProbeResponseFrame,
+        now: std::time::Instant,
+    ) -> bool {
+        if let Some(s) = self.sessions.get_mut(&session_id) {
+            let res = s.pmtud.handle_probe_ack(ack.probe_id, ack.token, ack.target_size as usize, now);
+            if res {
+                if let Some(ref mut path) = s.primary_path {
+                    path.pmtu = s.pmtud.current_pmtu();
+                }
+            }
+            res
+        } else {
+            false
+        }
+    }
+
+    /// Report packet loss on a session's transport path, triggering black hole recovery if warranted.
+    pub fn session_report_packet_loss(&mut self, session_id: u64, now: std::time::Instant) -> bool {
+        if let Some(s) = self.sessions.get_mut(&session_id) {
+            let triggered = s.pmtud.report_packet_loss(now);
+            if triggered {
+                if let Some(ref mut path) = s.primary_path {
+                    path.pmtu = s.pmtud.current_pmtu();
+                }
+            }
+            triggered
+        } else {
+            false
+        }
+    }
+
+    /// Aggregate PMTUD and datagram telemetry across all registered transport sessions.
+    pub fn pmtud_telemetry(&self) -> PmtudTelemetry {
+        let mut agg = PmtudTelemetry::default();
+        for s in self.sessions.values() {
+            let t = s.pmtud.telemetry();
+            agg.probes_sent += t.probes_sent;
+            agg.probes_acknowledged += t.probes_acknowledged;
+            agg.probes_lost += t.probes_lost;
+            agg.pmtu_raised_count += t.pmtu_raised_count;
+            agg.blackhole_recoveries += t.blackhole_recoveries;
+            agg.datagrams_fragmented += t.datagrams_fragmented;
+            agg.total_fragments_sent += t.total_fragments_sent;
+            agg.datagrams_reassembled += t.datagrams_reassembled;
+            agg.total_fragments_received += t.total_fragments_received;
+            agg.checksum_errors += t.checksum_errors;
+            agg.stale_fragments_pruned += t.stale_fragments_pruned;
+        }
+        agg
+    }
 }
 
 /// An idle pooled HTTP/2 connection paired with the timestamp at which it became idle.
@@ -11786,6 +12561,7 @@ pub struct AsyncHttp2Pool {
         std::sync::Arc<std::sync::Mutex<UnifiedHeaderCompressionManager>>,
     enable_connect_protocol: std::sync::Arc<std::sync::atomic::AtomicBool>,
     extended_connect_manager: std::sync::Arc<std::sync::Mutex<ExtendedConnectManager>>,
+    enable_pmtud: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AsyncHttp2Pool {
@@ -11876,6 +12652,7 @@ impl AsyncHttp2Pool {
             extended_connect_manager: std::sync::Arc::new(std::sync::Mutex::new(
                 ExtendedConnectManager::new(),
             )),
+            enable_pmtud: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -11980,6 +12757,85 @@ impl AsyncHttp2Pool {
             .lock()
             .map(|mgr| mgr.active_tunnel_count())
             .unwrap_or(0)
+    }
+
+    /// Configure whether Path MTU Discovery (PMTUD) and adaptive datagram fragmentation are enabled on this pool (default: true).
+    pub fn with_pmtud(self, enabled: bool) -> Self {
+        self.enable_pmtud
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// Check whether Path MTU Discovery (PMTUD) is enabled on this pool.
+    pub fn is_pmtud_enabled(&self) -> bool {
+        self.enable_pmtud
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Retrieve the current confirmed PMTU for a pooled transport session.
+    pub fn session_pmtu(&self, session_id: u64) -> Option<usize> {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.session_pmtu(session_id)
+        } else {
+            None
+        }
+    }
+
+    /// Update the operational PMTU for a pooled transport session.
+    pub fn update_session_pmtu(&self, session_id: u64, pmtu: usize) -> bool {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.update_session_pmtu(session_id, pmtu)
+        } else {
+            false
+        }
+    }
+
+    /// Trigger generation of the next DPLPMTUD probe packet for a pooled session.
+    pub fn trigger_session_pmtud_probe(
+        &self,
+        session_id: u64,
+        now: std::time::Instant,
+    ) -> Option<crate::simd_parser::PmtuProbeFrame> {
+        if !self.is_pmtud_enabled() {
+            return None;
+        }
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.session_pmtud_probe(session_id, now)
+        } else {
+            None
+        }
+    }
+
+    /// Validate a received PMTU probe acknowledgement for a pooled session.
+    pub fn validate_session_pmtud_probe(
+        &self,
+        session_id: u64,
+        ack: crate::simd_parser::PmtuProbeResponseFrame,
+        now: std::time::Instant,
+    ) -> bool {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.validate_session_pmtud_ack(session_id, ack, now)
+        } else {
+            false
+        }
+    }
+
+    /// Report packet loss on a session's transport path, triggering black hole recovery if warranted.
+    pub fn report_session_packet_loss(&self, session_id: u64, now: std::time::Instant) -> bool {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.session_report_packet_loss(session_id, now)
+        } else {
+            false
+        }
+    }
+
+    /// Retrieve cumulative PMTUD and datagram fragmentation telemetry across all pooled sessions.
+    pub fn pmtud_telemetry(&self) -> PmtudTelemetry {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.pmtud_telemetry()
+        } else {
+            PmtudTelemetry::default()
+        }
     }
 
     /// Configure a shared chunk buffer pool to reuse byte allocations across high-frequency streaming requests.
@@ -28243,5 +29099,304 @@ mod tls_alpn_tests {
         assert_eq!(pool.active_extended_tunnels_count(), 2);
         let telem = pool.extended_connect_telemetry();
         assert_eq!(telem.tunnels_requested, 2);
+    }
+
+    #[test]
+    fn test_pmtud_discovery_state_machine_and_probing() {
+        let now = std::time::Instant::now();
+        let config = PmtudConfig {
+            base_mtu: 1200,
+            max_mtu: 1500,
+            probe_candidates: vec![1200, 1280, 1420, 1500],
+            max_probes: 2,
+            probe_timeout: Duration::from_millis(500),
+            blackhole_loss_threshold: 3,
+        };
+        let mut pmtud = PathMtuDiscovery::new(config);
+        assert_eq!(pmtud.state(), PmtudState::Base);
+        assert_eq!(pmtud.current_pmtu(), 1200);
+
+        // First probe: candidate 1280
+        let p1 = pmtud.generate_next_probe(now).expect("generated probe 1");
+        assert_eq!(p1.target_size, 1280);
+        assert_eq!(pmtud.state(), PmtudState::Searching);
+
+        let ack1 = p1.to_response();
+        assert!(pmtud.handle_probe_ack(
+            ack1.probe_id,
+            ack1.token,
+            ack1.target_size as usize,
+            now
+        ));
+        assert_eq!(pmtud.current_pmtu(), 1280);
+
+        // Second probe: candidate 1420
+        let p2 = pmtud.generate_next_probe(now).expect("generated probe 2");
+        assert_eq!(p2.target_size, 1420);
+        let ack2 = p2.to_response();
+        assert!(pmtud.handle_probe_ack(
+            ack2.probe_id,
+            ack2.token,
+            ack2.target_size as usize,
+            now
+        ));
+        assert_eq!(pmtud.current_pmtu(), 1420);
+
+        // Third probe: candidate 1500
+        let p3 = pmtud.generate_next_probe(now).expect("generated probe 3");
+        assert_eq!(p3.target_size, 1500);
+        let ack3 = p3.to_response();
+        assert!(pmtud.handle_probe_ack(
+            ack3.probe_id,
+            ack3.token,
+            ack3.target_size as usize,
+            now
+        ));
+        assert_eq!(pmtud.current_pmtu(), 1500);
+        assert_eq!(pmtud.state(), PmtudState::SearchComplete);
+
+        // No more probes after convergence
+        assert!(pmtud.generate_next_probe(now).is_none());
+
+        let telem = pmtud.telemetry();
+        assert_eq!(telem.probes_sent, 3);
+        assert_eq!(telem.probes_acknowledged, 3);
+        assert_eq!(telem.pmtu_raised_count, 3);
+        assert_eq!(telem.probes_lost, 0);
+    }
+
+    #[test]
+    fn test_pmtud_blackhole_detection_and_fallback() {
+        let now = std::time::Instant::now();
+        let config = PmtudConfig {
+            base_mtu: 1200,
+            max_mtu: 1500,
+            probe_candidates: vec![1200, 1420],
+            max_probes: 2,
+            probe_timeout: Duration::from_millis(500),
+            blackhole_loss_threshold: 3,
+        };
+        let mut pmtud = PathMtuDiscovery::new(config);
+        // Elevate PMTU to 1420
+        let p1 = pmtud.generate_next_probe(now).unwrap();
+        pmtud.handle_probe_ack(p1.probe_id, p1.token, p1.target_size as usize, now);
+        assert_eq!(pmtud.current_pmtu(), 1420);
+
+        // Simulate path loss
+        assert!(!pmtud.report_packet_loss(now));
+        assert!(!pmtud.report_packet_loss(now));
+        // 3rd loss triggers black hole fallback
+        assert!(pmtud.report_packet_loss(now));
+        assert_eq!(pmtud.current_pmtu(), 1200);
+        assert_eq!(pmtud.state(), PmtudState::BlackHoleRecovery);
+        assert_eq!(pmtud.telemetry().blackhole_recoveries, 1);
+    }
+
+    #[test]
+    fn test_adaptive_datagram_fragmentation_and_reassembly() {
+        let now = std::time::Instant::now();
+        let mut original_payload = Vec::with_capacity(3500);
+        for i in 0..3500 {
+            original_payload.push((i % 251) as u8);
+        }
+
+        // Fragment into chunks max 1000 bytes (header 22 + payload 978)
+        let fragments = AdaptiveDatagramFragmenter::fragment(42, &original_payload, 1000);
+        assert_eq!(fragments.len(), 4); // 978 * 3 = 2934, 4th chunk 566
+
+        for f in &fragments {
+            assert!(f.wire_size() <= 1000);
+            assert_eq!(f.header.datagram_id, 42);
+            assert_eq!(f.header.original_length, 3500);
+        }
+
+        let mut reassembler = AdaptiveDatagramReassembler::new(10, Duration::from_secs(5));
+
+        // Ingest out-of-order: chunk 2, 0, 3, 1
+        assert!(reassembler
+            .ingest_fragment(fragments[2].clone(), now)
+            .is_none());
+        assert!(reassembler
+            .ingest_fragment(fragments[0].clone(), now)
+            .is_none());
+        assert!(reassembler
+            .ingest_fragment(fragments[3].clone(), now)
+            .is_none());
+
+        // Final chunk 1 completes reassembly
+        let result = reassembler
+            .ingest_fragment(fragments[1].clone(), now)
+            .expect("reassembly complete");
+        let reassembled = result.expect("reassembly successful");
+        assert_eq!(reassembled, original_payload);
+
+        let telem = reassembler.telemetry();
+        assert_eq!(telem.datagrams_reassembled, 1);
+        assert_eq!(telem.total_fragments_received, 4);
+        assert_eq!(telem.checksum_errors, 0);
+    }
+
+    #[test]
+    fn test_adaptive_datagram_reassembly_checksum_mismatch() {
+        let now = std::time::Instant::now();
+        let payload = b"critical-binary-data-requiring-crc32-validation-check-against-corruption";
+        let mut fragments = AdaptiveDatagramFragmenter::fragment(99, payload, 40);
+        assert!(fragments.len() > 1);
+
+        // Corrupt payload in one fragment
+        fragments[0].payload[0] ^= 0xFF;
+
+        let mut reassembler = AdaptiveDatagramReassembler::new(10, Duration::from_secs(5));
+        for i in 0..fragments.len() - 1 {
+            assert!(reassembler
+                .ingest_fragment(fragments[i].clone(), now)
+                .is_none());
+        }
+
+        let final_res = reassembler
+            .ingest_fragment(fragments.last().unwrap().clone(), now)
+            .expect("returned outcome");
+        match final_res {
+            Err(DatagramReassemblyError::ChecksumMismatch {
+                datagram_id, ..
+            }) => {
+                assert_eq!(datagram_id, 99);
+            }
+            other => panic!("expected ChecksumMismatch, got {:?}", other),
+        }
+        assert_eq!(reassembler.telemetry().checksum_errors, 1);
+    }
+
+    #[test]
+    fn test_hybrid_datagram_transport_end_to_end() {
+        let now = std::time::Instant::now();
+        let config = PmtudConfig {
+            base_mtu: 1200,
+            max_mtu: 1500,
+            probe_candidates: vec![1200, 1500],
+            ..Default::default()
+        };
+        let mut transport = HybridDatagramTransport::new(config).with_overhead(28);
+        assert_eq!(transport.current_pmtu(), 1200);
+        assert_eq!(transport.max_payload_size(), 1172);
+
+        // 1. Small datagram fits within PMTU -> single unfragmented wire chunk
+        let small_data = vec![0x42; 500];
+        let small_packets = transport.send_adaptive(&small_data);
+        assert_eq!(small_packets.len(), 1);
+
+        let mut receiver = HybridDatagramTransport::default();
+        let received_small = receiver
+            .recv_adaptive(&small_packets[0], now)
+            .expect("decoded packet")
+            .expect("received small datagram");
+        assert_eq!(received_small, small_data);
+
+        // 2. Large datagram exceeds PMTU -> fragmented into multiple wire chunks
+        let large_data = vec![0x7A; 3000];
+        let large_chunks = transport.send_adaptive(&large_data);
+        assert_eq!(large_chunks.len(), 3);
+
+        // Feed chunks to receiver
+        let mut reassembled_large = None;
+        for chunk in &large_chunks {
+            if let Some(res) = receiver
+                .recv_adaptive(chunk, now)
+                .expect("chunk ingested")
+            {
+                reassembled_large = Some(res);
+            }
+        }
+        assert_eq!(reassembled_large, Some(large_data));
+
+        // 3. Probing increases PMTU
+        let probe = transport.generate_probe(now).expect("generated probe");
+        assert_eq!(probe.target_size, 1500);
+        let resp = probe.to_response();
+        assert!(transport.handle_probe_response(&resp, now));
+        assert_eq!(transport.current_pmtu(), 1500);
+        assert_eq!(transport.max_payload_size(), 1472);
+    }
+
+    #[test]
+    fn test_extended_connect_tunnel_adaptive_datagram_integration() {
+        let now = std::time::Instant::now();
+        let mut sender = ExtendedConnectTunnel::new(
+            11,
+            TunnelProtocol::ConnectUdp,
+            "gateway.example.com/udp-stream",
+        );
+        sender.mark_established();
+
+        let mut receiver = ExtendedConnectTunnel::new(
+            11,
+            TunnelProtocol::ConnectUdp,
+            "gateway.example.com/udp-stream",
+        );
+        receiver.mark_established();
+
+        // Send a 2500-byte UDP packet with PMTU 1200
+        let big_packet = vec![0x55; 2500];
+        let chunk_count = sender.send_datagram_adaptive(&big_packet, 1200);
+        assert!(chunk_count >= 2);
+
+        let wire_frames = sender.drain_egress_data();
+        assert_eq!(wire_frames.len(), chunk_count);
+
+        for frame in &wire_frames {
+            receiver.ingest_network_data(frame);
+        }
+
+        // Receive with adaptive reassembly
+        let reassembled = receiver
+            .recv_datagram_adaptive(now)
+            .expect("reassembly returned")
+            .expect("reassembled successfully");
+        assert_eq!(reassembled, big_packet);
+    }
+
+    #[test]
+    fn test_async_http2_pool_pmtud_integration() {
+        let now = std::time::Instant::now();
+        let pool = AsyncHttp2Pool::new("quic.upstream.com", 443, 2).with_pmtud(true);
+        assert!(pool.is_pmtud_enabled());
+
+        // Register an HTTP/3 session in pool arbitrator
+        let session_id = 901;
+        pool.register_transport_session(
+            session_id,
+            "https://quic.upstream.com:443",
+            TransportProtocol::Http3,
+            100,
+        );
+
+        assert_eq!(pool.session_pmtu(session_id), Some(1200));
+
+        // Generate DPLPMTUD probe
+        let probe = pool
+            .trigger_session_pmtud_probe(session_id, now)
+            .expect("generated probe frame");
+        assert_eq!(probe.target_size, 1280);
+
+        // Validate probe response
+        let resp = probe.to_response();
+        assert!(pool.validate_session_pmtud_probe(session_id, resp, now));
+        assert_eq!(pool.session_pmtu(session_id), Some(1280));
+
+        // Update PMTU programmatically
+        assert!(pool.update_session_pmtu(session_id, 1420));
+        assert_eq!(pool.session_pmtu(session_id), Some(1420));
+
+        // Simulate packet loss triggering black hole fallback
+        assert!(!pool.report_session_packet_loss(session_id, now));
+        assert!(!pool.report_session_packet_loss(session_id, now));
+        assert!(pool.report_session_packet_loss(session_id, now));
+        assert_eq!(pool.session_pmtu(session_id), Some(1200));
+
+        let telem = pool.pmtud_telemetry();
+        assert_eq!(telem.probes_sent, 1);
+        assert_eq!(telem.probes_acknowledged, 1);
+        assert_eq!(telem.pmtu_raised_count, 1);
+        assert_eq!(telem.blackhole_recoveries, 1);
     }
 }
