@@ -15,6 +15,7 @@ pub mod latency_drift;
 pub mod mesh_lsa;
 pub mod mtls_attestation;
 pub mod multi_node_sla;
+pub mod multipath_congestion;
 pub mod multipath_fec;
 pub mod panic;
 pub mod reactor;
@@ -108,6 +109,13 @@ pub use multi_node_sla::{
     run_multi_node_sla_benchmark, ClosedLoopAdaptationResult, ClosedLoopControlAction,
     EndToEndPathSlaAudit, InterSliceInterferenceEvent, MultiNodeSlaMetrics, MultiNodeSlaReport,
     MultiNodeSlaSynthesizer, MultiNodeSliceTelemetryRecord, NodeSlaEvaluation, SliceSlaTarget,
+};
+pub use multipath_congestion::{
+    run_multipath_congestion_benchmark, Bbrv3Phase, Bbrv3ProbeBwSubPhase, Bbrv3SubpathState,
+    CongestionAlgorithm, CongestionSendVerdict, LedbatSubpathState,
+    MultipathCongestionBenchmarkReport, MultipathCongestionManager,
+    MultipathCongestionTelemetrySummary, SubpathCongestionController, SubpathSliceWindow,
+    LEDBAT_DEFAULT_TARGET_DELAY_US, MIN_CWND_BYTES, TCP_MSS_BYTES,
 };
 pub use multipath_fec::{
     build_cauchy_matrix, gf_add, gf_div, gf_inv, gf_mul, gf_sub, run_multipath_fec_benchmark,

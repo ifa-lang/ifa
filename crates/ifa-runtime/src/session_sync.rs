@@ -2320,6 +2320,7 @@ pub struct IsspDynamicMultipathRouter {
     pub subpath_scheduler: crate::subpath_scheduler::SubpathSchedulerGroup,
     pub reorder_engine: crate::reorder_engine::MultipathReorderEngine,
     pub fec_engine: crate::multipath_fec::MultipathFecEngine,
+    pub congestion_manager: crate::multipath_congestion::MultipathCongestionManager,
 }
 
 impl IsspDynamicMultipathRouter {
@@ -2360,6 +2361,7 @@ impl IsspDynamicMultipathRouter {
             subpath_scheduler: crate::subpath_scheduler::SubpathSchedulerGroup::new(),
             reorder_engine: crate::reorder_engine::MultipathReorderEngine::new(),
             fec_engine: crate::multipath_fec::MultipathFecEngine::new(),
+            congestion_manager: crate::multipath_congestion::MultipathCongestionManager::new(),
         }
     }
 
@@ -3656,6 +3658,53 @@ impl IsspDynamicMultipathRouter {
             delivered.append(&mut rec_del);
         }
         (recovered, delivered)
+    }
+
+    /// Read access to the multipath congestion control manager.
+    pub fn congestion_manager(&self) -> &crate::multipath_congestion::MultipathCongestionManager {
+        &self.congestion_manager
+    }
+
+    /// Mutable access to the multipath congestion control manager.
+    pub fn congestion_manager_mut(
+        &mut self,
+    ) -> &mut crate::multipath_congestion::MultipathCongestionManager {
+        &mut self.congestion_manager
+    }
+
+    /// Evaluate if a transmission on `subpath_id` is allowed under current BBRv3/LEDBAT congestion state.
+    pub fn evaluate_congestion_send(
+        &mut self,
+        subpath_id: u32,
+        slice_class: crate::traffic_slicing::FlowSliceClass,
+        packet_bytes: usize,
+        now_ns: u64,
+    ) -> crate::multipath_congestion::CongestionSendVerdict {
+        self.congestion_manager
+            .evaluate_send(subpath_id, slice_class, packet_bytes, now_ns)
+    }
+
+    /// Record acknowledgment, loss, and ECN feedback into the congestion manager.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_congestion_feedback(
+        &mut self,
+        subpath_id: u32,
+        slice_class: crate::traffic_slicing::FlowSliceClass,
+        acked_bytes: u64,
+        lost_bytes: u64,
+        ecn_ce_count: u64,
+        rtt_us: u64,
+        now_ns: u64,
+    ) {
+        self.congestion_manager.record_feedback(
+            subpath_id,
+            slice_class,
+            acked_bytes,
+            lost_bytes,
+            ecn_ce_count,
+            rtt_us,
+            now_ns,
+        );
     }
 
     /// Return an iterator over all registered routes.

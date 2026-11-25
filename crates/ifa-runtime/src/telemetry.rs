@@ -399,6 +399,14 @@ pub struct IsspMultipathBalancingSnapshot {
     pub total_fec_parity_packets: u64,
     /// FEC 0-RTT recovery success ratio.
     pub fec_recovery_ratio: f64,
+    /// Total rate and window negotiation cycles evaluated across subpaths.
+    pub total_congestion_window_negotiations: u64,
+    /// Total coupled cross-subpath window migration events executed.
+    pub total_congestion_window_migrations: u64,
+    /// Total aggregate multipath congestion window in bytes.
+    pub total_session_cwnd_bytes: u64,
+    /// Total aggregate multipath in-flight bytes.
+    pub total_session_inflight_bytes: u64,
     /// Instantaneous variance of marginal gradients across subpaths.
     pub last_gradient_variance: f64,
     /// Active flows partitioned by slice class name.
@@ -689,6 +697,20 @@ impl IsspMultipathBalancingSnapshot {
                 .fec_engine()
                 .telemetry_summary()
                 .recovery_success_ratio,
+            total_congestion_window_negotiations: router
+                .congestion_manager()
+                .window_negotiation_events_total,
+            total_congestion_window_migrations: router
+                .congestion_manager()
+                .window_migration_events_total,
+            total_session_cwnd_bytes: router
+                .congestion_manager()
+                .telemetry_summary()
+                .total_session_cwnd_bytes,
+            total_session_inflight_bytes: router
+                .congestion_manager()
+                .telemetry_summary()
+                .total_session_inflight_bytes,
             last_gradient_variance: router.cost_gradient_metrics().last_gradient_variance,
             active_flows_by_slice: {
                 let mut m = BTreeMap::new();
@@ -1798,6 +1820,33 @@ impl PrometheusMultipathBalancingExporter {
         out.push_str(&format!(
             "ifa_issp_fec_recovery_ratio{} {:.4}\n",
             base_lbl, s.fec_recovery_ratio
+        ));
+
+        out.push_str(
+            "# HELP ifa_issp_congestion_window_negotiations_total Total rate and window negotiation cycles.\n",
+        );
+        out.push_str("# TYPE ifa_issp_congestion_window_negotiations_total counter\n");
+        out.push_str(&format!(
+            "ifa_issp_congestion_window_negotiations_total{} {}\n",
+            base_lbl, s.total_congestion_window_negotiations
+        ));
+
+        out.push_str(
+            "# HELP ifa_issp_congestion_window_migrations_total Total cross-subpath coupled window migration events.\n",
+        );
+        out.push_str("# TYPE ifa_issp_congestion_window_migrations_total counter\n");
+        out.push_str(&format!(
+            "ifa_issp_congestion_window_migrations_total{} {}\n",
+            base_lbl, s.total_congestion_window_migrations
+        ));
+
+        out.push_str(
+            "# HELP ifa_issp_session_cwnd_bytes Total aggregate multipath congestion window in bytes.\n",
+        );
+        out.push_str("# TYPE ifa_issp_session_cwnd_bytes gauge\n");
+        out.push_str(&format!(
+            "ifa_issp_session_cwnd_bytes{} {}\n",
+            base_lbl, s.total_session_cwnd_bytes
         ));
 
         out

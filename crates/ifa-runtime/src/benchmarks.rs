@@ -1389,6 +1389,10 @@ pub fn create_saturated_multipath_snapshot(
         total_fec_recovered_packets: 0,
         total_fec_parity_packets: 0,
         fec_recovery_ratio: 1.0,
+        total_congestion_window_negotiations: 0,
+        total_congestion_window_migrations: 0,
+        total_session_cwnd_bytes: 0,
+        total_session_inflight_bytes: 0,
         last_gradient_variance: 0.0,
         active_flows_by_slice: BTreeMap::new(),
         sla_violations_by_slice: BTreeMap::new(),
@@ -3414,6 +3418,9 @@ pub use crate::ingress_admission::{
     run_ingress_admission_benchmark, IngressAdmissionBenchmarkReport,
 };
 pub use crate::multi_node_sla::{run_multi_node_sla_benchmark, MultiNodeSlaReport};
+pub use crate::multipath_congestion::{
+    run_multipath_congestion_benchmark, MultipathCongestionBenchmarkReport,
+};
 pub use crate::multipath_fec::{run_multipath_fec_benchmark, MultipathFecBenchmarkReport};
 pub use crate::reorder_engine::{
     run_multipath_reordering_benchmark, MultipathReorderingBenchmarkReport,
@@ -4432,6 +4439,25 @@ mod tests {
         let md = report.to_markdown_table();
         assert!(md.contains("URLLC 0-RTT Recovery"));
         assert!(md.contains("Mission-Critical Double Erasure"));
+        assert!(md.contains("PASSED"));
+
+        let json = report.to_json();
+        assert!(json.contains("\"verification_passed\":true"));
+    }
+
+    #[test]
+    fn test_multipath_congestion_benchmark_suite_runs() {
+        let report = run_multipath_congestion_benchmark();
+        assert!(report.verification_passed);
+        assert!(report.urllc_delay_containment_passed);
+        assert!(report.embb_pipe_utilization_passed);
+        assert!(report.mission_critical_loss_adaptation_passed);
+        assert!(report.cross_subpath_migration_passed);
+        assert!(report.best_effort_scavenger_yielding_passed);
+
+        let md = report.to_markdown_table();
+        assert!(md.contains("URLLC Queuing Delay Bounding"));
+        assert!(md.contains("eMBB Bottleneck Bandwidth"));
         assert!(md.contains("PASSED"));
 
         let json = report.to_json();
