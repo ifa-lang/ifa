@@ -1632,7 +1632,7 @@ fn test_cli_net_session_mtls_attestation_and_rotation() {
     let ifa_bin = env!("CARGO_BIN_EXE_ifa");
 
     // 1. Benchmark markdown table
-    let bench_out = Command::new(&ifa_bin)
+    let bench_out = Command::new(ifa_bin)
         .arg("net")
         .arg("session")
         .arg("mtls")
@@ -1647,7 +1647,7 @@ fn test_cli_net_session_mtls_attestation_and_rotation() {
     assert!(bench_str.contains("PASSED (100% mutual attestation & bit-exact zero packet loss)"));
 
     // 2. Benchmark JSON output
-    let bench_json = Command::new(&ifa_bin)
+    let bench_json = Command::new(ifa_bin)
         .arg("net")
         .arg("session")
         .arg("mtls")
@@ -1663,7 +1663,7 @@ fn test_cli_net_session_mtls_attestation_and_rotation() {
     assert!(json_str.contains("\"handshake_iterations\":10"));
 
     // 3. Status display
-    let status_out = Command::new(&ifa_bin)
+    let status_out = Command::new(ifa_bin)
         .arg("net")
         .arg("session")
         .arg("mtls")
@@ -1676,7 +1676,7 @@ fn test_cli_net_session_mtls_attestation_and_rotation() {
     assert!(status_str.contains("No mesh peer connections registered in cluster state."));
 
     // 4. Attest peer
-    let attest_out = Command::new(&ifa_bin)
+    let attest_out = Command::new(ifa_bin)
         .arg("net")
         .arg("session")
         .arg("mtls")
@@ -1692,7 +1692,7 @@ fn test_cli_net_session_mtls_attestation_and_rotation() {
     assert!(attest_str.contains("\"target_peer\":7"));
 
     // 5. Key rotation
-    let rot_out = Command::new(&ifa_bin)
+    let rot_out = Command::new(ifa_bin)
         .arg("net")
         .arg("session")
         .arg("mtls")
@@ -1711,7 +1711,7 @@ fn test_cli_net_session_mtls_attestation_and_rotation() {
     assert!(rot_str.contains("\"reason\":\"emergency_revocation\""));
 
     // 6. Metrics exposition
-    let metrics_out = Command::new(&ifa_bin)
+    let metrics_out = Command::new(ifa_bin)
         .arg("net")
         .arg("session")
         .arg("mtls")
