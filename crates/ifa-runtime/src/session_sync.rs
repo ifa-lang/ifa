@@ -2315,6 +2315,7 @@ pub struct IsspDynamicMultipathRouter {
     pub cost_gradient_balancer: crate::cost_gradient::CostGradientLoadBalancer,
     pub latency_drift_monitor: crate::latency_drift::LatencyDriftMonitor,
     pub slice_resilience: crate::slice_resilience::SliceResilienceManager,
+    pub multi_node_sla: crate::multi_node_sla::MultiNodeSlaSynthesizer,
 }
 
 impl IsspDynamicMultipathRouter {
@@ -2347,6 +2348,7 @@ impl IsspDynamicMultipathRouter {
             cost_gradient_balancer: crate::cost_gradient::CostGradientLoadBalancer::default(),
             latency_drift_monitor: crate::latency_drift::LatencyDriftMonitor::default(),
             slice_resilience: crate::slice_resilience::SliceResilienceManager::default(),
+            multi_node_sla: crate::multi_node_sla::MultiNodeSlaSynthesizer::new(local_node_id),
         }
     }
 
@@ -3449,6 +3451,32 @@ impl IsspDynamicMultipathRouter {
     /// Read access to slice resilience metrics.
     pub fn slice_resilience_metrics(&self) -> &crate::slice_resilience::SliceResilienceMetrics {
         self.slice_resilience.metrics()
+    }
+
+    /// Read access to multi-node SLA synthesizer.
+    pub fn multi_node_sla(&self) -> &crate::multi_node_sla::MultiNodeSlaSynthesizer {
+        &self.multi_node_sla
+    }
+
+    /// Mutable access to multi-node SLA synthesizer.
+    pub fn multi_node_sla_mut(&mut self) -> &mut crate::multi_node_sla::MultiNodeSlaSynthesizer {
+        &mut self.multi_node_sla
+    }
+
+    /// Ingest a multi-node slice telemetry sample.
+    pub fn ingest_multi_node_slice_telemetry(
+        &mut self,
+        record: crate::multi_node_sla::MultiNodeSliceTelemetryRecord,
+    ) {
+        self.multi_node_sla.ingest_telemetry(record);
+    }
+
+    /// Evaluate multi-node SLA compliance and trigger closed-loop isolation actions.
+    pub fn evaluate_multi_node_sla(
+        &mut self,
+        tick: u64,
+    ) -> crate::multi_node_sla::ClosedLoopAdaptationResult {
+        self.multi_node_sla.evaluate_and_adapt(tick)
     }
 
     /// Return an iterator over all registered routes.
@@ -8240,5 +8268,34 @@ mod tests {
                 .asymmetric_reroutes_executed,
             1
         );
+    }
+
+    #[test]
+    fn test_router_multi_node_sla_integration() {
+        let mut router =
+            IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::BandwidthAggregation);
+
+        router.ingest_multi_node_slice_telemetry(
+            crate::multi_node_sla::MultiNodeSliceTelemetryRecord {
+                node_id: 1,
+                timestamp_ns: 1000,
+                subpath_id: 10,
+                slice_class: crate::traffic_slicing::FlowSliceClass::UltraLowLatency,
+                packets_transmitted: 5000,
+                packets_lost: 0,
+                bytes_transmitted: 600_000,
+                avg_rtt_ns: 1_200_000,
+                p99_rtt_ns: 1_800_000,
+                jitter_ns: 150_000,
+                queuing_delay_ns: 50_000,
+                active_flows: 2,
+                allocated_bandwidth_bps: 10_000_000,
+            },
+        );
+
+        let result = router.evaluate_multi_node_sla(1);
+        assert_eq!(result.actions_triggered.len(), 0);
+        assert!((result.global_compliance_ratio - 1.0).abs() < f64::EPSILON);
+        assert!((result.isolation_score - 1.0).abs() < f64::EPSILON);
     }
 }

@@ -13,6 +13,7 @@ pub mod jitter_anomaly;
 pub mod latency_drift;
 pub mod mesh_lsa;
 pub mod mtls_attestation;
+pub mod multi_node_sla;
 pub mod panic;
 pub mod reactor;
 pub mod session_sync;
@@ -93,6 +94,11 @@ pub use mtls_attestation::{
     CAP_DYNAMIC_REKEY, CAP_MULTIPATH, CAP_POST_QUANTUM_READY, CAP_SIMD_ACCEL, CAP_ZSTD_STREAM,
     DEFAULT_GRACE_PERIOD_NS, DEFAULT_ROTATION_BYTES_THRESHOLD, DEFAULT_ROTATION_INTERVAL_NS,
     DEFAULT_ROTATION_PACKETS_THRESHOLD, ISSP_ENVELOPE_MAGIC, ISSP_MTLS_MAGIC, ISSP_MTLS_VERSION,
+};
+pub use multi_node_sla::{
+    run_multi_node_sla_benchmark, ClosedLoopAdaptationResult, ClosedLoopControlAction,
+    EndToEndPathSlaAudit, InterSliceInterferenceEvent, MultiNodeSlaMetrics, MultiNodeSlaReport,
+    MultiNodeSlaSynthesizer, MultiNodeSliceTelemetryRecord, NodeSlaEvaluation, SliceSlaTarget,
 };
 pub use panic::{
     catch_panic, clear_last_panic, dispatch_panic, get_last_panic, get_last_panic_raw_ptr,

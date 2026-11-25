@@ -367,6 +367,14 @@ pub struct IsspMultipathBalancingSnapshot {
     pub total_elastic_flows_throttled: u64,
     /// Ratio of priority flows maintaining SLA under adverse conditions.
     pub priority_sla_preservation_ratio: f64,
+    /// Global inter-slice isolation index across mesh nodes (0.0 to 1.0).
+    pub global_isolation_score: f64,
+    /// Global slice SLA compliance ratio across mesh nodes (0.0 to 1.0).
+    pub global_sla_compliance_ratio: f64,
+    /// Total closed-loop remedial isolation actions triggered.
+    pub total_closed_loop_sla_actions: u64,
+    /// Total upstream backpressure signals emitted to ingress nodes.
+    pub total_sla_backpressure_signals: u64,
     /// Instantaneous variance of marginal gradients across subpaths.
     pub last_gradient_variance: f64,
     /// Active flows partitioned by slice class name.
@@ -594,6 +602,16 @@ impl IsspMultipathBalancingSnapshot {
             priority_sla_preservation_ratio: router
                 .slice_resilience_metrics()
                 .priority_sla_preservation_ratio,
+            global_isolation_score: router.multi_node_sla().compute_global_isolation_score(),
+            global_sla_compliance_ratio: router.multi_node_sla().compute_global_compliance_ratio(),
+            total_closed_loop_sla_actions: router
+                .multi_node_sla()
+                .metrics()
+                .total_closed_loop_actions,
+            total_sla_backpressure_signals: router
+                .multi_node_sla()
+                .metrics()
+                .total_backpressure_signals,
             last_gradient_variance: router.cost_gradient_metrics().last_gradient_variance,
             active_flows_by_slice: {
                 let mut m = BTreeMap::new();
@@ -1559,6 +1577,42 @@ impl PrometheusMultipathBalancingExporter {
         out.push_str(&format!(
             "ifa_slice_priority_sla_ratio{} {:.4}\n",
             base_lbl, s.priority_sla_preservation_ratio
+        ));
+
+        out.push_str(
+            "# HELP ifa_slice_global_isolation_score Global inter-slice isolation index across mesh nodes.\n",
+        );
+        out.push_str("# TYPE ifa_slice_global_isolation_score gauge\n");
+        out.push_str(&format!(
+            "ifa_slice_global_isolation_score{} {:.4}\n",
+            base_lbl, s.global_isolation_score
+        ));
+
+        out.push_str(
+            "# HELP ifa_slice_global_sla_ratio Global slice SLA compliance ratio across mesh nodes.\n",
+        );
+        out.push_str("# TYPE ifa_slice_global_sla_ratio gauge\n");
+        out.push_str(&format!(
+            "ifa_slice_global_sla_ratio{} {:.4}\n",
+            base_lbl, s.global_sla_compliance_ratio
+        ));
+
+        out.push_str(
+            "# HELP ifa_slice_closed_loop_actions_total Total closed-loop remedial isolation actions.\n",
+        );
+        out.push_str("# TYPE ifa_slice_closed_loop_actions_total counter\n");
+        out.push_str(&format!(
+            "ifa_slice_closed_loop_actions_total{} {}\n",
+            base_lbl, s.total_closed_loop_sla_actions
+        ));
+
+        out.push_str(
+            "# HELP ifa_slice_backpressure_signals_total Total upstream backpressure signals emitted.\n",
+        );
+        out.push_str("# TYPE ifa_slice_backpressure_signals_total counter\n");
+        out.push_str(&format!(
+            "ifa_slice_backpressure_signals_total{} {}\n",
+            base_lbl, s.total_sla_backpressure_signals
         ));
 
         out

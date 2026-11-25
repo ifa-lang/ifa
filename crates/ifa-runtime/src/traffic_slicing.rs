@@ -14,7 +14,7 @@ use crate::session_sync::{IsspMultipathRoute, SessionId};
 use std::collections::HashMap;
 
 /// High-level traffic service class (QoS slice partition).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FlowSliceClass {
     /// Ultra-Low Latency slice (URLLC): Strict RTT & jitter bounds; prioritized over bandwidth.
     UltraLowLatency,

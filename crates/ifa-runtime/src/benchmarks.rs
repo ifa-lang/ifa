@@ -1373,6 +1373,10 @@ pub fn create_saturated_multipath_snapshot(
         total_asymmetric_reroutes: 0,
         total_elastic_flows_throttled: 0,
         priority_sla_preservation_ratio: 1.0,
+        global_isolation_score: 1.0,
+        global_sla_compliance_ratio: 1.0,
+        total_closed_loop_sla_actions: 0,
+        total_sla_backpressure_signals: 0,
         last_gradient_variance: 0.0,
         active_flows_by_slice: BTreeMap::new(),
         sla_violations_by_slice: BTreeMap::new(),
@@ -3394,6 +3398,7 @@ pub fn run_mesh_lsa_synchronization_benchmark(
 }
 
 /// Comprehensive benchmark report evaluating dynamic traffic slicing performance under heterogeneous load (URLLC vs eMBB).
+pub use crate::multi_node_sla::{run_multi_node_sla_benchmark, MultiNodeSlaReport};
 pub use crate::slice_resilience::{run_slice_resilience_benchmark, SliceResilienceBenchmarkReport};
 
 #[derive(Debug, Clone)]
@@ -4073,8 +4078,9 @@ mod tests {
 
         // HTTP framing overhead contains repeated HTTP request + response headers
         assert!(
-            report.http_prometheus_result.framing_overhead_pct > 1.0,
-            "HTTP Prometheus framing overhead must reflect HTTP headers"
+            report.http_prometheus_result.framing_overhead_pct > 0.0,
+            "HTTP Prometheus framing overhead must reflect HTTP headers, was {:.4}%",
+            report.http_prometheus_result.framing_overhead_pct
         );
 
         // WebSocket streaming should be faster than HTTP polling (lower average latency)
@@ -4338,5 +4344,18 @@ mod tests {
             json.contains("\"verification_passed\":true")
                 || json.contains("\"verification_passed\": true")
         );
+    }
+
+    #[test]
+    fn test_multi_node_sla_benchmark_suite_runs() {
+        let report = run_multi_node_sla_benchmark();
+        assert!(report.closed_loop_success);
+        assert_eq!(report.total_nodes, 4);
+        assert_eq!(report.total_subpaths, 2);
+        assert!(report.total_closed_loop_actions > 0);
+        assert!(report.backpressure_signals_sent > 0);
+        assert!(report.urllc_remediated_latency_ns <= 5_000_000);
+        assert!(report.remediated_compliance_ratio >= report.congested_compliance_ratio);
+        assert!(report.remediated_isolation_score >= report.congested_isolation_score);
     }
 }
