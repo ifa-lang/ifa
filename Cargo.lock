@@ -531,6 +531,7 @@ dependencies = [
  "ifa-stdlib",
  "ifa-wasm",
  "kori",
+ "serde",
  "serde_json",
 ]
 

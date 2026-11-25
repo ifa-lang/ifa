@@ -53,6 +53,15 @@ pub const ISSP_CAPSULE_MAGIC: u32 = 0x4953_4350; // 'ISCP'
 /// Wire size of the ISSP capsule container header in bytes.
 pub const ISSP_CAPSULE_HEADER_SIZE: usize = 12;
 
+/// State dump magic tag for ISSP cluster registry snapshots.
+pub const ISSP_DUMP_MAGIC: u32 = 0x4953_4450; // 'ISDP'
+
+/// State dump format version 1.
+pub const ISSP_DUMP_VERSION_V1: u32 = 1;
+
+/// Header size of an ISSP state dump file.
+pub const ISSP_DUMP_HEADER_SIZE: usize = 32;
+
 // ---------------------------------------------------------------------------
 // Session identifier
 // ---------------------------------------------------------------------------
@@ -98,6 +107,47 @@ impl SessionId {
             origin_node,
             nonce,
         }
+    }
+
+    /// Format as canonical string "01a2b3c4d5e6f708:0001:0042".
+    pub fn to_canonical_string(&self) -> String {
+        format!("{:016x}:{:04x}:{:04x}", self.flow_hash, self.origin_node, self.nonce)
+    }
+
+    /// Parse from canonical format ("flow_hash:origin_node:nonce") or hex flow hash.
+    pub fn parse_str(s: &str) -> Result<Self, String> {
+        let trimmed = s.trim();
+        let parts: Vec<&str> = trimmed.split(':').collect();
+        if parts.len() == 3 {
+            let flow_str = parts[0].strip_prefix("0x").unwrap_or(parts[0]);
+            let node_str = parts[1].strip_prefix("0x").unwrap_or(parts[1]);
+            let nonce_str = parts[2].strip_prefix("0x").unwrap_or(parts[2]);
+
+            let flow_hash = u64::from_str_radix(flow_str, 16)
+                .map_err(|e| format!("invalid flow_hash hex '{}': {}", flow_str, e))?;
+            let origin_node = u32::from_str_radix(node_str, 16)
+                .or_else(|_| node_str.parse::<u32>())
+                .map_err(|e| format!("invalid origin_node '{}': {}", node_str, e))?;
+            let nonce = u32::from_str_radix(nonce_str, 16)
+                .or_else(|_| nonce_str.parse::<u32>())
+                .map_err(|e| format!("invalid nonce '{}': {}", nonce_str, e))?;
+
+            Ok(Self::new(flow_hash, origin_node, nonce))
+        } else if parts.len() == 1 {
+            let s_clean = parts[0].strip_prefix("0x").unwrap_or(parts[0]);
+            let flow_hash = u64::from_str_radix(s_clean, 16)
+                .or_else(|_| s_clean.parse::<u64>())
+                .map_err(|e| format!("invalid flow hash identifier '{}': {}", s, e))?;
+            Ok(Self::new(flow_hash, 0, 0))
+        } else {
+            Err(format!("invalid session format '{}' (expected <flow_hash>:<node>:<nonce>)", s))
+        }
+    }
+}
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:016x}:{:04x}:{:04x}", self.flow_hash, self.origin_node, self.nonce)
     }
 }
 
@@ -794,7 +844,7 @@ pub struct SessionTickOutcome {
 // ---------------------------------------------------------------------------
 
 /// Per-session live record tracked by the local node.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SessionRecord {
     /// Most recent snapshot of this session.
     pub snapshot: SessionSnapshot,
@@ -1241,6 +1291,177 @@ impl SessionRegistry {
             evicted_sessions: to_evict,
         })
     }
+
+    /// List all registered sessions (both primary and standby), sorted deterministically by flow hash.
+    pub fn list_sessions(&self) -> Vec<SessionRecord> {
+        let guard = match self.sessions.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        let mut list: Vec<SessionRecord> = guard.values().cloned().collect();
+        list.sort_by_key(|a| a.snapshot.id.flow_hash);
+        list
+    }
+
+    /// Retrieve a specific session record by its exact `SessionId`.
+    pub fn get_session(&self, id: &SessionId) -> Option<SessionRecord> {
+        let guard = self.sessions.lock().ok()?;
+        guard.get(id).cloned()
+    }
+
+    /// Find a session by string query (exact canonical ID, flow hash hex, or flow hash decimal).
+    pub fn find_session(&self, query: &str) -> Option<SessionRecord> {
+        let trimmed = query.trim();
+        let guard = self.sessions.lock().ok()?;
+
+        // 1. Try canonical parse
+        if let Ok(parsed_id) = SessionId::parse_str(trimmed) {
+            if let Some(rec) = guard.get(&parsed_id) {
+                return Some(rec.clone());
+            }
+        }
+
+        let s_clean = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+        let parsed_hex_hash = u64::from_str_radix(s_clean, 16).ok();
+        let parsed_dec_hash = trimmed.parse::<u64>().ok();
+
+        // 2. Try match on string display, flow hash value, or prefix/suffix
+        for (id, rec) in guard.iter() {
+            let canon = id.to_canonical_string();
+            if canon.eq_ignore_ascii_case(trimmed) {
+                return Some(rec.clone());
+            }
+            if let Some(target) = parsed_hex_hash {
+                if id.flow_hash == target {
+                    return Some(rec.clone());
+                }
+            }
+            if let Some(target) = parsed_dec_hash {
+                if id.flow_hash == target {
+                    return Some(rec.clone());
+                }
+            }
+            let hex_hash = format!("{:016x}", id.flow_hash);
+            if hex_hash.eq_ignore_ascii_case(s_clean) || hex_hash.ends_with(s_clean) {
+                return Some(rec.clone());
+            }
+        }
+
+        None
+    }
+
+    /// Export all sessions and registry state into a deterministic binary state dump.
+    pub fn export_state_dump(&self) -> Vec<u8> {
+        let guard = match self.sessions.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut out = Vec::with_capacity(ISSP_DUMP_HEADER_SIZE + guard.len() * 97);
+        // Header
+        out.extend_from_slice(&ISSP_DUMP_MAGIC.to_be_bytes());
+        out.extend_from_slice(&ISSP_DUMP_VERSION_V1.to_be_bytes());
+        out.extend_from_slice(&self.node_id.to_be_bytes());
+        let policy_byte = match self.policy {
+            SecurityPolicy::StrictPsk => 0u8,
+            SecurityPolicy::Permissive => 1u8,
+            SecurityPolicy::PlaintextOnly => 2u8,
+        };
+        out.push(policy_byte);
+        out.extend_from_slice(&(guard.len() as u32).to_be_bytes());
+        out.extend_from_slice(&[0u8; 15]); // Reserved padding
+
+        // Sessions sorted by flow_hash for determinism
+        let mut records: Vec<&SessionRecord> = guard.values().collect();
+        records.sort_by_key(|a| a.snapshot.id.flow_hash);
+
+        for r in records {
+            out.push(if r.is_primary { 1 } else { 0 });
+            out.extend_from_slice(&r.snapshot.to_wire());
+        }
+
+        out
+    }
+
+    /// Import and reconstruct a `SessionRegistry` from a binary state dump.
+    pub fn import_state_dump(bytes: &[u8]) -> Result<Arc<Self>, SyncError> {
+        if bytes.len() < ISSP_DUMP_HEADER_SIZE {
+            return Err(SyncError::InvalidDumpLength(bytes.len()));
+        }
+
+        let magic = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+        if magic != ISSP_DUMP_MAGIC {
+            return Err(SyncError::BadDumpMagic);
+        }
+
+        let version = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
+        if version != ISSP_DUMP_VERSION_V1 {
+            return Err(SyncError::UnsupportedDumpVersion(version));
+        }
+
+        let node_id = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+        let policy = match bytes[12] {
+            0 => SecurityPolicy::StrictPsk,
+            1 => SecurityPolicy::Permissive,
+            _ => SecurityPolicy::PlaintextOnly,
+        };
+        let count = u32::from_be_bytes(bytes[13..17].try_into().unwrap()) as usize;
+
+        let expected_len = ISSP_DUMP_HEADER_SIZE + count * 97;
+        if bytes.len() < expected_len {
+            return Err(SyncError::InvalidDumpLength(bytes.len()));
+        }
+
+        let registry = Arc::new(Self {
+            node_id,
+            sessions: Mutex::new(HashMap::new()),
+            psk: None,
+            policy,
+            tx_nonce_seq: AtomicU64::new(1),
+            peer_last_seq: Mutex::new(HashMap::new()),
+            migration_count: AtomicU64::new(0),
+            gossip_rx_count: AtomicU64::new(0),
+            gossip_rejected_count: AtomicU64::new(0),
+            gossip_auth_failed_count: AtomicU64::new(0),
+            gossip_replay_failed_count: AtomicU64::new(0),
+        });
+        let mut reg_guard = registry.sessions.lock().map_err(|_| SyncError::LockPoisoned)?;
+
+        let mut offset = ISSP_DUMP_HEADER_SIZE;
+        for _ in 0..count {
+            let is_primary = bytes[offset] != 0;
+            offset += 1;
+            let wire_bytes: &[u8; 96] = bytes[offset..offset + 96].try_into().unwrap();
+            offset += 96;
+            let snap = SessionSnapshot::from_wire(wire_bytes);
+            reg_guard.insert(
+                snap.id,
+                SessionRecord {
+                    snapshot: snap,
+                    last_captured: Instant::now(),
+                    is_primary,
+                },
+            );
+        }
+
+        drop(reg_guard);
+        Ok(registry)
+    }
+
+    /// Save state dump atomically to file on disk.
+    pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let data = self.export_state_dump();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, data)
+    }
+
+    /// Load registry state dump from file.
+    pub fn load_from_file(path: &std::path::Path) -> Result<Arc<Self>, SyncError> {
+        let bytes = std::fs::read(path).map_err(|_| SyncError::SessionNotFound)?;
+        Self::import_state_dump(&bytes)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1377,6 +1598,12 @@ pub enum SyncError {
     BadCapsuleMagic,
     /// ISSP capsule buffer length is invalid.
     InvalidCapsuleLength(usize),
+    /// ISSP dump magic does not match ISSP_DUMP_MAGIC.
+    BadDumpMagic,
+    /// ISSP dump version is unsupported.
+    UnsupportedDumpVersion(u32),
+    /// ISSP dump buffer length is invalid.
+    InvalidDumpLength(usize),
 }
 
 impl std::fmt::Display for SyncError {
@@ -1397,6 +1624,9 @@ impl std::fmt::Display for SyncError {
             SyncError::InvalidCapsuleLength(len) => {
                 write!(f, "invalid ISSP capsule length: {len} bytes")
             }
+            SyncError::BadDumpMagic => write!(f, "invalid ISSP state dump magic tag"),
+            SyncError::UnsupportedDumpVersion(v) => write!(f, "unsupported ISSP dump version {v}"),
+            SyncError::InvalidDumpLength(len) => write!(f, "invalid ISSP dump length: {len} bytes"),
         }
     }
 }
@@ -2194,5 +2424,68 @@ mod tests {
         assert_eq!(outcome.auto_migrated_sessions[0].migration_epoch, 1);
         assert_eq!(outcome.outbound_secure_frames.len(), 1);
         assert_eq!(outcome.outbound_capsules.len(), 1);
+    }
+
+    #[test]
+    fn test_session_id_formatting_and_parsing() {
+        let id = SessionId::new(0x0123456789abcdef, 1, 42);
+        let s = id.to_canonical_string();
+        assert_eq!(s, "0123456789abcdef:0001:002a");
+        assert_eq!(format!("{id}"), "0123456789abcdef:0001:002a");
+
+        let parsed = SessionId::parse_str(&s).expect("parse canonical");
+        assert_eq!(parsed, id);
+
+        let parsed_plain_hash =
+            SessionId::parse_str("0x0123456789abcdef").expect("parse plain hex");
+        assert_eq!(parsed_plain_hash.flow_hash, 0x0123456789abcdef);
+    }
+
+    #[test]
+    fn test_registry_state_dump_and_session_lookup() {
+        let reg = SessionRegistry::new(7);
+        let id1 = SessionId::new(0x1000, 1, 10);
+        let id2 = SessionId::new(0x2000, 2, 20);
+
+        let snap1 = make_snap(id1, 0, 1_000);
+        let snap2 = make_snap(id2, 1, 1_000);
+
+        reg.upsert_primary(snap1).unwrap();
+        // Insert shadow session via gossip frame
+        let frame2 = GossipFrame {
+            sender_node_id: 2,
+            snapshot: snap2,
+        };
+        reg.apply_gossip(&frame2);
+
+        assert_eq!(reg.session_count(), 2);
+        let list = reg.list_sessions();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].is_primary);
+        assert!(!list[1].is_primary);
+
+        // find_session
+        let found = reg.find_session("1000").expect("find by hash");
+        assert_eq!(found.snapshot.id, id1);
+        let found_canon = reg
+            .find_session(&id2.to_canonical_string())
+            .expect("find by canonical");
+        assert_eq!(found_canon.snapshot.id, id2);
+
+        // Export and import state dump
+        let dump_bytes = reg.export_state_dump();
+        assert!(dump_bytes.len() >= ISSP_DUMP_HEADER_SIZE + 2 * 97);
+
+        let imported = SessionRegistry::import_state_dump(&dump_bytes).expect("import state dump");
+        assert_eq!(imported.node_id, 7);
+        assert_eq!(imported.session_count(), 2);
+
+        let rec1 = imported.get_session(&id1).expect("rec1");
+        assert!(rec1.is_primary);
+        assert_eq!(rec1.snapshot.tx_seq, snap1.tx_seq);
+
+        let rec2 = imported.get_session(&id2).expect("rec2");
+        assert!(!rec2.is_primary);
+        assert_eq!(rec2.snapshot.migration_epoch, snap2.migration_epoch);
     }
 }

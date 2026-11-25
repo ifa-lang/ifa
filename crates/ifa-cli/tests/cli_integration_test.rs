@@ -869,3 +869,186 @@ description = "Supervised resource usage telemetry end-to-end verification"
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_cli_net_session_list_inspect_migrate() {
+    use ifa_runtime::{GossipFrame, IsspCapsule, SessionId, SessionRegistry, SessionSnapshot};
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("ifa_cli_net_session_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let ifa_bin = get_ifa_binary();
+    let state_file = temp_dir.join("cluster_state.issp");
+    let capsule_file = temp_dir.join("cutover.cap");
+
+    // 1. Build an ISSP registry with 2 sessions and dump it to state_file
+    let reg = SessionRegistry::new(1);
+    let id1 = SessionId::new(0x0123456789abcdef, 1, 42);
+    let id2 = SessionId::new(0x89abcdef01234567, 2, 99);
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut snap1 = SessionSnapshot::new(id1, 1, now_secs);
+    snap1.tx_seq = 1000;
+    snap1.rx_seq_high = 995;
+    reg.upsert_primary(snap1).unwrap();
+
+    let mut snap2 = SessionSnapshot::new(id2, 1, now_secs);
+    snap2.tx_seq = 2500;
+    snap2.rx_seq_high = 2490;
+    let frame2 = GossipFrame {
+        sender_node_id: 2,
+        snapshot: snap2,
+    };
+    reg.apply_gossip(&frame2);
+
+    reg.save_to_file(&state_file).expect("save state dump");
+    assert!(state_file.exists());
+
+    // 2. Test `ifa net session list --file <state_file>`
+    let list_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("list")
+        .arg("--file")
+        .arg(&state_file)
+        .output()
+        .expect("execute `ifa net session list`");
+    assert!(
+        list_out.status.success(),
+        "ifa net session list failed: {}",
+        String::from_utf8_lossy(&list_out.stderr)
+    );
+    let list_str = String::from_utf8_lossy(&list_out.stdout);
+    assert!(list_str.contains("Total Sessions: 2"));
+    assert!(list_str.contains("Primary"));
+    assert!(list_str.contains("Standby"));
+    assert!(list_str.contains(&id1.to_canonical_string()));
+    assert!(list_str.contains(&id2.to_canonical_string()));
+
+    // 3. Test `ifa net session list --role primary`
+    let list_prim_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("list")
+        .arg("--file")
+        .arg(&state_file)
+        .arg("--role")
+        .arg("primary")
+        .output()
+        .expect("execute list primary");
+    assert!(list_prim_out.status.success());
+    let list_prim_str = String::from_utf8_lossy(&list_prim_out.stdout);
+    assert!(list_prim_str.contains(&id1.to_canonical_string()));
+    assert!(!list_prim_str.contains(&id2.to_canonical_string()));
+
+    // 4. Test `ifa net session list --json`
+    let list_json_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("list")
+        .arg("--file")
+        .arg(&state_file)
+        .arg("--json")
+        .output()
+        .expect("execute list json");
+    assert!(list_json_out.status.success());
+    let json_val: serde_json::Value =
+        serde_json::from_slice(&list_json_out.stdout).expect("valid JSON list output");
+    assert_eq!(json_val["total_sessions"], 2);
+    assert_eq!(json_val["sessions"].as_array().unwrap().len(), 2);
+
+    // 5. Test `ifa net session inspect <id>`
+    let inspect_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("inspect")
+        .arg(id1.to_canonical_string())
+        .arg("--file")
+        .arg(&state_file)
+        .output()
+        .expect("execute inspect");
+    assert!(inspect_out.status.success());
+    let inspect_str = String::from_utf8_lossy(&inspect_out.stdout);
+    assert!(inspect_str.contains("TX Sequence:      1000"));
+    assert!(inspect_str.contains("RX High Sequence: 995"));
+    assert!(inspect_str.contains("ChaCha20-Poly1305 (RFC 8439)"));
+
+    // 6. Test `ifa net session inspect <id> --json`
+    let inspect_json_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("inspect")
+        .arg(id1.to_canonical_string())
+        .arg("--file")
+        .arg(&state_file)
+        .arg("--json")
+        .output()
+        .expect("execute inspect json");
+    assert!(inspect_json_out.status.success());
+    let insp_json: serde_json::Value =
+        serde_json::from_slice(&inspect_json_out.stdout).expect("valid JSON inspect output");
+    assert_eq!(insp_json["sequence"]["tx_seq"], 1000);
+    assert_eq!(insp_json["sequence"]["rx_seq_high"], 995);
+
+    // 7. Test `ifa net session migrate <id2>` with `--out-capsule`
+    let migrate_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("migrate")
+        .arg(id2.to_canonical_string())
+        .arg("--file")
+        .arg(&state_file)
+        .arg("--out-capsule")
+        .arg(&capsule_file)
+        .output()
+        .expect("execute migrate");
+    assert!(
+        migrate_out.status.success(),
+        "migrate failed: {}",
+        String::from_utf8_lossy(&migrate_out.stderr)
+    );
+    let migrate_str = String::from_utf8_lossy(&migrate_out.stdout);
+    assert!(migrate_str.contains("Successfully triggered transparent migration"));
+    assert!(migrate_str.contains("New Epoch:       1"));
+    assert!(migrate_str.contains("Role:            Primary"));
+
+    // Verify capsule was produced
+    assert!(capsule_file.exists());
+    let cap_bytes = fs::read(&capsule_file).expect("read capsule");
+    let decoded_cap = IsspCapsule::from_bytes(&cap_bytes).expect("valid IsspCapsule");
+    assert_eq!(decoded_cap.origin_node_id, 1);
+
+    // Re-inspect session 2 in state_file to verify persistent migration
+    let verify_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("inspect")
+        .arg(id2.to_canonical_string())
+        .arg("--file")
+        .arg(&state_file)
+        .output()
+        .expect("execute re-inspect");
+    assert!(verify_out.status.success());
+    let verify_str = String::from_utf8_lossy(&verify_out.stdout);
+    assert!(verify_str.contains("Primary (Local Gateway)"));
+    assert!(verify_str.contains("Migration Epoch:    1"));
+
+    // 8. Test real empty state when no state file is configured
+    let empty_list_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("list")
+        .output()
+        .expect("execute empty list");
+    assert!(empty_list_out.status.success());
+    let empty_list_str = String::from_utf8_lossy(&empty_list_out.stdout);
+    assert!(empty_list_str.contains("No active or replicated tunnel sessions found in registry."));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

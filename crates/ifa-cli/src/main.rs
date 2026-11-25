@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 mod doc;
+mod net;
 mod tooling;
+use net::{execute_net_command, NetCommand};
 use tooling::{init_project, lint_program};
 
 #[derive(ClapParser)]
@@ -173,6 +175,11 @@ enum Commands {
     Wasm {
         #[command(subcommand)]
         command: WasmCommand,
+    },
+    /// Distributed network operations and ISSP session state inspection
+    Net {
+        #[command(subcommand)]
+        command: NetCommand,
     },
 }
 
@@ -1568,6 +1575,8 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         },
+
+        Commands::Net { command } => execute_net_command(command),
     }
 }
 
