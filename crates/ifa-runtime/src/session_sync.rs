@@ -3805,6 +3805,40 @@ impl SessionRegistry {
             .map_err(|_| SyncError::LockPoisoned)?;
         Ok(router.balancing_snapshot(timestamp_unix_ns))
     }
+
+    /// Handle an HTTP metrics endpoint request (`/metrics`, `/v1/metrics`, `/healthz`) for dynamic multipath balancing telemetry.
+    ///
+    /// Returns `(http_status_code, content_type_header, response_body_string)`.
+    pub fn handle_multipath_http_metrics(
+        &self,
+        path: &str,
+        accept_header: &str,
+        service_name: &str,
+        timestamp_unix_ns: u64,
+    ) -> (u16, &'static str, String) {
+        let handler = crate::telemetry::IsspTelemetryHttpHandler::new(service_name);
+        match self.multipath_balancing_snapshot(timestamp_unix_ns) {
+            Ok(snap) => handler.handle_snapshot(path, accept_header, &snap),
+            Err(_) => (
+                500,
+                "text/plain; charset=utf-8",
+                "Error collecting multipath balancing telemetry\n".to_string(),
+            ),
+        }
+    }
+
+    /// Create and bind a lightweight HTTP telemetry server exposing multipath balancing metrics.
+    pub fn create_telemetry_server(
+        self: &std::sync::Arc<Self>,
+        bind_addr: &str,
+        service_name: &str,
+    ) -> std::io::Result<crate::telemetry::IsspTelemetryServer> {
+        crate::telemetry::IsspTelemetryServer::bind(
+            bind_addr,
+            service_name,
+            std::sync::Arc::clone(self),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

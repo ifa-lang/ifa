@@ -12959,6 +12959,58 @@ impl ExtendedConnectTunnel {
             .map(|t| t.export_otlp_metrics_json(timestamp_nanos))
     }
 
+    /// Handle an HTTP metrics endpoint request (`/metrics`, `/v1/metrics`) against this tunnel's composite telemetry.
+    /// Returns `(http_status_code, content_type_header, response_body_string)`.
+    pub fn handle_http_metrics(
+        &mut self,
+        path: &str,
+        accept_header: &str,
+        timestamp_nanos: u64,
+    ) -> (u16, &'static str, String) {
+        self.collect_composite_metrics();
+        if let Some(ref telem) = self.telemetry {
+            telem.handle_http_metrics(path, accept_header, timestamp_nanos)
+        } else {
+            (503, "text/plain; charset=utf-8", "Telemetry unconfigured\n".to_string())
+        }
+    }
+
+    /// Process a raw HTTP request string and return the HTTP 1.1 formatted response with Prometheus/OTel payload.
+    pub fn handle_raw_http_metrics(
+        &mut self,
+        raw_request: &str,
+        timestamp_nanos: u64,
+    ) -> String {
+        let mut path = "/metrics";
+        let mut accept = "*/*";
+        for line in raw_request.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("GET ") {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    path = parts[1];
+                }
+            } else if trimmed.to_ascii_lowercase().starts_with("accept:") {
+                accept = trimmed.split(':').nth(1).unwrap_or("").trim();
+            }
+        }
+        let (code, ctype, body) = self.handle_http_metrics(path, accept, timestamp_nanos);
+        let status_text = match code {
+            200 => "OK",
+            404 => "Not Found",
+            503 => "Service Unavailable",
+            _ => "Error",
+        };
+        format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
+            code,
+            status_text,
+            ctype,
+            body.len(),
+            body
+        )
+    }
+
     /// Send a distributed trace context capsule over this tunnel.
     pub fn send_trace_context(&mut self, ctx: &TraceContext) -> Result<(), String> {
         let capsule = ctx.to_capsule();
@@ -26115,6 +26167,63 @@ impl DistributedTransportTelemetry {
     /// Record an updated multipath bonding telemetry snapshot.
     pub fn record_multipath(&mut self, telem: &MultipathBondingTelemetry) {
         self.multipath_telemetry = Some(telem.clone());
+    }
+
+    /// Record an ISSP dynamic multipath balancing telemetry snapshot into composite transport telemetry.
+    pub fn record_issp_multipath_balancing(
+        &mut self,
+        snapshot: &ifa_runtime::IsspMultipathBalancingSnapshot,
+    ) {
+        let mut paths = Vec::new();
+        let mut active_count = 0;
+        let mut degraded_count = 0;
+        let mut standby_count = 0;
+        let mut failed_count = 0;
+
+        for sp in &snapshot.subpaths {
+            let state = if !sp.is_usable {
+                failed_count += 1;
+                BondedPathState::Failed
+            } else if sp.state.contains("Degraded") {
+                degraded_count += 1;
+                BondedPathState::Degraded
+            } else if sp.state.contains("Standby") {
+                standby_count += 1;
+                BondedPathState::Standby
+            } else {
+                active_count += 1;
+                BondedPathState::Active
+            };
+
+            paths.push(PathTelemetrySnapshot {
+                tunnel_id: sp.path_id as u64,
+                name: sp.interface_name.clone(),
+                state,
+                weight: sp.effective_weight,
+                smoothed_rtt_ms: sp.rtt_us as f64 / 1000.0,
+                loss_rate: if sp.congestion_events > 0 { 0.01 } else { 0.0 },
+                quality_score: sp.effective_weight as f64 / 100.0,
+                packets_sent: sp.total_frames_sent,
+                bytes_sent: sp.bytes_in_flight,
+                packets_received: 0,
+                bytes_received: 0,
+            });
+        }
+
+        self.multipath_telemetry = Some(MultipathBondingTelemetry {
+            total_packets_sent: 0,
+            total_bytes_sent: 0,
+            total_packets_received: 0,
+            total_bytes_received: 0,
+            total_replicated_packets: 0,
+            total_failover_events: 0,
+            active_paths: active_count,
+            degraded_paths: degraded_count,
+            standby_paths: standby_count,
+            failed_paths: failed_count,
+            active_flows: snapshot.subpaths.len(),
+            paths,
+        });
     }
 
     /// Record an updated token bucket traffic shaper telemetry snapshot.
@@ -42048,6 +42157,44 @@ mod tls_alpn_tests {
             .export_otlp_metrics(1700000000000)
             .expect("export otlp");
         assert!(otel_json.contains("resourceMetrics"));
+
+        // 3. HTTP metrics endpoint inspection via tunnel
+        let (code, ctype, body) =
+            client_tunnel.handle_http_metrics("/metrics", "text/plain", 1700000000000);
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "text/plain; version=0.0.4; charset=utf-8");
+        assert!(body.contains("ifa_transport_rtt_seconds"));
+
+        let (code2, ctype2, body2) =
+            client_tunnel.handle_http_metrics("/v1/metrics", "application/json", 1700000000000);
+        assert_eq!(code2, 200);
+        assert_eq!(ctype2, "application/json");
+        assert!(body2.contains("resourceMetrics"));
+
+        let raw_resp = client_tunnel.handle_raw_http_metrics(
+            "GET /metrics HTTP/1.1\r\nHost: tunnel.ifa\r\nAccept: text/plain\r\n\r\n",
+            1700000000000,
+        );
+        assert!(raw_resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(raw_resp.contains("ifa_transport_rtt_seconds"));
+
+        // 4. Ingest and correlate ISSP dynamic multipath balancing snapshot
+        let issp_reg = ifa_runtime::SessionRegistry::new(10);
+        issp_reg
+            .set_multipath_routing_policy(ifa_runtime::IsspRoutingPolicy::BandwidthAggregation)
+            .unwrap();
+        issp_reg
+            .add_multipath_route(ifa_runtime::IsspMultipathRoute::new(1, 2, "eth0-wan", 1, 100))
+            .unwrap();
+        let issp_snap = issp_reg.multipath_balancing_snapshot(1700000000000).unwrap();
+
+        if let Some(ref mut t) = client_tunnel.telemetry {
+            t.record_issp_multipath_balancing(&issp_snap);
+        }
+        let prom_mp = client_tunnel
+            .export_prometheus()
+            .expect("export prom after multipath");
+        assert!(prom_mp.contains("ifa_transport_multipath_active_paths"));
     }
 
     #[test]

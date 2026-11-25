@@ -1,7 +1,10 @@
 //! System resource audit metrics and subprocess telemetry for IFA runtime, toolchain, and build orchestrator.
 
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::process::{Command, ExitStatus};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Telemetry metrics capturing execution time, CPU utilization, and memory usage.
@@ -1030,6 +1033,233 @@ impl OtelMultipathBalancingExporter {
     }
 }
 
+// ─── HTTP Telemetry Handlers & Exposition Server ──────────────────────────
+
+/// HTTP request dispatcher for dynamic ISSP multipath balancing telemetry.
+///
+/// Supports the standard observability endpoints:
+/// - `/metrics`: Prometheus Exposition text format (or OpenTelemetry OTLP JSON if `Accept: application/json` is requested)
+/// - `/v1/metrics`: OpenTelemetry OTLP JSON payload conforming to OTLP v1/metrics specification
+/// - `/healthz` or `/livez`: Liveness probe returning HTTP 200 OK
+#[derive(Debug, Clone)]
+pub struct IsspTelemetryHttpHandler {
+    service_name: String,
+}
+
+impl IsspTelemetryHttpHandler {
+    /// Create a new telemetry HTTP handler with the specified service name for OTLP reporting.
+    pub fn new(service_name: &str) -> Self {
+        Self {
+            service_name: service_name.to_string(),
+        }
+    }
+
+    /// Retrieve the configured service name.
+    pub fn service_name(&self) -> &str {
+        &self.service_name
+    }
+
+    /// Dispatch an HTTP request against a provided snapshot.
+    ///
+    /// Returns `(http_status_code, content_type_header, response_body_string)`.
+    pub fn handle_snapshot(
+        &self,
+        path: &str,
+        accept_header: &str,
+        snapshot: &IsspMultipathBalancingSnapshot,
+    ) -> (u16, &'static str, String) {
+        let clean_path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+        match clean_path {
+            "/metrics" => {
+                if accept_header.contains("application/json") {
+                    (
+                        200,
+                        "application/json",
+                        snapshot.export_otlp_json(&self.service_name),
+                    )
+                } else {
+                    (
+                        200,
+                        "text/plain; version=0.0.4; charset=utf-8",
+                        snapshot.export_prometheus(),
+                    )
+                }
+            }
+            "/v1/metrics" => (
+                200,
+                "application/json",
+                snapshot.export_otlp_json(&self.service_name),
+            ),
+            "/healthz" | "/livez" => (200, "text/plain; charset=utf-8", "OK\n".to_string()),
+            _ => (404, "text/plain; charset=utf-8", "Not Found\n".to_string()),
+        }
+    }
+
+    /// Parse a raw HTTP GET request string and format a complete HTTP 1.1 wire response.
+    pub fn handle_raw_http_request(
+        &self,
+        raw_request: &str,
+        snapshot: &IsspMultipathBalancingSnapshot,
+    ) -> String {
+        let mut path = "/metrics";
+        let mut accept = "*/*";
+
+        for line in raw_request.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("GET ") {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    path = parts[1];
+                }
+            } else if trimmed.to_ascii_lowercase().starts_with("accept:") {
+                accept = trimmed.split(':').nth(1).unwrap_or("").trim();
+            }
+        }
+
+        let (code, ctype, body) = self.handle_snapshot(path, accept, snapshot);
+        let status_text = match code {
+            200 => "OK",
+            404 => "Not Found",
+            500 => "Internal Server Error",
+            _ => "Unknown",
+        };
+
+        format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
+            code,
+            status_text,
+            ctype,
+            body.len(),
+            body
+        )
+    }
+}
+
+/// Lightweight HTTP telemetry server exposing ISSP dynamic multipath balancing metrics
+/// over standard network sockets (`std::net::TcpListener`).
+pub struct IsspTelemetryServer {
+    listener: TcpListener,
+    service_name: String,
+    registry: Arc<crate::session_sync::SessionRegistry>,
+}
+
+impl IsspTelemetryServer {
+    /// Bind the telemetry server to the requested socket address with an associated `SessionRegistry`.
+    pub fn bind<A: ToSocketAddrs>(
+        addr: A,
+        service_name: &str,
+        registry: Arc<crate::session_sync::SessionRegistry>,
+    ) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(addr)?;
+        Ok(Self {
+            listener,
+            service_name: service_name.to_string(),
+            registry,
+        })
+    }
+
+    /// Retrieve the local socket address on which the server is listening.
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    /// Configure non-blocking mode on the underlying TCP listener.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        self.listener.set_nonblocking(nonblocking)
+    }
+
+    /// Handle a request from a generic reader and write the formatted HTTP response to a generic writer.
+    ///
+    /// Returns `(http_status_code, requested_path)`.
+    pub fn serve_request_stream<R: Read, W: Write>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+    ) -> std::io::Result<(u16, String)> {
+        let mut buf = [0u8; 4096];
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok((400, String::new()));
+        }
+        let req_str = String::from_utf8_lossy(&buf[..n]);
+
+        let mut path = "/metrics";
+        let mut accept = "*/*";
+        for line in req_str.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("GET ") {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    path = parts[1];
+                }
+            } else if trimmed.to_ascii_lowercase().starts_with("accept:") {
+                accept = trimmed.split(':').nth(1).unwrap_or("").trim();
+            }
+        }
+
+        let timestamp_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
+        let snap_res = self.registry.multipath_balancing_snapshot(timestamp_ns);
+        let handler = IsspTelemetryHttpHandler::new(&self.service_name);
+
+        let (code, ctype, body) = match snap_res {
+            Ok(ref snap) => handler.handle_snapshot(path, accept, snap),
+            Err(_) => (
+                500,
+                "text/plain; charset=utf-8",
+                "Error collecting multipath balancing telemetry\n".to_string(),
+            ),
+        };
+
+        let status_text = match code {
+            200 => "OK",
+            404 => "Not Found",
+            500 => "Internal Server Error",
+            _ => "Unknown",
+        };
+
+        let resp = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
+            code,
+            status_text,
+            ctype,
+            body.len(),
+            body
+        );
+
+        writer.write_all(resp.as_bytes())?;
+        writer.flush()?;
+
+        Ok((code, path.to_string()))
+    }
+
+    /// Serve an incoming TCP connection synchronously.
+    pub fn serve_one_connection(&self, mut stream: TcpStream) -> std::io::Result<(u16, String)> {
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let mut reader = stream.try_clone()?;
+        let res = self.serve_request_stream(&mut reader, &mut stream)?;
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        Ok(res)
+    }
+
+    /// Try accepting and serving a single incoming connection.
+    /// In non-blocking mode, returns `Ok(None)` if no client connection is currently pending.
+    pub fn try_serve_one(&self) -> std::io::Result<Option<(u16, String)>> {
+        match self.listener.accept() {
+            Ok((stream, _)) => {
+                let res = self.serve_one_connection(stream)?;
+                Ok(Some(res))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1194,5 +1424,131 @@ mod tests {
 
         let otel = snap.export_otlp_json("test-ifa-service");
         assert!(otel.contains("test-ifa-service"));
+    }
+
+    #[test]
+    fn test_issp_telemetry_http_handler_endpoints() {
+        let reg = SessionRegistry::new(42);
+        reg.set_multipath_routing_policy(IsspRoutingPolicy::BandwidthAggregation)
+            .unwrap();
+        reg.add_multipath_route(IsspMultipathRoute::new(1, 2, "eth0-wan", 1, 100))
+            .unwrap();
+        reg.add_multipath_route(IsspMultipathRoute::new(2, 2, "wwan0-5g", 2, 50))
+            .unwrap();
+
+        let snap = reg.multipath_balancing_snapshot(1_700_000_000).unwrap();
+        let handler = IsspTelemetryHttpHandler::new("issp-ingress-gw");
+
+        // 1. /metrics with text/plain (Prometheus)
+        let (code, ctype, body) = handler.handle_snapshot("/metrics", "text/plain", &snap);
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "text/plain; version=0.0.4; charset=utf-8");
+        assert!(body.contains("ifa_issp_multipath_active_paths"));
+        assert!(body.contains("node_id=\"42\""));
+        assert!(body.contains("ifa_issp_subpath_configured_weight"));
+        assert!(body.contains("interface=\"eth0-wan\""));
+
+        // 2. /metrics with application/json (OTLP JSON)
+        let (code2, ctype2, body2) =
+            handler.handle_snapshot("/metrics", "application/json", &snap);
+        assert_eq!(code2, 200);
+        assert_eq!(ctype2, "application/json");
+        assert!(body2.contains("\"resourceMetrics\""));
+        assert!(body2.contains("\"issp-ingress-gw\""));
+
+        // 3. /v1/metrics (OTLP JSON)
+        let (code3, ctype3, body3) = handler.handle_snapshot("/v1/metrics", "*/*", &snap);
+        assert_eq!(code3, 200);
+        assert_eq!(ctype3, "application/json");
+        assert!(body3.contains("\"resourceMetrics\""));
+
+        // 4. /healthz and /livez
+        let (code_h, _, body_h) = handler.handle_snapshot("/healthz", "*/*", &snap);
+        assert_eq!(code_h, 200);
+        assert_eq!(body_h, "OK\n");
+
+        let (code_l, _, body_l) = handler.handle_snapshot("/livez", "*/*", &snap);
+        assert_eq!(code_l, 200);
+        assert_eq!(body_l, "OK\n");
+
+        // 5. 404 Not Found
+        let (code_404, _, body_404) = handler.handle_snapshot("/unknown/endpoint", "*/*", &snap);
+        assert_eq!(code_404, 404);
+        assert_eq!(body_404, "Not Found\n");
+
+        // 6. Raw HTTP request line parsing
+        let raw_req = "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1:9090\r\nUser-Agent: Prometheus/2.45.0\r\nAccept: text/plain\r\n\r\n";
+        let raw_resp = handler.handle_raw_http_request(raw_req, &snap);
+        assert!(raw_resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(raw_resp.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"));
+        assert!(raw_resp.contains("ifa_issp_multipath_active_paths"));
+        assert!(raw_resp.contains("node_id=\"42\""));
+    }
+
+    #[test]
+    fn test_issp_telemetry_server_tcp_real_sockets() {
+        let reg = SessionRegistry::new(77);
+        reg.set_multipath_routing_policy(IsspRoutingPolicy::BandwidthAggregation)
+            .unwrap();
+        reg.add_multipath_route(IsspMultipathRoute::new(1, 2, "eth0-wan", 1, 100))
+            .unwrap();
+        reg.add_multipath_route(IsspMultipathRoute::new(2, 2, "eth1-wan", 2, 80))
+            .unwrap();
+
+        let server = IsspTelemetryServer::bind("127.0.0.1:0", "ifa-issp-node-77", reg).unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let client_thread = std::thread::spawn(move || {
+            // 1. GET /metrics (Prometheus Exposition)
+            let mut s1 = TcpStream::connect(addr).expect("connect to telemetry server 1");
+            s1.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: text/plain\r\n\r\n")
+                .unwrap();
+            let mut resp1 = String::new();
+            s1.read_to_string(&mut resp1).unwrap();
+            assert!(resp1.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(resp1.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"));
+            assert!(resp1.contains("ifa_issp_multipath_active_paths"));
+            assert!(resp1.contains("node_id=\"77\""));
+
+            // 2. GET /v1/metrics (OTLP JSON)
+            let mut s2 = TcpStream::connect(addr).expect("connect to telemetry server 2");
+            s2.write_all(b"GET /v1/metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n")
+                .unwrap();
+            let mut resp2 = String::new();
+            s2.read_to_string(&mut resp2).unwrap();
+            assert!(resp2.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(resp2.contains("Content-Type: application/json\r\n"));
+            assert!(resp2.contains("\"resourceMetrics\""));
+            assert!(resp2.contains("\"ifa-issp-node-77\""));
+
+            // 3. GET /unknown (404)
+            let mut s3 = TcpStream::connect(addr).expect("connect to telemetry server 3");
+            s3.write_all(b"GET /nonexistent HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            let mut resp3 = String::new();
+            s3.read_to_string(&mut resp3).unwrap();
+            assert!(resp3.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        });
+
+        // Serve the 3 client requests
+        let (code1, path1) = server
+            .serve_one_connection(server.listener.accept().unwrap().0)
+            .unwrap();
+        assert_eq!(code1, 200);
+        assert_eq!(path1, "/metrics");
+
+        let (code2, path2) = server
+            .serve_one_connection(server.listener.accept().unwrap().0)
+            .unwrap();
+        assert_eq!(code2, 200);
+        assert_eq!(path2, "/v1/metrics");
+
+        let (code3, path3) = server
+            .serve_one_connection(server.listener.accept().unwrap().0)
+            .unwrap();
+        assert_eq!(code3, 404);
+        assert_eq!(path3, "/nonexistent");
+
+        client_thread.join().unwrap();
     }
 }
