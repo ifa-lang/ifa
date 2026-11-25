@@ -198,8 +198,8 @@ impl Bbrv3SubpathState {
             bw_hi_bps: 0,
             min_rtt_us: u64::MAX,
             min_rtt_stamp_ns: 0,
-            pacing_gain_q8: 738, // 2.885x Startup pacing gain
-            cwnd_gain_q8: 512,   // 2.0x Startup CWND gain
+            pacing_gain_q8: 738,         // 2.885x Startup pacing gain
+            cwnd_gain_q8: 512,           // 2.0x Startup CWND gain
             pacing_rate_bps: 10_000_000, // 10 Mbps initial pacing seed
             cwnd_bytes: MIN_CWND_BYTES * 2,
             inflight_hi_bytes: u64::MAX,
@@ -226,10 +226,7 @@ impl Bbrv3SubpathState {
             return MIN_CWND_BYTES;
         }
         // BDP = (bw_bps * min_rtt_us) / 8_000_000
-        let bdp = self
-            .estimated_bw_bps
-            .saturating_mul(self.min_rtt_us)
-            / 8_000_000;
+        let bdp = self.estimated_bw_bps.saturating_mul(self.min_rtt_us) / 8_000_000;
         bdp.max(MIN_CWND_BYTES)
     }
 
@@ -327,12 +324,12 @@ impl Bbrv3SubpathState {
         match self.phase {
             Bbrv3Phase::Startup => {
                 self.pacing_gain_q8 = 738; // 2.885x
-                self.cwnd_gain_q8 = 512;   // 2.0x
+                self.cwnd_gain_q8 = 512; // 2.0x
                 if self.rounds_without_bw_gain >= 3 {
                     // Pipe is filled; transition to Drain to shed queue
                     self.phase = Bbrv3Phase::Drain;
                     self.pacing_gain_q8 = 88; // 1 / 2.885x = ~0.347 (88/256)
-                    self.cwnd_gain_q8 = 256;  // 1.0x
+                    self.cwnd_gain_q8 = 256; // 1.0x
                 }
             }
             Bbrv3Phase::Drain => {
@@ -340,7 +337,7 @@ impl Bbrv3SubpathState {
                 if self.cwnd_bytes <= bdp || self.round_start {
                     self.phase = Bbrv3Phase::ProbeBw(Bbrv3ProbeBwSubPhase::Cruise);
                     self.pacing_gain_q8 = 256; // 1.0x
-                    self.cwnd_gain_q8 = 512;   // 2.0x
+                    self.cwnd_gain_q8 = 512; // 2.0x
                 }
             }
             Bbrv3Phase::ProbeBw(sub) => {
@@ -611,10 +608,7 @@ impl SubpathCongestionController {
             FlowSliceClass::MissionCritical,
             &FlowQoSProfile::mission_critical(),
         );
-        c.register_slice(
-            FlowSliceClass::BestEffort,
-            &FlowQoSProfile::best_effort(),
-        );
+        c.register_slice(FlowSliceClass::BestEffort, &FlowQoSProfile::best_effort());
 
         c.rebalance_slice_budgets();
         c
@@ -639,8 +633,8 @@ impl SubpathCongestionController {
         // Check pacing interval if enabled
         if self.bbrv3.pacing_rate_bps > 0 {
             // interval_ns = (packet_bytes * 8 * 1_000_000_000) / pacing_rate_bps
-            let pacing_interval_ns = (packet_bytes as u128 * 8_000_000_000
-                / self.bbrv3.pacing_rate_bps as u128) as u64;
+            let pacing_interval_ns =
+                (packet_bytes as u128 * 8_000_000_000 / self.bbrv3.pacing_rate_bps as u128) as u64;
             let elapsed_ns = now_ns.saturating_sub(self.last_transmission_ns);
             if elapsed_ns < pacing_interval_ns {
                 let wait = pacing_interval_ns - elapsed_ns;
@@ -676,7 +670,8 @@ impl SubpathCongestionController {
                 inflight_bytes: slice_inflight,
                 cwnd_bytes: slice_cwnd,
                 recommended_subpath_id: None,
-                backoff_reason: "UltraLowLatency target queuing delay exceeded (Bufferbloat prevention)",
+                backoff_reason:
+                    "UltraLowLatency target queuing delay exceeded (Bufferbloat prevention)",
             };
         }
 
@@ -731,7 +726,12 @@ impl SubpathCongestionController {
     }
 
     /// Record a transmitted packet.
-    pub fn on_packet_sent(&mut self, slice_class: FlowSliceClass, packet_bytes: usize, now_ns: u64) {
+    pub fn on_packet_sent(
+        &mut self,
+        slice_class: FlowSliceClass,
+        packet_bytes: usize,
+        now_ns: u64,
+    ) {
         let bytes_u64 = packet_bytes as u64;
         self.total_inflight_bytes = self.total_inflight_bytes.saturating_add(bytes_u64);
         self.last_transmission_ns = now_ns;
@@ -766,7 +766,8 @@ impl SubpathCongestionController {
         // Update subpath-level engines
         self.bbrv3.update_min_rtt(rtt_us, now_ns);
         self.bbrv3.update_bandwidth(acked_bytes, rtt_us);
-        self.bbrv3.on_loss_and_ecn(lost_bytes, acked_bytes, ecn_ce_count);
+        self.bbrv3
+            .on_loss_and_ecn(lost_bytes, acked_bytes, ecn_ce_count);
         self.bbrv3.advance_state_machine(now_ns);
 
         self.ledbat.update(rtt_us);
@@ -891,8 +892,10 @@ impl MultipathCongestionManager {
 
     /// Registers a subpath controller.
     pub fn register_subpath(&mut self, subpath_id: u32, algorithm: CongestionAlgorithm) {
-        self.controllers
-            .insert(subpath_id, SubpathCongestionController::new(subpath_id, algorithm));
+        self.controllers.insert(
+            subpath_id,
+            SubpathCongestionController::new(subpath_id, algorithm),
+        );
     }
 
     /// Read access to a subpath controller.
@@ -964,7 +967,9 @@ impl MultipathCongestionManager {
             if sid == exclude_subpath_id {
                 continue;
             }
-            if let CongestionSendVerdict::Allow { .. } = ctrl.can_send(slice_class, packet_bytes, now_ns) {
+            if let CongestionSendVerdict::Allow { .. } =
+                ctrl.can_send(slice_class, packet_bytes, now_ns)
+            {
                 let delay = ctrl.ledbat.queuing_delay_us;
                 let weight = ctrl.ledbat.delay_weight_factor();
                 candidates.push((sid, delay, weight));
@@ -1002,7 +1007,14 @@ impl MultipathCongestionManager {
         now_ns: u64,
     ) {
         if let Some(ctrl) = self.controllers.get_mut(&subpath_id) {
-            ctrl.on_feedback(slice_class, acked_bytes, lost_bytes, ecn_ce_count, rtt_us, now_ns);
+            ctrl.on_feedback(
+                slice_class,
+                acked_bytes,
+                lost_bytes,
+                ecn_ce_count,
+                rtt_us,
+                now_ns,
+            );
         }
 
         // Rebalance multipath coupled windows periodically or upon loss
@@ -1050,9 +1062,8 @@ impl MultipathCongestionManager {
                 / healthy_subpaths.len() as u64;
             for &h_id in &healthy_subpaths {
                 if let Some(h_ctrl) = self.controllers.get_mut(&h_id) {
-                    h_ctrl.total_cwnd_bytes = h_ctrl
-                        .total_cwnd_bytes
-                        .saturating_add(bonus_per_healthy);
+                    h_ctrl.total_cwnd_bytes =
+                        h_ctrl.total_cwnd_bytes.saturating_add(bonus_per_healthy);
                     h_ctrl.rebalance_slice_budgets();
                 }
             }
@@ -1065,9 +1076,9 @@ impl MultipathCongestionManager {
     pub fn sync_with_routes(&mut self, routes: &BTreeMap<u32, IsspMultipathRoute>) {
         for (&path_id, route) in routes.iter() {
             if route.state == IsspPathState::Active {
-                self.controllers
-                    .entry(path_id)
-                    .or_insert_with(|| SubpathCongestionController::new(path_id, CongestionAlgorithm::HybridQoSCoupled));
+                self.controllers.entry(path_id).or_insert_with(|| {
+                    SubpathCongestionController::new(path_id, CongestionAlgorithm::HybridQoSCoupled)
+                });
             }
         }
     }
@@ -1140,11 +1151,31 @@ impl MultipathCongestionBenchmarkReport {
         s.push_str("| Metric / Verification Test | Measured Result | SLA Target | Status |\n");
         s.push_str("| :--- | :--- | :--- | :--- |\n");
 
-        let urllc_status = if self.urllc_delay_containment_passed { "PASSED" } else { "FAILED" };
-        let embb_status = if self.embb_pipe_utilization_passed { "PASSED" } else { "FAILED" };
-        let mc_status = if self.mission_critical_loss_adaptation_passed { "PASSED" } else { "FAILED" };
-        let migr_status = if self.cross_subpath_migration_passed { "PASSED" } else { "FAILED" };
-        let scav_status = if self.best_effort_scavenger_yielding_passed { "PASSED" } else { "FAILED" };
+        let urllc_status = if self.urllc_delay_containment_passed {
+            "PASSED"
+        } else {
+            "FAILED"
+        };
+        let embb_status = if self.embb_pipe_utilization_passed {
+            "PASSED"
+        } else {
+            "FAILED"
+        };
+        let mc_status = if self.mission_critical_loss_adaptation_passed {
+            "PASSED"
+        } else {
+            "FAILED"
+        };
+        let migr_status = if self.cross_subpath_migration_passed {
+            "PASSED"
+        } else {
+            "FAILED"
+        };
+        let scav_status = if self.best_effort_scavenger_yielding_passed {
+            "PASSED"
+        } else {
+            "FAILED"
+        };
 
         let _ = writeln!(
             s,
@@ -1205,22 +1236,52 @@ pub fn run_multipath_congestion_benchmark() -> MultipathCongestionBenchmarkRepor
     let mut now_ns = 1_000_000_000u64; // 1.0s
 
     // Baseline propagation delay calibration for subpaths
-    manager.record_feedback(101, FlowSliceClass::UltraLowLatency, 1460, 0, 0, 4_000, now_ns);
-    manager.record_feedback(102, FlowSliceClass::UltraLowLatency, 1460, 0, 0, 6_000, now_ns);
+    manager.record_feedback(
+        101,
+        FlowSliceClass::UltraLowLatency,
+        1460,
+        0,
+        0,
+        4_000,
+        now_ns,
+    );
+    manager.record_feedback(
+        102,
+        FlowSliceClass::UltraLowLatency,
+        1460,
+        0,
+        0,
+        6_000,
+        now_ns,
+    );
 
     // ─── Test 1: URLLC delay containment ────────────────────────────────────
     // Feed high delay to Subpath 101 (20ms RTT -> 10ms OWD -> 8ms queuing delay > 5ms target)
     now_ns += 10_000_000;
-    manager.record_feedback(101, FlowSliceClass::UltraLowLatency, 14600, 0, 0, 20_000, now_ns);
+    manager.record_feedback(
+        101,
+        FlowSliceClass::UltraLowLatency,
+        14600,
+        0,
+        0,
+        20_000,
+        now_ns,
+    );
     let urllc_verdict = manager.evaluate_send(101, FlowSliceClass::UltraLowLatency, 1460, now_ns);
     let urllc_delay_containment_passed = match urllc_verdict {
-        CongestionSendVerdict::ThrottledCongested { recommended_subpath_id, .. } => {
+        CongestionSendVerdict::ThrottledCongested {
+            recommended_subpath_id,
+            ..
+        } => {
             // Recommended alternate subpath 102
             recommended_subpath_id == Some(102)
         }
         _ => false,
     };
-    let urllc_peak_queuing_delay_us = manager.controller(101).map(|c| c.ledbat.queuing_delay_us).unwrap_or(0);
+    let urllc_peak_queuing_delay_us = manager
+        .controller(101)
+        .map(|c| c.ledbat.queuing_delay_us)
+        .unwrap_or(0);
 
     // ─── Test 2: eMBB throughput discovery ──────────────────────────────────
     // Feed high bandwidth delivery feedback to Subpath 101
@@ -1236,11 +1297,17 @@ pub fn run_multipath_congestion_benchmark() -> MultipathCongestionBenchmarkRepor
             now_ns,
         );
     }
-    let embb_peak_bw_bps = manager.controller(101).map(|c| c.bbrv3.estimated_bw_bps).unwrap_or(0);
+    let embb_peak_bw_bps = manager
+        .controller(101)
+        .map(|c| c.bbrv3.estimated_bw_bps)
+        .unwrap_or(0);
     let embb_pipe_utilization_passed = embb_peak_bw_bps >= 40_000_000;
 
     // ─── Test 3: Mission-Critical loss adaptation ───────────────────────────
-    let prev_inflight_hi = manager.controller(101).map(|c| c.bbrv3.inflight_hi_bytes).unwrap_or(u64::MAX);
+    let prev_inflight_hi = manager
+        .controller(101)
+        .map(|c| c.bbrv3.inflight_hi_bytes)
+        .unwrap_or(u64::MAX);
     // Inject packet loss
     now_ns += 20_000_000;
     manager.record_feedback(
@@ -1252,13 +1319,24 @@ pub fn run_multipath_congestion_benchmark() -> MultipathCongestionBenchmarkRepor
         22_000,
         now_ns,
     );
-    let new_inflight_hi = manager.controller(101).map(|c| c.bbrv3.inflight_hi_bytes).unwrap_or(0);
+    let new_inflight_hi = manager
+        .controller(101)
+        .map(|c| c.bbrv3.inflight_hi_bytes)
+        .unwrap_or(0);
     let mission_critical_loss_adaptation_passed = new_inflight_hi < prev_inflight_hi;
 
     // ─── Test 4: Coupled cross-subpath window migration ─────────────────────
     // Subpath 101 is congested; Subpath 102 is clean (5ms RTT, zero loss)
     now_ns += 150_000_000;
-    manager.record_feedback(102, FlowSliceClass::HighThroughput, 60_000, 0, 0, 10_000, now_ns);
+    manager.record_feedback(
+        102,
+        FlowSliceClass::HighThroughput,
+        60_000,
+        0,
+        0,
+        10_000,
+        now_ns,
+    );
     // Trigger coupled rebalance
     manager.rebalance_coupled_windows(now_ns);
     let total_migration_events = manager.window_migration_events_total;
@@ -1267,12 +1345,18 @@ pub fn run_multipath_congestion_benchmark() -> MultipathCongestionBenchmarkRepor
     // ─── Test 5: BestEffort scavenger yielding ──────────────────────────────
     // Elevate queuing delay above LEDBAT target delay on Subpath 101 (50ms RTT -> 25ms OWD -> 23ms queuing delay > 15ms target)
     now_ns += 50_000_000;
-    manager.record_feedback(101, FlowSliceClass::HighThroughput, 1460, 0, 0, 50_000, now_ns);
-    let be_verdict = manager.evaluate_send(101, FlowSliceClass::BestEffort, 1460, now_ns);
-    let best_effort_scavenger_yielding_passed = matches!(
-        be_verdict,
-        CongestionSendVerdict::ThrottledCongested { .. }
+    manager.record_feedback(
+        101,
+        FlowSliceClass::HighThroughput,
+        1460,
+        0,
+        0,
+        50_000,
+        now_ns,
     );
+    let be_verdict = manager.evaluate_send(101, FlowSliceClass::BestEffort, 1460, now_ns);
+    let best_effort_scavenger_yielding_passed =
+        matches!(be_verdict, CongestionSendVerdict::ThrottledCongested { .. });
 
     let verification_passed = urllc_delay_containment_passed
         && embb_pipe_utilization_passed
@@ -1305,7 +1389,7 @@ mod tests {
         let bbr = Bbrv3SubpathState::new(1);
         assert_eq!(bbr.phase, Bbrv3Phase::Startup);
         assert_eq!(bbr.pacing_gain_q8, 738); // 2.885x
-        assert_eq!(bbr.cwnd_gain_q8, 512);   // 2.0x
+        assert_eq!(bbr.cwnd_gain_q8, 512); // 2.0x
         assert_eq!(bbr.cwnd_bytes, MIN_CWND_BYTES * 2);
     }
 
@@ -1352,7 +1436,14 @@ mod tests {
         assert_eq!(ctrl.total_inflight_bytes, 1460);
 
         // Ack feedback
-        ctrl.on_feedback(FlowSliceClass::HighThroughput, 1460, 0, 0, 15_000, now_ns + 15_000_000);
+        ctrl.on_feedback(
+            FlowSliceClass::HighThroughput,
+            1460,
+            0,
+            0,
+            15_000,
+            now_ns + 15_000_000,
+        );
         assert_eq!(ctrl.total_inflight_bytes, 0);
     }
 
@@ -1365,11 +1456,27 @@ mod tests {
         let now_ns = 1_000_000_000;
 
         // Subpath 1 is heavily congested with high queuing delay and loss
-        manager.record_feedback(1, FlowSliceClass::HighThroughput, 5000, 2920, 5, 80_000, now_ns);
+        manager.record_feedback(
+            1,
+            FlowSliceClass::HighThroughput,
+            5000,
+            2920,
+            5,
+            80_000,
+            now_ns,
+        );
         assert!(manager.controller(1).unwrap().is_congested);
 
         // Subpath 2 is clean
-        manager.record_feedback(2, FlowSliceClass::HighThroughput, 10000, 0, 0, 10_000, now_ns);
+        manager.record_feedback(
+            2,
+            FlowSliceClass::HighThroughput,
+            10000,
+            0,
+            0,
+            10_000,
+            now_ns,
+        );
         assert!(!manager.controller(2).unwrap().is_congested);
 
         let cwnd_1_before = manager.controller(1).unwrap().total_cwnd_bytes;
