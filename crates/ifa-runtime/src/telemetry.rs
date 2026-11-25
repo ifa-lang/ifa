@@ -482,6 +482,17 @@ impl IsspMultipathBalancingSnapshot {
     pub fn export_otlp_json(&self, service_name: &str) -> String {
         OtelMultipathBalancingExporter::new().export(self, service_name)
     }
+
+    /// Export snapshot in standard OpenTelemetry OTLP Protobuf (v1/metrics) binary format.
+    pub fn export_otlp_protobuf(&self, service_name: &str) -> Vec<u8> {
+        OtelProtobufMultipathExporter::new().export(self, service_name)
+    }
+
+    /// Export snapshot in standard gRPC-framed OpenTelemetry OTLP format (5-byte length prefix + Protobuf).
+    pub fn export_otlp_grpc_frame(&self, service_name: &str) -> Vec<u8> {
+        let proto = self.export_otlp_protobuf(service_name);
+        GrpcFrame::encode(&proto)
+    }
 }
 
 /// Detailed dynamic bandwidth balancing and congestion metrics for a single subpath.
@@ -1613,6 +1624,860 @@ impl OtelMultipathBalancingExporter {
     }
 }
 
+// ─── OpenTelemetry OTLP Protobuf (v1/metrics) & gRPC Exporter ─────────────
+
+/// High-performance, zero-allocation Protocol Buffers v3 wire writer.
+#[derive(Debug, Clone, Default)]
+pub struct ProtobufWriter {
+    buf: Vec<u8>,
+}
+
+impl ProtobufWriter {
+    /// Create a new protobuf writer.
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// Create a new protobuf writer with pre-allocated capacity.
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(cap),
+        }
+    }
+
+    /// Current length in bytes.
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Whether buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// Borrow buffer as byte slice.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Consume writer and return underlying bytes.
+    pub fn into_inner(self) -> Vec<u8> {
+        self.buf
+    }
+
+    /// Encode an unsigned 64-bit integer into protobuf varint format.
+    pub fn write_varint(&mut self, mut val: u64) {
+        while val >= 0x80 {
+            self.buf.push(((val & 0x7F) as u8) | 0x80);
+            val >>= 7;
+        }
+        self.buf.push((val & 0x7F) as u8);
+    }
+
+    /// Write field tag: `(field_number << 3) | wire_type`.
+    pub fn write_tag(&mut self, field_number: u32, wire_type: u8) {
+        self.write_varint(((field_number as u64) << 3) | (wire_type as u64));
+    }
+
+    /// Write a uint64 varint field (omitted if 0).
+    pub fn write_uint64(&mut self, field_number: u32, val: u64) {
+        if val != 0 {
+            self.write_tag(field_number, 0);
+            self.write_varint(val);
+        }
+    }
+
+    /// Write an int64 varint field (omitted if 0).
+    pub fn write_int64(&mut self, field_number: u32, val: i64) {
+        if val != 0 {
+            self.write_tag(field_number, 0);
+            self.write_varint(val as u64);
+        }
+    }
+
+    /// Write an int32 varint field (omitted if 0).
+    pub fn write_int32(&mut self, field_number: u32, val: i32) {
+        if val != 0 {
+            self.write_tag(field_number, 0);
+            self.write_varint(val as i64 as u64);
+        }
+    }
+
+    /// Write a boolean varint field (omitted if false).
+    pub fn write_bool(&mut self, field_number: u32, val: bool) {
+        if val {
+            self.write_tag(field_number, 0);
+            self.write_varint(1);
+        }
+    }
+
+    /// Write a fixed64 field (wire type 1, 8 bytes little-endian).
+    pub fn write_fixed64(&mut self, field_number: u32, val: u64) {
+        self.write_tag(field_number, 1);
+        self.buf.extend_from_slice(&val.to_le_bytes());
+    }
+
+    /// Write an sfixed64 field (wire type 1, 8 bytes little-endian).
+    pub fn write_sfixed64(&mut self, field_number: u32, val: i64) {
+        self.write_tag(field_number, 1);
+        self.buf.extend_from_slice(&val.to_le_bytes());
+    }
+
+    /// Write a double precision float field (wire type 1, 8 bytes little-endian).
+    pub fn write_double(&mut self, field_number: u32, val: f64) {
+        self.write_tag(field_number, 1);
+        self.buf.extend_from_slice(&val.to_bits().to_le_bytes());
+    }
+
+    /// Write a UTF-8 string field (wire type 2, length-delimited).
+    pub fn write_string(&mut self, field_number: u32, s: &str) {
+        if !s.is_empty() {
+            self.write_tag(field_number, 2);
+            self.write_varint(s.len() as u64);
+            self.buf.extend_from_slice(s.as_bytes());
+        }
+    }
+
+    /// Write a byte array field (wire type 2, length-delimited).
+    pub fn write_bytes(&mut self, field_number: u32, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.write_tag(field_number, 2);
+            self.write_varint(bytes.len() as u64);
+            self.buf.extend_from_slice(bytes);
+        }
+    }
+
+    /// Write an embedded message closure (wire type 2, length-delimited).
+    pub fn write_message<F>(&mut self, field_number: u32, f: F)
+    where
+        F: FnOnce(&mut ProtobufWriter),
+    {
+        let mut sub = ProtobufWriter::with_capacity(128);
+        f(&mut sub);
+        if !sub.is_empty() {
+            self.write_tag(field_number, 2);
+            self.write_varint(sub.len() as u64);
+            self.buf.extend_from_slice(sub.as_slice());
+        }
+    }
+
+    /// Write packed fixed64 integers (wire type 2, length-delimited).
+    pub fn write_packed_fixed64(&mut self, field_number: u32, values: &[u64]) {
+        if !values.is_empty() {
+            self.write_tag(field_number, 2);
+            self.write_varint((values.len() * 8) as u64);
+            for &v in values {
+                self.buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+
+    /// Write packed double-precision floats (wire type 2, length-delimited).
+    pub fn write_packed_doubles(&mut self, field_number: u32, values: &[f64]) {
+        if !values.is_empty() {
+            self.write_tag(field_number, 2);
+            self.write_varint((values.len() * 8) as u64);
+            for &v in values {
+                self.buf.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+        }
+    }
+}
+
+/// OpenTelemetry OTLP Protobuf (v1/metrics) exporter for dynamic ISSP multipath balancing.
+#[derive(Debug, Clone, Default)]
+pub struct OtelProtobufMultipathExporter {
+    pub default_attributes: BTreeMap<String, String>,
+}
+
+impl OtelProtobufMultipathExporter {
+    /// Create a new OpenTelemetry OTLP Protobuf multipath exporter.
+    pub fn new() -> Self {
+        Self {
+            default_attributes: BTreeMap::new(),
+        }
+    }
+
+    /// Add a resource attribute applied to the exported OTLP Protobuf payload.
+    pub fn with_attribute(mut self, key: &str, value: &str) -> Self {
+        self.default_attributes
+            .insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// Helper to write an OTLP KeyValue attribute message with a string value.
+    fn write_kv_string(w: &mut ProtobufWriter, key_field: u32, key: &str, val: &str) {
+        w.write_message(key_field, |kv| {
+            kv.write_string(1, key);
+            kv.write_message(2, |av| {
+                av.write_string(1, val);
+            });
+        });
+    }
+
+    /// Helper to write subpath attributes on a data point.
+    fn write_subpath_attributes(
+        w: &mut ProtobufWriter,
+        attr_field: u32,
+        node_id: u32,
+        sp: &IsspSubpathBalancingMetrics,
+    ) {
+        let node_str = node_id.to_string();
+        let path_str = sp.path_id.to_string();
+        Self::write_kv_string(w, attr_field, "node_id", &node_str);
+        Self::write_kv_string(w, attr_field, "path_id", &path_str);
+        Self::write_kv_string(w, attr_field, "interface", &sp.interface_name);
+        Self::write_kv_string(w, attr_field, "state", &sp.state);
+        Self::write_kv_string(w, attr_field, "phase", &sp.congestion_phase);
+    }
+
+    /// Helper to write pool-level attributes (node_id and policy).
+    fn write_pool_attributes(w: &mut ProtobufWriter, attr_field: u32, node_id: u32, policy: &str) {
+        let node_str = node_id.to_string();
+        Self::write_kv_string(w, attr_field, "node_id", &node_str);
+        Self::write_kv_string(w, attr_field, "policy", policy);
+    }
+
+    /// Export an `IsspMultipathBalancingSnapshot` into binary OpenTelemetry `ExportMetricsServiceRequest` Protobuf.
+    pub fn export(&self, s: &IsspMultipathBalancingSnapshot, service_name: &str) -> Vec<u8> {
+        let mut req_writer = ProtobufWriter::with_capacity(4096);
+        let ts_ns = s.timestamp_unix_ns;
+        let node_id = s.node_id;
+        let node_str = node_id.to_string();
+        let policy = &s.routing_policy;
+
+        // ExportMetricsServiceRequest.resource_metrics = 1 (repeated)
+        req_writer.write_message(1, |rm| {
+            // ResourceMetrics.resource = 1
+            rm.write_message(1, |res| {
+                // Resource.attributes = 1 (repeated KeyValue)
+                Self::write_kv_string(res, 1, "service.name", service_name);
+                let inst_id = format!("node-{}", node_id);
+                Self::write_kv_string(res, 1, "service.instance.id", &inst_id);
+                Self::write_kv_string(res, 1, "telemetry.sdk.name", "ifa-runtime");
+                Self::write_kv_string(res, 1, "telemetry.sdk.language", "ifa/rust");
+                for (k, v) in &self.default_attributes {
+                    Self::write_kv_string(res, 1, k, v);
+                }
+            });
+
+            // ResourceMetrics.scope_metrics = 2 (repeated ScopeMetrics)
+            rm.write_message(2, |sm| {
+                // ScopeMetrics.scope = 1 (InstrumentationScope)
+                sm.write_message(1, |scope| {
+                    scope.write_string(1, "ifa-runtime::issp_multipath");
+                    scope.write_string(2, "0.1.0");
+                });
+
+                // ScopeMetrics.metrics = 2 (repeated Metric)
+
+                // 1. Pool active paths (Gauge)
+                sm.write_message(2, |m| {
+                    m.write_string(1, "ifa.issp.multipath.active_paths");
+                    m.write_string(2, "Number of operational multipath subpaths");
+                    m.write_string(3, "1");
+                    m.write_message(5, |g| {
+                        g.write_message(1, |dp| {
+                            dp.write_fixed64(3, ts_ns);
+                            dp.write_sfixed64(6, s.active_paths as i64);
+                            Self::write_pool_attributes(dp, 7, node_id, policy);
+                        });
+                    });
+                });
+
+                // 2. Pool total effective weight (Gauge)
+                sm.write_message(2, |m| {
+                    m.write_string(1, "ifa.issp.multipath.total_effective_weight");
+                    m.write_string(
+                        2,
+                        "Aggregate effective scheduling weight across operational subpaths",
+                    );
+                    m.write_string(3, "1");
+                    m.write_message(5, |g| {
+                        g.write_message(1, |dp| {
+                            dp.write_fixed64(3, ts_ns);
+                            dp.write_sfixed64(6, s.total_effective_weight as i64);
+                            Self::write_pool_attributes(dp, 7, node_id, policy);
+                        });
+                    });
+                });
+
+                // 3. Subpath RTT (Gauge, seconds)
+                sm.write_message(2, |m| {
+                    m.write_string(1, "ifa.issp.subpath.rtt");
+                    m.write_string(2, "Smoothed round-trip time in seconds");
+                    m.write_string(3, "s");
+                    m.write_message(5, |g| {
+                        for sp in &s.subpaths {
+                            g.write_message(1, |dp| {
+                                dp.write_fixed64(3, ts_ns);
+                                dp.write_double(4, (sp.rtt_us as f64) / 1_000_000.0);
+                                Self::write_subpath_attributes(dp, 7, node_id, sp);
+                            });
+                        }
+                    });
+                });
+
+                // 4. Subpath RTT gradient (Gauge, seconds)
+                sm.write_message(2, |m| {
+                    m.write_string(1, "ifa.issp.subpath.rtt_gradient");
+                    m.write_string(2, "RTT gradient and queuing delay in seconds");
+                    m.write_string(3, "s");
+                    m.write_message(5, |g| {
+                        for sp in &s.subpaths {
+                            g.write_message(1, |dp| {
+                                dp.write_fixed64(3, ts_ns);
+                                dp.write_double(4, (sp.rtt_gradient_us as f64) / 1_000_000.0);
+                                Self::write_subpath_attributes(dp, 7, node_id, sp);
+                            });
+                        }
+                    });
+                });
+
+                // 5. BBR BtlBw (Gauge, bit/s)
+                sm.write_message(2, |m| {
+                    m.write_string(1, "ifa.issp.subpath.bbr_bw_bps");
+                    m.write_string(2, "BBR estimated bottleneck bandwidth in bits per second");
+                    m.write_string(3, "bit/s");
+                    m.write_message(5, |g| {
+                        for sp in &s.subpaths {
+                            g.write_message(1, |dp| {
+                                dp.write_fixed64(3, ts_ns);
+                                dp.write_sfixed64(6, sp.bbr_bw_bps as i64);
+                                Self::write_subpath_attributes(dp, 7, node_id, sp);
+                            });
+                        }
+                    });
+                });
+
+                // 6. LEDBAT CWND (Gauge, bytes)
+                sm.write_message(2, |m| {
+                    m.write_string(1, "ifa.issp.subpath.ledbat_cwnd_bytes");
+                    m.write_string(2, "LEDBAT congestion window in bytes");
+                    m.write_string(3, "By");
+                    m.write_message(5, |g| {
+                        for sp in &s.subpaths {
+                            g.write_message(1, |dp| {
+                                dp.write_fixed64(3, ts_ns);
+                                dp.write_sfixed64(6, sp.ledbat_cwnd_bytes as i64);
+                                Self::write_subpath_attributes(dp, 7, node_id, sp);
+                            });
+                        }
+                    });
+                });
+
+                // 7. Traffic share ratio (Gauge)
+                sm.write_message(2, |m| {
+                    m.write_string(1, "ifa.issp.subpath.traffic_share_ratio");
+                    m.write_string(
+                        2,
+                        "Dynamic traffic allocation ratio across aggregated subpaths",
+                    );
+                    m.write_string(3, "1");
+                    m.write_message(5, |g| {
+                        for sp in &s.subpaths {
+                            g.write_message(1, |dp| {
+                                dp.write_fixed64(3, ts_ns);
+                                dp.write_double(4, sp.traffic_share_ratio);
+                                Self::write_subpath_attributes(dp, 7, node_id, sp);
+                            });
+                        }
+                    });
+                });
+
+                // 8. Effective weight (Gauge)
+                sm.write_message(2, |m| {
+                    m.write_string(1, "ifa.issp.subpath.effective_weight");
+                    m.write_string(2, "Dynamic effective scheduling weight");
+                    m.write_string(3, "1");
+                    m.write_message(5, |g| {
+                        for sp in &s.subpaths {
+                            g.write_message(1, |dp| {
+                                dp.write_fixed64(3, ts_ns);
+                                dp.write_sfixed64(6, sp.effective_weight as i64);
+                                Self::write_subpath_attributes(dp, 7, node_id, sp);
+                            });
+                        }
+                    });
+                });
+
+                // 9. Congestion events (Sum, monotonic counter)
+                sm.write_message(2, |m| {
+                    m.write_string(1, "ifa.issp.subpath.congestion_events_total");
+                    m.write_string(2, "Total congestion events observed on subpath");
+                    m.write_string(3, "1");
+                    m.write_message(7, |sum| {
+                        for sp in &s.subpaths {
+                            sum.write_message(1, |dp| {
+                                dp.write_fixed64(3, ts_ns);
+                                dp.write_sfixed64(6, sp.congestion_events as i64);
+                                Self::write_subpath_attributes(dp, 7, node_id, sp);
+                            });
+                        }
+                        sum.write_int32(2, 2); // CUMULATIVE
+                        sum.write_bool(3, true); // is_monotonic
+                    });
+                });
+
+                // 10. Sessions count (Gauge)
+                sm.write_message(2, |m| {
+                    m.write_string(1, "ifa.session.total_sessions");
+                    m.write_string(2, "Total active sessions tracked in registry");
+                    m.write_string(3, "1");
+                    m.write_message(5, |g| {
+                        g.write_message(1, |dp| {
+                            dp.write_fixed64(3, ts_ns);
+                            dp.write_sfixed64(6, s.total_sessions as i64);
+                            Self::write_pool_attributes(dp, 7, node_id, policy);
+                        });
+                    });
+                });
+
+                // 11. TCP retransmission ratio (Gauge)
+                sm.write_message(2, |m| {
+                    m.write_string(1, "ifa.issp.subpath.tcp_retransmission_ratio");
+                    m.write_string(2, "TCP retransmission ratio on subpath");
+                    m.write_string(3, "1");
+                    m.write_message(5, |g| {
+                        for sp in &s.subpaths {
+                            g.write_message(1, |dp| {
+                                dp.write_fixed64(3, ts_ns);
+                                dp.write_double(4, sp.tcp_retrans_ratio);
+                                Self::write_subpath_attributes(dp, 7, node_id, sp);
+                            });
+                        }
+                    });
+                });
+
+                // 12. ISSP retransmission ratio (Gauge)
+                sm.write_message(2, |m| {
+                    m.write_string(1, "ifa.issp.subpath.issp_retransmission_ratio");
+                    m.write_string(2, "ISSP capsule retransmission ratio on subpath");
+                    m.write_string(3, "1");
+                    m.write_message(5, |g| {
+                        for sp in &s.subpaths {
+                            g.write_message(1, |dp| {
+                                dp.write_fixed64(3, ts_ns);
+                                dp.write_double(4, sp.issp_retrans_ratio);
+                                Self::write_subpath_attributes(dp, 7, node_id, sp);
+                            });
+                        }
+                    });
+                });
+
+                // 13. Interface Latency Histograms
+                if !s.interface_latency_histograms.is_empty() {
+                    sm.write_message(2, |m| {
+                        m.write_string(1, "ifa.issp.interface.latency");
+                        m.write_string(2, "Round-trip latency distribution per network interface");
+                        m.write_string(3, "s");
+                        m.write_message(9, |hist_msg| {
+                            for (iface, hist) in &s.interface_latency_histograms {
+                                hist_msg.write_message(1, |dp| {
+                                    dp.write_fixed64(3, ts_ns);
+                                    dp.write_fixed64(4, hist.count);
+                                    dp.write_double(5, hist.sum_seconds);
+                                    dp.write_packed_fixed64(6, &hist.cumulative_counts);
+                                    dp.write_packed_doubles(7, &hist.buckets);
+                                    dp.write_double(8, hist.safe_min_seconds());
+                                    Self::write_kv_string(dp, 9, "node_id", &node_str);
+                                    Self::write_kv_string(dp, 9, "interface", iface);
+                                    dp.write_double(11, hist.max_seconds);
+                                });
+                            }
+                            hist_msg.write_int32(2, 2); // CUMULATIVE
+                        });
+                    });
+                }
+            });
+        });
+
+        req_writer.into_inner()
+    }
+}
+
+// ─── gRPC Frame Formatting & OTLP gRPC Client ─────────────────────────────
+
+/// gRPC wire frame encoder and decoder (5-byte length prefix: 1 byte compressed flag + 4 bytes big-endian length).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrpcFrame;
+
+/// Errors arising during gRPC framing encode or decode operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrpcFrameError {
+    IncompleteHeader,
+    IncompleteBody { expected: usize, found: usize },
+    InvalidLength,
+}
+
+impl std::fmt::Display for GrpcFrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IncompleteHeader => write!(f, "Incomplete gRPC frame header (less than 5 bytes)"),
+            Self::IncompleteBody { expected, found } => {
+                write!(
+                    f,
+                    "Incomplete gRPC body (expected {} bytes, found {})",
+                    expected, found
+                )
+            }
+            Self::InvalidLength => write!(f, "Invalid gRPC frame length exceeds limit"),
+        }
+    }
+}
+
+impl std::error::Error for GrpcFrameError {}
+
+impl GrpcFrame {
+    /// Encode a payload slice into a standard uncompressed gRPC frame.
+    pub fn encode(payload: &[u8]) -> Vec<u8> {
+        let len = payload.len() as u32;
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(0x00); // 0 = uncompressed
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// Decode a gRPC frame from raw bytes. Returns `(is_compressed, payload_slice)`.
+    pub fn decode(buf: &[u8]) -> Result<(bool, &[u8]), GrpcFrameError> {
+        if buf.len() < 5 {
+            return Err(GrpcFrameError::IncompleteHeader);
+        }
+        let compressed = buf[0] != 0;
+        let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+        if buf.len() < 5 + len {
+            return Err(GrpcFrameError::IncompleteBody {
+                expected: 5 + len,
+                found: buf.len(),
+            });
+        }
+        Ok((compressed, &buf[5..5 + len]))
+    }
+}
+
+/// Result of an OTLP gRPC export operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OtlpGrpcExportResult {
+    /// gRPC status code (0 = OK).
+    pub status_code: u32,
+    /// Status message or description.
+    pub status_message: String,
+    /// Total bytes transmitted across the wire.
+    pub bytes_sent: usize,
+    /// Total bytes received in response.
+    pub bytes_received: usize,
+    /// Duration of export in microseconds.
+    pub duration_us: u64,
+}
+
+/// Errors occurring during OTLP gRPC export.
+#[derive(Debug)]
+pub enum OtlpGrpcError {
+    Io(std::io::Error),
+    GrpcStatus { code: u32, message: String },
+    ProtocolError(String),
+    Timeout,
+}
+
+impl From<std::io::Error> for OtlpGrpcError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl std::fmt::Display for OtlpGrpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "OTLP gRPC I/O error: {}", e),
+            Self::GrpcStatus { code, message } => {
+                write!(f, "OTLP gRPC error status {}: {}", code, message)
+            }
+            Self::ProtocolError(s) => write!(f, "OTLP gRPC protocol error: {}", s),
+            Self::Timeout => write!(f, "OTLP gRPC request timed out"),
+        }
+    }
+}
+
+impl std::error::Error for OtlpGrpcError {}
+
+/// OpenTelemetry OTLP gRPC (v1/metrics) client exporter for dynamic ISSP multipath balancing.
+#[derive(Debug, Clone)]
+pub struct OtelMultipathBalancingGrpcExporter {
+    pub endpoint: String,
+    pub timeout: Duration,
+    pub default_attributes: BTreeMap<String, String>,
+}
+
+impl OtelMultipathBalancingGrpcExporter {
+    /// Create a new OTLP gRPC exporter for the specified target endpoint (e.g. "127.0.0.1:4317").
+    pub fn new(endpoint: &str) -> Self {
+        Self {
+            endpoint: endpoint.to_string(),
+            timeout: Duration::from_secs(5),
+            default_attributes: BTreeMap::new(),
+        }
+    }
+
+    /// Set a custom network timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Add a resource attribute applied to all exported payloads.
+    pub fn with_attribute(mut self, key: &str, value: &str) -> Self {
+        self.default_attributes
+            .insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// Serialize snapshot to standard binary OTLP Protobuf format.
+    pub fn export_protobuf(
+        &self,
+        s: &IsspMultipathBalancingSnapshot,
+        service_name: &str,
+    ) -> Vec<u8> {
+        let mut exp = OtelProtobufMultipathExporter::new();
+        exp.default_attributes = self.default_attributes.clone();
+        exp.export(s, service_name)
+    }
+
+    /// Serialize snapshot to standard 5-byte framed gRPC format.
+    pub fn export_grpc_frame(
+        &self,
+        s: &IsspMultipathBalancingSnapshot,
+        service_name: &str,
+    ) -> Vec<u8> {
+        let proto = self.export_protobuf(s, service_name);
+        GrpcFrame::encode(&proto)
+    }
+
+    /// Export snapshot over a generic I/O stream using HTTP/2 gRPC or HTTP/1.1 gRPC transport.
+    pub fn export_stream<R: Read, W: Write>(
+        &self,
+        s: &IsspMultipathBalancingSnapshot,
+        service_name: &str,
+        reader: &mut R,
+        writer: &mut W,
+    ) -> Result<OtlpGrpcExportResult, OtlpGrpcError> {
+        let start = std::time::Instant::now();
+        let frame = self.export_grpc_frame(s, service_name);
+        let frame_len = frame.len();
+
+        // 1. Send HTTP/2 client connection preface + SETTINGS + HEADERS + DATA in one write
+        let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        let settings_frame = [0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+        let mut hpack_buf = Vec::with_capacity(256);
+        encode_literal_hpack_header(&mut hpack_buf, ":method", "POST");
+        encode_literal_hpack_header(&mut hpack_buf, ":scheme", "http");
+        encode_literal_hpack_header(
+            &mut hpack_buf,
+            ":path",
+            "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+        );
+        encode_literal_hpack_header(&mut hpack_buf, ":authority", &self.endpoint);
+        encode_literal_hpack_header(&mut hpack_buf, "content-type", "application/grpc");
+        encode_literal_hpack_header(&mut hpack_buf, "te", "trailers");
+        encode_literal_hpack_header(&mut hpack_buf, "user-agent", "ifa-runtime-otlp-grpc");
+
+        let h_len = hpack_buf.len();
+        let headers_hdr = [
+            ((h_len >> 16) & 0xFF) as u8,
+            ((h_len >> 8) & 0xFF) as u8,
+            (h_len & 0xFF) as u8,
+            0x01, // Type: HEADERS
+            0x04, // Flags: END_HEADERS
+            0x00,
+            0x00,
+            0x00,
+            0x01, // Stream ID 1
+        ];
+
+        let d_len = frame.len();
+        let data_hdr = [
+            ((d_len >> 16) & 0xFF) as u8,
+            ((d_len >> 8) & 0xFF) as u8,
+            (d_len & 0xFF) as u8,
+            0x00, // Type: DATA
+            0x01, // Flags: END_STREAM
+            0x00,
+            0x00,
+            0x00,
+            0x01, // Stream ID 1
+        ];
+
+        let mut full_req = Vec::with_capacity(
+            preface.len()
+                + settings_frame.len()
+                + headers_hdr.len()
+                + h_len
+                + data_hdr.len()
+                + frame_len,
+        );
+        full_req.extend_from_slice(preface);
+        full_req.extend_from_slice(&settings_frame);
+        full_req.extend_from_slice(&headers_hdr);
+        full_req.extend_from_slice(&hpack_buf);
+        full_req.extend_from_slice(&data_hdr);
+        full_req.extend_from_slice(&frame);
+
+        writer.write_all(&full_req)?;
+        writer.flush()?;
+
+        // 5. Read response frames from server
+        let mut resp_buf = [0u8; 8192];
+        let mut total_received = 0;
+        let mut status_code = 0u32;
+        let mut status_message = "OK".to_string();
+
+        let n = reader.read(&mut resp_buf)?;
+        total_received += n;
+
+        if n > 0 {
+            let resp_str = String::from_utf8_lossy(&resp_buf[..n]);
+            if resp_str.starts_with("HTTP/1.") {
+                for line in resp_str.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.to_ascii_lowercase().starts_with("grpc-status:") {
+                        let val = trimmed.split(':').nth(1).unwrap_or("0").trim();
+                        status_code = val.parse().unwrap_or(0);
+                    } else if trimmed.to_ascii_lowercase().starts_with("grpc-message:") {
+                        status_message =
+                            trimmed.split(':').nth(1).unwrap_or("OK").trim().to_string();
+                    }
+                }
+            } else {
+                let decoded = decode_hpack_headers_lossy(&resp_buf[..n]);
+                for (k, v) in decoded {
+                    if k == "grpc-status" {
+                        status_code = v.parse().unwrap_or(0);
+                    } else if k == "grpc-message" {
+                        status_message = v;
+                    }
+                }
+            }
+        }
+
+        if status_code != 0 {
+            return Err(OtlpGrpcError::GrpcStatus {
+                code: status_code,
+                message: status_message,
+            });
+        }
+
+        let duration_us = start.elapsed().as_micros() as u64;
+        Ok(OtlpGrpcExportResult {
+            status_code,
+            status_message,
+            bytes_sent: preface.len()
+                + settings_frame.len()
+                + headers_hdr.len()
+                + h_len
+                + data_hdr.len()
+                + frame_len,
+            bytes_received: total_received,
+            duration_us,
+        })
+    }
+
+    /// Export snapshot over network to configured endpoint.
+    pub fn export_to_endpoint(
+        &self,
+        s: &IsspMultipathBalancingSnapshot,
+        service_name: &str,
+    ) -> Result<OtlpGrpcExportResult, OtlpGrpcError> {
+        let addr_str = if self.endpoint.contains(':') {
+            self.endpoint.clone()
+        } else {
+            format!("{}:4317", self.endpoint)
+        };
+
+        let addrs: Vec<SocketAddr> = match addr_str.to_socket_addrs() {
+            Ok(iter) => iter.collect(),
+            Err(e) => return Err(OtlpGrpcError::Io(e)),
+        };
+
+        let mut last_err = None;
+        for addr in addrs {
+            match TcpStream::connect_timeout(&addr, self.timeout) {
+                Ok(mut stream) => {
+                    let _ = stream.set_read_timeout(Some(self.timeout));
+                    let _ = stream.set_write_timeout(Some(self.timeout));
+                    let mut reader = match stream.try_clone() {
+                        Ok(r) => r,
+                        Err(e) => return Err(OtlpGrpcError::Io(e)),
+                    };
+                    return self.export_stream(s, service_name, &mut reader, &mut stream);
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(OtlpGrpcError::Io(last_err.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "No socket addresses resolved",
+            )
+        })))
+    }
+}
+
+fn encode_literal_hpack_header(buf: &mut Vec<u8>, name: &str, value: &str) {
+    buf.push(0x00);
+    encode_hpack_string(buf, name.as_bytes());
+    encode_hpack_string(buf, value.as_bytes());
+}
+
+fn encode_hpack_string(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let len = bytes.len();
+    if len < 127 {
+        buf.push(len as u8);
+    } else {
+        buf.push(127);
+        let mut rem = len - 127;
+        while rem >= 128 {
+            buf.push(((rem & 0x7F) as u8) | 0x80);
+            rem >>= 7;
+        }
+        buf.push(rem as u8);
+    }
+    buf.extend_from_slice(bytes);
+}
+
+fn decode_hpack_headers_lossy(data: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        if let Some(pos) = data[i..].windows(11).position(|w| w == b"grpc-status") {
+            let start = i + pos + 11;
+            if start < data.len() {
+                let mut j = start;
+                while j < data.len()
+                    && (data[j] == 0 || data[j] == b':' || data[j] == b' ' || data[j] < 32)
+                {
+                    j += 1;
+                }
+                let mut val = String::new();
+                while j < data.len() && data[j] >= b'0' && data[j] <= b'9' {
+                    val.push(data[j] as char);
+                    j += 1;
+                }
+                if !val.is_empty() {
+                    out.push(("grpc-status".to_string(), val));
+                }
+            }
+            i = start + 1;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
 // ─── Cluster Quorum Health & Degradation Probes ───────────────────────────
 
 /// Configuration for cluster quorum health and degradation threshold evaluation.
@@ -2328,6 +3193,7 @@ impl IsspTelemetryHttpHandler {
                 "application/json",
                 snapshot.export_otlp_json(&self.service_name),
             ),
+            p if p.contains("MetricsService/Export") => (200, "application/grpc", String::new()),
             "/healthz" | "/livez" => {
                 if accept_header.contains("application/json") {
                     let json = format!(
@@ -2381,6 +3247,35 @@ impl IsspTelemetryHttpHandler {
         snapshot: &IsspMultipathBalancingSnapshot,
     ) -> (u16, &'static str, String) {
         self.handle_snapshot_with_quorum(path, accept_header, snapshot, 1)
+    }
+
+    /// Dispatch an HTTP or gRPC binary request returning raw payload bytes:
+    /// `(http_status_code, content_type_header, response_body_bytes)`.
+    pub fn handle_snapshot_binary(
+        &self,
+        path: &str,
+        accept_header: &str,
+        snapshot: &IsspMultipathBalancingSnapshot,
+    ) -> (u16, &'static str, Vec<u8>) {
+        let clean_path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+        if clean_path == "/v1/metrics"
+            && (accept_header.contains("application/x-protobuf")
+                || accept_header.contains("application/protobuf"))
+        {
+            (
+                200,
+                "application/x-protobuf",
+                snapshot.export_otlp_protobuf(&self.service_name),
+            )
+        } else if clean_path.contains("MetricsService/Export")
+            || accept_header.contains("application/grpc")
+        {
+            (200, "application/grpc", vec![0x00, 0x00, 0x00, 0x00, 0x00])
+        } else {
+            let (code, ctype, body_str) =
+                self.handle_snapshot_with_quorum(path, accept_header, snapshot, 1);
+            (code, ctype, body_str.into_bytes())
+        }
     }
 
     /// Parse a raw HTTP GET request string and format a complete HTTP 1.1 wire response.
@@ -2712,6 +3607,12 @@ impl IsspTelemetryServer {
         if n == 0 {
             return Ok((400, String::new()));
         }
+
+        // 1. Detect HTTP/2 connection preface (standard gRPC over HTTP/2)
+        if buf[..n].starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") {
+            return self.serve_http2_grpc_connection(&buf[..n], reader, writer);
+        }
+
         let req_str = String::from_utf8_lossy(&buf[..n]);
 
         let mut method = "GET";
@@ -2745,6 +3646,56 @@ impl IsspTelemetryServer {
         }
 
         let clean_path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+
+        let is_grpc = clean_path.contains("MetricsService/Export")
+            || req_str
+                .to_ascii_lowercase()
+                .contains("content-type: application/grpc")
+            || accept.contains("application/grpc");
+
+        if is_grpc {
+            // Respond with standard HTTP/1.1 gRPC response
+            let empty_grpc = [0x00, 0x00, 0x00, 0x00, 0x00];
+            let resp_hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/grpc\r\ngrpc-status: 0\r\ngrpc-message: OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                empty_grpc.len()
+            );
+            writer.write_all(resp_hdr.as_bytes())?;
+            writer.write_all(&empty_grpc)?;
+            writer.flush()?;
+            return Ok((200, clean_path.to_string()));
+        }
+
+        let is_protobuf_export = clean_path == "/v1/metrics"
+            && (accept.contains("application/x-protobuf")
+                || accept.contains("application/protobuf"));
+
+        if is_protobuf_export {
+            let timestamp_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            match self.registry.multipath_balancing_snapshot(timestamp_ns) {
+                Ok(snap) => {
+                    let proto_bytes = snap.export_otlp_protobuf(&self.service_name);
+                    let resp_hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+                        proto_bytes.len()
+                    );
+                    writer.write_all(resp_hdr.as_bytes())?;
+                    writer.write_all(&proto_bytes)?;
+                    writer.flush()?;
+                    return Ok((200, clean_path.to_string()));
+                }
+                Err(_) => {
+                    let resp_hdr =
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+                    writer.write_all(resp_hdr.as_bytes())?;
+                    writer.flush()?;
+                    return Ok((500, clean_path.to_string()));
+                }
+            }
+        }
 
         let (code, ctype, body) = if method == "POST" {
             if clean_path == "/webhook/alerts"
@@ -2829,7 +3780,7 @@ impl IsspTelemetryServer {
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         let mut reader = stream.try_clone()?;
         let res = self.serve_request_stream(&mut reader, &mut stream)?;
-        let _ = stream.shutdown(std::net::Shutdown::Both);
+        let _ = stream.shutdown(std::net::Shutdown::Write);
         Ok(res)
     }
 
@@ -2844,6 +3795,101 @@ impl IsspTelemetryServer {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Serve an incoming HTTP/2 gRPC connection (OTLP metrics export or reflection).
+    pub fn serve_http2_grpc_connection<R: Read, W: Write>(
+        &self,
+        initial_buf: &[u8],
+        reader: &mut R,
+        writer: &mut W,
+    ) -> std::io::Result<(u16, String)> {
+        // Read until we see client's DATA frame with END_STREAM (flags & 0x01 != 0) or EOF
+        let mut full_buf = initial_buf.to_vec();
+        let mut chunk = [0u8; 4096];
+        while !full_buf
+            .windows(9)
+            .any(|w| w[3] == 0x00 && (w[4] & 0x01) != 0)
+        {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    full_buf.extend_from_slice(&chunk[..n]);
+                }
+                Err(_) => break,
+            }
+        }
+
+        // 1. Send server SETTINGS frame
+        let server_settings = [0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
+        writer.write_all(&server_settings)?;
+
+        // 2. Send SETTINGS ACK (flags = 0x01)
+        let settings_ack = [0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00];
+        writer.write_all(&settings_ack)?;
+
+        // 3. Build response HEADERS frame on stream ID 1 (flags = 0x04 END_HEADERS)
+        let mut hpack_buf = Vec::with_capacity(128);
+        encode_literal_hpack_header(&mut hpack_buf, ":status", "200");
+        encode_literal_hpack_header(&mut hpack_buf, "content-type", "application/grpc");
+
+        let h_len = hpack_buf.len();
+        let headers_hdr = [
+            ((h_len >> 16) & 0xFF) as u8,
+            ((h_len >> 8) & 0xFF) as u8,
+            (h_len & 0xFF) as u8,
+            0x01, // Type: HEADERS
+            0x04, // Flags: END_HEADERS
+            0x00,
+            0x00,
+            0x00,
+            0x01, // Stream ID 1
+        ];
+        writer.write_all(&headers_hdr)?;
+        writer.write_all(&hpack_buf)?;
+
+        // 4. Send DATA frame with empty gRPC message (5 bytes: 0 flag + 0 length)
+        let grpc_resp_msg = [0x00, 0x00, 0x00, 0x00, 0x00];
+        let d_len = grpc_resp_msg.len();
+        let data_hdr = [
+            ((d_len >> 16) & 0xFF) as u8,
+            ((d_len >> 8) & 0xFF) as u8,
+            (d_len & 0xFF) as u8,
+            0x00, // Type: DATA
+            0x00, // Flags: none
+            0x00,
+            0x00,
+            0x00,
+            0x01, // Stream ID 1
+        ];
+        writer.write_all(&data_hdr)?;
+        writer.write_all(&grpc_resp_msg)?;
+
+        // 5. Send trailing HEADERS frame with trailers (flags = 0x05 END_STREAM | END_HEADERS)
+        let mut trailers_buf = Vec::with_capacity(64);
+        encode_literal_hpack_header(&mut trailers_buf, "grpc-status", "0");
+        encode_literal_hpack_header(&mut trailers_buf, "grpc-message", "OK");
+
+        let t_len = trailers_buf.len();
+        let trailers_hdr = [
+            ((t_len >> 16) & 0xFF) as u8,
+            ((t_len >> 8) & 0xFF) as u8,
+            (t_len & 0xFF) as u8,
+            0x01, // Type: HEADERS
+            0x05, // Flags: END_STREAM | END_HEADERS
+            0x00,
+            0x00,
+            0x00,
+            0x01, // Stream ID 1
+        ];
+        writer.write_all(&trailers_hdr)?;
+        writer.write_all(&trailers_buf)?;
+        writer.flush()?;
+
+        Ok((
+            200,
+            "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export".to_string(),
+        ))
     }
 
     /// Serve a WebSocket upgrade on `GET /ws/metrics` (RFC 6455 mini-handshake, `std::net` only).
@@ -4339,5 +5385,157 @@ mod tests {
         // Confirm sessions are now routed to path 20
         assert_eq!(reg.resolve_session_path(&s1, 200).unwrap(), 20);
         assert_eq!(reg.resolve_session_path(&s2, 200).unwrap(), 20);
+    }
+
+    #[test]
+    fn test_protobuf_writer_primitives_and_varint() {
+        let mut pw = ProtobufWriter::new();
+        pw.write_uint64(1, 150);
+        pw.write_string(2, "testing");
+        pw.write_double(3, 42.5);
+        pw.write_packed_fixed64(4, &[10, 20, 30]);
+
+        let bytes = pw.into_inner();
+        assert!(!bytes.is_empty());
+
+        // Field 1: tag (1 << 3) | 0 = 8. Varint 150 -> 0x96, 0x01
+        assert_eq!(bytes[0], 0x08);
+        assert_eq!(bytes[1], 0x96);
+        assert_eq!(bytes[2], 0x01);
+
+        // Field 2: tag (2 << 3) | 2 = 18. Length 7, "testing"
+        assert_eq!(bytes[3], 0x12);
+        assert_eq!(bytes[4], 7);
+        assert_eq!(&bytes[5..12], b"testing");
+    }
+
+    #[test]
+    fn test_otlp_protobuf_exporter_and_grpc_frame() {
+        let mut router = IsspDynamicMultipathRouter::new(42, IsspRoutingPolicy::LowestLatency);
+        let mut r1 = IsspMultipathRoute::new(1, 2, "wan0", 1, 80);
+        r1.metrics.smoothed_rtt_us = 12_000;
+        router.add_route(r1);
+
+        let snap = router.balancing_snapshot(1_700_000_000_000_000_000);
+        let exporter = OtelProtobufMultipathExporter::new().with_attribute("env", "staging");
+
+        let proto = exporter.export(&snap, "ifa-multipath-service");
+        assert!(!proto.is_empty());
+
+        // Frame as gRPC
+        let frame = GrpcFrame::encode(&proto);
+        assert_eq!(frame.len(), 5 + proto.len());
+        assert_eq!(frame[0], 0x00); // uncompressed
+        let frame_len = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
+        assert_eq!(frame_len, proto.len());
+
+        let (is_comp, payload) = GrpcFrame::decode(&frame).unwrap();
+        assert!(!is_comp);
+        assert_eq!(payload, &proto[..]);
+
+        // Test error conditions on decode
+        assert_eq!(
+            GrpcFrame::decode(&[0, 0, 0]),
+            Err(GrpcFrameError::IncompleteHeader)
+        );
+        assert!(matches!(
+            GrpcFrame::decode(&[0, 0, 0, 0, 10, 1, 2]),
+            Err(GrpcFrameError::IncompleteBody {
+                expected: 15,
+                found: 7
+            })
+        ));
+    }
+
+    #[test]
+    fn test_issp_telemetry_http_handler_binary_protobuf_endpoint() {
+        let router = IsspDynamicMultipathRouter::new(10, IsspRoutingPolicy::LowestLatency);
+        let snap = router.balancing_snapshot(1_700_000_000_000_000_000);
+        let handler = IsspTelemetryHttpHandler::new("ifa-gateway");
+
+        let (code, ctype, bytes) =
+            handler.handle_snapshot_binary("/v1/metrics", "application/x-protobuf", &snap);
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "application/x-protobuf");
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn test_issp_telemetry_server_grpc_real_tcp_export() {
+        use crate::session_sync::SessionRegistry;
+
+        let reg = SessionRegistry::new(55);
+        let server = IsspTelemetryServer::bind("127.0.0.1:0", "ifa-grpc-node", reg).unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let router = IsspDynamicMultipathRouter::new(55, IsspRoutingPolicy::BandwidthAggregation);
+        let snap = router.balancing_snapshot(1_700_000_000_000_000_000);
+
+        let client = std::thread::spawn(move || {
+            let exporter = OtelMultipathBalancingGrpcExporter::new(&addr.to_string())
+                .with_timeout(Duration::from_secs(2));
+            let res = exporter.export_to_endpoint(&snap, "ifa-grpc-node").unwrap();
+            assert_eq!(res.status_code, 0);
+            assert_eq!(res.status_message, "OK");
+            assert!(res.bytes_sent > 0);
+            assert!(res.bytes_received > 0);
+        });
+
+        let (stream, _) = server.listener.accept().unwrap();
+        let (code, path) = server.serve_one_connection(stream).unwrap();
+        assert_eq!(code, 200);
+        assert!(path.contains("MetricsService/Export"));
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn test_issp_telemetry_server_http1_grpc_and_protobuf_export() {
+        use crate::session_sync::SessionRegistry;
+
+        let reg = SessionRegistry::new(77);
+        let server = IsspTelemetryServer::bind("127.0.0.1:0", "ifa-http-grpc", reg).unwrap();
+        let addr = server.local_addr().unwrap();
+
+        // 1. Test HTTP/1.1 gRPC POST
+        let client1 = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            let grpc_body = [0u8, 0, 0, 0, 2, 0x08, 0x01];
+            let req = format!(
+                "POST /opentelemetry.proto.collector.metrics.v1.MetricsService/Export HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/grpc\r\nContent-Length: {}\r\n\r\n",
+                grpc_body.len()
+            );
+            s.write_all(req.as_bytes()).unwrap();
+            s.write_all(&grpc_body).unwrap();
+            s.flush().unwrap();
+
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).unwrap();
+            let resp_str = String::from_utf8_lossy(&resp);
+            assert!(resp_str.contains("HTTP/1.1 200 OK"));
+            assert!(resp_str.contains("Content-Type: application/grpc"));
+            assert!(resp_str.contains("grpc-status: 0"));
+        });
+
+        let (stream1, _) = server.listener.accept().unwrap();
+        server.serve_one_connection(stream1).unwrap();
+        client1.join().unwrap();
+
+        // 2. Test HTTP/1.1 GET /v1/metrics with Accept: application/x-protobuf
+        let client2 = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            let req = "GET /v1/metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/x-protobuf\r\n\r\n";
+            s.write_all(req.as_bytes()).unwrap();
+            s.flush().unwrap();
+
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).unwrap();
+            let resp_str = String::from_utf8_lossy(&resp);
+            assert!(resp_str.contains("HTTP/1.1 200 OK"));
+            assert!(resp_str.contains("Content-Type: application/x-protobuf"));
+        });
+
+        let (stream2, _) = server.listener.accept().unwrap();
+        server.serve_one_connection(stream2).unwrap();
+        client2.join().unwrap();
     }
 }
