@@ -9464,6 +9464,656 @@ impl AdaptiveTokenBucketShaper {
     }
 }
 
+// ── Strict-Priority Weighted Deficit Round-Robin (SP-WDRR) Capsule Scheduler ─
+
+/// Classification key for queues managed by the Strict-Priority Weighted Deficit Round-Robin (SP-WDRR) scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpQueueKey {
+    /// High-priority data traffic queue (interactive datagrams, time-critical frames).
+    High,
+    /// Normal-priority data traffic queue (standard datagrams and application capsules).
+    Normal,
+    /// Bulk-priority data traffic queue (background transfer, bulk data).
+    Bulk,
+    /// Custom multiplexed flow queue (e.g. identified by datagram Context ID or Stream ID).
+    CustomFlow(u32),
+}
+
+/// Scheduled packet or capsule waiting in the SP-WDRR multiplexer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpWdrrPacket {
+    /// Unique monotonic identifier.
+    pub id: u64,
+    /// Encapsulated byte payload (e.g. raw or encoded RFC 9297 capsule).
+    pub payload: Vec<u8>,
+    /// Priority classification: `Control` is serviced strictly before data; `High`, `Normal`, `Bulk` are WDRR.
+    pub priority: TrafficPriority,
+    /// Flow identifier (e.g. stream ID, datagram context ID, or custom flow).
+    pub flow_id: u32,
+    /// Exact byte size.
+    pub byte_cost: usize,
+    /// Wall-clock timestamp when packet entered the queue.
+    pub enqueued_at: std::time::Instant,
+}
+
+/// Configuration settings for the Strict-Priority Weighted Deficit Round-Robin (SP-WDRR) scheduler.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpWdrrConfig {
+    /// Base DRR quantum in bytes (default: 1024).
+    pub base_quantum: usize,
+    /// Maximum deficit cap in bytes preventing credit hoarding during idle periods (default: 65536).
+    pub max_deficit: usize,
+    /// Consecutive unserved active rounds before applying an anti-starvation deficit boost (default: 3).
+    pub starvation_threshold_rounds: usize,
+    /// Quantum multiplier applied during anti-starvation boost (default: 2).
+    pub anti_starvation_boost_factor: usize,
+    /// Optional limit on the number of control packets serviced before yielding to data queues (None = strict infinite priority).
+    pub max_control_burst_packets: Option<usize>,
+    /// Weight assigned to High priority data queue (default: 4).
+    pub high_weight: u16,
+    /// Weight assigned to Normal priority data queue (default: 2).
+    pub normal_weight: u16,
+    /// Weight assigned to Bulk priority data queue (default: 1).
+    pub bulk_weight: u16,
+    /// Maximum packet capacity across all queues before tail drop (default: 1024).
+    pub max_queue_depth_packets: usize,
+    /// Maximum byte capacity across all queues before tail drop (default: 2097152 = 2MB).
+    pub max_queue_depth_bytes: usize,
+}
+
+impl Default for SpWdrrConfig {
+    fn default() -> Self {
+        Self {
+            base_quantum: 1024,
+            max_deficit: 65536,
+            starvation_threshold_rounds: 3,
+            anti_starvation_boost_factor: 2,
+            max_control_burst_packets: None,
+            high_weight: 4,
+            normal_weight: 2,
+            bulk_weight: 1,
+            max_queue_depth_packets: 1024,
+            max_queue_depth_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
+
+impl SpWdrrConfig {
+    /// Set the base DRR quantum in bytes.
+    pub fn with_base_quantum(mut self, base_quantum: usize) -> Self {
+        self.base_quantum = base_quantum.max(1);
+        self
+    }
+
+    /// Set the maximum deficit cap in bytes.
+    pub fn with_max_deficit(mut self, max_deficit: usize) -> Self {
+        self.max_deficit = max_deficit.max(self.base_quantum);
+        self
+    }
+
+    /// Set the starvation threshold in rounds and boost factor.
+    pub fn with_starvation_params(mut self, rounds: usize, boost_factor: usize) -> Self {
+        self.starvation_threshold_rounds = rounds.max(1);
+        self.anti_starvation_boost_factor = boost_factor.max(1);
+        self
+    }
+
+    /// Set weights for High, Normal, and Bulk priority classes.
+    pub fn with_priority_weights(mut self, high: u16, normal: u16, bulk: u16) -> Self {
+        self.high_weight = high.max(1);
+        self.normal_weight = normal.max(1);
+        self.bulk_weight = bulk.max(1);
+        self
+    }
+
+    /// Set maximum control burst packet limit before yielding.
+    pub fn with_max_control_burst(mut self, limit: Option<usize>) -> Self {
+        self.max_control_burst_packets = limit;
+        self
+    }
+
+    /// Set queue capacity limits.
+    pub fn with_queue_limits(mut self, max_packets: usize, max_bytes: usize) -> Self {
+        self.max_queue_depth_packets = max_packets.max(1);
+        self.max_queue_depth_bytes = max_bytes.max(1);
+        self
+    }
+}
+
+/// Real-time statistics and state for an individual SP-WDRR queue.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpWdrrQueueStats {
+    pub key: SpQueueKey,
+    pub weight: u16,
+    pub deficit: usize,
+    pub packets_queued: usize,
+    pub bytes_queued: usize,
+    pub total_packets_serviced: usize,
+    pub total_bytes_serviced: usize,
+    pub consecutive_starved_rounds: usize,
+    pub starvation_boosts_applied: usize,
+}
+
+/// Comprehensive telemetry metrics for the SP-WDRR multiplexer.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SpWdrrTelemetry {
+    pub control_packets_serviced: usize,
+    pub control_bytes_serviced: usize,
+    pub data_packets_serviced: usize,
+    pub data_bytes_serviced: usize,
+    pub high_packets_serviced: usize,
+    pub high_bytes_serviced: usize,
+    pub normal_packets_serviced: usize,
+    pub normal_bytes_serviced: usize,
+    pub bulk_packets_serviced: usize,
+    pub bulk_bytes_serviced: usize,
+    pub rounds_completed: usize,
+    pub starvation_boosts_applied: usize,
+    pub deficit_resets_on_empty: usize,
+    pub packets_dropped_queue_full: usize,
+    pub bytes_dropped_queue_full: usize,
+    pub control_queue_depth: usize,
+    pub data_queue_depth: usize,
+    pub total_queued_bytes: usize,
+    pub jains_fairness_index: f64,
+}
+
+#[derive(Debug, Clone)]
+struct SpQueueState {
+    key: SpQueueKey,
+    weight: u16,
+    deficit: usize,
+    packets: std::collections::VecDeque<SpWdrrPacket>,
+    queued_bytes: usize,
+    total_packets_serviced: usize,
+    total_bytes_serviced: usize,
+    consecutive_starved_rounds: usize,
+    starvation_boosts_applied: usize,
+}
+
+impl SpQueueState {
+    fn new(key: SpQueueKey, weight: u16) -> Self {
+        Self {
+            key,
+            weight: weight.max(1),
+            deficit: 0,
+            packets: std::collections::VecDeque::new(),
+            queued_bytes: 0,
+            total_packets_serviced: 0,
+            total_bytes_serviced: 0,
+            consecutive_starved_rounds: 0,
+            starvation_boosts_applied: 0,
+        }
+    }
+}
+
+/// Strict-Priority Weighted Deficit Round-Robin (SP-WDRR) Multiplexer & Scheduler.
+///
+/// Features:
+/// 1. Strict Priority (SP) plane for Control traffic (RFC 9297 Close, Drain, Route, Address capsules).
+///    Control capsules never get blocked or delayed by bulk data bursts and can bypass data queues.
+/// 2. Weighted Deficit Round-Robin (WDRR) plane for data traffic (High, Normal, Bulk, and custom flows).
+/// 3. Guaranteed proportional fair bandwidth sharing without starvation.
+/// 4. Strict Deficit Conservation: deficit is reset to 0 whenever a queue becomes empty.
+/// 5. Deficit Cap: deficits are bounded by `max_deficit` to avoid massive burst dumping after idle periods.
+/// 6. Anti-Starvation Mechanism: automatic deficit boost when a queue is unserved for N consecutive rounds.
+/// 7. Jain's Fairness Index telemetry computed across active weighted data queues.
+#[derive(Debug, Clone)]
+pub struct StrictPriorityWdrrScheduler {
+    pub config: SpWdrrConfig,
+    control_queue: std::collections::VecDeque<SpWdrrPacket>,
+    control_bytes: usize,
+    data_queues: std::collections::HashMap<SpQueueKey, SpQueueState>,
+    data_keys_order: Vec<SpQueueKey>,
+    next_packet_id: u64,
+    total_queued_bytes: usize,
+    total_control_packets_serviced: usize,
+    total_control_bytes_serviced: usize,
+    total_rounds_completed: usize,
+    total_starvation_boosts: usize,
+    total_deficit_resets: usize,
+    packets_dropped_queue_full: usize,
+    bytes_dropped_queue_full: usize,
+}
+
+impl Default for StrictPriorityWdrrScheduler {
+    fn default() -> Self {
+        Self::new(SpWdrrConfig::default())
+    }
+}
+
+impl StrictPriorityWdrrScheduler {
+    /// Create a new SP-WDRR scheduler with the specified configuration.
+    pub fn new(config: SpWdrrConfig) -> Self {
+        let mut data_queues = std::collections::HashMap::new();
+        data_queues.insert(
+            SpQueueKey::High,
+            SpQueueState::new(SpQueueKey::High, config.high_weight),
+        );
+        data_queues.insert(
+            SpQueueKey::Normal,
+            SpQueueState::new(SpQueueKey::Normal, config.normal_weight),
+        );
+        data_queues.insert(
+            SpQueueKey::Bulk,
+            SpQueueState::new(SpQueueKey::Bulk, config.bulk_weight),
+        );
+
+        let data_keys_order = vec![SpQueueKey::High, SpQueueKey::Normal, SpQueueKey::Bulk];
+
+        Self {
+            config,
+            control_queue: std::collections::VecDeque::new(),
+            control_bytes: 0,
+            data_queues,
+            data_keys_order,
+            next_packet_id: 1,
+            total_queued_bytes: 0,
+            total_control_packets_serviced: 0,
+            total_control_bytes_serviced: 0,
+            total_rounds_completed: 0,
+            total_starvation_boosts: 0,
+            total_deficit_resets: 0,
+            packets_dropped_queue_full: 0,
+            bytes_dropped_queue_full: 0,
+        }
+    }
+
+    /// Register a custom flow ID with an explicit WDRR scheduling weight.
+    pub fn register_flow(&mut self, flow_id: u32, weight: u16) {
+        let key = SpQueueKey::CustomFlow(flow_id);
+        if let Some(existing) = self.data_queues.get_mut(&key) {
+            existing.weight = weight.max(1);
+        } else {
+            self.data_queues.insert(key, SpQueueState::new(key, weight));
+            self.data_keys_order.push(key);
+        }
+    }
+
+    /// Unregister a custom flow ID. Any remaining queued packets are safely migrated to the Normal queue.
+    pub fn unregister_flow(&mut self, flow_id: u32) {
+        let key = SpQueueKey::CustomFlow(flow_id);
+        if let Some(mut state) = self.data_queues.remove(&key) {
+            self.data_keys_order.retain(|&k| k != key);
+            if !state.packets.is_empty() {
+                if let Some(normal_q) = self.data_queues.get_mut(&SpQueueKey::Normal) {
+                    while let Some(pkt) = state.packets.pop_front() {
+                        normal_q.queued_bytes += pkt.byte_cost;
+                        normal_q.packets.push_back(pkt);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Enqueue an arbitrary byte payload with given priority and flow identifier.
+    pub fn enqueue(
+        &mut self,
+        payload: Vec<u8>,
+        priority: TrafficPriority,
+        flow_id: u32,
+        now: std::time::Instant,
+    ) -> Result<u64, DropReason> {
+        let byte_cost = payload.len();
+        let total_pkts = self.total_queue_len();
+
+        if total_pkts >= self.config.max_queue_depth_packets
+            || self.total_queued_bytes + byte_cost > self.config.max_queue_depth_bytes
+        {
+            self.packets_dropped_queue_full += 1;
+            self.bytes_dropped_queue_full += byte_cost;
+            return Err(DropReason::QueueFull {
+                current_depth: total_pkts,
+                max_depth: self.config.max_queue_depth_packets,
+            });
+        }
+
+        let id = self.next_packet_id;
+        self.next_packet_id = self.next_packet_id.wrapping_add(1);
+
+        let pkt = SpWdrrPacket {
+            id,
+            payload,
+            priority,
+            flow_id,
+            byte_cost,
+            enqueued_at: now,
+        };
+
+        if priority == TrafficPriority::Control {
+            self.control_bytes += byte_cost;
+            self.control_queue.push_back(pkt);
+        } else {
+            let key = if flow_id != 0
+                && self
+                    .data_queues
+                    .contains_key(&SpQueueKey::CustomFlow(flow_id))
+            {
+                SpQueueKey::CustomFlow(flow_id)
+            } else {
+                match priority {
+                    TrafficPriority::High => SpQueueKey::High,
+                    TrafficPriority::Normal => SpQueueKey::Normal,
+                    TrafficPriority::Bulk => SpQueueKey::Bulk,
+                    TrafficPriority::Control => unreachable!(),
+                }
+            };
+
+            if let Some(q) = self.data_queues.get_mut(&key) {
+                q.queued_bytes += byte_cost;
+                q.packets.push_back(pkt);
+            }
+        }
+
+        self.total_queued_bytes += byte_cost;
+        Ok(id)
+    }
+
+    /// Enqueue an RFC 9297 HTTP capsule into the SP-WDRR scheduler.
+    /// Control capsules (CloseWebTransportSession, DrainWebTransportSession, AddressAssign, AddressRequest,
+    /// RouteAdvertisement) automatically receive Strict Priority unless explicitly overridden.
+    pub fn enqueue_capsule(
+        &mut self,
+        capsule: &crate::simd_parser::HttpCapsule,
+        priority: Option<TrafficPriority>,
+        flow_id: u32,
+        now: std::time::Instant,
+    ) -> Result<u64, DropReason> {
+        let prio = priority.unwrap_or(match capsule.capsule_type {
+            crate::simd_parser::CapsuleType::CloseWebTransportSession
+            | crate::simd_parser::CapsuleType::DrainWebTransportSession
+            | crate::simd_parser::CapsuleType::AddressAssign
+            | crate::simd_parser::CapsuleType::AddressRequest
+            | crate::simd_parser::CapsuleType::RouteAdvertisement => TrafficPriority::Control,
+            _ => TrafficPriority::Normal,
+        });
+        let encoded = capsule.encode_to_vec();
+        self.enqueue(encoded, prio, flow_id, now)
+    }
+
+    /// Schedule and dequeue the next packet, strictly checking Control first, then WDRR.
+    pub fn schedule_next(&mut self) -> Option<SpWdrrPacket> {
+        let mut batch = self.schedule_batch(0, 1);
+        batch.pop()
+    }
+
+    /// Schedule and dequeue a batch of packets up to `max_bytes` and `max_packets`.
+    /// Control traffic is dequeued with Strict Priority before data traffic.
+    /// Data queues are scheduled fairly using Weighted Deficit Round-Robin.
+    pub fn schedule_batch(&mut self, max_bytes: usize, max_packets: usize) -> Vec<SpWdrrPacket> {
+        let mut result = Vec::new();
+        let mut bytes_dispatched = 0;
+
+        let byte_limit = if max_bytes == 0 {
+            usize::MAX
+        } else {
+            max_bytes
+        };
+        let packet_limit = if max_packets == 0 {
+            usize::MAX
+        } else {
+            max_packets
+        };
+
+        // 1. Strict Priority plane: Drain Control queue
+        let control_limit = self.config.max_control_burst_packets.unwrap_or(usize::MAX);
+        let mut control_serviced_this_call = 0;
+
+        while control_serviced_this_call < control_limit && result.len() < packet_limit {
+            if let Some(front) = self.control_queue.front() {
+                if bytes_dispatched + front.byte_cost > byte_limit && !result.is_empty() {
+                    break;
+                }
+                let pkt = self.control_queue.pop_front().unwrap();
+                bytes_dispatched += pkt.byte_cost;
+                self.control_bytes = self.control_bytes.saturating_sub(pkt.byte_cost);
+                self.total_control_bytes_serviced += pkt.byte_cost;
+                self.total_control_packets_serviced += 1;
+                self.total_queued_bytes = self.total_queued_bytes.saturating_sub(pkt.byte_cost);
+                control_serviced_this_call += 1;
+                result.push(pkt);
+            } else {
+                break;
+            }
+        }
+
+        if result.len() >= packet_limit || bytes_dispatched >= byte_limit {
+            return result;
+        }
+
+        // 2. Data plane: Weighted Deficit Round-Robin
+        if !self.has_any_data_packets() {
+            return result;
+        }
+
+        let max_rounds = 100;
+        let mut round_count = 0;
+
+        while round_count < max_rounds
+            && result.len() < packet_limit
+            && bytes_dispatched < byte_limit
+        {
+            if !self.has_any_data_packets() {
+                break;
+            }
+
+            let mut packets_dispatched_in_round = 0;
+
+            for idx in 0..self.data_keys_order.len() {
+                let key = self.data_keys_order[idx];
+                let q_state = match self.data_queues.get_mut(&key) {
+                    Some(q) => q,
+                    None => continue,
+                };
+
+                if q_state.packets.is_empty() {
+                    if q_state.deficit > 0 {
+                        q_state.deficit = 0;
+                        self.total_deficit_resets += 1;
+                    }
+                    continue;
+                }
+
+                let quantum = self.config.base_quantum * (q_state.weight as usize);
+                q_state.deficit = (q_state.deficit + quantum).min(self.config.max_deficit);
+
+                if q_state.consecutive_starved_rounds >= self.config.starvation_threshold_rounds {
+                    let boost = self.config.base_quantum * self.config.anti_starvation_boost_factor;
+                    q_state.deficit = (q_state.deficit + boost).min(self.config.max_deficit);
+                    q_state.starvation_boosts_applied += 1;
+                    self.total_starvation_boosts += 1;
+                }
+
+                let mut served_this_queue_in_round = 0;
+
+                while let Some(front) = q_state.packets.front() {
+                    if q_state.deficit >= front.byte_cost {
+                        if bytes_dispatched + front.byte_cost > byte_limit && !result.is_empty() {
+                            break;
+                        }
+                        let pkt = q_state.packets.pop_front().unwrap();
+                        q_state.deficit -= pkt.byte_cost;
+                        q_state.queued_bytes = q_state.queued_bytes.saturating_sub(pkt.byte_cost);
+                        q_state.total_packets_serviced += 1;
+                        q_state.total_bytes_serviced += pkt.byte_cost;
+
+                        self.total_queued_bytes =
+                            self.total_queued_bytes.saturating_sub(pkt.byte_cost);
+                        bytes_dispatched += pkt.byte_cost;
+                        served_this_queue_in_round += 1;
+                        packets_dispatched_in_round += 1;
+                        result.push(pkt);
+
+                        if result.len() >= packet_limit || bytes_dispatched >= byte_limit {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                if q_state.packets.is_empty() {
+                    q_state.deficit = 0;
+                    self.total_deficit_resets += 1;
+                }
+
+                if served_this_queue_in_round > 0 {
+                    q_state.consecutive_starved_rounds = 0;
+                } else if !q_state.packets.is_empty() {
+                    q_state.consecutive_starved_rounds += 1;
+                }
+
+                if result.len() >= packet_limit || bytes_dispatched >= byte_limit {
+                    break;
+                }
+            }
+
+            self.total_rounds_completed += 1;
+            round_count += 1;
+
+            if packets_dispatched_in_round == 0 && !self.has_any_data_packets() {
+                break;
+            }
+        }
+
+        result
+    }
+
+    /// Whether any data queue currently contains waiting packets.
+    pub fn has_any_data_packets(&self) -> bool {
+        self.data_queues.values().any(|q| !q.packets.is_empty())
+    }
+
+    /// Total packets currently waiting in the Control queue.
+    pub fn control_queue_len(&self) -> usize {
+        self.control_queue.len()
+    }
+
+    /// Total bytes currently waiting in the Control queue.
+    pub fn control_queue_bytes(&self) -> usize {
+        self.control_bytes
+    }
+
+    /// Total packets waiting across all data queues.
+    pub fn data_queue_len(&self) -> usize {
+        self.data_queues.values().map(|q| q.packets.len()).sum()
+    }
+
+    /// Total packets waiting across both Control and Data queues.
+    pub fn total_queue_len(&self) -> usize {
+        self.control_queue.len() + self.data_queue_len()
+    }
+
+    /// Total bytes waiting across all queues.
+    pub fn total_queue_bytes(&self) -> usize {
+        self.total_queued_bytes
+    }
+
+    /// Whether the scheduler is completely empty.
+    pub fn is_empty(&self) -> bool {
+        self.control_queue.is_empty() && !self.has_any_data_packets()
+    }
+
+    /// Calculate Jain's fairness index across active data queues normalized by weights (1.0 = optimal fair share).
+    pub fn jains_fairness_index(&self) -> f64 {
+        let mut normalized_rates = Vec::new();
+        for q in self.data_queues.values() {
+            if q.total_bytes_serviced > 0 {
+                let norm = q.total_bytes_serviced as f64 / q.weight as f64;
+                normalized_rates.push(norm);
+            }
+        }
+
+        if normalized_rates.len() <= 1 {
+            return 1.0;
+        }
+
+        let n = normalized_rates.len() as f64;
+        let sum: f64 = normalized_rates.iter().sum();
+        let sum_sq: f64 = normalized_rates.iter().map(|&x| x * x).sum();
+
+        if sum_sq <= 0.0 {
+            return 1.0;
+        }
+
+        let j = (sum * sum) / (n * sum_sq);
+        j.clamp(0.0, 1.0)
+    }
+
+    /// Retrieve real-time telemetry metrics.
+    pub fn telemetry(&self) -> SpWdrrTelemetry {
+        let mut telem = SpWdrrTelemetry {
+            control_packets_serviced: self.total_control_packets_serviced,
+            control_bytes_serviced: self.total_control_bytes_serviced,
+            rounds_completed: self.total_rounds_completed,
+            starvation_boosts_applied: self.total_starvation_boosts,
+            deficit_resets_on_empty: self.total_deficit_resets,
+            packets_dropped_queue_full: self.packets_dropped_queue_full,
+            bytes_dropped_queue_full: self.bytes_dropped_queue_full,
+            control_queue_depth: self.control_queue.len(),
+            data_queue_depth: self.data_queue_len(),
+            total_queued_bytes: self.total_queued_bytes,
+            jains_fairness_index: self.jains_fairness_index(),
+            ..Default::default()
+        };
+
+        let mut data_pkts = 0;
+        let mut data_bytes = 0;
+
+        for (k, q) in &self.data_queues {
+            data_pkts += q.total_packets_serviced;
+            data_bytes += q.total_bytes_serviced;
+            match k {
+                SpQueueKey::High => {
+                    telem.high_packets_serviced = q.total_packets_serviced;
+                    telem.high_bytes_serviced = q.total_bytes_serviced;
+                }
+                SpQueueKey::Normal => {
+                    telem.normal_packets_serviced = q.total_packets_serviced;
+                    telem.normal_bytes_serviced = q.total_bytes_serviced;
+                }
+                SpQueueKey::Bulk => {
+                    telem.bulk_packets_serviced = q.total_packets_serviced;
+                    telem.bulk_bytes_serviced = q.total_bytes_serviced;
+                }
+                SpQueueKey::CustomFlow(_) => {}
+            }
+        }
+
+        telem.data_packets_serviced = data_pkts;
+        telem.data_bytes_serviced = data_bytes;
+
+        telem
+    }
+
+    /// Retrieve queue state for an individual priority class or custom flow.
+    pub fn queue_stats(&self, key: SpQueueKey) -> Option<SpWdrrQueueStats> {
+        self.data_queues.get(&key).map(|q| SpWdrrQueueStats {
+            key: q.key,
+            weight: q.weight,
+            deficit: q.deficit,
+            packets_queued: q.packets.len(),
+            bytes_queued: q.queued_bytes,
+            total_packets_serviced: q.total_packets_serviced,
+            total_bytes_serviced: q.total_bytes_serviced,
+            consecutive_starved_rounds: q.consecutive_starved_rounds,
+            starvation_boosts_applied: q.starvation_boosts_applied,
+        })
+    }
+
+    /// Clear all queues and reset queued bytes.
+    pub fn clear(&mut self) {
+        self.control_queue.clear();
+        self.control_bytes = 0;
+        for q in self.data_queues.values_mut() {
+            q.packets.clear();
+            q.queued_bytes = 0;
+            q.deficit = 0;
+        }
+        self.total_queued_bytes = 0;
+    }
+}
+
 /// Network path associating a local network interface with a remote peer endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPath {
@@ -10662,6 +11312,7 @@ pub struct ExtendedConnectTunnel {
     pub target: String,
     pub state: TunnelState,
     pub shaper: Option<AdaptiveTokenBucketShaper>,
+    pub sp_wdrr_scheduler: Option<StrictPriorityWdrrScheduler>,
     ingress_buffer: std::collections::VecDeque<u8>,
     egress_frames: std::collections::VecDeque<Vec<u8>>,
     capsule_queue: std::collections::VecDeque<crate::simd_parser::HttpCapsule>,
@@ -10681,6 +11332,7 @@ impl ExtendedConnectTunnel {
             target: target.to_string(),
             state: TunnelState::PendingHandshake,
             shaper: None,
+            sp_wdrr_scheduler: None,
             ingress_buffer: std::collections::VecDeque::with_capacity(4096),
             egress_frames: std::collections::VecDeque::new(),
             capsule_queue: std::collections::VecDeque::new(),
@@ -10695,6 +11347,12 @@ impl ExtendedConnectTunnel {
     /// Attach an adaptive token bucket traffic shaper to regulate outbound capsule throughput.
     pub fn with_traffic_shaper(mut self, shaper: AdaptiveTokenBucketShaper) -> Self {
         self.shaper = Some(shaper);
+        self
+    }
+
+    /// Attach a Strict-Priority Weighted Deficit Round-Robin (SP-WDRR) scheduler for control/data isolation.
+    pub fn with_sp_wdrr_scheduler(mut self, scheduler: StrictPriorityWdrrScheduler) -> Self {
+        self.sp_wdrr_scheduler = Some(scheduler);
         self
     }
 
@@ -10809,6 +11467,55 @@ impl ExtendedConnectTunnel {
     /// Retrieve tunnel traffic shaper telemetry snapshot if enabled.
     pub fn shaper_telemetry(&self) -> Option<TrafficShaperTelemetry> {
         self.shaper.as_ref().map(|s| s.telemetry())
+    }
+
+    /// Enqueue an RFC 9297 capsule into the SP-WDRR scheduler.
+    /// Control capsules (Close/Drain/Route/Address) automatically receive Strict Priority.
+    /// Data capsules receive fair weighted deficit allocation based on priority and flow ID.
+    pub fn send_capsule_scheduled(
+        &mut self,
+        capsule: &crate::simd_parser::HttpCapsule,
+        priority: Option<TrafficPriority>,
+        flow_id: u32,
+        now: std::time::Instant,
+    ) -> Result<u64, DropReason> {
+        let prio = priority.unwrap_or(match capsule.capsule_type {
+            crate::simd_parser::CapsuleType::CloseWebTransportSession
+            | crate::simd_parser::CapsuleType::DrainWebTransportSession
+            | crate::simd_parser::CapsuleType::AddressAssign
+            | crate::simd_parser::CapsuleType::AddressRequest
+            | crate::simd_parser::CapsuleType::RouteAdvertisement => TrafficPriority::Control,
+            _ => TrafficPriority::Normal,
+        });
+
+        if let Some(ref mut sched) = self.sp_wdrr_scheduler {
+            sched.enqueue_capsule(capsule, Some(prio), flow_id, now)
+        } else {
+            self.send_capsule(capsule);
+            Ok(0)
+        }
+    }
+
+    /// Drain up to `max_bytes` and `max_packets` scheduled capsules using the SP-WDRR algorithm
+    /// and commit them into the tunnel's outbound transmission queue (`egress_frames`).
+    /// Returns the number of capsules drained and staged for wire transmission.
+    pub fn drain_scheduled_capsules(&mut self, max_bytes: usize, max_packets: usize) -> usize {
+        if let Some(ref mut sched) = self.sp_wdrr_scheduler {
+            let packets = sched.schedule_batch(max_bytes, max_packets);
+            let count = packets.len();
+            for pkt in packets {
+                self.total_bytes_sent += pkt.payload.len();
+                self.egress_frames.push_back(pkt.payload);
+            }
+            count
+        } else {
+            0
+        }
+    }
+
+    /// Retrieve SP-WDRR telemetry if enabled on this tunnel.
+    pub fn sp_wdrr_telemetry(&self) -> Option<SpWdrrTelemetry> {
+        self.sp_wdrr_scheduler.as_ref().map(|s| s.telemetry())
     }
 
     /// Poll and dequeue the next incoming UDP datagram packet payload.
@@ -31610,5 +32317,250 @@ mod tls_alpn_tests {
 
         let telem = tunnel.shaper_telemetry().expect("shaper telemetry");
         assert!(telem.packets_admitted_immediate >= 1);
+    }
+
+    #[test]
+    fn test_sp_wdrr_strict_priority_control_isolation() {
+        let now = std::time::Instant::now();
+        let config = SpWdrrConfig::default().with_base_quantum(1000);
+        let mut sched = StrictPriorityWdrrScheduler::new(config);
+
+        // Enqueue high and bulk data packets FIRST
+        sched
+            .enqueue(vec![1; 500], TrafficPriority::High, 0, now)
+            .expect("enqueue high");
+        sched
+            .enqueue(vec![2; 500], TrafficPriority::Bulk, 0, now)
+            .expect("enqueue bulk");
+
+        // Enqueue control packet LAST
+        sched
+            .enqueue(vec![9; 100], TrafficPriority::Control, 0, now)
+            .expect("enqueue control");
+
+        assert_eq!(sched.control_queue_len(), 1);
+        assert_eq!(sched.data_queue_len(), 2);
+
+        // First packet scheduled MUST be Control due to Strict Priority
+        let first = sched.schedule_next().expect("first packet");
+        assert_eq!(first.priority, TrafficPriority::Control);
+        assert_eq!(first.payload, vec![9; 100]);
+        assert_eq!(sched.control_queue_len(), 0);
+
+        // Next packets scheduled are Data according to WDRR
+        let second = sched.schedule_next().expect("second packet");
+        assert_eq!(second.priority, TrafficPriority::High);
+
+        let third = sched.schedule_next().expect("third packet");
+        assert_eq!(third.priority, TrafficPriority::Bulk);
+
+        assert!(sched.is_empty());
+        let telem = sched.telemetry();
+        assert_eq!(telem.control_packets_serviced, 1);
+        assert_eq!(telem.control_bytes_serviced, 100);
+        assert_eq!(telem.data_packets_serviced, 2);
+    }
+
+    #[test]
+    fn test_sp_wdrr_weighted_fairness_and_deficit_rounds() {
+        let now = std::time::Instant::now();
+        // High = 4, Normal = 2, Bulk = 1. Base quantum = 1000.
+        // Round quanta: High = 4000, Normal = 2000, Bulk = 1000.
+        let config = SpWdrrConfig::default()
+            .with_base_quantum(1000)
+            .with_priority_weights(4, 2, 1);
+        let mut sched = StrictPriorityWdrrScheduler::new(config);
+
+        // Enqueue 50 packets of 100 bytes each for High (5000 bytes)
+        for _ in 0..50 {
+            sched
+                .enqueue(vec![1; 100], TrafficPriority::High, 0, now)
+                .expect("enqueue high");
+        }
+        // Enqueue 30 packets of 100 bytes each for Normal (3000 bytes)
+        for _ in 0..30 {
+            sched
+                .enqueue(vec![2; 100], TrafficPriority::Normal, 0, now)
+                .expect("enqueue normal");
+        }
+        // Enqueue 20 packets of 100 bytes each for Bulk (2000 bytes)
+        for _ in 0..20 {
+            sched
+                .enqueue(vec![3; 100], TrafficPriority::Bulk, 0, now)
+                .expect("enqueue bulk");
+        }
+
+        // Run 1 scheduling round by requesting exactly 1 round's worth of data
+        // High should transmit 40 packets (4000 bytes)
+        // Normal should transmit 20 packets (2000 bytes)
+        // Bulk should transmit 10 packets (1000 bytes)
+        let batch = sched.schedule_batch(7000, 70);
+        assert_eq!(batch.len(), 70);
+
+        let high_serviced = batch
+            .iter()
+            .filter(|p| p.priority == TrafficPriority::High)
+            .count();
+        let normal_serviced = batch
+            .iter()
+            .filter(|p| p.priority == TrafficPriority::Normal)
+            .count();
+        let bulk_serviced = batch
+            .iter()
+            .filter(|p| p.priority == TrafficPriority::Bulk)
+            .count();
+
+        assert_eq!(high_serviced, 40);
+        assert_eq!(normal_serviced, 20);
+        assert_eq!(bulk_serviced, 10);
+
+        let telem = sched.telemetry();
+        assert_eq!(telem.high_bytes_serviced, 4000);
+        assert_eq!(telem.normal_bytes_serviced, 2000);
+        assert_eq!(telem.bulk_bytes_serviced, 1000);
+
+        // Perfect 4 : 2 : 1 ratio -> Jain's fairness index should be 1.0!
+        assert!((telem.jains_fairness_index - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_sp_wdrr_deficit_conservation_on_empty_queue() {
+        let now = std::time::Instant::now();
+        let config = SpWdrrConfig::default()
+            .with_base_quantum(1000)
+            .with_priority_weights(4, 2, 1);
+        let mut sched = StrictPriorityWdrrScheduler::new(config);
+
+        // High queue receives quantum of 4000, but only has 1 packet of 150 bytes
+        sched
+            .enqueue(vec![1; 150], TrafficPriority::High, 0, now)
+            .expect("enqueue high");
+
+        let batch = sched.schedule_batch(0, 10);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].byte_cost, 150);
+
+        // Deficit must be reset to 0 because High queue is now empty (credit conservation)
+        let stats = sched
+            .queue_stats(SpQueueKey::High)
+            .expect("high queue stats");
+        assert_eq!(stats.deficit, 0);
+        assert_eq!(stats.packets_queued, 0);
+
+        let telem = sched.telemetry();
+        assert!(telem.deficit_resets_on_empty >= 1);
+    }
+
+    #[test]
+    fn test_sp_wdrr_starvation_prevention_boost() {
+        let now = std::time::Instant::now();
+        // Base quantum = 500, bulk weight = 1 (quantum = 500).
+        // Starvation threshold = 2 rounds, boost factor = 3 (boost = 1500).
+        let config = SpWdrrConfig::default()
+            .with_base_quantum(500)
+            .with_priority_weights(1, 1, 1)
+            .with_starvation_params(2, 3);
+        let mut sched = StrictPriorityWdrrScheduler::new(config);
+
+        // Bulk has a single 1800-byte packet.
+        // Round 1: deficit +500 = 500 (< 1800), unserved (starved round 1).
+        // Round 2: deficit +500 = 1000 (< 1800), unserved (starved round 2).
+        // Round 3: threshold reached -> boost +1500 added! Deficit = 1000 + 500 + 1500 = 3000 (>= 1800)!
+        sched
+            .enqueue(vec![4; 1800], TrafficPriority::Bulk, 0, now)
+            .expect("enqueue bulk");
+
+        // Schedule packet
+        let pkt = sched.schedule_next().expect("packet scheduled after boost");
+        assert_eq!(pkt.byte_cost, 1800);
+        assert_eq!(pkt.priority, TrafficPriority::Bulk);
+
+        let telem = sched.telemetry();
+        assert!(telem.starvation_boosts_applied >= 1);
+        assert_eq!(telem.bulk_packets_serviced, 1);
+    }
+
+    #[test]
+    fn test_sp_wdrr_custom_flow_registration_and_unregistration() {
+        let now = std::time::Instant::now();
+        let config = SpWdrrConfig::default().with_base_quantum(500);
+        let mut sched = StrictPriorityWdrrScheduler::new(config);
+
+        // Register custom flow 99 with weight 6 (quantum = 3000)
+        sched.register_flow(99, 6);
+
+        sched
+            .enqueue(vec![5; 200], TrafficPriority::Normal, 99, now)
+            .expect("enqueue flow 99");
+        sched
+            .enqueue(vec![6; 200], TrafficPriority::Normal, 99, now)
+            .expect("enqueue flow 99");
+
+        let stats = sched
+            .queue_stats(SpQueueKey::CustomFlow(99))
+            .expect("custom flow stats");
+        assert_eq!(stats.weight, 6);
+        assert_eq!(stats.packets_queued, 2);
+
+        // Unregister flow 99 with packets pending -> should migrate to Normal queue
+        sched.unregister_flow(99);
+        assert!(sched.queue_stats(SpQueueKey::CustomFlow(99)).is_none());
+
+        let normal_stats = sched
+            .queue_stats(SpQueueKey::Normal)
+            .expect("normal queue stats");
+        assert_eq!(normal_stats.packets_queued, 2);
+
+        let batch = sched.schedule_batch(0, 10);
+        assert_eq!(batch.len(), 2);
+    }
+
+    #[test]
+    fn test_extended_connect_tunnel_sp_wdrr_integration() {
+        let now = std::time::Instant::now();
+        let config = SpWdrrConfig::default().with_base_quantum(1000);
+        let sched = StrictPriorityWdrrScheduler::new(config);
+        let mut tunnel = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "proxy.local")
+            .with_sp_wdrr_scheduler(sched);
+
+        // Enqueue bulk datagram capsule
+        let bulk_cap = crate::simd_parser::HttpCapsule::udp_datagram(0, b"BULK_DATAGRAM_PAYLOAD");
+        tunnel
+            .send_capsule_scheduled(&bulk_cap, Some(TrafficPriority::Bulk), 0, now)
+            .expect("enqueue bulk capsule");
+
+        // Enqueue high datagram capsule
+        let high_cap = crate::simd_parser::HttpCapsule::udp_datagram(0, b"HIGH_DATAGRAM_PAYLOAD");
+        tunnel
+            .send_capsule_scheduled(&high_cap, Some(TrafficPriority::High), 0, now)
+            .expect("enqueue high capsule");
+
+        // Enqueue close session control capsule (defaults to Strict Priority Control)
+        let close_cap = crate::simd_parser::HttpCapsule::new(
+            crate::simd_parser::CapsuleType::CloseWebTransportSession,
+            vec![0, 0],
+        );
+        tunnel
+            .send_capsule_scheduled(&close_cap, None, 0, now)
+            .expect("enqueue close capsule");
+
+        // Drain scheduled capsules into egress transmission queue
+        let drained = tunnel.drain_scheduled_capsules(0, 10);
+        assert_eq!(drained, 3);
+
+        let egress = tunnel.drain_egress_data();
+        assert_eq!(egress.len(), 3);
+
+        // Decode first capsule from wire egress: MUST be CloseWebTransportSession (Strict Priority)
+        let (first_cap, _) =
+            crate::simd_parser::HttpCapsule::decode_one(&egress[0]).expect("decode cap 1");
+        assert_eq!(
+            first_cap.capsule_type,
+            crate::simd_parser::CapsuleType::CloseWebTransportSession
+        );
+
+        let telem = tunnel.sp_wdrr_telemetry().expect("sp wdrr telemetry");
+        assert_eq!(telem.control_packets_serviced, 1);
+        assert_eq!(telem.data_packets_serviced, 2);
     }
 }
