@@ -1137,14 +1137,9 @@ pub enum IsspResequenceStatus {
         buffer_depth: usize,
     },
     /// Duplicate or obsolete sequence number discarded.
-    DuplicateOrStale {
-        seq: u64,
-        expected_seq: u64,
-    },
+    DuplicateOrStale { seq: u64, expected_seq: u64 },
     /// Arrival of missing packet triggered in-order drain of one or more buffered packets.
-    ResequencedDelivered {
-        delivered_count: usize,
-    },
+    ResequencedDelivered { delivered_count: usize },
     /// Gap timeout expired waiting for missing packet; window advanced to prevent HoL blocking.
     GapExpired {
         skipped_seq: u64,
@@ -1245,7 +1240,8 @@ impl IsspResequencingBuffer {
             // Drain contiguous buffered packets
             while let Some(&first_buffered_seq) = self.buffer.keys().next() {
                 if first_buffered_seq == self.expected_seq {
-                    let (buffered_pkt, arrival_ms) = self.buffer.remove(&first_buffered_seq).unwrap();
+                    let (buffered_pkt, arrival_ms) =
+                        self.buffer.remove(&first_buffered_seq).unwrap();
                     let delay = now_ms.saturating_sub(arrival_ms);
                     self.total_reorder_delay_ms += delay;
                     self.max_reorder_delay_ms = self.max_reorder_delay_ms.max(delay);
@@ -1291,7 +1287,8 @@ impl IsspResequencingBuffer {
         }
 
         // Buffer full / gap overflow protection: force advance to prevent Head-of-Line deadlock
-        if (seq - self.expected_seq) as usize >= self.capacity || self.buffer.len() >= self.capacity {
+        if (seq - self.expected_seq) as usize >= self.capacity || self.buffer.len() >= self.capacity
+        {
             let skipped = self.expected_seq;
             let mut delivered = Vec::new();
 
@@ -1363,7 +1360,10 @@ impl IsspResequencingBuffer {
     }
 
     /// Check if gap timeout expired and force window forward to drain buffered packets.
-    pub fn check_gap_timeout(&mut self, now_ms: u64) -> (Vec<IsspDeliveredPacket>, Option<IsspResequenceStatus>) {
+    pub fn check_gap_timeout(
+        &mut self,
+        now_ms: u64,
+    ) -> (Vec<IsspDeliveredPacket>, Option<IsspResequenceStatus>) {
         if self.buffer.is_empty() || self.gap_wait_start_unix_ms == 0 {
             return (Vec::new(), None);
         }
@@ -4074,9 +4074,7 @@ mod tests {
         assert_eq!(del3[1].reorder_delay_ms, 1060 - 1016); // 44ms in buffer
         assert_eq!(
             st3,
-            IsspResequenceStatus::ResequencedDelivered {
-                delivered_count: 2
-            }
+            IsspResequenceStatus::ResequencedDelivered { delivered_count: 2 }
         );
 
         let telem = reseq.telemetry();
@@ -4127,7 +4125,10 @@ mod tests {
         // Ingest duplicate seq 12
         let (del12_dup, st12_dup) = reseq.ingest(make_pkt(12), 1025);
         assert!(del12_dup.is_empty());
-        assert!(matches!(st12_dup, IsspResequenceStatus::DuplicateOrStale { .. }));
+        assert!(matches!(
+            st12_dup,
+            IsspResequenceStatus::DuplicateOrStale { .. }
+        ));
 
         // Check timeout at t = 1050 (elapsed 35ms < 100ms) -> no timeout yet
         let (tout_early, st_early) = reseq.check_gap_timeout(1050);
@@ -4152,16 +4153,17 @@ mod tests {
 
     #[test]
     fn test_dynamic_multipath_bandwidth_aggregation_scheduling() {
-        let mut router = IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::BandwidthAggregation);
+        let mut router =
+            IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::BandwidthAggregation);
 
         // Path 1: 1Gbps Fiber (Weight 100, RTT 10ms)
-        let mut r1 = IsspMultipathRoute::new(1, 10, "eth0-fiber", 1, 100)
-            .with_state(IsspPathState::Active);
+        let mut r1 =
+            IsspMultipathRoute::new(1, 10, "eth0-fiber", 1, 100).with_state(IsspPathState::Active);
         r1.metrics.smoothed_rtt_us = 10_000;
 
         // Path 2: 500Mbps 5G (Weight 50, RTT 40ms)
-        let mut r2 = IsspMultipathRoute::new(2, 10, "wwan0-5g", 2, 50)
-            .with_state(IsspPathState::Active);
+        let mut r2 =
+            IsspMultipathRoute::new(2, 10, "wwan0-5g", 2, 50).with_state(IsspPathState::Active);
         r2.metrics.smoothed_rtt_us = 40_000;
 
         router.add_route(r1);
@@ -4185,7 +4187,11 @@ mod tests {
 
         // With weights 100 vs 50, Path 1 should schedule approximately double Path 2
         assert_eq!(count_p1 + count_p2, 30);
-        assert!(count_p1 >= 18 && count_p1 <= 22, "count_p1 was {}", count_p1);
+        assert!(
+            count_p1 >= 18 && count_p1 <= 22,
+            "count_p1 was {}",
+            count_p1
+        );
         assert!(count_p2 >= 8 && count_p2 <= 12, "count_p2 was {}", count_p2);
 
         let r1_m = router.get_route(1).unwrap();
@@ -4222,7 +4228,11 @@ mod tests {
         let mut inflight = Vec::new();
         for i in 0..15 {
             let pkt = reg
-                .schedule_multipath_packet(&s_id, format!("msg-{}", i + 1).into_bytes(), t_start + i * 2)
+                .schedule_multipath_packet(
+                    &s_id,
+                    format!("msg-{}", i + 1).into_bytes(),
+                    t_start + i * 2,
+                )
                 .unwrap();
             let arrival_time = pkt.estimated_arrival_unix_ms;
             inflight.push((pkt, arrival_time));

@@ -765,7 +765,11 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 Some(p) if p.exists() => match SessionRegistry::load_from_file(p) {
                     Ok(reg) => reg,
                     Err(e) => {
-                        eprintln!("error: failed to load ISSP state file `{}`: {}", p.display(), e);
+                        eprintln!(
+                            "error: failed to load ISSP state file `{}`: {}",
+                            p.display(),
+                            e
+                        );
                         return ExitCode::FAILURE;
                     }
                 },
@@ -846,16 +850,18 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                     session_ordered_valid = false;
                 }
                 for (idx, d) in sess_delivered.iter().enumerate() {
-                    if d.packet.multipath_seq == 0 || (idx > 0 && d.packet.multipath_seq <= sess_delivered[idx - 1].packet.multipath_seq) {
+                    if d.packet.multipath_seq == 0
+                        || (idx > 0
+                            && d.packet.multipath_seq
+                                <= sess_delivered[idx - 1].packet.multipath_seq)
+                    {
                         session_ordered_valid = false;
                     }
                 }
                 total_delivered += sess_delivered.len();
             }
 
-            let reseq_telem = registry
-                .resequencing_telemetry(None)
-                .unwrap_or(None);
+            let reseq_telem = registry.resequencing_telemetry(None).unwrap_or(None);
 
             let route_telem = registry
                 .multipath_telemetry()
@@ -905,15 +911,28 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 println!("\n=== ISSP MULTIPATH BANDWIDTH AGGREGATION & RESEQUENCING ===");
                 println!(
                     "Sessions: {} | Packets/Sess: {} | Total Packets: {} | Path Skew: {} ms",
-                    sessions, packets, all_inflight.len(), skew_ms
+                    sessions,
+                    packets,
+                    all_inflight.len(),
+                    skew_ms
                 );
 
                 if let Some(ref t) = reseq_telem {
                     println!("\n[RESEQUENCING COMPENSATION TELEMETRY]");
                     println!("- Packets Ingested:    {}", t.total_received);
-                    println!("- In-Order Immediate:  {} ({:.1}%)", t.in_order_count, (t.in_order_count as f64 / t.total_received.max(1) as f64) * 100.0);
-                    println!("- Resequenced/Drain:   {} ({:.1}%)", t.reordered_count, t.reorder_rate_percent);
-                    println!("- Average Buffer Wait: {:.2} ms", t.average_reorder_delay_ms);
+                    println!(
+                        "- In-Order Immediate:  {} ({:.1}%)",
+                        t.in_order_count,
+                        (t.in_order_count as f64 / t.total_received.max(1) as f64) * 100.0
+                    );
+                    println!(
+                        "- Resequenced/Drain:   {} ({:.1}%)",
+                        t.reordered_count, t.reorder_rate_percent
+                    );
+                    println!(
+                        "- Average Buffer Wait: {:.2} ms",
+                        t.average_reorder_delay_ms
+                    );
                     println!("- Max Resequence Hold: {} ms", t.max_reorder_delay_ms);
                     println!("- Duplicates Dropped:  {}", t.duplicate_count);
                     println!("- Expired Gaps/Drops:  {}", t.gaps_expired_count);
@@ -923,7 +942,12 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 println!("| Path ID | Interface | Capacity Weight | Packets Striped | RTT Latency | Target Share |");
                 println!("| :---: | :--- | :---: | :---: | :---: | :---: |");
                 for r in &route_telem.routes {
-                    let total_s = route_telem.routes.iter().map(|x| x.metrics.total_frames_sent).sum::<u64>().max(1);
+                    let total_s = route_telem
+                        .routes
+                        .iter()
+                        .map(|x| x.metrics.total_frames_sent)
+                        .sum::<u64>()
+                        .max(1);
                     let share = (r.metrics.total_frames_sent as f64 / total_s as f64) * 100.0;
                     println!(
                         "| #{} | {} | {} | {} frames | {:.2} ms | {:.1}% |",
