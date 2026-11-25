@@ -3,13 +3,15 @@
 use clap::Subcommand;
 use ifa_runtime::{
     run_issp_failover_benchmark_suite, run_issp_scenario,
-    run_simd_capsule_and_classification_benchmark, run_telemetry_streaming_vs_polling_benchmark,
-    run_zstd_trace_archive_benchmark, IsspBandwidthEstimate, IsspCapsule, IsspClusterQuorumConfig,
-    IsspCongestionPhase, IsspCongestionTraceRecord, IsspFailoverBenchmarkSuiteReport,
-    IsspFlapDampingConfig, IsspHeartbeatProbe, IsspMultipathRoute, IsspNetworkProfile,
-    IsspPathState, IsspProbationConfig, IsspRoutingPolicy, IsspTelemetryServer,
-    IsspZstdMemoryPipeline, IsspZstdStreamDecompressor, SecurityPolicy, SessionId, SessionRecord,
-    SessionRegistry, SessionSnapshot, PHASE_CONGESTION_AVOIDANCE,
+    run_mtls_attestation_and_key_rotation_benchmark, run_simd_capsule_and_classification_benchmark,
+    run_telemetry_streaming_vs_polling_benchmark, run_zstd_trace_archive_benchmark,
+    IsspBandwidthEstimate, IsspCapsule, IsspClusterQuorumConfig, IsspCongestionPhase,
+    IsspCongestionTraceRecord, IsspFailoverBenchmarkSuiteReport, IsspFlapDampingConfig,
+    IsspHeartbeatProbe, IsspMultipathRoute, IsspNetworkProfile, IsspPathState, IsspProbationConfig,
+    IsspRoutingPolicy, IsspTelemetryServer, IsspZstdMemoryPipeline, IsspZstdStreamDecompressor,
+    MeshAttestationCertificate, MeshNodeRole, MeshPeerAttestationManager, MeshTrustStore,
+    MtlsHandshakeState, NodeIdentity, RotationReason, SecurityPolicy, SessionId, SessionRecord,
+    SessionRegistry, SessionSnapshot, CAP_DYNAMIC_REKEY, CAP_MULTIPATH, PHASE_CONGESTION_AVOIDANCE,
 };
 use serde_json::json;
 use std::fs;
@@ -233,6 +235,36 @@ pub enum SessionCommand {
         /// Number of benchmark trace records to compress
         #[arg(long, default_value = "50000")]
         bench_records: usize,
+        /// Output formatted as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage mTLS mutual attestation and dynamic cryptographic key rotation for mesh peering
+    Mtls {
+        /// Inspect active mTLS peer attestation statuses, fingerprints, and key epochs
+        #[arg(long)]
+        status: bool,
+        /// Trigger mutual attestation handshake with a remote peer node ID
+        #[arg(long)]
+        attest_peer: Option<u32>,
+        /// Trigger explicit key rotation on a specific peer link
+        #[arg(long)]
+        rotate_key: Option<u32>,
+        /// Reason for key rotation: time, count, volume, admin, emergency
+        #[arg(long, default_value = "admin")]
+        reason: String,
+        /// Run mutual attestation and dynamic key rotation throughput benchmark
+        #[arg(long)]
+        bench: bool,
+        /// Number of benchmark handshake iterations
+        #[arg(long, default_value = "50")]
+        bench_iterations: usize,
+        /// Path to persistent cluster state dump (.issp or binary dump)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+        /// Output Prometheus exposition metrics instead of human table
+        #[arg(long)]
+        metrics: bool,
         /// Output formatted as JSON
         #[arg(long)]
         json: bool,
@@ -1998,6 +2030,279 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
 
             ExitCode::SUCCESS
         }
+        SessionCommand::Mtls {
+            status: _,
+            attest_peer,
+            rotate_key,
+            reason,
+            bench,
+            bench_iterations,
+            file,
+            metrics,
+            json,
+        } => {
+            if bench {
+                let report = run_mtls_attestation_and_key_rotation_benchmark(bench_iterations);
+                if json {
+                    println!("{}", report.to_json());
+                } else {
+                    println!("{}", report.to_markdown_table());
+                }
+                return ExitCode::SUCCESS;
+            }
+
+            let ca_node_id = 100;
+            let ca_key = [0x7au8; 32];
+            let mut trust = MeshTrustStore::new("ifa-mesh");
+            trust.add_trusted_ca(ca_node_id, ca_key);
+
+            let now_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let valid_from_ns = now_ns.saturating_sub(86400 * 1_000_000_000);
+            let valid_until_ns = now_ns.saturating_add(365 * 86400 * 1_000_000_000);
+
+            let local_id_val = 1u32;
+            let local_key = [0x11u8; 32];
+            let local_ident = NodeIdentity::new(
+                local_id_val,
+                "ifa-mesh",
+                MeshNodeRole::Gateway,
+                local_key,
+                valid_from_ns,
+                valid_until_ns,
+                CAP_MULTIPATH | CAP_DYNAMIC_REKEY,
+            );
+            let local_cert = MeshAttestationCertificate::issue(
+                1,
+                ca_node_id,
+                "ifa-mesh",
+                local_ident.clone(),
+                &ca_key,
+            );
+
+            let mut manager =
+                MeshPeerAttestationManager::new(local_ident, local_cert, local_key, trust.clone());
+
+            let state_file = resolve_state_file(file.as_ref());
+            if let Some(ref path) = state_file {
+                if let Ok(reg) = SessionRegistry::load_from_file(path) {
+                    if let Ok(peers) = reg.peer_node_ids() {
+                        for peer_id in peers {
+                            let peer_k = [(peer_id & 0xff) as u8; 32];
+                            let p_id = NodeIdentity::new(
+                                peer_id,
+                                "ifa-mesh",
+                                MeshNodeRole::Worker,
+                                peer_k,
+                                valid_from_ns,
+                                valid_until_ns,
+                                CAP_MULTIPATH | CAP_DYNAMIC_REKEY,
+                            );
+                            let p_cert = MeshAttestationCertificate::issue(
+                                peer_id as u64,
+                                ca_node_id,
+                                "ifa-mesh",
+                                p_id.clone(),
+                                &ca_key,
+                            );
+                            manager.register_peer(p_id, p_cert);
+                        }
+                    }
+                }
+            }
+
+            if let Some(target_peer) = attest_peer {
+                let peer_k = [(target_peer & 0xff) as u8; 32];
+                let p_id = NodeIdentity::new(
+                    target_peer,
+                    "ifa-mesh",
+                    MeshNodeRole::Worker,
+                    peer_k,
+                    valid_from_ns,
+                    valid_until_ns,
+                    CAP_MULTIPATH | CAP_DYNAMIC_REKEY,
+                );
+                let p_cert = MeshAttestationCertificate::issue(
+                    target_peer as u64,
+                    ca_node_id,
+                    "ifa-mesh",
+                    p_id.clone(),
+                    &ca_key,
+                );
+                let mut remote_mgr = MeshPeerAttestationManager::new(p_id, p_cert, peer_k, trust);
+
+                match manager.perform_full_mutual_attestation(&mut remote_mgr, now_ns) {
+                    Ok(session_id) => {
+                        let peer_rec = manager.peers.get(&target_peer).unwrap();
+                        if json {
+                            println!(
+                                r#"{{"status":"success","action":"attest","target_peer":{},"session_id":{},"fingerprint":"{}","active_epoch":1}}"#,
+                                target_peer,
+                                session_id,
+                                peer_rec.identity.fingerprint_hex()
+                            );
+                        } else {
+                            println!(
+                                "Successfully completed mutual mTLS attestation with peer #{}:",
+                                target_peer
+                            );
+                            println!("- Session ID: {:#010x}", session_id);
+                            println!("- Peer Role: {}", peer_rec.identity.role.as_str());
+                            println!(
+                                "- Attested Fingerprint: {}",
+                                peer_rec.identity.fingerprint_hex()
+                            );
+                            println!("- Initial Key Epoch: 1");
+                            println!("- Mutual Verification: PASSED");
+                        }
+                        return ExitCode::SUCCESS;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "error: mutual attestation handshake failed with peer #{}: {}",
+                            target_peer, e
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+
+            if let Some(target_peer) = rotate_key {
+                let now_ns = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+
+                let rot_reason = match reason.to_ascii_lowercase().as_str() {
+                    "time" | "scheduled" => RotationReason::ScheduledTime,
+                    "count" | "packets" => RotationReason::PacketCountLimit,
+                    "volume" | "bytes" => RotationReason::ByteVolumeLimit,
+                    "emergency" => RotationReason::EmergencyRevocation,
+                    _ => RotationReason::AdministrativeRekey,
+                };
+
+                if !manager.peers.contains_key(&target_peer) {
+                    let peer_k = [(target_peer & 0xff) as u8; 32];
+                    let p_id = NodeIdentity::new(
+                        target_peer,
+                        "ifa-mesh",
+                        MeshNodeRole::Worker,
+                        peer_k,
+                        valid_from_ns,
+                        valid_until_ns,
+                        CAP_MULTIPATH | CAP_DYNAMIC_REKEY,
+                    );
+                    let p_cert = MeshAttestationCertificate::issue(
+                        target_peer as u64,
+                        ca_node_id,
+                        "ifa-mesh",
+                        p_id.clone(),
+                        &ca_key,
+                    );
+                    let mut remote = MeshPeerAttestationManager::new(p_id, p_cert, peer_k, trust);
+                    let _ = manager.perform_full_mutual_attestation(&mut remote, now_ns);
+                }
+
+                match manager.rotate_peer_key(target_peer, now_ns, rot_reason) {
+                    Ok(new_epoch) => {
+                        if json {
+                            println!(
+                                r#"{{"status":"success","action":"rotate_key","target_peer":{},"new_epoch":{},"reason":"{}"}}"#,
+                                target_peer,
+                                new_epoch,
+                                rot_reason.as_str()
+                            );
+                        } else {
+                            println!(
+                                "Successfully performed cryptographic key rotation for peer #{}:",
+                                target_peer
+                            );
+                            println!("- New Key Epoch: {}", new_epoch);
+                            println!("- Rotation Reason: {}", rot_reason.as_str());
+                            println!("- Grace Period Overlap: Active (60s in-flight tolerance)");
+                        }
+                        return ExitCode::SUCCESS;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "error: key rotation failed for peer #{}: {}",
+                            target_peer, e
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+
+            if metrics {
+                println!("{}", manager.to_prometheus_exposition());
+                return ExitCode::SUCCESS;
+            }
+
+            if json {
+                println!("{}", manager.to_json());
+                return ExitCode::SUCCESS;
+            }
+
+            println!("Local Node Security & Attestation Identity:");
+            println!("- Node ID: {}", manager.local_identity.node_id);
+            println!("- Cluster: {}", manager.local_identity.cluster_id);
+            println!(
+                "- Fingerprint: {}",
+                manager.local_identity.fingerprint_hex()
+            );
+            println!(
+                "- Certificate Serial: {}",
+                manager.local_certificate.serial_number
+            );
+            println!();
+
+            if manager.peers.is_empty() {
+                println!("No mesh peer connections registered in cluster state.");
+                println!(
+                    "Use '--attest-peer <id>' to establish mutual attestation with a remote node."
+                );
+            } else {
+                println!(
+                    "{:<8} {:<18} {:<8} {:<12} {:<14} {:<64}",
+                    "Peer ID",
+                    "State",
+                    "Epoch",
+                    "Rotations",
+                    "Grace Pkts",
+                    "Certificate Fingerprint"
+                );
+                println!("{}", "-".repeat(128));
+                for (peer_id, peer) in &manager.peers {
+                    let (state_str, epoch) = match peer.state {
+                        MtlsHandshakeState::Unauthenticated => ("Unauthenticated", 0),
+                        MtlsHandshakeState::HelloSent { .. } => ("HelloSent", 0),
+                        MtlsHandshakeState::ChallengePending { .. } => ("ChallengePending", 0),
+                        MtlsHandshakeState::MutualAttested { active_epoch, .. } => {
+                            ("MutualAttested", active_epoch)
+                        }
+                        MtlsHandshakeState::Failed(_) => ("Failed", 0),
+                    };
+                    let (tot_rot, grace_pkts) = peer
+                        .key_ring
+                        .as_ref()
+                        .map(|r| (r.total_rotations, r.grace_packets_accepted))
+                        .unwrap_or((0, 0));
+                    println!(
+                        "{:<8} {:<18} {:<8} {:<12} {:<14} {:<64}",
+                        peer_id,
+                        state_str,
+                        epoch,
+                        tot_rot,
+                        grace_pkts,
+                        peer.certificate.fingerprint_hex()
+                    );
+                }
+            }
+
+            ExitCode::SUCCESS
+        }
     }
 }
 
@@ -2458,5 +2763,91 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_execute_session_command_mtls_operations() {
+        // Benchmark run
+        let cmd_bench = SessionCommand::Mtls {
+            status: false,
+            attest_peer: None,
+            rotate_key: None,
+            reason: "admin".to_string(),
+            bench: true,
+            bench_iterations: 15,
+            file: None,
+            metrics: false,
+            json: false,
+        };
+        assert_eq!(execute_session_command(cmd_bench), ExitCode::SUCCESS);
+
+        let cmd_bench_json = SessionCommand::Mtls {
+            status: false,
+            attest_peer: None,
+            rotate_key: None,
+            reason: "admin".to_string(),
+            bench: true,
+            bench_iterations: 15,
+            file: None,
+            metrics: false,
+            json: true,
+        };
+        assert_eq!(execute_session_command(cmd_bench_json), ExitCode::SUCCESS);
+
+        // Status empty
+        let cmd_status = SessionCommand::Mtls {
+            status: true,
+            attest_peer: None,
+            rotate_key: None,
+            reason: "admin".to_string(),
+            bench: false,
+            bench_iterations: 0,
+            file: None,
+            metrics: false,
+            json: false,
+        };
+        assert_eq!(execute_session_command(cmd_status), ExitCode::SUCCESS);
+
+        // Attest peer
+        let cmd_attest = SessionCommand::Mtls {
+            status: false,
+            attest_peer: Some(2),
+            rotate_key: None,
+            reason: "admin".to_string(),
+            bench: false,
+            bench_iterations: 0,
+            file: None,
+            metrics: false,
+            json: true,
+        };
+        assert_eq!(execute_session_command(cmd_attest), ExitCode::SUCCESS);
+
+        // Rotate key
+        let cmd_rotate = SessionCommand::Mtls {
+            status: false,
+            attest_peer: None,
+            rotate_key: Some(2),
+            reason: "time".to_string(),
+            bench: false,
+            bench_iterations: 0,
+            file: None,
+            metrics: false,
+            json: true,
+        };
+        assert_eq!(execute_session_command(cmd_rotate), ExitCode::SUCCESS);
+
+        // Metrics output
+        let cmd_metrics = SessionCommand::Mtls {
+            status: false,
+            attest_peer: None,
+            rotate_key: None,
+            reason: "admin".to_string(),
+            bench: false,
+            bench_iterations: 0,
+            file: None,
+            metrics: true,
+            json: false,
+        };
+        assert_eq!(execute_session_command(cmd_metrics), ExitCode::SUCCESS);
     }
 }

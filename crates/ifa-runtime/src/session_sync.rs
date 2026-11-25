@@ -429,7 +429,7 @@ fn chacha20_quarter_round(state: &mut [u32; 16], a: usize, b: usize, c: usize, d
     state[b] = state[b].rotate_left(7);
 }
 
-fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
+pub(crate) fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
     let mut state = [
         0x61707865,
         0x3320646e,
@@ -471,7 +471,7 @@ fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
     out
 }
 
-fn chacha20_xor_slice(key: &[u8; 32], nonce: &[u8; 12], counter: u32, data: &mut [u8]) {
+pub(crate) fn chacha20_xor_slice(key: &[u8; 32], nonce: &[u8; 12], counter: u32, data: &mut [u8]) {
     let mut curr_counter = counter;
     for chunk in data.chunks_mut(64) {
         let block = chacha20_block(key, curr_counter, nonce);
@@ -579,7 +579,7 @@ impl Poly1305Accumulator {
     }
 }
 
-fn poly1305_aead_tag(poly_key: &[u8; 32], aad: &[u8], ciphertext: &[u8]) -> [u8; 16] {
+pub(crate) fn poly1305_aead_tag(poly_key: &[u8; 32], aad: &[u8], ciphertext: &[u8]) -> [u8; 16] {
     let mut acc = Poly1305Accumulator::new(poly_key);
     acc.update_padded_16(aad);
     acc.update_padded_16(ciphertext);

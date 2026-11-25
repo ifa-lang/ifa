@@ -1626,3 +1626,100 @@ fn test_net_session_trace_archive_cli() {
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[test]
+fn test_cli_net_session_mtls_attestation_and_rotation() {
+    let ifa_bin = env!("CARGO_BIN_EXE_ifa");
+
+    // 1. Benchmark markdown table
+    let bench_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("mtls")
+        .arg("--bench")
+        .arg("--bench-iterations")
+        .arg("10")
+        .output()
+        .expect("exec mtls bench");
+    assert!(bench_out.status.success());
+    let bench_str = String::from_utf8_lossy(&bench_out.stdout);
+    assert!(bench_str.contains("ISSP mTLS Mutual Attestation & Dynamic Key Rotation Benchmark"));
+    assert!(bench_str.contains("PASSED (100% mutual attestation & bit-exact zero packet loss)"));
+
+    // 2. Benchmark JSON output
+    let bench_json = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("mtls")
+        .arg("--bench")
+        .arg("--bench-iterations")
+        .arg("10")
+        .arg("--json")
+        .output()
+        .expect("exec mtls bench json");
+    assert!(bench_json.status.success());
+    let json_str = String::from_utf8_lossy(&bench_json.stdout);
+    assert!(json_str.contains("\"verification_passed\":true"));
+    assert!(json_str.contains("\"handshake_iterations\":10"));
+
+    // 3. Status display
+    let status_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("mtls")
+        .arg("--status")
+        .output()
+        .expect("exec mtls status");
+    assert!(status_out.status.success());
+    let status_str = String::from_utf8_lossy(&status_out.stdout);
+    assert!(status_str.contains("Local Node Security & Attestation Identity:"));
+    assert!(status_str.contains("No mesh peer connections registered in cluster state."));
+
+    // 4. Attest peer
+    let attest_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("mtls")
+        .arg("--attest-peer")
+        .arg("7")
+        .arg("--json")
+        .output()
+        .expect("exec mtls attest");
+    assert!(attest_out.status.success());
+    let attest_str = String::from_utf8_lossy(&attest_out.stdout);
+    assert!(attest_str.contains("\"status\":\"success\""));
+    assert!(attest_str.contains("\"action\":\"attest\""));
+    assert!(attest_str.contains("\"target_peer\":7"));
+
+    // 5. Key rotation
+    let rot_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("mtls")
+        .arg("--rotate-key")
+        .arg("7")
+        .arg("--reason")
+        .arg("emergency")
+        .arg("--json")
+        .output()
+        .expect("exec mtls rotate");
+    assert!(rot_out.status.success());
+    let rot_str = String::from_utf8_lossy(&rot_out.stdout);
+    assert!(rot_str.contains("\"status\":\"success\""));
+    assert!(rot_str.contains("\"action\":\"rotate_key\""));
+    assert!(rot_str.contains("\"new_epoch\":2"));
+    assert!(rot_str.contains("\"reason\":\"emergency_revocation\""));
+
+    // 6. Metrics exposition
+    let metrics_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("mtls")
+        .arg("--metrics")
+        .output()
+        .expect("exec mtls metrics");
+    assert!(metrics_out.status.success());
+    let metrics_str = String::from_utf8_lossy(&metrics_out.stdout);
+    assert!(metrics_str.contains("ifa_mesh_mtls_peers_total"));
+    assert!(metrics_str.contains("ifa_mesh_mtls_attested_peers"));
+}

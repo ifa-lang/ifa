@@ -8,6 +8,7 @@ pub mod ffi;
 pub mod fiber;
 pub mod header;
 pub mod io;
+pub mod mtls_attestation;
 pub mod panic;
 pub mod reactor;
 pub mod session_sync;
@@ -27,12 +28,13 @@ pub use allocator::{
 pub use benchmarks::{
     create_saturated_multipath_snapshot, profile_allocator_engine, run_allocator_multithread_suite,
     run_generational_benchmark_suite, run_issp_failover_benchmark_suite, run_issp_scenario,
-    run_simd_capsule_and_classification_benchmark, run_telemetry_streaming_vs_polling_benchmark,
-    run_zstd_trace_archive_benchmark, AllocatorEngine, AllocatorThroughputResult, BenchmarkReport,
-    BenchmarkResult, IsspBenchmarkScenarioResult, IsspFailoverBenchmarkSuiteReport,
-    IsspNetworkProfile, MultithreadBenchmarkSuiteReport, SimdClassificationBenchmarkReport,
-    SimdPhaseResult, TelemetryComparativeReport, TelemetryLoadResult, TelemetryTransportKind,
-    ZstdTraceArchiveBenchmarkReport,
+    run_mtls_attestation_and_key_rotation_benchmark, run_simd_capsule_and_classification_benchmark,
+    run_telemetry_streaming_vs_polling_benchmark, run_zstd_trace_archive_benchmark,
+    AllocatorEngine, AllocatorThroughputResult, BenchmarkReport, BenchmarkResult,
+    IsspBenchmarkScenarioResult, IsspFailoverBenchmarkSuiteReport, IsspNetworkProfile,
+    MtlsAttestationBenchmarkReport, MultithreadBenchmarkSuiteReport,
+    SimdClassificationBenchmarkReport, SimdPhaseResult, TelemetryComparativeReport,
+    TelemetryLoadResult, TelemetryTransportKind, ZstdTraceArchiveBenchmarkReport,
 };
 pub use blocking::{
     ifa_rt_blocking_call, ifa_rt_blocking_pool_active_workers, ifa_rt_blocking_pool_capacity,
@@ -49,6 +51,15 @@ pub use fiber::{
 pub use header::{
     EpochTransition, GenHeader, GenRef, ARENA_THREAD_LOCAL_CALL, FLAG_ACTIVE, FLAG_ARENA_SCOPED,
     FLAG_EPOCH_1, FLAG_FREE, FLAG_PINNED, FLAG_QUARANTINED, FLAG_READONLY,
+};
+pub use mtls_attestation::{
+    ifa_digest32, ifa_kdf_derive, ifa_mac, MeshAttestationCertificate, MeshNodeRole,
+    MeshPeerAttestationManager, MeshTrustStore, MtlsClientHello, MtlsClientProof, MtlsEnvelope,
+    MtlsError, MtlsHandshakeState, MtlsServerChallenge, MtlsServerFinished, NodeIdentity,
+    PeerAttestationRecord, PeeringKeyEpoch, PeeringKeyRing, RotationReason, CAP_BBR_CONGESTION,
+    CAP_DYNAMIC_REKEY, CAP_MULTIPATH, CAP_POST_QUANTUM_READY, CAP_SIMD_ACCEL, CAP_ZSTD_STREAM,
+    DEFAULT_GRACE_PERIOD_NS, DEFAULT_ROTATION_BYTES_THRESHOLD, DEFAULT_ROTATION_INTERVAL_NS,
+    DEFAULT_ROTATION_PACKETS_THRESHOLD, ISSP_ENVELOPE_MAGIC, ISSP_MTLS_MAGIC, ISSP_MTLS_VERSION,
 };
 pub use panic::{
     catch_panic, clear_last_panic, dispatch_panic, get_last_panic, get_last_panic_raw_ptr,

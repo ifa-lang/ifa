@@ -2,6 +2,10 @@
 
 use crate::allocator::GLOBAL_ALLOCATOR;
 use crate::header::GenHeader;
+use crate::mtls_attestation::{
+    MeshAttestationCertificate, MeshNodeRole, MeshPeerAttestationManager, MeshTrustStore,
+    NodeIdentity, RotationReason, CAP_DYNAMIC_REKEY, CAP_MULTIPATH,
+};
 use crate::session_sync::{
     ClusterPsk, GossipResult, SecurityPolicy, SessionId, SessionRegistry, SessionSnapshot,
     SessionTickConfig, SECURE_GOSSIP_FRAME_SIZE,
@@ -2113,6 +2117,300 @@ pub fn run_zstd_trace_archive_benchmark(record_count: usize) -> ZstdTraceArchive
     }
 }
 
+// ---------------------------------------------------------------------------
+// ISSP mTLS Mutual Attestation & Dynamic Key Rotation Benchmark Suite
+// ---------------------------------------------------------------------------
+
+/// Comprehensive benchmark report evaluating mTLS mutual attestation and dynamic cryptographic key rotation.
+#[derive(Debug, Clone)]
+pub struct MtlsAttestationBenchmarkReport {
+    pub handshake_iterations: usize,
+    pub handshake_time_ms: f64,
+    pub handshakes_per_sec: f64,
+    pub avg_handshake_latency_us: f64,
+
+    pub rotation_iterations: usize,
+    pub rotation_time_ms: f64,
+    pub rotations_per_sec: f64,
+    pub avg_rotation_latency_ns: f64,
+
+    pub data_packets_processed: usize,
+    pub data_bytes_processed: usize,
+    pub data_time_ms: f64,
+    pub data_mops: f64,
+    pub data_mb_per_sec: f64,
+
+    pub grace_packets_accepted: u64,
+    pub replays_prevented: u64,
+    pub verification_passed: bool,
+}
+
+impl MtlsAttestationBenchmarkReport {
+    pub fn to_markdown_table(&self) -> String {
+        let mut s = String::new();
+        s.push_str("### ISSP mTLS Mutual Attestation & Dynamic Key Rotation Benchmark\n\n");
+        s.push_str(&format!(
+            "- **Mutual Attestation Handshakes**: {} complete 4-way exchanges in {:.2} ms\n",
+            self.handshake_iterations, self.handshake_time_ms
+        ));
+        s.push_str(&format!(
+            "- **Handshake Throughput**: {:.2} handshakes/sec (avg {:.2} µs/handshake)\n",
+            self.handshakes_per_sec, self.avg_handshake_latency_us
+        ));
+        s.push_str(&format!(
+            "- **Cryptographic Key Rotations**: {} ratchet epoch rotations in {:.2} ms\n",
+            self.rotation_iterations, self.rotation_time_ms
+        ));
+        s.push_str(&format!(
+            "- **Rotation Throughput**: {:.2} rotations/sec (avg {:.2} ns/ratchet)\n",
+            self.rotations_per_sec, self.avg_rotation_latency_ns
+        ));
+        s.push_str(&format!(
+            "- **AEAD Wire Encrypt/Decrypt**: {} packets ({:.2} MB) in {:.2} ms\n",
+            self.data_packets_processed,
+            self.data_bytes_processed as f64 / (1024.0 * 1024.0),
+            self.data_time_ms
+        ));
+        s.push_str(&format!(
+            "- **Data Throughput**: {:.3} Mops ({:.2} MB/s)\n",
+            self.data_mops, self.data_mb_per_sec
+        ));
+        s.push_str(&format!(
+            "- **Grace Window Handling**: {} in-flight packets accepted across epoch transitions\n",
+            self.grace_packets_accepted
+        ));
+        s.push_str(&format!(
+            "- **Anti-Replay Defense**: {} replayed packets dropped\n",
+            self.replays_prevented
+        ));
+        s.push_str(&format!(
+            "- **Verification Status**: {}\n\n",
+            if self.verification_passed {
+                "PASSED (100% mutual attestation & bit-exact zero packet loss)"
+            } else {
+                "FAILED (data or attestation verification error)"
+            }
+        ));
+
+        s.push_str("| Benchmark Phase | Metric | Value | Unit |\n");
+        s.push_str("|---|---|---|---|\n");
+        s.push_str(&format!(
+            "| mTLS Mutual Attestation | Throughput | {:.2} | handshakes/sec |\n",
+            self.handshakes_per_sec
+        ));
+        s.push_str(&format!(
+            "| mTLS Mutual Attestation | Mean Latency | {:.2} | µs |\n",
+            self.avg_handshake_latency_us
+        ));
+        s.push_str(&format!(
+            "| Forward-Ratchet Rekey | Throughput | {:.2} | rotations/sec |\n",
+            self.rotations_per_sec
+        ));
+        s.push_str(&format!(
+            "| Forward-Ratchet Rekey | Mean Latency | {:.2} | ns |\n",
+            self.avg_rotation_latency_ns
+        ));
+        s.push_str(&format!(
+            "| AEAD Wire Traffic | Throughput | {:.3} | Mops |\n",
+            self.data_mops
+        ));
+        s.push_str(&format!(
+            "| AEAD Wire Traffic | Bandwidth | {:.2} | MB/s |\n",
+            self.data_mb_per_sec
+        ));
+        s
+    }
+
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"handshake_iterations\":{},\"handshake_time_ms\":{:.4},\"handshakes_per_sec\":{:.2},\"avg_handshake_latency_us\":{:.2},\"rotation_iterations\":{},\"rotation_time_ms\":{:.4},\"rotations_per_sec\":{:.2},\"avg_rotation_latency_ns\":{:.2},\"data_packets_processed\":{},\"data_bytes_processed\":{},\"data_time_ms\":{:.4},\"data_mops\":{:.3},\"data_mb_per_sec\":{:.2},\"grace_packets_accepted\":{},\"replays_prevented\":{},\"verification_passed\":{}}}",
+            self.handshake_iterations,
+            self.handshake_time_ms,
+            self.handshakes_per_sec,
+            self.avg_handshake_latency_us,
+            self.rotation_iterations,
+            self.rotation_time_ms,
+            self.rotations_per_sec,
+            self.avg_rotation_latency_ns,
+            self.data_packets_processed,
+            self.data_bytes_processed,
+            self.data_time_ms,
+            self.data_mops,
+            self.data_mb_per_sec,
+            self.grace_packets_accepted,
+            self.replays_prevented,
+            self.verification_passed
+        )
+    }
+}
+
+/// Run automated high-performance benchmark measuring mTLS mutual attestation handshakes,
+/// dynamic forward-ratchet key rotations, and wire AEAD streaming throughput with grace window transitions.
+pub fn run_mtls_attestation_and_key_rotation_benchmark(
+    iterations: usize,
+) -> MtlsAttestationBenchmarkReport {
+    let count = iterations.max(10);
+    let ca_node_id = 999;
+    let ca_key = [0x5cu8; 32];
+    let mut trust = MeshTrustStore::new("ifa-cluster-bench");
+    trust.add_trusted_ca(ca_node_id, ca_key);
+
+    let node1_key = [0x11u8; 32];
+    let node2_key = [0x22u8; 32];
+
+    let id1 = NodeIdentity::new(
+        1,
+        "ifa-cluster-bench",
+        MeshNodeRole::Gateway,
+        node1_key,
+        1_000_000,
+        2_000_000_000_000,
+        CAP_MULTIPATH | CAP_DYNAMIC_REKEY,
+    );
+    let cert1 =
+        MeshAttestationCertificate::issue(1, ca_node_id, "ifa-cluster-bench", id1.clone(), &ca_key);
+
+    let id2 = NodeIdentity::new(
+        2,
+        "ifa-cluster-bench",
+        MeshNodeRole::Worker,
+        node2_key,
+        1_000_000,
+        2_000_000_000_000,
+        CAP_MULTIPATH | CAP_DYNAMIC_REKEY,
+    );
+    let cert2 =
+        MeshAttestationCertificate::issue(2, ca_node_id, "ifa-cluster-bench", id2.clone(), &ca_key);
+
+    // ── Phase 1: Mutual Attestation Handshake Benchmark ─────────────────────
+    let t_hs_start = Instant::now();
+    for i in 0..count {
+        let mut client =
+            MeshPeerAttestationManager::new(id1.clone(), cert1.clone(), node1_key, trust.clone());
+        let mut server =
+            MeshPeerAttestationManager::new(id2.clone(), cert2.clone(), node2_key, trust.clone());
+        let now_ns = 1_000_000_000 + (i as u64 * 1_000);
+        let res = client.perform_full_mutual_attestation(&mut server, now_ns);
+        black_box(res).expect("handshake must succeed");
+    }
+    let hs_elapsed = t_hs_start.elapsed();
+    let hs_time_ms = hs_elapsed.as_secs_f64() * 1000.0;
+    let handshakes_per_sec = (count as f64) / hs_elapsed.as_secs_f64().max(1e-9);
+    let avg_handshake_latency_us = (hs_elapsed.as_nanos() as f64 / count as f64) / 1000.0;
+
+    // ── Phase 2: Dynamic Ratchet Key Rotation Benchmark ─────────────────────
+    let mut client =
+        MeshPeerAttestationManager::new(id1.clone(), cert1.clone(), node1_key, trust.clone());
+    let mut server = MeshPeerAttestationManager::new(id2, cert2, node2_key, trust);
+    client
+        .perform_full_mutual_attestation(&mut server, 1_000_000_000)
+        .expect("initial handshake");
+
+    let rot_count = count * 2;
+    let t_rot_start = Instant::now();
+    for i in 1..=rot_count {
+        let now_ns = 1_000_000_000 + (i as u64 * 5_000);
+        let c_epoch = client
+            .rotate_peer_key(2, now_ns, RotationReason::ScheduledTime)
+            .expect("client rotate");
+        let s_epoch = server
+            .rotate_peer_key(1, now_ns, RotationReason::ScheduledTime)
+            .expect("server rotate");
+        black_box((c_epoch, s_epoch));
+    }
+    let rot_elapsed = t_rot_start.elapsed();
+    let rot_time_ms = rot_elapsed.as_secs_f64() * 1000.0;
+    let rotations_per_sec = ((rot_count * 2) as f64) / rot_elapsed.as_secs_f64().max(1e-9);
+    let avg_rotation_latency_ns = rot_elapsed.as_nanos() as f64 / (rot_count * 2) as f64;
+
+    // ── Phase 3: AEAD Data Streaming with Grace Overlap and Anti-Replay ─────
+    let data_packets = count * 10;
+    let payload = b"ISSP high-performance encrypted telemetry wire payload chunk 64B";
+    let aad = b"issp-session-header-aad";
+    let total_bytes = data_packets * payload.len();
+
+    let mut in_flight_grace_packets = Vec::new();
+    let mut replays_count = 0u64;
+    let mut grace_count = 0u64;
+
+    let t_data_start = Instant::now();
+    for i in 0..data_packets {
+        let now_ns = 2_000_000_000 + (i as u64 * 100);
+
+        // Every 50 packets, trigger a key rotation to test grace period handling
+        if i > 0 && i % 50 == 0 {
+            client
+                .rotate_peer_key(2, now_ns, RotationReason::PacketCountLimit)
+                .expect("client rotate");
+            server
+                .rotate_peer_key(1, now_ns, RotationReason::PacketCountLimit)
+                .expect("server rotate");
+        }
+
+        let envelope = client
+            .encrypt_for_peer(2, payload, aad)
+            .expect("encrypt data packet");
+
+        // Delay delivery of packets across epoch boundary to test grace window
+        if i % 50 == 49 {
+            in_flight_grace_packets.push((envelope, now_ns));
+            continue;
+        }
+
+        let dec = server
+            .decrypt_from_peer(1, &envelope, aad, now_ns + 10)
+            .expect("decrypt data packet");
+        assert_eq!(dec, payload);
+
+        // Test deliberate replay on 5 packets
+        if i % 100 == 0 {
+            let replay_err = server.decrypt_from_peer(1, &envelope, aad, now_ns + 20);
+            if replay_err.is_err() {
+                replays_count += 1;
+            }
+        }
+    }
+
+    // Deliver the in-flight grace packets (encrypted under prior epochs)
+    for (grace_env, send_time) in in_flight_grace_packets {
+        let dec = server
+            .decrypt_from_peer(1, &grace_env, aad, send_time + 5_000)
+            .expect("deliver in-flight grace packet");
+        assert_eq!(dec, payload);
+        grace_count += 1;
+    }
+
+    let data_elapsed = t_data_start.elapsed();
+    let data_time_ms = data_elapsed.as_secs_f64() * 1000.0;
+    let data_mops = (data_packets as f64) / (data_elapsed.as_nanos().max(1) as f64 / 1_000.0);
+    let data_mb_per_sec =
+        (total_bytes as f64 / (1024.0 * 1024.0)) / data_elapsed.as_secs_f64().max(1e-9);
+
+    let verification_passed = replays_count > 0 && (data_packets >= 10);
+
+    MtlsAttestationBenchmarkReport {
+        handshake_iterations: count,
+        handshake_time_ms: hs_time_ms,
+        handshakes_per_sec,
+        avg_handshake_latency_us,
+
+        rotation_iterations: rot_count * 2,
+        rotation_time_ms: rot_time_ms,
+        rotations_per_sec,
+        avg_rotation_latency_ns,
+
+        data_packets_processed: data_packets,
+        data_bytes_processed: total_bytes,
+        data_time_ms,
+        data_mops,
+        data_mb_per_sec,
+
+        grace_packets_accepted: grace_count,
+        replays_prevented: replays_count,
+        verification_passed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2330,6 +2628,29 @@ mod tests {
 
         let json = report.to_json();
         assert!(json.contains("\"record_count\":300"));
+        assert!(json.contains("\"verification_passed\":true"));
+    }
+
+    #[test]
+    fn test_mtls_attestation_and_key_rotation_benchmark_runs() {
+        let report = run_mtls_attestation_and_key_rotation_benchmark(20);
+        assert_eq!(report.handshake_iterations, 20);
+        assert!(report.handshakes_per_sec > 0.0);
+        assert!(report.avg_handshake_latency_us > 0.0);
+        assert!(report.rotations_per_sec > 0.0);
+        assert!(report.avg_rotation_latency_ns > 0.0);
+        assert!(report.data_mops > 0.0);
+        assert!(report.data_mb_per_sec > 0.0);
+        assert!(report.grace_packets_accepted > 0);
+        assert!(report.replays_prevented > 0);
+        assert!(report.verification_passed);
+
+        let md = report.to_markdown_table();
+        assert!(md.contains("ISSP mTLS Mutual Attestation & Dynamic Key Rotation Benchmark"));
+        assert!(md.contains("PASSED (100% mutual attestation & bit-exact zero packet loss)"));
+
+        let json = report.to_json();
+        assert!(json.contains("\"handshake_iterations\":20"));
         assert!(json.contains("\"verification_passed\":true"));
     }
 }
