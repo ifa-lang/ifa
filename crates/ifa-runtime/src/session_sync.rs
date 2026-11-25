@@ -963,7 +963,8 @@ impl IsspPathMetrics {
 
     /// Total retransmissions (TCP + ISSP).
     pub fn total_retrans_count(&self) -> u64 {
-        self.tcp_retrans_count.saturating_add(self.issp_retrans_count)
+        self.tcp_retrans_count
+            .saturating_add(self.issp_retrans_count)
     }
 
     /// TCP retransmission ratio (0.0 to 1.0).

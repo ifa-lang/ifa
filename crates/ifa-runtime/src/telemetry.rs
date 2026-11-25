@@ -612,14 +612,18 @@ impl PrometheusMultipathBalancingExporter {
         ));
 
         // Cluster session metrics
-        out.push_str("# HELP ifa_session_total_sessions Total active sessions tracked in registry.\n");
+        out.push_str(
+            "# HELP ifa_session_total_sessions Total active sessions tracked in registry.\n",
+        );
         out.push_str("# TYPE ifa_session_total_sessions gauge\n");
         out.push_str(&format!(
             "ifa_session_total_sessions{} {}\n",
             base_lbl, s.total_sessions
         ));
 
-        out.push_str("# HELP ifa_session_primary_sessions Primary active sessions owned by local node.\n");
+        out.push_str(
+            "# HELP ifa_session_primary_sessions Primary active sessions owned by local node.\n",
+        );
         out.push_str("# TYPE ifa_session_primary_sessions gauge\n");
         out.push_str(&format!(
             "ifa_session_primary_sessions{} {}\n",
@@ -993,10 +997,7 @@ impl PrometheusMultipathBalancingExporter {
                     "ifa_issp_interface_latency_seconds_bucket{} {}\n",
                     inf_lbl, hist.count
                 ));
-                let sum_lbl = self.format_labels(&[
-                    ("node_id", &node_str),
-                    ("interface", iface),
-                ]);
+                let sum_lbl = self.format_labels(&[("node_id", &node_str), ("interface", iface)]);
                 out.push_str(&format!(
                     "ifa_issp_interface_latency_seconds_sum{} {:.6}\n",
                     sum_lbl, hist.sum_seconds
@@ -1009,7 +1010,8 @@ impl PrometheusMultipathBalancingExporter {
         }
 
         // 4. Interface Retransmission Ratios
-        if !s.interface_tcp_retrans_ratios.is_empty() || !s.interface_issp_retrans_ratios.is_empty() {
+        if !s.interface_tcp_retrans_ratios.is_empty() || !s.interface_issp_retrans_ratios.is_empty()
+        {
             out.push_str("# HELP ifa_session_interface_retransmission_ratio Retransmission ratio per network interface categorized by protocol (tcp or issp).\n");
             out.push_str("# TYPE ifa_session_interface_retransmission_ratio gauge\n");
             for (iface, ratio) in &s.interface_tcp_retrans_ratios {
@@ -2751,16 +2753,8 @@ mod tests {
         reg.add_multipath_route(r2).unwrap();
 
         // Register dummy sessions to test session counting
-        let s1 = SessionSnapshot::new(
-            crate::session_sync::SessionId::new(1, 10, 1),
-            1,
-            1000,
-        );
-        let s2 = SessionSnapshot::new(
-            crate::session_sync::SessionId::new(2, 10, 2),
-            1,
-            1000,
-        );
+        let s1 = SessionSnapshot::new(crate::session_sync::SessionId::new(1, 10, 1), 1, 1000);
+        let s2 = SessionSnapshot::new(crate::session_sync::SessionId::new(2, 10, 2), 1, 1000);
         reg.upsert_primary(s1).unwrap();
         reg.upsert_primary(s2).unwrap();
 
