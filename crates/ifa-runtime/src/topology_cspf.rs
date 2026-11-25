@@ -160,9 +160,9 @@ impl TopologyGraph {
         blocked_edges: &[(NodeId, NodeId)],
         blocked_nodes: &[NodeId],
     ) -> Option<Vec<NodeId>> {
-        // Min-heap entry: (neg_cost, node) — using i64 so BinaryHeap acts as min-heap.
+        // Min-heap entry: (cost, node).
         #[derive(Eq, PartialEq)]
-        struct Entry(i64, NodeId);
+        struct Entry(u64, NodeId);
         impl Ord for Entry {
             fn cmp(&self, other: &Self) -> std::cmp::Ordering {
                 // Reversed for min-heap behavior.
@@ -182,8 +182,7 @@ impl TopologyGraph {
         dist.insert(src, 0);
         heap.push(Entry(0, src));
 
-        while let Some(Entry(neg_cost, u)) = heap.pop() {
-            let cost_u = (-neg_cost) as u64;
+        while let Some(Entry(cost_u, u)) = heap.pop() {
             if let Some(&best) = dist.get(&u) {
                 if cost_u > best {
                     continue;
@@ -198,7 +197,7 @@ impl TopologyGraph {
                 if better {
                     dist.insert(edge.to, next_cost);
                     prev.insert(edge.to, u);
-                    heap.push(Entry(-(next_cost as i64), edge.to));
+                    heap.push(Entry(next_cost, edge.to));
                 }
             }
         }
@@ -405,6 +404,194 @@ pub fn topology_graph_from_snapshot(snapshot: &IsspMeshTopologySnapshot) -> Topo
     graph
 }
 
+// ─── Disjoint Path Mode ───────────────────────────────────────────────────────
+
+/// Disjoint path mode for resilient multipath synthesis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisjointMode {
+    /// Allow arbitrary path overlap (standard K-shortest paths).
+    None,
+    /// Paths must not share any physical directed edge.
+    EdgeDisjoint,
+    /// Paths must not share any intermediate node (except source and destination).
+    NodeDisjoint,
+}
+
+/// Compute up to `k` diverse or disjoint constraint-satisfying paths from `src` to `dst`.
+pub fn cspf_k_disjoint_paths(
+    graph: &TopologyGraph,
+    src: NodeId,
+    dst: NodeId,
+    constraints: &CspfConstraints,
+    k: usize,
+    mode: DisjointMode,
+) -> Vec<CspfPath> {
+    if k == 0 || src == dst {
+        return Vec::new();
+    }
+    if mode == DisjointMode::None {
+        return cspf_k_shortest_paths(graph, src, dst, constraints, k);
+    }
+
+    let mut paths: Vec<CspfPath> = Vec::with_capacity(k);
+    let mut blocked_edges: Vec<(NodeId, NodeId)> = Vec::new();
+    let mut blocked_nodes: Vec<NodeId> = Vec::new();
+
+    for _ in 0..k {
+        let candidate = graph.dijkstra(src, dst, constraints, &blocked_edges, &blocked_nodes);
+        match candidate {
+            Some(nodes) => {
+                if let Some(cspf_path) = CspfPath::from_node_list(graph, nodes.clone()) {
+                    match mode {
+                        DisjointMode::EdgeDisjoint => {
+                            for w in nodes.windows(2) {
+                                blocked_edges.push((w[0], w[1]));
+                            }
+                        }
+                        DisjointMode::NodeDisjoint => {
+                            for w in nodes.windows(2) {
+                                blocked_edges.push((w[0], w[1]));
+                            }
+                            for &n in &nodes[1..nodes.len() - 1] {
+                                if !blocked_nodes.contains(&n) {
+                                    blocked_nodes.push(n);
+                                }
+                            }
+                        }
+                        DisjointMode::None => {}
+                    }
+                    paths.push(cspf_path);
+                } else {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+
+    paths.sort_by_key(|p| p.total_cost);
+    paths
+}
+
+// ─── Multipath Forwarding Group ───────────────────────────────────────────────
+
+/// Resilient multipath group managing primary and alternate routes with dynamic failover.
+#[derive(Debug, Clone)]
+pub struct CspfMultipathGroup {
+    pub src: NodeId,
+    pub dst: NodeId,
+    pub paths: Vec<CspfPath>,
+    /// Flags indicating if a path is currently operational.
+    pub path_healthy: Vec<bool>,
+    /// Proportional traffic weights calculated from bottleneck bandwidth and composite cost.
+    pub traffic_weights: Vec<u32>,
+    pub total_failovers: u64,
+}
+
+impl CspfMultipathGroup {
+    /// Create a new multipath group from computed CSPF paths.
+    pub fn new(src: NodeId, dst: NodeId, paths: Vec<CspfPath>) -> Self {
+        let n = paths.len();
+        let path_healthy = vec![true; n];
+        let mut group = Self {
+            src,
+            dst,
+            paths,
+            path_healthy,
+            traffic_weights: Vec::with_capacity(n),
+            total_failovers: 0,
+        };
+        group.recompute_weights();
+        group
+    }
+
+    /// Recompute proportional weights across healthy paths.
+    /// Higher bottleneck bandwidth and lower composite cost yield higher scheduling weight.
+    pub fn recompute_weights(&mut self) {
+        self.traffic_weights.clear();
+        for (i, p) in self.paths.iter().enumerate() {
+            if !self.path_healthy[i] {
+                self.traffic_weights.push(0);
+                continue;
+            }
+            let bw_mbps = (p.bottleneck_bw_bps / 1_000_000).max(1);
+            let cost_factor = p.total_cost.max(1);
+            let weight = ((bw_mbps * 100) / cost_factor).clamp(1, 10_000) as u32;
+            self.traffic_weights.push(weight);
+        }
+    }
+
+    /// Mark a directed link as failed, disabling any paths traversing it.
+    /// Returns the number of newly disabled paths.
+    pub fn mark_link_failed(&mut self, from: NodeId, to: NodeId) -> usize {
+        let mut affected = 0;
+        for (i, p) in self.paths.iter().enumerate() {
+            if self.path_healthy[i] {
+                let uses_link = p.nodes.windows(2).any(|w| w[0] == from && w[1] == to);
+                if uses_link {
+                    self.path_healthy[i] = false;
+                    affected += 1;
+                    self.total_failovers += 1;
+                }
+            }
+        }
+        if affected > 0 {
+            self.recompute_weights();
+        }
+        affected
+    }
+
+    /// Restore health to all paths whose links are now verified operational.
+    pub fn restore_all_paths(&mut self) {
+        self.path_healthy.fill(true);
+        self.recompute_weights();
+    }
+
+    /// Set individual path health by index.
+    pub fn set_path_health(&mut self, index: usize, healthy: bool) {
+        if let Some(h) = self.path_healthy.get_mut(index) {
+            *h = healthy;
+            self.recompute_weights();
+        }
+    }
+
+    /// Select an active path for a session or flow using consistent hashing across healthy paths.
+    pub fn select_path_for_flow(&self, flow_hash: u64) -> Option<&CspfPath> {
+        let total_weight: u32 = self.traffic_weights.iter().sum();
+        if total_weight == 0 {
+            return None;
+        }
+        let mut target = (flow_hash % (total_weight as u64)) as u32;
+        for (i, &w) in self.traffic_weights.iter().enumerate() {
+            if w > 0 {
+                if target < w {
+                    return Some(&self.paths[i]);
+                }
+                target -= w;
+            }
+        }
+        self.primary_healthy_path()
+    }
+
+    /// Return primary (lowest-cost) healthy path.
+    pub fn primary_healthy_path(&self) -> Option<&CspfPath> {
+        self.paths
+            .iter()
+            .zip(&self.path_healthy)
+            .find_map(|(p, &h)| if h { Some(p) } else { None })
+    }
+
+    /// Count healthy operational paths.
+    pub fn healthy_count(&self) -> usize {
+        self.path_healthy.iter().filter(|&&h| h).count()
+    }
+
+    /// Total configured paths in group.
+    pub fn total_paths(&self) -> usize {
+        self.paths.len()
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -529,5 +716,120 @@ mod tests {
         let g = diamond_graph();
         let paths = cspf_k_shortest_paths(&g, n(0), n(0), &CspfConstraints::unconstrained(), 3);
         assert!(paths.is_empty(), "src==dst must yield no paths");
+    }
+
+    #[test]
+    fn test_disjoint_edge_paths() {
+        let g = diamond_graph();
+        let paths = cspf_k_disjoint_paths(
+            &g,
+            n(0),
+            n(3),
+            &CspfConstraints::unconstrained(),
+            2,
+            DisjointMode::EdgeDisjoint,
+        );
+        assert_eq!(paths.len(), 2, "diamond topology has 2 edge-disjoint paths");
+        let edges_p0: std::collections::HashSet<(NodeId, NodeId)> =
+            paths[0].nodes.windows(2).map(|w| (w[0], w[1])).collect();
+        let edges_p1: std::collections::HashSet<(NodeId, NodeId)> =
+            paths[1].nodes.windows(2).map(|w| (w[0], w[1])).collect();
+        assert!(
+            edges_p0.is_disjoint(&edges_p1),
+            "edge disjoint paths must not share any edge"
+        );
+    }
+
+    #[test]
+    fn test_disjoint_node_paths() {
+        let g = diamond_graph();
+        let paths = cspf_k_disjoint_paths(
+            &g,
+            n(0),
+            n(3),
+            &CspfConstraints::unconstrained(),
+            2,
+            DisjointMode::NodeDisjoint,
+        );
+        assert_eq!(paths.len(), 2, "diamond topology has 2 node-disjoint paths");
+        // Intermediate nodes of p0 and p1 must be disjoint
+        let inter_p0: std::collections::HashSet<NodeId> = paths[0].nodes
+            [1..paths[0].nodes.len() - 1]
+            .iter()
+            .copied()
+            .collect();
+        let inter_p1: std::collections::HashSet<NodeId> = paths[1].nodes
+            [1..paths[1].nodes.len() - 1]
+            .iter()
+            .copied()
+            .collect();
+        assert!(
+            inter_p0.is_disjoint(&inter_p1),
+            "node disjoint paths must not share intermediate nodes"
+        );
+    }
+
+    #[test]
+    fn test_multipath_group_failover_and_recovery() {
+        let g = diamond_graph();
+        let paths = cspf_k_disjoint_paths(
+            &g,
+            n(0),
+            n(3),
+            &CspfConstraints::unconstrained(),
+            2,
+            DisjointMode::EdgeDisjoint,
+        );
+        let mut group = CspfMultipathGroup::new(n(0), n(3), paths);
+        assert_eq!(group.total_paths(), 2);
+        assert_eq!(group.healthy_count(), 2);
+        assert_eq!(group.total_failovers, 0);
+
+        // Path 0 is 0->1->3. Path 1 is 0->2->3.
+        let primary_before = group.primary_healthy_path().unwrap().clone();
+        assert_eq!(primary_before.nodes, vec![n(0), n(1), n(3)]);
+
+        // Fail link 1->3
+        let affected = group.mark_link_failed(n(1), n(3));
+        assert_eq!(affected, 1);
+        assert_eq!(group.healthy_count(), 1);
+        assert_eq!(group.total_failovers, 1);
+
+        // Primary is now 0->2->3
+        let primary_after = group.primary_healthy_path().unwrap();
+        assert_eq!(primary_after.nodes, vec![n(0), n(2), n(3)]);
+
+        // Flow selection must route exclusively to path 1
+        for hash in [10u64, 42, 999, 1337] {
+            let selected = group.select_path_for_flow(hash).unwrap();
+            assert_eq!(selected.nodes, vec![n(0), n(2), n(3)]);
+        }
+
+        // Restore health
+        group.restore_all_paths();
+        assert_eq!(group.healthy_count(), 2);
+        assert_eq!(
+            group.primary_healthy_path().unwrap().nodes,
+            vec![n(0), n(1), n(3)]
+        );
+    }
+
+    #[test]
+    fn test_multipath_group_all_failed() {
+        let g = diamond_graph();
+        let paths = cspf_k_disjoint_paths(
+            &g,
+            n(0),
+            n(3),
+            &CspfConstraints::unconstrained(),
+            2,
+            DisjointMode::EdgeDisjoint,
+        );
+        let mut group = CspfMultipathGroup::new(n(0), n(3), paths);
+        group.mark_link_failed(n(0), n(1));
+        group.mark_link_failed(n(0), n(2));
+        assert_eq!(group.healthy_count(), 0);
+        assert!(group.primary_healthy_path().is_none());
+        assert!(group.select_path_for_flow(123).is_none());
     }
 }

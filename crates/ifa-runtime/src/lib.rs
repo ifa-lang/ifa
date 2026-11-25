@@ -131,8 +131,8 @@ pub use telemetry_queue::{
     DEBUG_RING_CAPACITY, HIGH_RING_CAPACITY, NORMAL_RING_CAPACITY,
 };
 pub use topology_cspf::{
-    cspf_k_shortest_paths, topology_graph_from_snapshot, CspfConstraints, CspfPath, NodeId,
-    TopoEdge, TopologyGraph,
+    cspf_k_disjoint_paths, cspf_k_shortest_paths, topology_graph_from_snapshot, CspfConstraints,
+    CspfMultipathGroup, CspfPath, DisjointMode, NodeId, TopoEdge, TopologyGraph,
 };
 pub use wasi::*;
 pub use zstd_archive::{
