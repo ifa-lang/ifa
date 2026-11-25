@@ -7290,8 +7290,14 @@ impl PathMtuDiscovery {
     }
 
     /// Generate the next DPLPMTUD probe frame targeting candidate MTU, if ready.
-    pub fn generate_next_probe(&mut self, now: std::time::Instant) -> Option<crate::simd_parser::PmtuProbeFrame> {
-        if matches!(self.state, PmtudState::Disabled | PmtudState::SearchComplete) {
+    pub fn generate_next_probe(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<crate::simd_parser::PmtuProbeFrame> {
+        if matches!(
+            self.state,
+            PmtudState::Disabled | PmtudState::SearchComplete
+        ) {
             return None;
         }
 
@@ -7439,18 +7445,46 @@ pub enum DatagramReassemblyError {
 impl std::fmt::Display for DatagramReassemblyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Incomplete { datagram_id, received_fragments, total_fragments } => {
-                write!(f, "Datagram {} incomplete: {}/{} fragments", datagram_id, received_fragments, total_fragments)
+            Self::Incomplete {
+                datagram_id,
+                received_fragments,
+                total_fragments,
+            } => {
+                write!(
+                    f,
+                    "Datagram {} incomplete: {}/{} fragments",
+                    datagram_id, received_fragments, total_fragments
+                )
             }
-            Self::ChecksumMismatch { datagram_id, expected, computed } => {
-                write!(f, "Datagram {} checksum mismatch: expected {:#010X}, computed {:#010X}", datagram_id, expected, computed)
+            Self::ChecksumMismatch {
+                datagram_id,
+                expected,
+                computed,
+            } => {
+                write!(
+                    f,
+                    "Datagram {} checksum mismatch: expected {:#010X}, computed {:#010X}",
+                    datagram_id, expected, computed
+                )
             }
-            Self::LengthMismatch { datagram_id, expected, computed } => {
-                write!(f, "Datagram {} length mismatch: expected {}, computed {}", datagram_id, expected, computed)
+            Self::LengthMismatch {
+                datagram_id,
+                expected,
+                computed,
+            } => {
+                write!(
+                    f,
+                    "Datagram {} length mismatch: expected {}, computed {}",
+                    datagram_id, expected, computed
+                )
             }
             Self::InvalidFragment(msg) => write!(f, "Invalid fragment: {}", msg),
-            Self::Expired { datagram_id } => write!(f, "Datagram {} reassembly expired", datagram_id),
-            Self::BufferCapacityExceeded => write!(f, "Datagram reassembly buffer capacity exceeded"),
+            Self::Expired { datagram_id } => {
+                write!(f, "Datagram {} reassembly expired", datagram_id)
+            }
+            Self::BufferCapacityExceeded => {
+                write!(f, "Datagram reassembly buffer capacity exceeded")
+            }
         }
     }
 }
@@ -7558,9 +7592,10 @@ impl AdaptiveDatagramReassembler {
         let idx = fragment.header.fragment_index;
 
         if idx >= total {
-            return Some(Err(DatagramReassemblyError::InvalidFragment(
-                format!("Fragment index {} >= total {}", idx, total),
-            )));
+            return Some(Err(DatagramReassemblyError::InvalidFragment(format!(
+                "Fragment index {} >= total {}",
+                idx, total
+            ))));
         }
 
         if !self.pending.contains_key(&d_id) && self.pending.len() >= self.max_pending {
@@ -7570,15 +7605,18 @@ impl AdaptiveDatagramReassembler {
             }
         }
 
-        let entry = self.pending.entry(d_id).or_insert_with(|| IncompleteDatagram {
-            datagram_id: d_id,
-            total_fragments: total,
-            original_length: fragment.header.original_length,
-            checksum: fragment.header.checksum,
-            fragments: std::collections::BTreeMap::new(),
-            first_seen: now,
-            last_seen: now,
-        });
+        let entry = self
+            .pending
+            .entry(d_id)
+            .or_insert_with(|| IncompleteDatagram {
+                datagram_id: d_id,
+                total_fragments: total,
+                original_length: fragment.header.original_length,
+                checksum: fragment.header.checksum,
+                fragments: std::collections::BTreeMap::new(),
+                first_seen: now,
+                last_seen: now,
+            });
 
         entry.last_seen = now;
         entry.fragments.insert(idx, fragment.payload);
@@ -7739,7 +7777,10 @@ impl HybridDatagramTransport {
     }
 
     /// Generate the next DPLPMTUD probe packet if probing is active.
-    pub fn generate_probe(&mut self, now: std::time::Instant) -> Option<crate::simd_parser::PmtuProbeFrame> {
+    pub fn generate_probe(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<crate::simd_parser::PmtuProbeFrame> {
         self.pmtud.generate_next_probe(now)
     }
 
@@ -7749,7 +7790,12 @@ impl HybridDatagramTransport {
         response: &crate::simd_parser::PmtuProbeResponseFrame,
         now: std::time::Instant,
     ) -> bool {
-        self.pmtud.handle_probe_ack(response.probe_id, response.token, response.target_size as usize, now)
+        self.pmtud.handle_probe_ack(
+            response.probe_id,
+            response.token,
+            response.target_size as usize,
+            now,
+        )
     }
 
     /// Report packet loss on path, potentially triggering black hole recovery.
@@ -12408,7 +12454,9 @@ impl InterSessionDrrArbitrator {
 
     /// Retrieve current confirmed PMTU for a transport session.
     pub fn session_pmtu(&self, session_id: u64) -> Option<usize> {
-        self.sessions.get(&session_id).map(|s| s.pmtud.current_pmtu())
+        self.sessions
+            .get(&session_id)
+            .map(|s| s.pmtud.current_pmtu())
     }
 
     /// Manually or programmatically update the operational PMTU for a transport session.
@@ -12430,7 +12478,9 @@ impl InterSessionDrrArbitrator {
         session_id: u64,
         now: std::time::Instant,
     ) -> Option<crate::simd_parser::PmtuProbeFrame> {
-        self.sessions.get_mut(&session_id).and_then(|s| s.pmtud.generate_next_probe(now))
+        self.sessions
+            .get_mut(&session_id)
+            .and_then(|s| s.pmtud.generate_next_probe(now))
     }
 
     /// Process a received PMTU probe acknowledgement for a transport session.
@@ -12441,7 +12491,9 @@ impl InterSessionDrrArbitrator {
         now: std::time::Instant,
     ) -> bool {
         if let Some(s) = self.sessions.get_mut(&session_id) {
-            let res = s.pmtud.handle_probe_ack(ack.probe_id, ack.token, ack.target_size as usize, now);
+            let res =
+                s.pmtud
+                    .handle_probe_ack(ack.probe_id, ack.token, ack.target_size as usize, now);
             if res {
                 if let Some(ref mut path) = s.primary_path {
                     path.pmtu = s.pmtud.current_pmtu();
@@ -12768,8 +12820,7 @@ impl AsyncHttp2Pool {
 
     /// Check whether Path MTU Discovery (PMTUD) is enabled on this pool.
     pub fn is_pmtud_enabled(&self) -> bool {
-        self.enable_pmtud
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.enable_pmtud.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Retrieve the current confirmed PMTU for a pooled transport session.
@@ -26400,6 +26451,10 @@ mod tls_alpn_tests {
                                 Some(b"batch-received"),
                             )
                             .expect("send response");
+                        for _ in 0..20 {
+                            let _ = server.try_recv_frame();
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
                         break;
                     }
                     Ok(_) => {}
@@ -26463,7 +26518,9 @@ mod tls_alpn_tests {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                Err(_) => break,
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
             }
         }
         assert!(got_resp_data);
@@ -29122,36 +29179,21 @@ mod tls_alpn_tests {
         assert_eq!(pmtud.state(), PmtudState::Searching);
 
         let ack1 = p1.to_response();
-        assert!(pmtud.handle_probe_ack(
-            ack1.probe_id,
-            ack1.token,
-            ack1.target_size as usize,
-            now
-        ));
+        assert!(pmtud.handle_probe_ack(ack1.probe_id, ack1.token, ack1.target_size as usize, now));
         assert_eq!(pmtud.current_pmtu(), 1280);
 
         // Second probe: candidate 1420
         let p2 = pmtud.generate_next_probe(now).expect("generated probe 2");
         assert_eq!(p2.target_size, 1420);
         let ack2 = p2.to_response();
-        assert!(pmtud.handle_probe_ack(
-            ack2.probe_id,
-            ack2.token,
-            ack2.target_size as usize,
-            now
-        ));
+        assert!(pmtud.handle_probe_ack(ack2.probe_id, ack2.token, ack2.target_size as usize, now));
         assert_eq!(pmtud.current_pmtu(), 1420);
 
         // Third probe: candidate 1500
         let p3 = pmtud.generate_next_probe(now).expect("generated probe 3");
         assert_eq!(p3.target_size, 1500);
         let ack3 = p3.to_response();
-        assert!(pmtud.handle_probe_ack(
-            ack3.probe_id,
-            ack3.token,
-            ack3.target_size as usize,
-            now
-        ));
+        assert!(pmtud.handle_probe_ack(ack3.probe_id, ack3.token, ack3.target_size as usize, now));
         assert_eq!(pmtud.current_pmtu(), 1500);
         assert_eq!(pmtud.state(), PmtudState::SearchComplete);
 
@@ -29247,19 +29289,15 @@ mod tls_alpn_tests {
         fragments[0].payload[0] ^= 0xFF;
 
         let mut reassembler = AdaptiveDatagramReassembler::new(10, Duration::from_secs(5));
-        for i in 0..fragments.len() - 1 {
-            assert!(reassembler
-                .ingest_fragment(fragments[i].clone(), now)
-                .is_none());
+        for frag in &fragments[..fragments.len() - 1] {
+            assert!(reassembler.ingest_fragment(frag.clone(), now).is_none());
         }
 
         let final_res = reassembler
             .ingest_fragment(fragments.last().unwrap().clone(), now)
             .expect("returned outcome");
         match final_res {
-            Err(DatagramReassemblyError::ChecksumMismatch {
-                datagram_id, ..
-            }) => {
+            Err(DatagramReassemblyError::ChecksumMismatch { datagram_id, .. }) => {
                 assert_eq!(datagram_id, 99);
             }
             other => panic!("expected ChecksumMismatch, got {:?}", other),
@@ -29300,10 +29338,7 @@ mod tls_alpn_tests {
         // Feed chunks to receiver
         let mut reassembled_large = None;
         for chunk in &large_chunks {
-            if let Some(res) = receiver
-                .recv_adaptive(chunk, now)
-                .expect("chunk ingested")
-            {
+            if let Some(res) = receiver.recv_adaptive(chunk, now).expect("chunk ingested") {
                 reassembled_large = Some(res);
             }
         }

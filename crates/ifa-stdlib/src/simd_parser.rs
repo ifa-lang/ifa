@@ -7880,10 +7880,7 @@ mod http2_tests {
         assert_eq!(header.checksum, 0x12345678);
 
         let fragment = DatagramFragment::new(header, vec![10, 20, 30, 40]);
-        assert_eq!(
-            fragment.wire_size(),
-            DatagramFragmentHeader::HEADER_LEN + 4
-        );
+        assert_eq!(fragment.wire_size(), DatagramFragmentHeader::HEADER_LEN + 4);
 
         let wire = fragment.encode_to_vec();
         assert!(DatagramFragmentHeader::is_fragment_header(&wire));
