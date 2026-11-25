@@ -14047,6 +14047,7 @@ pub struct MultipathTunnelBondingEngine {
     rtt_degrade_threshold: Duration,
     loss_degrade_threshold: f64,
     flow_idle_timeout: Duration,
+    heartbeat_timeout: Duration,
     start_time: std::time::Instant,
 }
 
@@ -14066,6 +14067,7 @@ impl MultipathTunnelBondingEngine {
             rtt_degrade_threshold: Duration::from_millis(300),
             loss_degrade_threshold: 0.15,
             flow_idle_timeout: Duration::from_secs(60),
+            heartbeat_timeout: Duration::from_secs(3),
             start_time: std::time::Instant::now(),
         }
     }
@@ -14085,6 +14087,12 @@ impl MultipathTunnelBondingEngine {
     /// Set idle timeout for flow table entries.
     pub fn with_flow_idle_timeout(mut self, timeout: Duration) -> Self {
         self.flow_idle_timeout = timeout;
+        self
+    }
+
+    /// Set maximum silence duration before a path's heartbeat expires and failover is triggered.
+    pub fn with_heartbeat_timeout(mut self, timeout: Duration) -> Self {
+        self.heartbeat_timeout = timeout;
         self
     }
 
@@ -14460,8 +14468,89 @@ impl MultipathTunnelBondingEngine {
         }
     }
 
-    /// Evaluate path metrics against degrade thresholds and update path operational states.
-    pub fn evaluate_health_and_failover(&mut self, _now: std::time::Instant) {
+    /// Check all registered bonded tunnel paths for heartbeat expiration and mark them Failed if timeout exceeded.
+    /// Returns list of tunnel IDs that were newly marked as failed.
+    pub fn check_heartbeat_expiration(
+        &mut self,
+        now: std::time::Instant,
+        heartbeat_timeout: Duration,
+    ) -> Vec<u64> {
+        let mut failed = Vec::new();
+        for (&id, path) in &mut self.paths {
+            if path.state != BondedPathState::Failed {
+                let elapsed = now.saturating_duration_since(path.last_heartbeat);
+                if elapsed >= heartbeat_timeout {
+                    path.state = BondedPathState::Failed;
+                    path.consecutive_failures += 1;
+                    failed.push(id);
+                }
+            }
+        }
+        if !failed.is_empty() {
+            for &failed_id in &failed {
+                let _ = self.failover_path(failed_id, now);
+            }
+        }
+        failed
+    }
+
+    /// Trigger failover of all flows currently bound to `failed_tunnel_id` to an operational candidate path.
+    pub fn failover_path(
+        &mut self,
+        failed_tunnel_id: u64,
+        now: std::time::Instant,
+    ) -> Result<Option<u64>, BondingError> {
+        let usable_paths: Vec<u64> = self
+            .paths
+            .iter()
+            .filter(|(&id, p)| id != failed_tunnel_id && p.is_usable())
+            .map(|(&id, _)| id)
+            .collect();
+
+        if usable_paths.is_empty() {
+            let standby: Vec<u64> = self
+                .paths
+                .iter()
+                .filter(|(&id, p)| id != failed_tunnel_id && p.state == BondedPathState::Standby)
+                .map(|(&id, _)| id)
+                .collect();
+            if let Some(&first_sb) = standby.first() {
+                if let Some(p) = self.paths.get_mut(&first_sb) {
+                    p.state = BondedPathState::Active;
+                    let target_id = first_sb;
+                    for entry in self.flow_table.values_mut() {
+                        if entry.assigned_tunnel_id == failed_tunnel_id {
+                            entry.assigned_tunnel_id = target_id;
+                            entry.last_seen = now;
+                        }
+                    }
+                    self.total_failovers += 1;
+                    return Ok(Some(target_id));
+                }
+            }
+            return Ok(None);
+        }
+
+        let target_id = usable_paths[0];
+        let mut rerouted = 0;
+        for entry in self.flow_table.values_mut() {
+            if entry.assigned_tunnel_id == failed_tunnel_id {
+                entry.assigned_tunnel_id = target_id;
+                entry.last_seen = now;
+                rerouted += 1;
+            }
+        }
+        if rerouted > 0 {
+            self.total_failovers += 1;
+        }
+        Ok(Some(target_id))
+    }
+
+    /// Evaluate path metrics against degrade thresholds, monitor heartbeat expiration, and trigger failovers.
+    pub fn evaluate_health_and_failover(&mut self, now: std::time::Instant) {
+        let hb_timeout = self.heartbeat_timeout;
+        self.check_heartbeat_expiration(now, hb_timeout);
+
         for path in self.paths.values_mut() {
             if path.state == BondedPathState::Active
                 && (path.smoothed_rtt > self.rtt_degrade_threshold
@@ -40820,6 +40909,64 @@ mod tls_alpn_tests {
 
         let telem = engine.telemetry();
         assert_eq!(telem.total_failover_events, 1);
+    }
+
+    #[test]
+    fn test_multipath_heartbeat_expiration_and_automatic_flow_failover() {
+        let t0 = std::time::Instant::now();
+        let mut engine = MultipathTunnelBondingEngine::new(MultipathBalancingPolicy::FlowHashing)
+            .with_heartbeat_timeout(Duration::from_millis(200));
+
+        let t1 = ExtendedConnectTunnel::new(101, TunnelProtocol::ConnectUdp, "primary-wan.com")
+            .into_bonded_path(101, "wan0", 100, t0)
+            .with_state(BondedPathState::Active);
+        let t2 = ExtendedConnectTunnel::new(102, TunnelProtocol::ConnectUdp, "backup-5g.com")
+            .into_bonded_path(102, "wwan0", 80, t0)
+            .with_state(BondedPathState::Standby);
+
+        engine.add_path(t1);
+        engine.add_path(t2);
+
+        let key = FlowKey::new(
+            "10.10.10.1".parse().unwrap(),
+            "10.10.10.2".parse().unwrap(),
+            5000,
+            5000,
+            17,
+        );
+
+        // Send packet on t0 -> assigned to initial tunnel 101
+        let d1 = engine
+            .send_datagram(&key, b"DATA_0", false, false, t0)
+            .unwrap();
+        let initial_tunnel = d1[0].tunnel_id;
+        assert_eq!(initial_tunnel, 101);
+
+        // Path 102 receives heartbeat update at t0 + 150ms
+        if let Some(p) = engine.get_path_mut(102) {
+            p.last_heartbeat = t0 + Duration::from_millis(150);
+        }
+
+        // At t0 + 250ms: path 101 has silence of 250ms > 200ms heartbeat timeout!
+        let check_time = t0 + Duration::from_millis(250);
+        engine.evaluate_health_and_failover(check_time);
+
+        // Path 101 must be marked Failed
+        assert_eq!(engine.get_path(101).unwrap().state, BondedPathState::Failed);
+        // Path 102 is promoted to Active
+        assert_eq!(engine.get_path(102).unwrap().state, BondedPathState::Active);
+
+        // Subsequent datagram for flow must route over path 102 without error!
+        let d2 = engine
+            .send_datagram(&key, b"DATA_1", false, false, check_time)
+            .unwrap();
+        assert_eq!(d2.len(), 1);
+        assert_eq!(d2[0].tunnel_id, 102);
+
+        let telem = engine.telemetry();
+        assert_eq!(telem.failed_paths, 1);
+        assert_eq!(telem.active_paths, 1);
+        assert!(telem.total_failover_events >= 1);
     }
 
     #[test]

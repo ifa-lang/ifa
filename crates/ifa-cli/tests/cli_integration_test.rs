@@ -1110,5 +1110,42 @@ fn test_cli_net_session_list_inspect_migrate() {
     assert!(custom_str.contains("Custom Profile (5.0% loss, 15ms jitter)"));
     assert!(custom_str.contains("100% PASS"));
 
+    // 12. Test `ifa net session route` table output
+    let route_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("route")
+        .output()
+        .expect("execute route");
+    assert!(
+        route_out.status.success(),
+        "route failed: {}",
+        String::from_utf8_lossy(&route_out.stderr)
+    );
+    let route_str = String::from_utf8_lossy(&route_out.stdout);
+    assert!(route_str.contains("ISSP DYNAMIC MULTIPATH ROUTING & HEARTBEAT FAILOVER"));
+    assert!(route_str.contains("eth0-fiber-wan"));
+    assert!(route_str.contains("wwan0-5g-edge"));
+    assert!(route_str.contains("leo-sat-orbit"));
+
+    // 13. Test `ifa net session route --fail-path 1 --json`
+    let fail_route_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("route")
+        .arg("--fail-path")
+        .arg("1")
+        .arg("--json")
+        .output()
+        .expect("execute route failover json");
+    assert!(fail_route_out.status.success());
+    let fail_val: serde_json::Value =
+        serde_json::from_slice(&fail_route_out.stdout).expect("valid JSON route output");
+    assert_eq!(fail_val["failover_triggered"], true);
+    assert_eq!(fail_val["failover_event"]["failed_path_id"], 1);
+    assert_eq!(fail_val["failover_event"]["target_path_id"], 2);
+    assert_eq!(fail_val["failed_paths"], 1);
+    assert_eq!(fail_val["active_paths"], 1);
+
     let _ = fs::remove_dir_all(&temp_dir);
 }

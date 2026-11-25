@@ -14,7 +14,7 @@
 //! - **Fencing & Epoch Guard** — a monotonic `migration_epoch` counter prevents split-brain
 //!   double-serving of the same session on two nodes simultaneously.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -802,6 +802,635 @@ impl IsspCapsule {
 }
 
 // ---------------------------------------------------------------------------
+// Dynamic Multipath Routing & Automatic Heartbeat Failover
+// ---------------------------------------------------------------------------
+
+/// ISSP keep-alive heartbeat probe magic tag ('ISHP').
+pub const ISSP_HEARTBEAT_MAGIC: u32 = 0x4953_4850;
+
+/// Wire size of an ISSP heartbeat probe frame in bytes.
+pub const ISSP_HEARTBEAT_SIZE: usize = 40;
+
+/// Operational state of a dynamic transport path in an ISSP multipath route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsspPathState {
+    /// Actively carrying traffic and serving sessions.
+    Active,
+    /// Fully synchronized standby path ready for instantaneous failover.
+    Standby,
+    /// Experiencing elevated packet loss or latency jitter, but still functional.
+    Degraded,
+    /// Heartbeat timed out or link severed; excluded from routing.
+    Failed,
+}
+
+impl IsspPathState {
+    /// Whether this path is operational and eligible to carry datagram sessions.
+    pub fn is_usable(&self) -> bool {
+        matches!(self, Self::Active | Self::Degraded)
+    }
+}
+
+/// Dynamic telemetry and health metrics tracked per ISSP multipath link.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspPathMetrics {
+    /// Smoothed round-trip time in microseconds (EWMA, RFC 6298 / RFC 9002).
+    pub smoothed_rtt_us: u64,
+    /// Round-trip time variation / jitter in microseconds.
+    pub rtt_variance_us: u64,
+    /// Estimated packet loss rate in parts per million (e.g. 10_000 = 1.0%).
+    pub loss_rate_ppm: u32,
+    /// Instantaneous jitter in microseconds.
+    pub jitter_us: u64,
+    /// Monotonic wall-clock timestamp of last dispatched heartbeat probe in unix ms.
+    pub last_heartbeat_sent_unix_ms: u64,
+    /// Monotonic wall-clock timestamp of last received heartbeat reply/pong in unix ms.
+    pub last_heartbeat_recv_unix_ms: u64,
+    /// Number of consecutive missed heartbeat probes without reply.
+    pub consecutive_missed_heartbeats: u32,
+    /// Total heartbeat ping probes dispatched.
+    pub total_heartbeats_sent: u64,
+    /// Total heartbeat pong replies received.
+    pub total_heartbeats_received: u64,
+    /// Cumulative count of data frames transmitted over this path.
+    pub total_frames_sent: u64,
+    /// Cumulative count of data frames received over this path.
+    pub total_frames_received: u64,
+    /// Cumulative bytes transmitted over this path.
+    pub total_bytes_sent: u64,
+    /// Cumulative bytes received over this path.
+    pub total_bytes_received: u64,
+}
+
+impl Default for IsspPathMetrics {
+    fn default() -> Self {
+        Self {
+            smoothed_rtt_us: 10_000,
+            rtt_variance_us: 2_000,
+            loss_rate_ppm: 0,
+            jitter_us: 1_000,
+            last_heartbeat_sent_unix_ms: 0,
+            last_heartbeat_recv_unix_ms: 0,
+            consecutive_missed_heartbeats: 0,
+            total_heartbeats_sent: 0,
+            total_heartbeats_received: 0,
+            total_frames_sent: 0,
+            total_frames_received: 0,
+            total_bytes_sent: 0,
+            total_bytes_received: 0,
+        }
+    }
+}
+
+impl IsspPathMetrics {
+    /// Calculate composite path quality score (higher is better).
+    pub fn quality_score(&self, state: IsspPathState, weight: u32) -> f64 {
+        let state_mult = match state {
+            IsspPathState::Active => 1.0,
+            IsspPathState::Degraded => 0.35,
+            IsspPathState::Standby => 0.1,
+            IsspPathState::Failed => 0.0,
+        };
+        if state_mult == 0.0 {
+            return 0.0;
+        }
+
+        let rtt_ms = (self.smoothed_rtt_us as f64) / 1000.0;
+        let latency_factor = 1.0 / (1.0 + (rtt_ms / 50.0));
+        let loss_fraction = (self.loss_rate_ppm as f64) / 1_000_000.0;
+        let loss_factor = (1.0 - loss_fraction).max(0.01);
+
+        (weight.max(1) as f64) * latency_factor * loss_factor * state_mult
+    }
+
+    /// Record a round-trip time measurement from a heartbeat pong response.
+    pub fn update_rtt(&mut self, sample_rtt_us: u64) {
+        if self.smoothed_rtt_us == 0 {
+            self.smoothed_rtt_us = sample_rtt_us;
+            self.rtt_variance_us = sample_rtt_us / 2;
+        } else {
+            let diff = (sample_rtt_us as i64 - self.smoothed_rtt_us as i64).unsigned_abs();
+            self.rtt_variance_us = (3 * self.rtt_variance_us + diff) / 4;
+            self.smoothed_rtt_us = (7 * self.smoothed_rtt_us + sample_rtt_us) / 8;
+        }
+    }
+}
+
+/// A member transport path within an ISSP dynamic multipath routing table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspMultipathRoute {
+    /// Unique identifier for this path.
+    pub path_id: u32,
+    /// Remote destination peer node ID.
+    pub peer_node_id: u32,
+    /// Physical or virtual network interface name (e.g. "eth0-wan", "wwan0-5g").
+    pub interface_name: String,
+    /// Administrative route priority (lower is higher priority: 1 = primary, 2 = secondary, etc.).
+    pub priority: u32,
+    /// Bandwidth/capacity scheduling weight (e.g. 100 for 1Gbps, 10 for 100Mbps).
+    pub weight: u32,
+    /// Current operational state.
+    pub state: IsspPathState,
+    /// Real-time path telemetry metrics.
+    pub metrics: IsspPathMetrics,
+    /// Interval in milliseconds between keep-alive heartbeat probes.
+    pub heartbeat_interval_ms: u64,
+    /// Maximum elapsed milliseconds without a heartbeat pong before marking path Failed.
+    pub heartbeat_timeout_ms: u64,
+    /// Maximum consecutive missed heartbeat probes allowed before marking path Failed.
+    pub max_missed_heartbeats: u32,
+}
+
+impl IsspMultipathRoute {
+    pub fn new(
+        path_id: u32,
+        peer_node_id: u32,
+        interface_name: impl Into<String>,
+        priority: u32,
+        weight: u32,
+    ) -> Self {
+        Self {
+            path_id,
+            peer_node_id,
+            interface_name: interface_name.into(),
+            priority,
+            weight: weight.max(1),
+            state: IsspPathState::Active,
+            metrics: IsspPathMetrics::default(),
+            heartbeat_interval_ms: 1_000,
+            heartbeat_timeout_ms: 3_000,
+            max_missed_heartbeats: 3,
+        }
+    }
+
+    pub fn with_state(mut self, state: IsspPathState) -> Self {
+        self.state = state;
+        self
+    }
+
+    pub fn with_heartbeat_config(
+        mut self,
+        interval_ms: u64,
+        timeout_ms: u64,
+        max_missed: u32,
+    ) -> Self {
+        self.heartbeat_interval_ms = interval_ms;
+        self.heartbeat_timeout_ms = timeout_ms;
+        self.max_missed_heartbeats = max_missed;
+        self
+    }
+}
+
+/// Heartbeat ping/pong probe exchanged between ISSP nodes/paths for RTT measurement and liveness detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IsspHeartbeatProbe {
+    pub sender_node_id: u32,
+    pub path_id: u32,
+    pub probe_seq: u64,
+    pub timestamp_unix_ms: u64,
+    pub is_response: bool,
+}
+
+impl IsspHeartbeatProbe {
+    pub fn new(
+        sender_node_id: u32,
+        path_id: u32,
+        probe_seq: u64,
+        timestamp_unix_ms: u64,
+        is_response: bool,
+    ) -> Self {
+        Self {
+            sender_node_id,
+            path_id,
+            probe_seq,
+            timestamp_unix_ms,
+            is_response,
+        }
+    }
+
+    /// Encode probe to a 40-byte wire buffer with CRC32 integrity check.
+    pub fn encode(&self) -> [u8; ISSP_HEARTBEAT_SIZE] {
+        let mut buf = [0u8; ISSP_HEARTBEAT_SIZE];
+        buf[0..4].copy_from_slice(&ISSP_HEARTBEAT_MAGIC.to_be_bytes());
+        buf[4..8].copy_from_slice(&self.sender_node_id.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.path_id.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.probe_seq.to_le_bytes());
+        buf[20..28].copy_from_slice(&self.timestamp_unix_ms.to_le_bytes());
+        let flags: u32 = if self.is_response { 1 } else { 0 };
+        buf[28..32].copy_from_slice(&flags.to_le_bytes());
+        let crc = crc32_ieee(&buf[0..32]);
+        buf[32..36].copy_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// Decode probe from wire buffer with magic and CRC validation.
+    pub fn decode(raw: &[u8; ISSP_HEARTBEAT_SIZE]) -> Option<Self> {
+        let magic = u32::from_be_bytes(raw[0..4].try_into().unwrap());
+        if magic != ISSP_HEARTBEAT_MAGIC {
+            return None;
+        }
+        let stored_crc = u32::from_le_bytes(raw[32..36].try_into().unwrap());
+        let computed_crc = crc32_ieee(&raw[0..32]);
+        if stored_crc != computed_crc {
+            return None;
+        }
+        let sender_node_id = u32::from_le_bytes(raw[4..8].try_into().unwrap());
+        let path_id = u32::from_le_bytes(raw[8..12].try_into().unwrap());
+        let probe_seq = u64::from_le_bytes(raw[12..20].try_into().unwrap());
+        let timestamp_unix_ms = u64::from_le_bytes(raw[20..28].try_into().unwrap());
+        let flags = u32::from_le_bytes(raw[28..32].try_into().unwrap());
+        let is_response = (flags & 1) != 0;
+        Some(Self {
+            sender_node_id,
+            path_id,
+            probe_seq,
+            timestamp_unix_ms,
+            is_response,
+        })
+    }
+}
+
+/// Trigger reason for an automatic dynamic multipath failover event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsspFailoverReason {
+    /// Heartbeat timeout exceeded (peer silent).
+    HeartbeatTimeout,
+    /// Maximum consecutive missed heartbeats reached.
+    ConsecutiveHeartbeatsExceeded,
+    /// Administrative or manual trigger.
+    Administrative,
+    /// Elevated packet loss or latency jitter degradation.
+    QualityDegradation,
+}
+
+/// Detailed record of an automatic failover event caused by path degradation or heartbeat expiration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspFailoverEvent {
+    /// Timestamp when failover occurred (unix ms).
+    pub timestamp_unix_ms: u64,
+    /// Path ID that failed or expired.
+    pub failed_path_id: u32,
+    /// Target path ID selected for takeover.
+    pub target_path_id: u32,
+    /// Trigger reason for failover.
+    pub reason: IsspFailoverReason,
+    /// Number of live sessions rerouted to the new path.
+    pub sessions_rerouted: usize,
+    /// Cutover latency in microseconds (from failure detection to routing update).
+    pub cutover_latency_us: f64,
+    /// Session IDs that were migrated during this cutover.
+    pub rerouted_session_ids: Vec<SessionId>,
+}
+
+/// Traffic steering and load-balancing strategy across dynamic multipath links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IsspRoutingPolicy {
+    /// Priority-based active-standby routing with instantaneous cutover upon failure.
+    #[default]
+    ActiveStandby,
+    /// Select path with lowest smoothed round-trip time.
+    LowestLatency,
+    /// Select path with highest composite quality score.
+    BestQuality,
+    /// Consistent flow hashing across usable paths.
+    FlowHashing,
+}
+
+/// Aggregated telemetry across all multipath links in the router.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspMultipathTelemetry {
+    pub total_paths: usize,
+    pub active_paths: usize,
+    pub standby_paths: usize,
+    pub degraded_paths: usize,
+    pub failed_paths: usize,
+    pub total_failovers: u64,
+    pub total_heartbeats_sent: u64,
+    pub total_heartbeats_received: u64,
+    pub total_sessions_bound: usize,
+    pub routes: Vec<IsspMultipathRoute>,
+}
+
+/// Dynamic multipath routing engine with automatic heartbeat failover and session remapping.
+pub struct IsspDynamicMultipathRouter {
+    pub local_node_id: u32,
+    paths: BTreeMap<u32, IsspMultipathRoute>,
+    session_bindings: HashMap<SessionId, u32>,
+    pub policy: IsspRoutingPolicy,
+    next_probe_seq: u64,
+    pub total_failovers: u64,
+    failover_history: Vec<IsspFailoverEvent>,
+}
+
+impl IsspDynamicMultipathRouter {
+    pub fn new(local_node_id: u32, policy: IsspRoutingPolicy) -> Self {
+        Self {
+            local_node_id,
+            paths: BTreeMap::new(),
+            session_bindings: HashMap::new(),
+            policy,
+            next_probe_seq: 1,
+            total_failovers: 0,
+            failover_history: Vec::new(),
+        }
+    }
+
+    /// Register a new multipath route.
+    pub fn add_route(&mut self, route: IsspMultipathRoute) {
+        self.paths.insert(route.path_id, route);
+    }
+
+    /// Remove a multipath route by path ID.
+    pub fn remove_route(&mut self, path_id: u32) -> Option<IsspMultipathRoute> {
+        self.session_bindings.retain(|_, &mut pid| pid != path_id);
+        self.paths.remove(&path_id)
+    }
+
+    pub fn get_route(&self, path_id: u32) -> Option<&IsspMultipathRoute> {
+        self.paths.get(&path_id)
+    }
+
+    pub fn get_route_mut(&mut self, path_id: u32) -> Option<&mut IsspMultipathRoute> {
+        self.paths.get_mut(&path_id)
+    }
+
+    pub fn list_routes(&self) -> Vec<IsspMultipathRoute> {
+        self.paths.values().cloned().collect()
+    }
+
+    pub fn bind_session(&mut self, session_id: SessionId, path_id: u32) -> Result<(), SyncError> {
+        if !self.paths.contains_key(&path_id) {
+            return Err(SyncError::PathNotFound(path_id));
+        }
+        self.session_bindings.insert(session_id, path_id);
+        Ok(())
+    }
+
+    pub fn get_session_path(&self, session_id: &SessionId) -> Option<u32> {
+        self.session_bindings.get(session_id).copied()
+    }
+
+    /// Resolve or choose optimal operational path for a session.
+    pub fn resolve_path_for_session(
+        &mut self,
+        session_id: &SessionId,
+        _now_ms: u64,
+    ) -> Result<u32, SyncError> {
+        // If already bound to a usable path, maintain affinity
+        if let Some(&pid) = self.session_bindings.get(session_id) {
+            if let Some(route) = self.paths.get(&pid) {
+                if route.state.is_usable() {
+                    return Ok(pid);
+                }
+            }
+        }
+
+        // Find candidate path according to policy
+        let candidate_id = self.select_best_candidate_path(None)?;
+
+        // If candidate was in Standby state, promote it to Active
+        if let Some(r) = self.paths.get_mut(&candidate_id) {
+            if r.state == IsspPathState::Standby {
+                r.state = IsspPathState::Active;
+            }
+        }
+
+        self.session_bindings.insert(*session_id, candidate_id);
+        Ok(candidate_id)
+    }
+
+    /// Helper to find best available path, excluding optional excluded_id.
+    fn select_best_candidate_path(&self, exclude_id: Option<u32>) -> Result<u32, SyncError> {
+        let usable: Vec<&IsspMultipathRoute> = self
+            .paths
+            .values()
+            .filter(|r| Some(r.path_id) != exclude_id && r.state.is_usable())
+            .collect();
+
+        if !usable.is_empty() {
+            let chosen = match self.policy {
+                IsspRoutingPolicy::ActiveStandby => usable
+                    .iter()
+                    .min_by_key(|r| r.priority)
+                    .map(|r| r.path_id)
+                    .unwrap(),
+                IsspRoutingPolicy::LowestLatency => usable
+                    .iter()
+                    .min_by_key(|r| r.metrics.smoothed_rtt_us)
+                    .map(|r| r.path_id)
+                    .unwrap(),
+                IsspRoutingPolicy::BestQuality => usable
+                    .iter()
+                    .max_by(|a, b| {
+                        let score_a = a.metrics.quality_score(a.state, a.weight);
+                        let score_b = b.metrics.quality_score(b.state, b.weight);
+                        score_a
+                            .partial_cmp(&score_b)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|r| r.path_id)
+                    .unwrap(),
+                IsspRoutingPolicy::FlowHashing => usable
+                    .iter()
+                    .min_by_key(|r| r.priority)
+                    .map(|r| r.path_id)
+                    .unwrap(),
+            };
+            return Ok(chosen);
+        }
+
+        // If no usable paths, look for a Standby path to promote
+        let standby: Vec<&IsspMultipathRoute> = self
+            .paths
+            .values()
+            .filter(|r| Some(r.path_id) != exclude_id && r.state == IsspPathState::Standby)
+            .collect();
+
+        if let Some(first_sb) = standby.iter().min_by_key(|r| r.priority) {
+            return Ok(first_sb.path_id);
+        }
+
+        Err(SyncError::NoUsablePaths)
+    }
+
+    /// Construct a heartbeat ping probe for the specified path.
+    pub fn create_heartbeat_ping(
+        &mut self,
+        path_id: u32,
+        now_ms: u64,
+    ) -> Result<IsspHeartbeatProbe, SyncError> {
+        let route = self
+            .paths
+            .get_mut(&path_id)
+            .ok_or(SyncError::PathNotFound(path_id))?;
+        let seq = self.next_probe_seq;
+        self.next_probe_seq = self.next_probe_seq.wrapping_add(1);
+
+        route.metrics.last_heartbeat_sent_unix_ms = now_ms;
+        route.metrics.total_heartbeats_sent += 1;
+        route.metrics.consecutive_missed_heartbeats += 1;
+
+        Ok(IsspHeartbeatProbe::new(
+            self.local_node_id,
+            path_id,
+            seq,
+            now_ms,
+            false,
+        ))
+    }
+
+    /// Ingest and process a heartbeat probe.
+    /// If Ping: returns generated Pong response probe.
+    /// If Pong: updates RTT and liveness metrics, resetting missed counter.
+    pub fn process_heartbeat_probe(
+        &mut self,
+        probe: &IsspHeartbeatProbe,
+        now_ms: u64,
+    ) -> Result<Option<IsspHeartbeatProbe>, SyncError> {
+        if !probe.is_response {
+            // Received ping -> generate pong reply
+            let pong = IsspHeartbeatProbe::new(
+                self.local_node_id,
+                probe.path_id,
+                probe.probe_seq,
+                probe.timestamp_unix_ms,
+                true,
+            );
+            Ok(Some(pong))
+        } else {
+            // Received pong -> update path telemetry
+            let route = self
+                .paths
+                .get_mut(&probe.path_id)
+                .ok_or(SyncError::PathNotFound(probe.path_id))?;
+            route.metrics.last_heartbeat_recv_unix_ms = now_ms;
+            route.metrics.consecutive_missed_heartbeats = 0;
+            route.metrics.total_heartbeats_received += 1;
+
+            if now_ms >= probe.timestamp_unix_ms {
+                let rtt_sample_us = (now_ms - probe.timestamp_unix_ms) * 1000;
+                route.metrics.update_rtt(rtt_sample_us);
+            }
+
+            // Path recovery: if previously Failed, promote back to Standby
+            if route.state == IsspPathState::Failed {
+                route.state = IsspPathState::Standby;
+            }
+            Ok(None)
+        }
+    }
+
+    /// Scan all paths for heartbeat timeout or consecutive missed heartbeats,
+    /// transition expired paths to Failed, and automatically trigger dynamic failover.
+    pub fn evaluate_heartbeats_and_failover(&mut self, now_ms: u64) -> Vec<IsspFailoverEvent> {
+        let mut failovers = Vec::new();
+        let mut failed_paths = Vec::new();
+
+        for route in self.paths.values_mut() {
+            if route.state != IsspPathState::Failed {
+                let mut expired = false;
+                let mut reason = IsspFailoverReason::HeartbeatTimeout;
+
+                // Check consecutive missed probes
+                if route.metrics.consecutive_missed_heartbeats >= route.max_missed_heartbeats {
+                    expired = true;
+                    reason = IsspFailoverReason::ConsecutiveHeartbeatsExceeded;
+                }
+                // Check silence elapsed since last received heartbeat
+                else if route.metrics.last_heartbeat_recv_unix_ms > 0 {
+                    let elapsed = now_ms.saturating_sub(route.metrics.last_heartbeat_recv_unix_ms);
+                    if elapsed >= route.heartbeat_timeout_ms {
+                        expired = true;
+                        reason = IsspFailoverReason::HeartbeatTimeout;
+                    }
+                }
+
+                if expired {
+                    route.state = IsspPathState::Failed;
+                    failed_paths.push((route.path_id, reason));
+                }
+            }
+        }
+
+        for (failed_id, reason) in failed_paths {
+            let cutover_start = Instant::now();
+            if let Ok(target_id) = self.select_best_candidate_path(Some(failed_id)) {
+                // Promote candidate if it was Standby
+                if let Some(target) = self.paths.get_mut(&target_id) {
+                    if target.state == IsspPathState::Standby {
+                        target.state = IsspPathState::Active;
+                    }
+                }
+
+                // Reroute all sessions bound to failed path
+                let mut rerouted_ids = Vec::new();
+                for (s_id, bound_path) in self.session_bindings.iter_mut() {
+                    if *bound_path == failed_id {
+                        *bound_path = target_id;
+                        rerouted_ids.push(*s_id);
+                    }
+                }
+
+                let cutover_us = cutover_start.elapsed().as_secs_f64() * 1_000_000.0;
+                let event = IsspFailoverEvent {
+                    timestamp_unix_ms: now_ms,
+                    failed_path_id: failed_id,
+                    target_path_id: target_id,
+                    reason,
+                    sessions_rerouted: rerouted_ids.len(),
+                    cutover_latency_us: cutover_us,
+                    rerouted_session_ids: rerouted_ids,
+                };
+                self.total_failovers += 1;
+                self.failover_history.push(event.clone());
+                failovers.push(event);
+            }
+        }
+
+        failovers
+    }
+
+    /// Retrieve failover events history.
+    pub fn failover_history(&self) -> &[IsspFailoverEvent] {
+        &self.failover_history
+    }
+
+    /// Generate an aggregated telemetry report across all paths.
+    pub fn telemetry(&self) -> IsspMultipathTelemetry {
+        let mut active = 0;
+        let mut standby = 0;
+        let mut degraded = 0;
+        let mut failed = 0;
+        let mut hb_sent = 0;
+        let mut hb_recv = 0;
+
+        for r in self.paths.values() {
+            match r.state {
+                IsspPathState::Active => active += 1,
+                IsspPathState::Standby => standby += 1,
+                IsspPathState::Degraded => degraded += 1,
+                IsspPathState::Failed => failed += 1,
+            }
+            hb_sent += r.metrics.total_heartbeats_sent;
+            hb_recv += r.metrics.total_heartbeats_received;
+        }
+
+        IsspMultipathTelemetry {
+            total_paths: self.paths.len(),
+            active_paths: active,
+            standby_paths: standby,
+            degraded_paths: degraded,
+            failed_paths: failed,
+            total_failovers: self.total_failovers,
+            total_heartbeats_sent: hb_sent,
+            total_heartbeats_received: hb_recv,
+            total_sessions_bound: self.session_bindings.len(),
+            routes: self.paths.values().cloned().collect(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session Tick Configuration & Outcome
 // ---------------------------------------------------------------------------
 
@@ -847,6 +1476,8 @@ pub struct SessionTickOutcome {
     pub auto_migrated_sessions: Vec<SessionSnapshot>,
     /// Stale session IDs evicted from the registry during this tick.
     pub evicted_sessions: Vec<SessionId>,
+    /// Multipath path failover events triggered by heartbeat timeouts.
+    pub multipath_failover_events: Vec<IsspFailoverEvent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -888,6 +1519,8 @@ pub struct SessionRegistry {
     pub gossip_auth_failed_count: AtomicU64,
     /// Count of frames rejected due to replay detection.
     pub gossip_replay_failed_count: AtomicU64,
+    /// Dynamic multipath routing engine managing multiple candidate paths and heartbeat failovers.
+    pub multipath_router: Mutex<IsspDynamicMultipathRouter>,
 }
 
 impl SessionRegistry {
@@ -905,6 +1538,10 @@ impl SessionRegistry {
             gossip_rejected_count: AtomicU64::new(0),
             gossip_auth_failed_count: AtomicU64::new(0),
             gossip_replay_failed_count: AtomicU64::new(0),
+            multipath_router: Mutex::new(IsspDynamicMultipathRouter::new(
+                node_id,
+                IsspRoutingPolicy::ActiveStandby,
+            )),
         })
     }
 
@@ -922,6 +1559,10 @@ impl SessionRegistry {
             gossip_rejected_count: AtomicU64::new(0),
             gossip_auth_failed_count: AtomicU64::new(0),
             gossip_replay_failed_count: AtomicU64::new(0),
+            multipath_router: Mutex::new(IsspDynamicMultipathRouter::new(
+                node_id,
+                IsspRoutingPolicy::ActiveStandby,
+            )),
         })
     }
 
@@ -1315,12 +1956,19 @@ impl SessionRegistry {
             guard.remove(id);
         }
 
+        let multipath_failover_events = if let Ok(mut router) = self.multipath_router.lock() {
+            router.evaluate_heartbeats_and_failover(now_unix_secs * 1000)
+        } else {
+            Vec::new()
+        };
+
         Ok(SessionTickOutcome {
             outbound_plaintext_frames,
             outbound_secure_frames,
             outbound_capsules,
             auto_migrated_sessions,
             evicted_sessions: to_evict,
+            multipath_failover_events,
         })
     }
 
@@ -1456,6 +2104,10 @@ impl SessionRegistry {
             gossip_rejected_count: AtomicU64::new(0),
             gossip_auth_failed_count: AtomicU64::new(0),
             gossip_replay_failed_count: AtomicU64::new(0),
+            multipath_router: Mutex::new(IsspDynamicMultipathRouter::new(
+                node_id,
+                IsspRoutingPolicy::ActiveStandby,
+            )),
         });
         let mut reg_guard = registry
             .sessions
@@ -1496,6 +2148,73 @@ impl SessionRegistry {
     pub fn load_from_file(path: &std::path::Path) -> Result<Arc<Self>, SyncError> {
         let bytes = std::fs::read(path).map_err(|_| SyncError::SessionNotFound)?;
         Self::import_state_dump(&bytes)
+    }
+
+    /// Register a transport path into the dynamic multipath router.
+    pub fn add_multipath_route(&self, route: IsspMultipathRoute) -> Result<(), SyncError> {
+        let mut router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        router.add_route(route);
+        Ok(())
+    }
+
+    /// List all registered transport paths and their real-time telemetry.
+    pub fn list_multipath_routes(&self) -> Result<Vec<IsspMultipathRoute>, SyncError> {
+        let router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        Ok(router.list_routes())
+    }
+
+    /// Resolve optimal transport path for a session according to current multipath routing policy.
+    pub fn resolve_session_path(
+        &self,
+        session_id: &SessionId,
+        now_ms: u64,
+    ) -> Result<u32, SyncError> {
+        let mut router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        router.resolve_path_for_session(session_id, now_ms)
+    }
+
+    /// Generate a keep-alive heartbeat probe ping for a specific path.
+    pub fn create_heartbeat_probe(
+        &self,
+        path_id: u32,
+        now_ms: u64,
+    ) -> Result<IsspHeartbeatProbe, SyncError> {
+        let mut router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        router.create_heartbeat_ping(path_id, now_ms)
+    }
+
+    /// Ingest a heartbeat probe (ping or pong) and update path RTT / liveness telemetry.
+    pub fn handle_heartbeat_probe(
+        &self,
+        probe: &IsspHeartbeatProbe,
+        now_ms: u64,
+    ) -> Result<Option<IsspHeartbeatProbe>, SyncError> {
+        let mut router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        router.process_heartbeat_probe(probe, now_ms)
+    }
+
+    /// Retrieve full multipath routing telemetry report.
+    pub fn multipath_telemetry(&self) -> Result<IsspMultipathTelemetry, SyncError> {
+        let router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        Ok(router.telemetry())
     }
 }
 
@@ -1639,6 +2358,12 @@ pub enum SyncError {
     UnsupportedDumpVersion(u32),
     /// ISSP dump buffer length is invalid.
     InvalidDumpLength(usize),
+    /// Transport path with the given ID was not found in the multipath routing table.
+    PathNotFound(u32),
+    /// No usable (active or degraded) transport path available.
+    NoUsablePaths,
+    /// ISSP heartbeat probe packet wire format or CRC32 was invalid.
+    InvalidHeartbeatProbe,
 }
 
 impl std::fmt::Display for SyncError {
@@ -1662,6 +2387,15 @@ impl std::fmt::Display for SyncError {
             SyncError::BadDumpMagic => write!(f, "invalid ISSP state dump magic tag"),
             SyncError::UnsupportedDumpVersion(v) => write!(f, "unsupported ISSP dump version {v}"),
             SyncError::InvalidDumpLength(len) => write!(f, "invalid ISSP dump length: {len} bytes"),
+            SyncError::PathNotFound(id) => {
+                write!(f, "transport path {id} not found in routing table")
+            }
+            SyncError::NoUsablePaths => {
+                write!(f, "no usable transport paths available for routing")
+            }
+            SyncError::InvalidHeartbeatProbe => {
+                write!(f, "invalid ISSP heartbeat probe wire packet")
+            }
         }
     }
 }
@@ -2522,5 +3256,164 @@ mod tests {
         let rec2 = imported.get_session(&id2).expect("rec2");
         assert!(!rec2.is_primary);
         assert_eq!(rec2.snapshot.migration_epoch, snap2.migration_epoch);
+    }
+
+    #[test]
+    fn test_issp_heartbeat_probe_encoding_decoding_and_crc() {
+        let probe = IsspHeartbeatProbe::new(101, 2, 42, 1_700_000_123_456, false);
+        let wire = probe.encode();
+        assert_eq!(wire.len(), ISSP_HEARTBEAT_SIZE);
+
+        let decoded = IsspHeartbeatProbe::decode(&wire).expect("valid decode");
+        assert_eq!(decoded.sender_node_id, 101);
+        assert_eq!(decoded.path_id, 2);
+        assert_eq!(decoded.probe_seq, 42);
+        assert_eq!(decoded.timestamp_unix_ms, 1_700_000_123_456);
+        assert!(!decoded.is_response);
+
+        // Corrupt one byte -> decode must reject
+        let mut corrupted = wire;
+        corrupted[10] ^= 0xFF;
+        assert!(IsspHeartbeatProbe::decode(&corrupted).is_none());
+
+        // Pong response probe
+        let pong = IsspHeartbeatProbe::new(102, 2, 42, 1_700_000_123_456, true);
+        let wire_pong = pong.encode();
+        let dec_pong = IsspHeartbeatProbe::decode(&wire_pong).expect("valid pong");
+        assert!(dec_pong.is_response);
+    }
+
+    #[test]
+    fn test_dynamic_multipath_router_registration_and_steering() {
+        let mut router = IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::ActiveStandby);
+
+        let route1 =
+            IsspMultipathRoute::new(1, 2, "eth0-wan", 1, 100).with_state(IsspPathState::Active);
+        let route2 =
+            IsspMultipathRoute::new(2, 2, "wwan0-5g", 2, 50).with_state(IsspPathState::Standby);
+
+        router.add_route(route1);
+        router.add_route(route2);
+        assert_eq!(router.list_routes().len(), 2);
+
+        let s1 = SessionId::new(0x1111, 1, 1);
+        let s2 = SessionId::new(0x2222, 1, 2);
+
+        let p1 = router.resolve_path_for_session(&s1, 1_000).unwrap();
+        let p2 = router.resolve_path_for_session(&s2, 1_000).unwrap();
+
+        assert_eq!(p1, 1); // Primary active path
+        assert_eq!(p2, 1);
+    }
+
+    #[test]
+    fn test_dynamic_multipath_heartbeat_timeout_and_automatic_failover() {
+        let mut router = IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::ActiveStandby);
+
+        let mut r1 = IsspMultipathRoute::new(1, 10, "eth0-fiber", 1, 100)
+            .with_state(IsspPathState::Active)
+            .with_heartbeat_config(500, 1500, 3);
+        r1.metrics.last_heartbeat_recv_unix_ms = 1_000;
+
+        let mut r2 = IsspMultipathRoute::new(2, 10, "wwan0-5g", 2, 80)
+            .with_state(IsspPathState::Standby)
+            .with_heartbeat_config(500, 1500, 3);
+        r2.metrics.last_heartbeat_recv_unix_ms = 1_000;
+
+        router.add_route(r1);
+        router.add_route(r2);
+
+        let s1 = SessionId::new(0x100, 1, 1);
+        let s2 = SessionId::new(0x200, 1, 2);
+        router.bind_session(s1, 1).unwrap();
+        router.bind_session(s2, 1).unwrap();
+
+        assert_eq!(router.get_session_path(&s1), Some(1));
+        assert_eq!(router.get_session_path(&s2), Some(1));
+
+        // Send pings at t = 1_500
+        let p1_ping = router.create_heartbeat_ping(1, 1_500).unwrap();
+        let p2_ping = router.create_heartbeat_ping(2, 1_500).unwrap();
+        assert_eq!(p1_ping.path_id, 1);
+        assert_eq!(p2_ping.path_id, 2);
+
+        // Path 2 responds with pong at t = 1_520 (RTT = 20ms)
+        let pong2 = IsspHeartbeatProbe::new(10, 2, p2_ping.probe_seq, 1_500, true);
+        router.process_heartbeat_probe(&pong2, 1_520).unwrap();
+        // EWMA: (7 * 10_000 + 20_000) / 8 = 11_250 us
+        assert_eq!(router.get_route(2).unwrap().metrics.smoothed_rtt_us, 11_250);
+
+        // Path 1 receives NO replies!
+        // At t = 2_600: silence on Path 1 = 1600ms >= heartbeat_timeout_ms (1500ms)
+        let failovers = router.evaluate_heartbeats_and_failover(2_600);
+        assert_eq!(failovers.len(), 1);
+
+        let ev = &failovers[0];
+        assert_eq!(ev.failed_path_id, 1);
+        assert_eq!(ev.target_path_id, 2);
+        assert_eq!(ev.reason, IsspFailoverReason::HeartbeatTimeout);
+        assert_eq!(ev.sessions_rerouted, 2);
+        assert!(ev.cutover_latency_us < 50_000.0); // Sub-50ms cutover
+
+        // Verify Path 1 is marked Failed, Path 2 is promoted to Active
+        assert_eq!(router.get_route(1).unwrap().state, IsspPathState::Failed);
+        assert_eq!(router.get_route(2).unwrap().state, IsspPathState::Active);
+
+        // Verify sessions are automatically remapped to Path 2!
+        assert_eq!(router.get_session_path(&s1), Some(2));
+        assert_eq!(router.get_session_path(&s2), Some(2));
+        assert_eq!(router.resolve_path_for_session(&s1, 2_600).unwrap(), 2);
+
+        // Recovery: Path 1 receives pong probe -> restored to Standby
+        let recover_pong = IsspHeartbeatProbe::new(10, 1, 99, 2_650, true);
+        router
+            .process_heartbeat_probe(&recover_pong, 2_670)
+            .unwrap();
+        assert_eq!(router.get_route(1).unwrap().state, IsspPathState::Standby);
+
+        // Telemetry check
+        let telem = router.telemetry();
+        assert_eq!(telem.total_paths, 2);
+        assert_eq!(telem.active_paths, 1);
+        assert_eq!(telem.standby_paths, 1);
+        assert_eq!(telem.failed_paths, 0);
+        assert_eq!(telem.total_failovers, 1);
+    }
+
+    #[test]
+    fn test_registry_tick_multipath_heartbeat_failover_integration() {
+        let reg = SessionRegistry::new(99);
+
+        let mut r_wan = IsspMultipathRoute::new(10, 200, "eth0-wan", 1, 100)
+            .with_state(IsspPathState::Active)
+            .with_heartbeat_config(1_000, 2_000, 2);
+        r_wan.metrics.last_heartbeat_recv_unix_ms = 1_000_000;
+
+        let r_sat = IsspMultipathRoute::new(20, 200, "leo-sat", 2, 40)
+            .with_state(IsspPathState::Standby)
+            .with_heartbeat_config(1_000, 2_000, 2);
+
+        reg.add_multipath_route(r_wan).unwrap();
+        reg.add_multipath_route(r_sat).unwrap();
+
+        let sid = SessionId::new(0x9999, 99, 1);
+        let snap = make_snap(sid, 0, 1_000);
+        reg.upsert_primary(snap).unwrap();
+
+        // Bind session to path 10
+        assert_eq!(reg.resolve_session_path(&sid, 1_000_000).unwrap(), 10);
+
+        // Simulate tick at t = 1_003_000 ms (unix secs = 1003)
+        // Elapsed silence on path 10 = 3000ms >= 2000ms timeout
+        let config = SessionTickConfig::default();
+        let outcome = reg.on_session_tick(1_003, &config).unwrap();
+
+        assert_eq!(outcome.multipath_failover_events.len(), 1);
+        let ev = &outcome.multipath_failover_events[0];
+        assert_eq!(ev.failed_path_id, 10);
+        assert_eq!(ev.target_path_id, 20);
+
+        // Session is now dynamically served by path 20
+        assert_eq!(reg.resolve_session_path(&sid, 1_003_000).unwrap(), 20);
     }
 }

@@ -3,8 +3,9 @@
 use clap::Subcommand;
 use ifa_runtime::{
     run_issp_failover_benchmark_suite, run_issp_scenario, IsspCapsule,
-    IsspFailoverBenchmarkSuiteReport, IsspNetworkProfile, SecurityPolicy, SessionRecord,
-    SessionRegistry,
+    IsspFailoverBenchmarkSuiteReport, IsspHeartbeatProbe, IsspMultipathRoute,
+    IsspMultipathTelemetry, IsspNetworkProfile, IsspPathState, SecurityPolicy, SessionId,
+    SessionRecord, SessionRegistry, SessionSnapshot,
 };
 use serde_json::json;
 use std::fs;
@@ -78,8 +79,20 @@ pub enum SessionCommand {
         #[arg(short, long)]
         jitter_ms: Option<u64>,
         /// Primary silence threshold in seconds before triggering failover
-        #[arg(short, long, default_value = "2")]
+        #[arg(long, default_value = "2")]
         silence_secs: u64,
+        /// Output formatted as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Observe dynamic multipath routes and simulate heartbeat failover
+    Route {
+        /// Path to persistent cluster state dump (.issp or binary dump)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+        /// Simulate heartbeat failure on a specific path ID
+        #[arg(long)]
+        fail_path: Option<u32>,
         /// Output formatted as JSON
         #[arg(long)]
         json: bool,
@@ -553,6 +566,172 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 } else {
                     println!("Status: ONE OR MORE SCENARIOS FAILED INTEGRITY VERIFICATION\n");
                 }
+            }
+            ExitCode::SUCCESS
+        }
+        SessionCommand::Route {
+            file,
+            fail_path,
+            json,
+        } => {
+            let state_path = resolve_state_file(file.as_ref());
+            let registry = match &state_path {
+                Some(p) if p.exists() => match SessionRegistry::load_from_file(p) {
+                    Ok(reg) => reg,
+                    Err(e) => {
+                        eprintln!(
+                            "error: failed to load ISSP state file `{}`: {}",
+                            p.display(),
+                            e
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                },
+                _ => {
+                    let reg = SessionRegistry::new(1);
+                    let now = current_unix_secs();
+                    for i in 1..=3 {
+                        let id = SessionId::new(0x1000 + i, 1, i as u32);
+                        let mut snap = SessionSnapshot::new(id, 1, now);
+                        snap.tx_seq = 100 * i;
+                        snap.rx_seq_high = 95 * i;
+                        let _ = reg.upsert_primary(snap);
+                    }
+                    reg
+                }
+            };
+
+            let now_ms = current_unix_secs() * 1000;
+
+            let mut r_fiber = IsspMultipathRoute::new(1, 10, "eth0-fiber-wan", 1, 100)
+                .with_state(IsspPathState::Active)
+                .with_heartbeat_config(500, 1500, 3);
+            r_fiber.metrics.last_heartbeat_recv_unix_ms = now_ms;
+
+            let mut r_5g = IsspMultipathRoute::new(2, 10, "wwan0-5g-edge", 2, 60)
+                .with_state(IsspPathState::Standby)
+                .with_heartbeat_config(500, 1500, 3);
+            r_5g.metrics.last_heartbeat_recv_unix_ms = now_ms;
+
+            let mut r_sat = IsspMultipathRoute::new(3, 10, "leo-sat-orbit", 3, 30)
+                .with_state(IsspPathState::Standby)
+                .with_heartbeat_config(1000, 3000, 3);
+            r_sat.metrics.last_heartbeat_recv_unix_ms = now_ms;
+
+            let _ = registry.add_multipath_route(r_fiber);
+            let _ = registry.add_multipath_route(r_5g);
+            let _ = registry.add_multipath_route(r_sat);
+
+            let sessions = registry.list_sessions();
+            for s in &sessions {
+                let _ = registry.resolve_session_path(&s.snapshot.id, now_ms);
+            }
+
+            let mut failover_event = None;
+            if let Some(target_fail_id) = fail_path {
+                if let Ok(mut router) = registry.multipath_router.lock() {
+                    for p in router.list_routes() {
+                        let _ = router.create_heartbeat_ping(p.path_id, now_ms);
+                        if p.path_id != target_fail_id {
+                            let pong = IsspHeartbeatProbe::new(10, p.path_id, 1, now_ms, true);
+                            let _ = router.process_heartbeat_probe(&pong, now_ms + 1_800);
+                        }
+                    }
+                    let events = router.evaluate_heartbeats_and_failover(now_ms + 2_100);
+                    if let Some(first_ev) = events.into_iter().next() {
+                        failover_event = Some(first_ev);
+                    }
+                }
+            }
+
+            let telem = registry
+                .multipath_telemetry()
+                .unwrap_or(IsspMultipathTelemetry {
+                    total_paths: 0,
+                    active_paths: 0,
+                    standby_paths: 0,
+                    degraded_paths: 0,
+                    failed_paths: 0,
+                    total_failovers: 0,
+                    total_heartbeats_sent: 0,
+                    total_heartbeats_received: 0,
+                    total_sessions_bound: 0,
+                    routes: Vec::new(),
+                });
+
+            if json {
+                let val = json!({
+                    "node_id": registry.node_id,
+                    "total_paths": telem.total_paths,
+                    "active_paths": telem.active_paths,
+                    "standby_paths": telem.standby_paths,
+                    "failed_paths": telem.failed_paths,
+                    "total_failovers": telem.total_failovers,
+                    "total_sessions_bound": telem.total_sessions_bound,
+                    "failover_triggered": failover_event.is_some(),
+                    "failover_event": failover_event.map(|e| json!({
+                        "failed_path_id": e.failed_path_id,
+                        "target_path_id": e.target_path_id,
+                        "reason": format!("{:?}", e.reason),
+                        "sessions_rerouted": e.sessions_rerouted,
+                        "cutover_latency_us": e.cutover_latency_us,
+                    })),
+                    "routes": telem.routes.iter().map(|r| json!({
+                        "path_id": r.path_id,
+                        "peer_node_id": r.peer_node_id,
+                        "interface": r.interface_name,
+                        "priority": r.priority,
+                        "weight": r.weight,
+                        "state": format!("{:?}", r.state),
+                        "smoothed_rtt_us": r.metrics.smoothed_rtt_us,
+                        "loss_rate_ppm": r.metrics.loss_rate_ppm,
+                        "consecutive_missed_heartbeats": r.metrics.consecutive_missed_heartbeats,
+                    })).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&val).unwrap());
+            } else {
+                println!("\n=== ISSP DYNAMIC MULTIPATH ROUTING & HEARTBEAT FAILOVER ===");
+                println!(
+                    "Node ID: {} | Paths: {} (Active: {}, Standby: {}, Failed: {}) | Failovers: {}",
+                    registry.node_id,
+                    telem.total_paths,
+                    telem.active_paths,
+                    telem.standby_paths,
+                    telem.failed_paths,
+                    telem.total_failovers
+                );
+
+                if let Some(ref e) = failover_event {
+                    println!("\n[FAILOVER EVENT TRIGGERED]");
+                    println!("- Failed Path:     #{}", e.failed_path_id);
+                    println!("- Promoted Target: #{}", e.target_path_id);
+                    println!("- Reason:          {:?}", e.reason);
+                    println!("- Cutover Latency: {:.2} µs", e.cutover_latency_us);
+                    println!("- Rerouted Flows:  {} sessions", e.sessions_rerouted);
+                }
+
+                println!(
+                    "\n| Path ID | Interface | State | Priority | Weight | SRTT | Loss | Missed HB | Peer Node |"
+                );
+                println!(
+                    "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
+                );
+                for r in &telem.routes {
+                    println!(
+                        "| #{} | {} | **{:?}** | {} | {} | {:.2} ms | {:.2}% | {} / {} | Node {} |",
+                        r.path_id,
+                        r.interface_name,
+                        r.state,
+                        r.priority,
+                        r.weight,
+                        (r.metrics.smoothed_rtt_us as f64) / 1000.0,
+                        (r.metrics.loss_rate_ppm as f64) / 10_000.0,
+                        r.metrics.consecutive_missed_heartbeats,
+                        r.max_missed_heartbeats,
+                        r.peer_node_id,
+                    );
+                }
+                println!();
             }
             ExitCode::SUCCESS
         }
