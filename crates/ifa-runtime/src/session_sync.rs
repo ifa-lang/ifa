@@ -3141,8 +3141,11 @@ impl IsspDynamicMultipathRouter {
 
         for eval in evaluations {
             // Update peak observed telemetry
-            if eval.bandwidth_saturation_ratio > self.constraint_metrics.max_observed_saturation_ratio {
-                self.constraint_metrics.max_observed_saturation_ratio = eval.bandwidth_saturation_ratio;
+            if eval.bandwidth_saturation_ratio
+                > self.constraint_metrics.max_observed_saturation_ratio
+            {
+                self.constraint_metrics.max_observed_saturation_ratio =
+                    eval.bandwidth_saturation_ratio;
             }
             if eval.jitter_us > self.constraint_metrics.max_observed_jitter_us {
                 self.constraint_metrics.max_observed_jitter_us = eval.jitter_us;
@@ -7734,8 +7737,16 @@ mod tests {
         router.add_route(r1);
         router.add_route(r2);
 
-        let s1 = SessionId { flow_hash: 111, origin_node: 1, nonce: 1 };
-        let s2 = SessionId { flow_hash: 222, origin_node: 1, nonce: 2 };
+        let s1 = SessionId {
+            flow_hash: 111,
+            origin_node: 1,
+            nonce: 1,
+        };
+        let s2 = SessionId {
+            flow_hash: 222,
+            origin_node: 1,
+            nonce: 2,
+        };
         router.bind_session(s1, 1).expect("bind s1");
         router.bind_session(s2, 1).expect("bind s2");
 
@@ -7760,8 +7771,18 @@ mod tests {
         assert_eq!(router.get_route(2).unwrap().state, IsspPathState::Active);
         assert_eq!(router.get_session_path(&s1), Some(2));
         assert_eq!(router.get_session_path(&s2), Some(2));
-        assert_eq!(router.subpath_constraint_metrics().total_saturation_failovers, 1);
-        assert!(router.subpath_constraint_metrics().max_observed_saturation_ratio >= 0.88);
+        assert_eq!(
+            router
+                .subpath_constraint_metrics()
+                .total_saturation_failovers,
+            1
+        );
+        assert!(
+            router
+                .subpath_constraint_metrics()
+                .max_observed_saturation_ratio
+                >= 0.88
+        );
 
         // 3. Jitter exceedance on Path 2
         // Restore Path 1 to Active, simulate severe jitter on Path 2
@@ -7777,8 +7798,14 @@ mod tests {
         assert_eq!(evs[0].failed_path_id, 2);
         assert_eq!(evs[0].target_path_id, 1);
         assert_eq!(evs[0].reason, IsspFailoverReason::JitterExceeded);
-        assert_eq!(router.subpath_constraint_metrics().total_jitter_failovers, 1);
-        assert_eq!(router.subpath_constraint_metrics().max_observed_jitter_us, 16_000);
+        assert_eq!(
+            router.subpath_constraint_metrics().total_jitter_failovers,
+            1
+        );
+        assert_eq!(
+            router.subpath_constraint_metrics().max_observed_jitter_us,
+            16_000
+        );
 
         assert_eq!(router.get_session_path(&s1), Some(1));
         assert_eq!(router.get_session_path(&s2), Some(1));

@@ -479,9 +479,14 @@ impl IsspMultipathBalancingSnapshot {
             } else {
                 0.0
             };
-            let is_sat = sat_ratio >= router.subpath_constraint_config().max_bandwidth_saturation_ratio;
-            let is_jit = route.metrics.jitter_us >= router.subpath_constraint_config().max_jitter_us
-                || route.metrics.rtt_variance_us >= router.subpath_constraint_config().max_rtt_variance_us;
+            let is_sat = sat_ratio
+                >= router
+                    .subpath_constraint_config()
+                    .max_bandwidth_saturation_ratio;
+            let is_jit = route.metrics.jitter_us
+                >= router.subpath_constraint_config().max_jitter_us
+                || route.metrics.rtt_variance_us
+                    >= router.subpath_constraint_config().max_rtt_variance_us;
 
             subpaths.push(IsspSubpathBalancingMetrics {
                 path_id: route.path_id,
@@ -539,9 +544,13 @@ impl IsspMultipathBalancingSnapshot {
             aggregate_tcp_retrans_ratio: agg_tcp_ratio,
             aggregate_issp_retrans_ratio: agg_issp_ratio,
             total_failovers: router.total_failovers,
-            total_saturation_failovers: router.subpath_constraint_metrics().total_saturation_failovers,
+            total_saturation_failovers: router
+                .subpath_constraint_metrics()
+                .total_saturation_failovers,
             total_jitter_failovers: router.subpath_constraint_metrics().total_jitter_failovers,
-            max_observed_saturation_ratio: router.subpath_constraint_metrics().max_observed_saturation_ratio,
+            max_observed_saturation_ratio: router
+                .subpath_constraint_metrics()
+                .max_observed_saturation_ratio,
             max_observed_jitter_us: router.subpath_constraint_metrics().max_observed_jitter_us,
             last_cutover_latency_us: router.subpath_constraint_metrics().last_cutover_latency_us,
             cspf_resilience: router.cspf_group().map(CspfResilienceSnapshot::from_group),
@@ -8020,11 +8029,39 @@ mod tests {
 
         let mut graph = TopologyGraph::new();
         // Path 1: 1 -> 2 -> 4 (bottleneck 10 MB/s, RTT 4ms)
-        graph.add_edge(TopoEdge { from: NodeId(1), to: NodeId(2), avail_bw_bps: 10_000_000, rtt_us: 2000, loss_millipct: 10, cost: 2 });
-        graph.add_edge(TopoEdge { from: NodeId(2), to: NodeId(4), avail_bw_bps: 10_000_000, rtt_us: 2000, loss_millipct: 10, cost: 2 });
+        graph.add_edge(TopoEdge {
+            from: NodeId(1),
+            to: NodeId(2),
+            avail_bw_bps: 10_000_000,
+            rtt_us: 2000,
+            loss_millipct: 10,
+            cost: 2,
+        });
+        graph.add_edge(TopoEdge {
+            from: NodeId(2),
+            to: NodeId(4),
+            avail_bw_bps: 10_000_000,
+            rtt_us: 2000,
+            loss_millipct: 10,
+            cost: 2,
+        });
         // Path 2: 1 -> 3 -> 4 (bottleneck 20 MB/s, RTT 6ms)
-        graph.add_edge(TopoEdge { from: NodeId(1), to: NodeId(3), avail_bw_bps: 20_000_000, rtt_us: 3000, loss_millipct: 10, cost: 3 });
-        graph.add_edge(TopoEdge { from: NodeId(3), to: NodeId(4), avail_bw_bps: 20_000_000, rtt_us: 3000, loss_millipct: 10, cost: 3 });
+        graph.add_edge(TopoEdge {
+            from: NodeId(1),
+            to: NodeId(3),
+            avail_bw_bps: 20_000_000,
+            rtt_us: 3000,
+            loss_millipct: 10,
+            cost: 3,
+        });
+        graph.add_edge(TopoEdge {
+            from: NodeId(3),
+            to: NodeId(4),
+            avail_bw_bps: 20_000_000,
+            rtt_us: 3000,
+            loss_millipct: 10,
+            cost: 3,
+        });
 
         let paths = cspf_k_disjoint_paths(
             &graph,
@@ -8048,7 +8085,11 @@ mod tests {
                 jitter_action: FailoverAction::SwitchToStandby,
             });
 
-        let s1 = SessionId { flow_hash: 1, origin_node: 1, nonce: 1 };
+        let s1 = SessionId {
+            flow_hash: 1,
+            origin_node: 1,
+            nonce: 1,
+        };
         router.bind_session(s1, 1).expect("bind session");
 
         // Simulate 9.2 MB/s throughput on Path 1 (92% saturation > 85% threshold)
@@ -8059,7 +8100,10 @@ mod tests {
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].failed_path_id, 1);
         assert_eq!(evs[0].target_path_id, 2);
-        assert_eq!(evs[0].reason, crate::session_sync::IsspFailoverReason::BandwidthSaturation);
+        assert_eq!(
+            evs[0].reason,
+            crate::session_sync::IsspFailoverReason::BandwidthSaturation
+        );
 
         // Snapshot and telemetry exports
         let snap = IsspMultipathBalancingSnapshot::from_router(&router, 1_000_000_000);
@@ -8068,8 +8112,12 @@ mod tests {
         let prom = snap.export_prometheus();
         assert!(prom.contains("ifa_mesh_subpath_bandwidth_saturation_ratio"));
         assert!(prom.contains("ifa_mesh_subpath_jitter_microseconds"));
-        assert!(prom.contains("ifa_mesh_subpath_saturation_failovers_total{node_id=\"1\",policy=\"ActiveStandby\"} 1"));
-        assert!(prom.contains("ifa_mesh_subpath_jitter_failovers_total{node_id=\"1\",policy=\"ActiveStandby\"} 0"));
+        assert!(prom.contains(
+            "ifa_mesh_subpath_saturation_failovers_total{node_id=\"1\",policy=\"ActiveStandby\"} 1"
+        ));
+        assert!(prom.contains(
+            "ifa_mesh_subpath_jitter_failovers_total{node_id=\"1\",policy=\"ActiveStandby\"} 0"
+        ));
         assert!(prom.contains("ifa_mesh_subpath_last_cutover_latency_microseconds"));
 
         let otlp = OtelMultipathBalancingExporter::new().export(&snap, "ifa-service");
