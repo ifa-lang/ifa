@@ -4187,12 +4187,8 @@ mod tests {
 
         // With weights 100 vs 50, Path 1 should schedule approximately double Path 2
         assert_eq!(count_p1 + count_p2, 30);
-        assert!(
-            count_p1 >= 18 && count_p1 <= 22,
-            "count_p1 was {}",
-            count_p1
-        );
-        assert!(count_p2 >= 8 && count_p2 <= 12, "count_p2 was {}", count_p2);
+        assert!((18..=22).contains(&count_p1), "count_p1 was {}", count_p1);
+        assert!((8..=12).contains(&count_p2), "count_p2 was {}", count_p2);
 
         let r1_m = router.get_route(1).unwrap();
         let r2_m = router.get_route(2).unwrap();
