@@ -1,6 +1,6 @@
 # **IFA Programming Language**
 
-[License: MIT/Apache 2.0](#licence) | [Release Notes v0.1.0](docs/RELEASE_NOTES_v0.1.0.md) | [Changelog](CHANGELOG.md) | [Quickstart & Tour of IFA](docs/TOUR_OF_IFA.md)
+[License: MIT/Apache 2.0](#licence) | [Release Notes v0.1.0](docs/RELEASE_NOTES_v0.1.0.md) | [Changelog](CHANGELOG.md) | [Quickstart & Tour of IFA](docs/TOUR_OF_IFA.md) | [Supervision & Métriques](docs/OPERATIONS_SUPERVISION_PROMETHEUS_GRAFANA.md)
 
 ---
 

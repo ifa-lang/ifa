@@ -346,3 +346,13 @@ println!("TCP Throughput: {:.1} ops/sec", tcp_result.ops_per_sec);
 2. **Backpressure Awareness**: When using high-frequency SSE or WebSocket feeds, inspect `stats.utilization_rate()` periodically to throttle upstream ingestion.
 3. **Interceptor Layering**: Place security interceptors (token validation, mutual TLS verification) at the head of the interceptor pipeline, before logging or caching.
 4. **Zero-Copy Serialization**: Prefer borrowing byte slices when constructing `WsFrame` or `Http2ClientRequest` payloads to leverage IFA's generational reference and CoW guarantees.
+
+---
+
+## 8. Multipath Ingress Telemetry & Operations
+
+For production operations of bonded ISSP links, dynamic traffic balancing, and bufferbloat avoidance, IFA provides native Prometheus `/metrics`, OpenTelemetry `/v1/metrics`, and streaming WebSocket `/ws/metrics` endpoints:
+
+- **Operational Guide**: [docs/OPERATIONS_SUPERVISION_PROMETHEUS_GRAFANA.md](OPERATIONS_SUPERVISION_PROMETHEUS_GRAFANA.md)
+- **Turnkey Monitoring Stack**: [examples/multipath_monitoring](../examples/multipath_monitoring) with `docker-compose.yml`, Prometheus alert rules, and production Grafana dashboard.
+

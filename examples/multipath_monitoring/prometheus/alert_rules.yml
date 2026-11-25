@@ -1,0 +1,52 @@
+groups:
+  - name: ifa_issp_multipath_alerts
+    rules:
+      - alert: IfaIsspNoActiveSubpaths
+        expr: ifa_issp_multipath_active_paths == 0
+        for: 10s
+        labels:
+          severity: critical
+          tier: networking
+        annotations:
+          summary: "All ISSP multipath subpaths are unavailable on node {{ $labels.node_id }}"
+          description: "Node {{ $labels.node_id }} has 0 active operational subpaths. Ingress traffic cannot be routed across bonded paths."
+
+      - alert: IfaIsspSubpathDown
+        expr: ifa_issp_subpath_configured_weight > 0 and ifa_issp_subpath_effective_weight == 0
+        for: 30s
+        labels:
+          severity: warning
+          tier: networking
+        annotations:
+          summary: "Subpath {{ $labels.interface }} (path ID {{ $labels.path_id }}) degraded to zero weight"
+          description: "Subpath {{ $labels.interface }} on node {{ $labels.node_id }} has dropped out of active scheduling due to heartbeat timeout, flapping probation, or severe link degradation."
+
+      - alert: IfaIsspHighQueuingDelayGradient
+        expr: ifa_issp_subpath_rtt_gradient_seconds > 0.05
+        for: 1m
+        labels:
+          severity: warning
+          tier: networking
+        annotations:
+          summary: "Elevated bufferbloat queuing delay on {{ $labels.interface }} (node {{ $labels.node_id }})"
+          description: "LEDBAT measured queuing delay gradient of {{ $value }}s on {{ $labels.interface }}, exceeding the 50ms threshold."
+
+      - alert: IfaIsspCongestionSurge
+        expr: rate(ifa_issp_subpath_congestion_events_total[1m]) > 2
+        for: 1m
+        labels:
+          severity: warning
+          tier: networking
+        annotations:
+          summary: "Persistent congestion signals observed on {{ $labels.interface }} (node {{ $labels.node_id }})"
+          description: "Congestion events are accumulating at {{ $value }} events/sec over the last 60 seconds."
+
+      - alert: IfaIsspBbrBandwidthCollapse
+        expr: ifa_issp_subpath_bbr_bw_bps < 1000000 and ifa_issp_subpath_effective_weight > 0
+        for: 2m
+        labels:
+          severity: warning
+          tier: networking
+        annotations:
+          summary: "BBR bottleneck bandwidth below 1 Mbps on active subpath {{ $labels.interface }}"
+          description: "Estimated bottleneck bandwidth on {{ $labels.interface }} (node {{ $labels.node_id }}) collapsed to {{ $value }} bps."
