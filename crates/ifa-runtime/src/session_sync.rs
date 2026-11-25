@@ -2317,6 +2317,7 @@ pub struct IsspDynamicMultipathRouter {
     pub slice_resilience: crate::slice_resilience::SliceResilienceManager,
     pub multi_node_sla: crate::multi_node_sla::MultiNodeSlaSynthesizer,
     pub ingress_gatekeeper: crate::ingress_admission::IngressAdmissionGatekeeper,
+    pub subpath_scheduler: crate::subpath_scheduler::SubpathSchedulerGroup,
 }
 
 impl IsspDynamicMultipathRouter {
@@ -2354,6 +2355,7 @@ impl IsspDynamicMultipathRouter {
                 crate::ingress_admission::IngressAdmissionGatekeeper::default_for_node(
                     local_node_id,
                 ),
+            subpath_scheduler: crate::subpath_scheduler::SubpathSchedulerGroup::new(),
         }
     }
 
@@ -2392,12 +2394,15 @@ impl IsspDynamicMultipathRouter {
 
     /// Register a new multipath route.
     pub fn add_route(&mut self, route: IsspMultipathRoute) {
-        self.paths.insert(route.path_id, route);
+        let pid = route.path_id;
+        self.paths.insert(pid, route);
+        self.subpath_scheduler.ensure_subpath(pid);
     }
 
     /// Remove a multipath route by path ID.
     pub fn remove_route(&mut self, path_id: u32) -> Option<IsspMultipathRoute> {
         self.session_bindings.retain(|_, &mut pid| pid != path_id);
+        self.subpath_scheduler.remove_subpath(path_id);
         self.paths.remove(&path_id)
     }
 
@@ -3496,12 +3501,14 @@ impl IsspDynamicMultipathRouter {
         &mut self.ingress_gatekeeper
     }
 
-    /// Apply an upstream backpressure signal directly to the ingress gatekeeper.
+    /// Apply an upstream backpressure signal directly to the ingress gatekeeper and egress scheduler.
     pub fn apply_closed_loop_backpressure(
         &mut self,
         signal: &crate::multi_node_sla::ClosedLoopControlAction,
         now_ns: u64,
     ) -> bool {
+        self.subpath_scheduler
+            .apply_closed_loop_backpressure(signal);
         self.ingress_gatekeeper.apply_backpressure(signal, now_ns)
     }
 
@@ -3514,6 +3521,36 @@ impl IsspDynamicMultipathRouter {
     ) -> crate::ingress_admission::AdmissionDecision {
         self.ingress_gatekeeper
             .admit_packet(slice, packet_bytes, now_ns)
+    }
+
+    /// Read access to subpath egress scheduler group.
+    pub fn subpath_scheduler(&self) -> &crate::subpath_scheduler::SubpathSchedulerGroup {
+        &self.subpath_scheduler
+    }
+
+    /// Mutable access to subpath egress scheduler group.
+    pub fn subpath_scheduler_mut(
+        &mut self,
+    ) -> &mut crate::subpath_scheduler::SubpathSchedulerGroup {
+        &mut self.subpath_scheduler
+    }
+
+    /// Enqueue a packet for egress scheduling on a specific subpath.
+    pub fn enqueue_subpath_packet(
+        &mut self,
+        path_id: u32,
+        packet: crate::subpath_scheduler::SubpathQueuedPacket,
+    ) -> crate::subpath_scheduler::EnqueueVerdict {
+        self.subpath_scheduler.enqueue_packet(path_id, packet)
+    }
+
+    /// Schedule and dequeue the next packet for transmission over a specific subpath.
+    pub fn schedule_subpath_packet(
+        &mut self,
+        path_id: u32,
+        now_ns: u64,
+    ) -> Option<crate::subpath_scheduler::ScheduledPacket> {
+        self.subpath_scheduler.schedule_next(path_id, now_ns)
     }
 
     /// Return an iterator over all registered routes.
@@ -8334,5 +8371,57 @@ mod tests {
         assert_eq!(result.actions_triggered.len(), 0);
         assert!((result.global_compliance_ratio - 1.0).abs() < f64::EPSILON);
         assert!((result.isolation_score - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_router_subpath_scheduler_integration() {
+        let mut router =
+            IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::BandwidthAggregation);
+        let path = IsspMultipathRoute::new(10, 2, "eth0-subpath", 1, 100);
+        router.add_route(path);
+
+        let now_ns = 1_000_000_000;
+        let v1 = router.enqueue_subpath_packet(
+            10,
+            crate::subpath_scheduler::SubpathQueuedPacket::new(
+                101,
+                crate::traffic_slicing::FlowSliceClass::HighThroughput,
+                1500,
+                now_ns,
+            ),
+        );
+        assert!(matches!(
+            v1,
+            crate::subpath_scheduler::EnqueueVerdict::Enqueued { .. }
+        ));
+
+        let v2 = router.enqueue_subpath_packet(
+            10,
+            crate::subpath_scheduler::SubpathQueuedPacket::new(
+                102,
+                crate::traffic_slicing::FlowSliceClass::UltraLowLatency,
+                64,
+                now_ns,
+            ),
+        );
+        assert!(matches!(
+            v2,
+            crate::subpath_scheduler::EnqueueVerdict::Enqueued { .. }
+        ));
+
+        // Strict priority scheduling: URLLC packet must be dispatched first
+        let pkt1 = router.schedule_subpath_packet(10, now_ns + 1000).unwrap();
+        assert_eq!(pkt1.packet_id, 102);
+        assert_eq!(
+            pkt1.slice_class,
+            crate::traffic_slicing::FlowSliceClass::UltraLowLatency
+        );
+
+        let pkt2 = router.schedule_subpath_packet(10, now_ns + 2000).unwrap();
+        assert_eq!(pkt2.packet_id, 101);
+        assert_eq!(
+            pkt2.slice_class,
+            crate::traffic_slicing::FlowSliceClass::HighThroughput
+        );
     }
 }

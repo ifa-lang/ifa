@@ -21,6 +21,7 @@ pub mod session_sync;
 pub mod simd_classifier;
 pub mod slice_resilience;
 pub mod string;
+pub mod subpath_scheduler;
 pub mod telemetry;
 pub mod telemetry_queue;
 pub mod topology_cspf;
@@ -158,6 +159,10 @@ pub use slice_resilience::{
     SliceResilienceMetrics, SubpathProbationTracker,
 };
 pub use string::IfaString;
+pub use subpath_scheduler::{
+    run_subpath_scheduler_benchmark, EnqueueVerdict, ScheduledPacket, SubpathDeficitScheduler,
+    SubpathQueuedPacket, SubpathSchedulerBenchmarkReport, SubpathSchedulerGroup, SubpathSliceQueue,
+};
 pub use telemetry::{
     snapshot_to_compact_json, supervise_command, ws_build_close_frame, ws_build_text_frame,
     AlertFailoverPolicy, AlertmanagerWebhookAlert, AlertmanagerWebhookPayload, CspfPathMetricItem,

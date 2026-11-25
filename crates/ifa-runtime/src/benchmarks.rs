@@ -1380,6 +1380,8 @@ pub fn create_saturated_multipath_snapshot(
         total_ingress_admitted_packets: 0,
         total_ingress_throttled_packets: 0,
         total_ingress_backpressures_applied: 0,
+        total_subpath_scheduled_packets: 0,
+        total_subpath_dropped_packets: 0,
         last_gradient_variance: 0.0,
         active_flows_by_slice: BTreeMap::new(),
         sla_violations_by_slice: BTreeMap::new(),
@@ -3406,6 +3408,9 @@ pub use crate::ingress_admission::{
 };
 pub use crate::multi_node_sla::{run_multi_node_sla_benchmark, MultiNodeSlaReport};
 pub use crate::slice_resilience::{run_slice_resilience_benchmark, SliceResilienceBenchmarkReport};
+pub use crate::subpath_scheduler::{
+    run_subpath_scheduler_benchmark, SubpathSchedulerBenchmarkReport,
+};
 
 #[derive(Debug, Clone)]
 pub struct TrafficSlicingBenchmarkReport {
@@ -4363,5 +4368,25 @@ mod tests {
         assert!(report.urllc_remediated_latency_ns <= 5_000_000);
         assert!(report.remediated_compliance_ratio >= report.congested_compliance_ratio);
         assert!(report.remediated_isolation_score >= report.congested_isolation_score);
+    }
+
+    #[test]
+    fn test_subpath_scheduler_benchmark_suite_runs() {
+        let report = run_subpath_scheduler_benchmark();
+        assert!(report.verification_passed);
+        assert!(report.urllc_head_of_line_blocking_prevented);
+        assert!(report.best_effort_starvation_prevented);
+        assert!(report.mission_critical_packets_scheduled > 0);
+        assert!(report.embb_packets_scheduled > 0);
+        assert!(report.best_effort_packets_scheduled > 0);
+        assert!(report.overcapacity_tail_drops > 0);
+
+        let md = report.to_markdown_table();
+        assert!(md.contains("URLLC Strict Priority Guard"));
+        assert!(md.contains("BestEffort Starvation Prevention"));
+        assert!(md.contains("PASSED"));
+
+        let json = report.to_json();
+        assert!(json.contains("\"verification_passed\":true"));
     }
 }

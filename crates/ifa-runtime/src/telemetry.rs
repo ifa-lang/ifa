@@ -381,6 +381,10 @@ pub struct IsspMultipathBalancingSnapshot {
     pub total_ingress_throttled_packets: u64,
     /// Total upstream backpressure signals applied to ingress policing.
     pub total_ingress_backpressures_applied: u64,
+    /// Total packets scheduled across all egress subpaths.
+    pub total_subpath_scheduled_packets: u64,
+    /// Total packets dropped across all egress subpaths due to queue buffer exhaustion.
+    pub total_subpath_dropped_packets: u64,
     /// Instantaneous variance of marginal gradients across subpaths.
     pub last_gradient_variance: f64,
     /// Active flows partitioned by slice class name.
@@ -630,6 +634,28 @@ impl IsspMultipathBalancingSnapshot {
                 .ingress_gatekeeper()
                 .metrics()
                 .total_backpressures_received,
+            total_subpath_scheduled_packets: router
+                .subpath_scheduler()
+                .schedulers
+                .values()
+                .map(|s| {
+                    s.queues
+                        .values()
+                        .map(|q| q.total_dequeued_packets)
+                        .sum::<u64>()
+                })
+                .sum(),
+            total_subpath_dropped_packets: router
+                .subpath_scheduler()
+                .schedulers
+                .values()
+                .map(|s| {
+                    s.queues
+                        .values()
+                        .map(|q| q.total_dropped_packets)
+                        .sum::<u64>()
+                })
+                .sum(),
             last_gradient_variance: router.cost_gradient_metrics().last_gradient_variance,
             active_flows_by_slice: {
                 let mut m = BTreeMap::new();
@@ -1658,6 +1684,24 @@ impl PrometheusMultipathBalancingExporter {
         out.push_str(&format!(
             "ifa_ingress_backpressures_applied_total{} {}\n",
             base_lbl, s.total_ingress_backpressures_applied
+        ));
+
+        out.push_str(
+            "# HELP ifa_subpath_scheduled_packets_total Total packets scheduled over subpaths.\n",
+        );
+        out.push_str("# TYPE ifa_subpath_scheduled_packets_total counter\n");
+        out.push_str(&format!(
+            "ifa_subpath_scheduled_packets_total{} {}\n",
+            base_lbl, s.total_subpath_scheduled_packets
+        ));
+
+        out.push_str(
+            "# HELP ifa_subpath_dropped_packets_total Total packets dropped at subpath queues.\n",
+        );
+        out.push_str("# TYPE ifa_subpath_dropped_packets_total counter\n");
+        out.push_str(&format!(
+            "ifa_subpath_dropped_packets_total{} {}\n",
+            base_lbl, s.total_subpath_dropped_packets
         ));
 
         out
