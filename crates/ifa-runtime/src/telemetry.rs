@@ -1258,6 +1258,339 @@ impl IsspTelemetryServer {
             Err(e) => Err(e),
         }
     }
+
+    /// Serve a WebSocket upgrade on `GET /ws/metrics` (RFC 6455 mini-handshake, `std::net` only).
+    ///
+    /// After handshake:
+    /// - Pushes one JSON text frame per `interval_ms` milliseconds.
+    /// - Each frame contains a `IsspMultipathBalancingSnapshot` serialised as compact JSON.
+    /// - Stops after `max_frames` pushes (0 = unlimited) or on write error.
+    ///
+    /// Returns the number of frames actually sent.
+    pub fn serve_ws_metrics_connection(
+        &self,
+        mut stream: TcpStream,
+        interval_ms: u64,
+        max_frames: u64,
+    ) -> std::io::Result<u64> {
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+        // ── 1. Read and validate the HTTP Upgrade request ────────────────────
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Ok(0);
+        }
+        let req_str = String::from_utf8_lossy(&buf[..n]);
+
+        // Extract `Sec-WebSocket-Key` header (required by RFC 6455).
+        let ws_key = ws_extract_header(&req_str, "Sec-WebSocket-Key").ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Missing Sec-WebSocket-Key header",
+            )
+        })?;
+
+        // Verify the client requests an upgrade to `websocket` on `/ws/metrics`.
+        let path_ok = req_str
+            .lines()
+            .next()
+            .is_some_and(|l| l.contains("/ws/metrics"));
+        let upgrade_ok = ws_extract_header(&req_str, "Upgrade")
+            .map(|v| v.to_ascii_lowercase().contains("websocket"))
+            .unwrap_or(false);
+
+        if !path_ok || !upgrade_ok {
+            // Not a valid WS upgrade to our endpoint — reply 400 and exit.
+            stream.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )?;
+            stream.flush()?;
+            return Ok(0);
+        }
+
+        // ── 2. Build the RFC 6455 `101 Switching Protocols` response ─────────
+        let accept_key = ws_accept_key(&ws_key);
+        let handshake_resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {}\r\n\r\n",
+            accept_key
+        );
+        stream.write_all(handshake_resp.as_bytes())?;
+        stream.flush()?;
+
+        // ── 3. Streaming push loop ────────────────────────────────────────────
+        let interval = Duration::from_millis(interval_ms.max(1));
+        let mut frames_sent: u64 = 0;
+
+        // Set a longer write timeout for the streaming phase.
+        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+
+        loop {
+            if max_frames > 0 && frames_sent >= max_frames {
+                break;
+            }
+
+            // Collect snapshot.
+            let ts_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let snap_res = self.registry.multipath_balancing_snapshot(ts_ns);
+            let payload = match snap_res {
+                Ok(ref snap) => snapshot_to_compact_json(snap),
+                Err(e) => format!("{{\"error\":\"{}\"}}", e),
+            };
+
+            // Build RFC 6455 text frame (server → client, no mask, FIN=1, opcode=0x1).
+            let frame = ws_build_text_frame(payload.as_bytes());
+            if stream.write_all(&frame).is_err() {
+                break; // Client disconnected.
+            }
+            if stream.flush().is_err() {
+                break;
+            }
+            frames_sent += 1;
+
+            if max_frames > 0 && frames_sent >= max_frames {
+                break;
+            }
+            std::thread::sleep(interval);
+        }
+
+        // Send RFC 6455 close frame (opcode 0x8, payload=1000 normal closure).
+        let _ = stream.write_all(&ws_build_close_frame(1000));
+        let _ = stream.flush();
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+
+        Ok(frames_sent)
+    }
+
+    /// Accept and dispatch one connection: routes `/ws/metrics` to the WebSocket handler
+    /// and all other requests to the HTTP handler.
+    ///
+    /// Returns `(http_status_or_ws_frames, path)`.
+    pub fn serve_one_smart(
+        &self,
+        stream: TcpStream,
+        ws_interval_ms: u64,
+        ws_max_frames: u64,
+    ) -> std::io::Result<(u64, String)> {
+        // Ensure stream is blocking for header peek and dispatch.
+        let _ = stream.set_nonblocking(false);
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let mut peek_buf = [0u8; 512];
+        let peeked = stream.peek(&mut peek_buf).unwrap_or(0);
+        let peek_str = std::str::from_utf8(&peek_buf[..peeked]).unwrap_or("");
+
+        let is_ws_upgrade = peek_str.contains("/ws/metrics")
+            && peek_str.to_ascii_lowercase().contains("upgrade: websocket");
+
+        if is_ws_upgrade {
+            let frames = self.serve_ws_metrics_connection(stream, ws_interval_ms, ws_max_frames)?;
+            Ok((frames, "/ws/metrics".to_string()))
+        } else {
+            let (code, path) = self.serve_one_connection(stream)?;
+            Ok((code as u64, path))
+        }
+    }
+
+    /// In non-blocking mode, try accepting and routing a single incoming connection.
+    /// Routes `/ws/metrics` to the WebSocket streaming handler and standard HTTP paths
+    /// to the HTTP telemetry handler.
+    ///
+    /// Returns `Ok(Some((status_or_frames, path)))`, or `Ok(None)` if no client is pending.
+    pub fn try_serve_one_smart(
+        &self,
+        ws_interval_ms: u64,
+        ws_max_frames: u64,
+    ) -> std::io::Result<Option<(u64, String)>> {
+        match self.listener.accept() {
+            Ok((stream, _)) => {
+                let res = self.serve_one_smart(stream, ws_interval_ms, ws_max_frames)?;
+                Ok(Some(res))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+// ─── RFC 6455 WebSocket helpers (std::net only, no external crates) ──────────
+
+/// Extract the value of a named HTTP header from a raw request string.
+fn ws_extract_header(raw: &str, name: &str) -> Option<String> {
+    let lower_name = name.to_ascii_lowercase();
+    for line in raw.lines() {
+        let lower_line = line.to_ascii_lowercase();
+        if lower_line.starts_with(&lower_name) && lower_line[lower_name.len()..].starts_with(':') {
+            let value = line[lower_name.len() + 1..].trim();
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// Compute the RFC 6455 `Sec-WebSocket-Accept` base64 value from a client key.
+/// SHA-1 implemented inline (no external crates) per the WebSocket spec.
+fn ws_accept_key(client_key: &str) -> String {
+    const MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    let combined = format!("{}{}", client_key.trim(), MAGIC);
+    let hash = sha1_bytes(combined.as_bytes());
+    base64_encode(&hash)
+}
+
+/// Minimal SHA-1 implementation (FIPS 180-4) for RFC 6455 handshake.
+fn sha1_bytes(msg: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let bit_len = (msg.len() as u64) * 8;
+    let mut padded: Vec<u8> = msg.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0x00);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in padded.chunks(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, &w_i) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
+                _ => (b ^ c ^ d, 0xCA62C1D6u32),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(w_i);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+    let mut out = [0u8; 20];
+    for (i, &v) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+/// Minimal base64 encoder (RFC 4648) for the WebSocket handshake `Accept` key.
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Build a RFC 6455 text frame (FIN=1, opcode=0x1, server→client, unmasked).
+fn ws_build_text_frame(payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(payload.len() + 10);
+    frame.push(0x81); // FIN=1, opcode=1 (text)
+    let len = payload.len();
+    if len < 126 {
+        frame.push(len as u8);
+    } else if len < 65536 {
+        frame.push(126);
+        frame.push((len >> 8) as u8);
+        frame.push((len & 0xFF) as u8);
+    } else {
+        frame.push(127);
+        for shift in (0..8).rev() {
+            frame.push(((len >> (shift * 8)) & 0xFF) as u8);
+        }
+    }
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// Build a RFC 6455 close frame (opcode 0x8, 2-byte status code, unmasked).
+fn ws_build_close_frame(code: u16) -> Vec<u8> {
+    vec![0x88, 0x02, (code >> 8) as u8, (code & 0xFF) as u8]
+}
+
+/// Serialise an `IsspMultipathBalancingSnapshot` as compact JSON for WebSocket push.
+fn snapshot_to_compact_json(s: &IsspMultipathBalancingSnapshot) -> String {
+    let mut out = String::with_capacity(512);
+    out.push_str("{\"ts\":");
+    out.push_str(&s.timestamp_unix_ns.to_string());
+    out.push_str(",\"node\":");
+    out.push_str(&s.node_id.to_string());
+    out.push_str(",\"policy\":\"");
+    out.push_str(&escape_json_str(&s.routing_policy));
+    out.push_str("\",\"total_paths\":");
+    out.push_str(&s.total_paths.to_string());
+    out.push_str(",\"active_paths\":");
+    out.push_str(&s.active_paths.to_string());
+    out.push_str(",\"total_eff_w\":");
+    out.push_str(&s.total_effective_weight.to_string());
+    out.push_str(",\"subpaths\":[");
+    for (i, sp) in s.subpaths.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"id\":");
+        out.push_str(&sp.path_id.to_string());
+        out.push_str(",\"iface\":\"");
+        out.push_str(&escape_json_str(&sp.interface_name));
+        out.push_str("\",\"state\":\"");
+        out.push_str(&escape_json_str(&sp.state));
+        out.push_str("\",\"eff_w\":");
+        out.push_str(&sp.effective_weight.to_string());
+        out.push_str(",\"share\":");
+        out.push_str(&format!("{:.4}", sp.traffic_share_ratio));
+        out.push_str(",\"rtt_us\":");
+        out.push_str(&sp.rtt_us.to_string());
+        out.push_str(",\"bbr_bps\":");
+        out.push_str(&sp.bbr_bw_bps.to_string());
+        out.push_str(",\"phase\":\"");
+        out.push_str(&escape_json_str(&sp.congestion_phase));
+        out.push_str("\"}");
+    }
+    out.push_str("]}");
+    out
 }
 
 #[cfg(test)]
@@ -1551,5 +1884,202 @@ mod tests {
         assert_eq!(path3, "/nonexistent");
 
         client_thread.join().unwrap();
+    }
+
+    // ── WebSocket helper unit tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_ws_accept_key_rfc6455_vector() {
+        // RFC 6455 §1.3 example: client key "dGhlIHNhbXBsZSBub25jZQ==" → accept "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let accept = ws_accept_key(key);
+        assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    #[test]
+    fn test_ws_text_frame_encode_decode() {
+        let payload = b"hello ws";
+        let frame = ws_build_text_frame(payload);
+        // FIN + text opcode
+        assert_eq!(frame[0], 0x81);
+        // 7-bit length (< 126)
+        assert_eq!(frame[1] as usize, payload.len());
+        // Payload verbatim
+        assert_eq!(&frame[2..], payload);
+    }
+
+    #[test]
+    fn test_snapshot_to_compact_json_fields() {
+        use crate::session_sync::{
+            IsspDynamicMultipathRouter, IsspMultipathRoute, IsspRoutingPolicy,
+        };
+        let mut router =
+            IsspDynamicMultipathRouter::new(5, IsspRoutingPolicy::BandwidthAggregation);
+        router.add_route(IsspMultipathRoute::new(1, 2, "eth0", 1, 100));
+        router.add_route(IsspMultipathRoute::new(2, 2, "eth1", 2, 50));
+        let snap = router.balancing_snapshot(42_000_000_000);
+        let json = snapshot_to_compact_json(&snap);
+        assert!(json.starts_with('{'));
+        assert!(json.contains("\"ts\":42000000000"));
+        assert!(json.contains("\"node\":5"));
+        assert!(json.contains("\"active_paths\":2"));
+        assert!(json.contains("\"iface\":\"eth0\""));
+        assert!(json.contains("\"iface\":\"eth1\""));
+        assert!(json.ends_with('}'));
+        // Verify parseable structure — count braces
+        let opens = json.chars().filter(|&c| c == '{').count();
+        let closes = json.chars().filter(|&c| c == '}').count();
+        assert_eq!(opens, closes);
+    }
+
+    #[test]
+    fn test_ws_metrics_server_full_handshake_and_frames() {
+        use crate::session_sync::{IsspMultipathRoute, IsspRoutingPolicy, SessionRegistry};
+
+        let reg = SessionRegistry::new(55);
+        reg.set_multipath_routing_policy(IsspRoutingPolicy::BandwidthAggregation)
+            .unwrap();
+        reg.add_multipath_route(IsspMultipathRoute::new(1, 2, "wan0", 1, 100))
+            .unwrap();
+
+        let server = IsspTelemetryServer::bind("127.0.0.1:0", "ifa-ws-test", reg).unwrap();
+        let addr = server.local_addr().unwrap();
+
+        // Client: perform RFC 6455 handshake then read 2 text frames.
+        let client = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+            // Send upgrade request with a known key.
+            let key = "dGhlIHNhbXBsZSBub25jZQ==";
+            let req = format!(
+                "GET /ws/metrics HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Key: {}\r\n\
+                 Sec-WebSocket-Version: 13\r\n\r\n",
+                key
+            );
+            s.write_all(req.as_bytes()).unwrap();
+
+            // Read the 101 response byte-by-byte until \r\n\r\n sentinel.
+            // This avoids reading into the first WS binary frame.
+            let mut resp_bytes: Vec<u8> = Vec::with_capacity(256);
+            let mut one = [0u8; 1];
+            loop {
+                s.read_exact(&mut one).unwrap();
+                resp_bytes.push(one[0]);
+                if resp_bytes.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let resp_str = std::str::from_utf8(&resp_bytes).unwrap();
+            assert!(resp_str.starts_with("HTTP/1.1 101 Switching Protocols"));
+            assert!(resp_str.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+
+            // Read 2 text frames.
+            for _i in 0..2 {
+                let mut header = [0u8; 2];
+                s.read_exact(&mut header).unwrap();
+                assert_eq!(header[0], 0x81, "FIN+text opcode");
+                let payload_len: usize = match header[1] & 0x7F {
+                    126 => {
+                        let mut ext = [0u8; 2];
+                        s.read_exact(&mut ext).unwrap();
+                        u16::from_be_bytes(ext) as usize
+                    }
+                    127 => {
+                        let mut ext = [0u8; 8];
+                        s.read_exact(&mut ext).unwrap();
+                        u64::from_be_bytes(ext) as usize
+                    }
+                    n => n as usize,
+                };
+                assert!(payload_len > 0);
+                let mut payload = vec![0u8; payload_len];
+                s.read_exact(&mut payload).unwrap();
+                let json = std::str::from_utf8(&payload).unwrap();
+                assert!(json.contains("\"active_paths\""), "frame JSON: {}", json);
+                assert!(json.contains("\"node\":55"), "frame JSON: {}", json);
+            }
+        });
+
+        // Server: serve 1 WS connection with 2 frames, 1ms interval.
+        let frames = server
+            .serve_ws_metrics_connection(server.listener.accept().unwrap().0, 1, 2)
+            .unwrap();
+        assert_eq!(frames, 2);
+
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn test_try_serve_one_smart_http_and_ws() {
+        use crate::session_sync::{IsspMultipathRoute, IsspRoutingPolicy, SessionRegistry};
+
+        let reg = SessionRegistry::new(99);
+        reg.set_multipath_routing_policy(IsspRoutingPolicy::LowestLatency)
+            .unwrap();
+        reg.add_multipath_route(IsspMultipathRoute::new(1, 2, "eth0", 1, 100))
+            .unwrap();
+
+        let server = IsspTelemetryServer::bind("127.0.0.1:0", "smart-test", reg).unwrap();
+        server.set_nonblocking(true).unwrap();
+        let addr = server.local_addr().unwrap();
+
+        // 1. Client connects via standard HTTP GET /metrics
+        let client1 = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).expect("connect http");
+            s.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut buf = String::new();
+            s.read_to_string(&mut buf).unwrap();
+            assert!(buf.starts_with("HTTP/1.1 200 OK"));
+        });
+
+        let mut res1 = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while res1.is_none() && std::time::Instant::now() < deadline {
+            match server.try_serve_one_smart(1, 1) {
+                Ok(Some(r)) => res1 = Some(r),
+                _ => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        client1.join().unwrap();
+        let (status, path) = res1.expect("expected HTTP request served");
+        assert_eq!(status, 200);
+        assert_eq!(path, "/metrics");
+
+        // 2. Client connects via WebSocket GET /ws/metrics
+        let client2 = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).expect("connect ws");
+            s.write_all(
+                b"GET /ws/metrics HTTP/1.1\r\n\
+                  Host: localhost\r\n\
+                  Upgrade: websocket\r\n\
+                  Connection: Upgrade\r\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                  Sec-WebSocket-Version: 13\r\n\r\n",
+            )
+            .unwrap();
+            let mut header = [0u8; 128];
+            let n = s.read(&mut header).unwrap();
+            let resp = std::str::from_utf8(&header[..n]).unwrap();
+            assert!(resp.starts_with("HTTP/1.1 101 Switching Protocols"));
+        });
+
+        let mut res2 = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while res2.is_none() && std::time::Instant::now() < deadline {
+            match server.try_serve_one_smart(1, 1) {
+                Ok(Some(r)) => res2 = Some(r),
+                _ => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        client2.join().unwrap();
+        let (frames, path) = res2.expect("expected WS connection served");
+        assert_eq!(frames, 1);
+        assert_eq!(path, "/ws/metrics");
     }
 }
