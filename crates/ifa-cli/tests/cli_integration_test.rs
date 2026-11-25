@@ -1723,3 +1723,81 @@ fn test_cli_net_session_mtls_attestation_and_rotation() {
     assert!(metrics_str.contains("ifa_mesh_mtls_peers_total"));
     assert!(metrics_str.contains("ifa_mesh_mtls_attested_peers"));
 }
+
+#[test]
+fn test_cli_net_session_jitter_anomaly_and_thresholds() {
+    let ifa_bin = env!("CARGO_BIN_EXE_ifa");
+
+    // 1. Benchmark markdown table
+    let bench_out = Command::new(ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("jitter")
+        .arg("--bench")
+        .arg("--bench-samples")
+        .arg("300")
+        .output()
+        .expect("exec jitter bench");
+    assert!(bench_out.status.success());
+    let bench_str = String::from_utf8_lossy(&bench_out.stdout);
+    assert!(bench_str.contains("ISSP Jitter Anomaly Detection & Dynamic BBR/LEDBAT Threshold Benchmark"));
+    assert!(bench_str.contains("PASSED (100% anomaly pattern classification & dynamic threshold derivation)"));
+
+    // 2. Benchmark JSON output
+    let bench_json = Command::new(ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("jitter")
+        .arg("--bench")
+        .arg("--bench-samples")
+        .arg("300")
+        .arg("--json")
+        .output()
+        .expect("exec jitter bench json");
+    assert!(bench_json.status.success());
+    let json_str = String::from_utf8_lossy(&bench_json.stdout);
+    assert!(json_str.contains("\"verification_passed\":true"));
+    assert!(json_str.contains("\"total_samples\":300"));
+
+    // 3. Status display
+    let status_out = Command::new(ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("jitter")
+        .arg("--status")
+        .output()
+        .expect("exec jitter status");
+    assert!(status_out.status.success());
+    let status_str = String::from_utf8_lossy(&status_out.stdout);
+    assert!(status_str.contains("ISSP Jitter Anomaly & Dynamic Congestion Thresholds"));
+    assert!(status_str.contains("eth0-fiber-wan"));
+    assert!(status_str.contains("wwan0-5g-edge"));
+
+    // 4. Status JSON output
+    let status_json = Command::new(ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("jitter")
+        .arg("--json")
+        .output()
+        .expect("exec jitter status json");
+    assert!(status_json.status.success());
+    let st_json_str = String::from_utf8_lossy(&status_json.stdout);
+    assert!(st_json_str.contains("\"jitter_subpaths\":"));
+    assert!(st_json_str.contains("\"dynamic_ledbat_target_us\":"));
+    assert!(st_json_str.contains("\"dynamic_bbr_pacing_gain_q8\":"));
+
+    // 5. Prometheus metrics output
+    let metrics_out = Command::new(ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("jitter")
+        .arg("--metrics")
+        .output()
+        .expect("exec jitter metrics");
+    assert!(metrics_out.status.success());
+    let metrics_str = String::from_utf8_lossy(&metrics_out.stdout);
+    assert!(metrics_str.contains("ifa_jitter_mean_rtt_us"));
+    assert!(metrics_str.contains("ifa_dynamic_ledbat_target_us"));
+    assert!(metrics_str.contains("ifa_dynamic_bbr_pacing_gain"));
+}

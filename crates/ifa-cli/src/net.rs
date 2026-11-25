@@ -3,12 +3,13 @@
 use clap::Subcommand;
 use ifa_runtime::{
     run_issp_failover_benchmark_suite, run_issp_scenario,
-    run_mtls_attestation_and_key_rotation_benchmark, run_simd_capsule_and_classification_benchmark,
-    run_telemetry_streaming_vs_polling_benchmark, run_zstd_trace_archive_benchmark,
-    IsspBandwidthEstimate, IsspCapsule, IsspClusterQuorumConfig, IsspCongestionPhase,
-    IsspCongestionTraceRecord, IsspFailoverBenchmarkSuiteReport, IsspFlapDampingConfig,
-    IsspHeartbeatProbe, IsspMultipathRoute, IsspNetworkProfile, IsspPathState, IsspProbationConfig,
-    IsspRoutingPolicy, IsspTelemetryServer, IsspZstdMemoryPipeline, IsspZstdStreamDecompressor,
+    run_jitter_anomaly_and_threshold_benchmark, run_mtls_attestation_and_key_rotation_benchmark,
+    run_simd_capsule_and_classification_benchmark, run_telemetry_streaming_vs_polling_benchmark,
+    run_zstd_trace_archive_benchmark, IsspBandwidthEstimate, IsspCapsule, IsspClusterQuorumConfig,
+    IsspCongestionPhase, IsspCongestionTraceRecord, IsspFailoverBenchmarkSuiteReport,
+    IsspFlapDampingConfig, IsspHeartbeatProbe, IsspMultipathRoute, IsspNetworkProfile,
+    IsspPathState, IsspProbationConfig, IsspRoutingPolicy, IsspTelemetryServer,
+    IsspZstdMemoryPipeline, IsspZstdStreamDecompressor, JitterMultipathBridge,
     MeshAttestationCertificate, MeshNodeRole, MeshPeerAttestationManager, MeshTrustStore,
     MtlsHandshakeState, NodeIdentity, RotationReason, SecurityPolicy, SessionId, SessionRecord,
     SessionRegistry, SessionSnapshot, CAP_DYNAMIC_REKEY, CAP_MULTIPATH, PHASE_CONGESTION_AVOIDANCE,
@@ -259,6 +260,27 @@ pub enum SessionCommand {
         /// Number of benchmark handshake iterations
         #[arg(long, default_value = "50")]
         bench_iterations: usize,
+        /// Path to persistent cluster state dump (.issp or binary dump)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+        /// Output Prometheus exposition metrics instead of human table
+        #[arg(long)]
+        metrics: bool,
+        /// Output formatted as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Detect jitter anomalies and derive predictive dynamic BBR/LEDBAT congestion thresholds
+    Jitter {
+        /// Inspect current jitter statistics and derived dynamic thresholds across cluster subpaths
+        #[arg(long)]
+        status: bool,
+        /// Run high-throughput jitter anomaly detector and dynamic threshold derivation benchmark
+        #[arg(long)]
+        bench: bool,
+        /// Number of benchmark sample iterations
+        #[arg(long, default_value = "20000")]
+        bench_samples: usize,
         /// Path to persistent cluster state dump (.issp or binary dump)
         #[arg(short, long)]
         file: Option<PathBuf>,
@@ -2303,6 +2325,134 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
 
             ExitCode::SUCCESS
         }
+        SessionCommand::Jitter {
+            status: _,
+            bench,
+            bench_samples,
+            file,
+            metrics,
+            json,
+        } => {
+            if bench {
+                let report = run_jitter_anomaly_and_threshold_benchmark(bench_samples);
+                if json {
+                    println!("{}", report.to_json());
+                } else {
+                    println!("{}", report.to_markdown_table());
+                }
+                return ExitCode::SUCCESS;
+            }
+
+            let registry = match resolve_state_file(file.as_ref()) {
+                Some(p) if p.exists() => match SessionRegistry::load_from_file(&p) {
+                    Ok(reg) => reg,
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: failed loading state from {:?} ({}), using active registry",
+                            p, e
+                        );
+                        SessionRegistry::new(1)
+                    }
+                },
+                _ => SessionRegistry::new(1),
+            };
+
+            // Ensure baseline routes are present if none exist
+            if let Ok(routes) = registry.list_multipath_routes() {
+                if routes.is_empty() {
+                    let mut r1 = IsspMultipathRoute::new(1, 10, "eth0-fiber-wan", 1, 100)
+                        .with_state(IsspPathState::Active);
+                    r1.metrics.smoothed_rtt_us = 12_000;
+                    r1.metrics.jitter_us = 450;
+                    let _ = registry.add_multipath_route(r1);
+
+                    let mut r2 = IsspMultipathRoute::new(2, 10, "wwan0-5g-edge", 2, 50)
+                        .with_state(IsspPathState::Active);
+                    r2.metrics.smoothed_rtt_us = 28_000;
+                    r2.metrics.jitter_us = 2_100;
+                    let _ = registry.add_multipath_route(r2);
+                }
+            }
+
+            let mut bridge = JitterMultipathBridge::new();
+            let mut evaluations = Vec::new();
+
+            if let Ok(mut routes) = registry.list_multipath_routes() {
+                let now_ns = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+
+                for route in &mut routes {
+                    let detector = bridge.get_or_create(route.path_id, &route.interface_name);
+                    for i in 0..15 {
+                        let sample = route.metrics.smoothed_rtt_us + (i % 3) * 60;
+                        detector.record_sample(
+                            sample,
+                            None,
+                            now_ns.saturating_sub((15 - i) * 10_000_000),
+                        );
+                    }
+                    let eval = detector.record_sample(route.metrics.smoothed_rtt_us, None, now_ns);
+                    evaluations.push((route.path_id, route.interface_name.clone(), eval));
+                }
+            }
+
+            if metrics {
+                print!("{}", bridge.export_prometheus_metrics());
+                return ExitCode::SUCCESS;
+            }
+
+            if json {
+                let items: Vec<serde_json::Value> = evaluations
+                    .iter()
+                    .map(|(path_id, iface, eval)| {
+                        json!({
+                            "path_id": path_id,
+                            "interface_name": iface,
+                            "rtt_us": eval.rtt_us,
+                            "rfc3550_jitter_us": eval.rfc3550_jitter_us,
+                            "base_rtt_us": eval.base_rtt_us,
+                            "queuing_delay_us": eval.queuing_delay_us,
+                            "anomaly_kind": eval.anomaly_kind.as_str(),
+                            "severity": eval.severity.as_str(),
+                            "derived_thresholds": {
+                                "dynamic_ledbat_target_us": eval.derived_thresholds.dynamic_ledbat_target_us,
+                                "dynamic_bbr_pacing_gain_q8": eval.derived_thresholds.dynamic_bbr_pacing_gain_q8,
+                                "bbr_pacing_multiplier": eval.derived_thresholds.dynamic_bbr_pacing_gain_q8 as f64 / 256.0,
+                                "probe_rtt_required": eval.derived_thresholds.probe_rtt_required,
+                                "congestion_risk_score": eval.derived_thresholds.congestion_risk_score,
+                                "recommended_action": eval.derived_thresholds.recommended_action.as_str(),
+                            }
+                        })
+                    })
+                    .collect();
+                println!("{}", json!({ "jitter_subpaths": items }));
+                return ExitCode::SUCCESS;
+            }
+
+            println!("### ISSP Jitter Anomaly & Dynamic Congestion Thresholds\n");
+            println!(
+                "| Path ID | Interface | Mean RTT (µs) | Jitter RFC 3550 (µs) | Anomaly | Severity | LEDBAT Target (µs) | BBR Pacing | Action |"
+            );
+            println!("|---|---|---|---|---|---|---|---|---|");
+            for (path_id, iface, eval) in &evaluations {
+                println!(
+                    "| {} | {} | {} | {} | {} | {} | {} | {:.3}x | {} |",
+                    path_id,
+                    iface,
+                    eval.rtt_us,
+                    eval.rfc3550_jitter_us,
+                    eval.anomaly_kind.as_str(),
+                    eval.severity.as_str(),
+                    eval.derived_thresholds.dynamic_ledbat_target_us,
+                    eval.derived_thresholds.dynamic_bbr_pacing_gain_q8 as f64 / 256.0,
+                    eval.derived_thresholds.recommended_action.as_str(),
+                );
+            }
+
+            ExitCode::SUCCESS
+        }
     }
 }
 
@@ -2844,6 +2994,64 @@ mod tests {
             reason: "admin".to_string(),
             bench: false,
             bench_iterations: 0,
+            file: None,
+            metrics: true,
+            json: false,
+        };
+        assert_eq!(execute_session_command(cmd_metrics), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_execute_session_command_jitter() {
+        // 1. Bench
+        let cmd_bench = SessionCommand::Jitter {
+            status: false,
+            bench: true,
+            bench_samples: 300,
+            file: None,
+            metrics: false,
+            json: false,
+        };
+        assert_eq!(execute_session_command(cmd_bench), ExitCode::SUCCESS);
+
+        // 2. Bench JSON
+        let cmd_bench_json = SessionCommand::Jitter {
+            status: false,
+            bench: true,
+            bench_samples: 300,
+            file: None,
+            metrics: false,
+            json: true,
+        };
+        assert_eq!(execute_session_command(cmd_bench_json), ExitCode::SUCCESS);
+
+        // 3. Status table
+        let cmd_status = SessionCommand::Jitter {
+            status: true,
+            bench: false,
+            bench_samples: 0,
+            file: None,
+            metrics: false,
+            json: false,
+        };
+        assert_eq!(execute_session_command(cmd_status), ExitCode::SUCCESS);
+
+        // 4. Status JSON
+        let cmd_json = SessionCommand::Jitter {
+            status: true,
+            bench: false,
+            bench_samples: 0,
+            file: None,
+            metrics: false,
+            json: true,
+        };
+        assert_eq!(execute_session_command(cmd_json), ExitCode::SUCCESS);
+
+        // 5. Metrics output
+        let cmd_metrics = SessionCommand::Jitter {
+            status: false,
+            bench: false,
+            bench_samples: 0,
             file: None,
             metrics: true,
             json: false,

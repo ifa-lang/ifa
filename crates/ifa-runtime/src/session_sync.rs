@@ -1339,6 +1339,14 @@ impl IsspCongestionState {
         let bbr_factor = self.bbr.weight_factor();
         (phase_factor * ledbat_factor * bbr_factor).clamp(0.05, 1.0)
     }
+
+    /// Apply dynamically derived thresholds from the jitter anomaly detection engine.
+    pub fn apply_dynamic_thresholds(
+        &mut self,
+        thresholds: &crate::jitter_anomaly::DynamicCongestionThresholds,
+    ) {
+        crate::jitter_anomaly::apply_dynamic_thresholds(self, thresholds);
+    }
 }
 
 // ─── BBR State ────────────────────────────────────────────────────────────────

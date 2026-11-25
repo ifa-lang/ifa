@@ -8,6 +8,7 @@ pub mod ffi;
 pub mod fiber;
 pub mod header;
 pub mod io;
+pub mod jitter_anomaly;
 pub mod mtls_attestation;
 pub mod panic;
 pub mod reactor;
@@ -28,13 +29,14 @@ pub use allocator::{
 pub use benchmarks::{
     create_saturated_multipath_snapshot, profile_allocator_engine, run_allocator_multithread_suite,
     run_generational_benchmark_suite, run_issp_failover_benchmark_suite, run_issp_scenario,
-    run_mtls_attestation_and_key_rotation_benchmark, run_simd_capsule_and_classification_benchmark,
-    run_telemetry_streaming_vs_polling_benchmark, run_zstd_trace_archive_benchmark,
-    AllocatorEngine, AllocatorThroughputResult, BenchmarkReport, BenchmarkResult,
-    IsspBenchmarkScenarioResult, IsspFailoverBenchmarkSuiteReport, IsspNetworkProfile,
-    MtlsAttestationBenchmarkReport, MultithreadBenchmarkSuiteReport,
-    SimdClassificationBenchmarkReport, SimdPhaseResult, TelemetryComparativeReport,
-    TelemetryLoadResult, TelemetryTransportKind, ZstdTraceArchiveBenchmarkReport,
+    run_jitter_anomaly_and_threshold_benchmark, run_mtls_attestation_and_key_rotation_benchmark,
+    run_simd_capsule_and_classification_benchmark, run_telemetry_streaming_vs_polling_benchmark,
+    run_zstd_trace_archive_benchmark, AllocatorEngine, AllocatorThroughputResult, BenchmarkReport,
+    BenchmarkResult, IsspBenchmarkScenarioResult, IsspFailoverBenchmarkSuiteReport,
+    IsspNetworkProfile, JitterAnomalyBenchmarkReport, MtlsAttestationBenchmarkReport,
+    MultithreadBenchmarkSuiteReport, SimdClassificationBenchmarkReport, SimdPhaseResult,
+    TelemetryComparativeReport, TelemetryLoadResult, TelemetryTransportKind,
+    ZstdTraceArchiveBenchmarkReport,
 };
 pub use blocking::{
     ifa_rt_blocking_call, ifa_rt_blocking_pool_active_workers, ifa_rt_blocking_pool_capacity,
@@ -51,6 +53,11 @@ pub use fiber::{
 pub use header::{
     EpochTransition, GenHeader, GenRef, ARENA_THREAD_LOCAL_CALL, FLAG_ACTIVE, FLAG_ARENA_SCOPED,
     FLAG_EPOCH_1, FLAG_FREE, FLAG_PINNED, FLAG_QUARANTINED, FLAG_READONLY,
+};
+pub use jitter_anomaly::{
+    apply_dynamic_thresholds, AnomalySeverity, DynamicCongestionThresholds,
+    JitterAnomalyDetector, JitterAnomalyKind, JitterDetectorConfig, JitterDetectorStats,
+    JitterMitigationAction, JitterMultipathBridge, JitterSampleEvaluation,
 };
 pub use mtls_attestation::{
     ifa_digest32, ifa_kdf_derive, ifa_mac, MeshAttestationCertificate, MeshNodeRole,
