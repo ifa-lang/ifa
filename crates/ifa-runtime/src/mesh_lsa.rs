@@ -952,8 +952,8 @@ mod tests {
             .with_congestion_phase(LSA_PHASE_THROTTLE)
             .with_flags(LSA_FLAG_BOTTLENECK | LSA_FLAG_ECN_MARKED);
 
-        assert_eq!(record.is_bottleneck(), true);
-        assert_eq!(record.is_link_down(), false);
+        assert!(record.is_bottleneck());
+        assert!(!record.is_link_down());
         assert_eq!(record.compute_composite_cost(), 4 + 2); // 4500/1000 + 250/100 = 4 + 2 = 6
 
         let mut buf = [0u8; ISSP_LSA_LINK_RECORD_SIZE];
@@ -1067,7 +1067,7 @@ mod tests {
         let summary = sync
             .ingest_packet(&comp_wire, 1_000_000)
             .expect("must ingest compressed packet");
-        assert_eq!(summary.was_compressed, true);
+        assert!(summary.was_compressed);
         assert_eq!(summary.links_updated, 4);
         assert_eq!(sync.total_lsdb_links(), 4);
         assert!(summary.compression_savings_pct >= 0.0);
@@ -1138,7 +1138,7 @@ mod tests {
 
         // Apply to topology graph
         sync.apply_to_topology_graph(&mut graph);
-        assert_eq!(graph.has_edge(NodeId(1), NodeId(3)), false);
+        assert!(!graph.has_edge(NodeId(1), NodeId(3)));
 
         // Apply to multipath group
         let remaining_healthy = sync.apply_to_multipath_group(&mut group, &graph, &constraints);
