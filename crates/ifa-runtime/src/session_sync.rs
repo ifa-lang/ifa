@@ -54,7 +54,11 @@ pub struct SessionId {
 impl SessionId {
     /// Construct a new session ID.
     pub fn new(flow_hash: u64, origin_node: u32, nonce: u32) -> Self {
-        Self { flow_hash, origin_node, nonce }
+        Self {
+            flow_hash,
+            origin_node,
+            nonce,
+        }
     }
 
     /// Encode as a compact 16-byte array for wire transmission.
@@ -71,7 +75,11 @@ impl SessionId {
         let flow_hash = u64::from_be_bytes(b[..8].try_into().unwrap());
         let origin_node = u32::from_be_bytes(b[8..12].try_into().unwrap());
         let nonce = u32::from_be_bytes(b[12..16].try_into().unwrap());
-        Self { flow_hash, origin_node, nonce }
+        Self {
+            flow_hash,
+            origin_node,
+            nonce,
+        }
     }
 }
 
@@ -268,7 +276,10 @@ impl GossipFrame {
         let sender_node_id = u32::from_le_bytes(raw[8..12].try_into().unwrap());
         let snap_buf: &[u8; 96] = raw[16..112].try_into().unwrap();
         let snapshot = SessionSnapshot::from_wire(snap_buf);
-        Some(Self { sender_node_id, snapshot })
+        Some(Self {
+            sender_node_id,
+            snapshot,
+        })
     }
 }
 
@@ -350,11 +361,14 @@ impl SessionRegistry {
         if guard.len() >= MAX_SESSIONS && !guard.contains_key(&snapshot.id) {
             return Err(SyncError::RegistryFull);
         }
-        guard.insert(snapshot.id, SessionRecord {
-            snapshot,
-            last_captured: Instant::now(),
-            is_primary: true,
-        });
+        guard.insert(
+            snapshot.id,
+            SessionRecord {
+                snapshot,
+                last_captured: Instant::now(),
+                is_primary: true,
+            },
+        );
         Ok(())
     }
 
@@ -398,11 +412,14 @@ impl SessionRegistry {
                 self.gossip_rejected_count.fetch_add(1, Ordering::Relaxed);
                 return GossipResult::Rejected(RejectReason::RegistryFull);
             }
-            guard.insert(snap.id, SessionRecord {
-                snapshot: *snap,
-                last_captured: Instant::now(),
-                is_primary: false,
-            });
+            guard.insert(
+                snap.id,
+                SessionRecord {
+                    snapshot: *snap,
+                    last_captured: Instant::now(),
+                    is_primary: false,
+                },
+            );
             GossipResult::Inserted
         }
     }
@@ -420,7 +437,9 @@ impl SessionRegistry {
     ) -> Result<SessionSnapshot, SyncError> {
         let mut guard = self.sessions.lock().map_err(|_| SyncError::LockPoisoned)?;
 
-        let record = guard.get_mut(&session_id).ok_or(SyncError::SessionNotFound)?;
+        let record = guard
+            .get_mut(&session_id)
+            .ok_or(SyncError::SessionNotFound)?;
 
         // Reject stale snapshots — do not resume a session with ancient state.
         let age_secs = now_unix_secs.saturating_sub(record.snapshot.captured_unix_secs);
@@ -460,7 +479,8 @@ impl SessionRegistry {
             Err(_) => return Vec::new(),
         };
         let now = Instant::now();
-        guard.iter()
+        guard
+            .iter()
             .filter(|(_, r)| now.duration_since(r.last_captured) > max_age)
             .map(|(id, _)| *id)
             .collect()
@@ -541,7 +561,11 @@ impl std::fmt::Display for SyncError {
             SyncError::SessionNotFound => write!(f, "session not found in registry"),
             SyncError::AlreadyPrimary => write!(f, "node already holds primary ownership"),
             SyncError::SnapshotStale { age_secs } => {
-                write!(f, "snapshot is stale ({age_secs}s old, max {}s)", SNAPSHOT_MAX_AGE.as_secs())
+                write!(
+                    f,
+                    "snapshot is stale ({age_secs}s old, max {}s)",
+                    SNAPSHOT_MAX_AGE.as_secs()
+                )
             }
             SyncError::RegistryFull => write!(f, "registry capacity ({MAX_SESSIONS}) reached"),
             SyncError::LockPoisoned => write!(f, "internal mutex poisoned"),
@@ -607,7 +631,10 @@ mod tests {
     fn test_gossip_frame_crc_ok() {
         let id = make_id(2);
         let snap = make_snap(id, 1, 1_700_000_001);
-        let frame = GossipFrame { sender_node_id: 42, snapshot: snap };
+        let frame = GossipFrame {
+            sender_node_id: 42,
+            snapshot: snap,
+        };
         let encoded = frame.encode();
         let decoded = GossipFrame::decode(&encoded);
         assert!(decoded.is_some());
@@ -620,7 +647,10 @@ mod tests {
     fn test_gossip_frame_crc_corruption() {
         let id = make_id(3);
         let snap = make_snap(id, 1, 1_700_000_002);
-        let frame = GossipFrame { sender_node_id: 1, snapshot: snap };
+        let frame = GossipFrame {
+            sender_node_id: 1,
+            snapshot: snap,
+        };
         let mut encoded = frame.encode();
         encoded[20] ^= 0xFF; // corrupt snapshot byte
         assert!(GossipFrame::decode(&encoded).is_none());
@@ -630,7 +660,10 @@ mod tests {
     fn test_gossip_frame_bad_magic() {
         let id = make_id(4);
         let snap = make_snap(id, 1, 1_700_000_003);
-        let frame = GossipFrame { sender_node_id: 1, snapshot: snap };
+        let frame = GossipFrame {
+            sender_node_id: 1,
+            snapshot: snap,
+        };
         let mut encoded = frame.encode();
         encoded[0] = 0x00; // corrupt magic
         assert!(GossipFrame::decode(&encoded).is_none());
@@ -651,7 +684,10 @@ mod tests {
         let reg = SessionRegistry::new(1);
         let id = make_id(20);
         let snap = make_snap(id, 1, 1_700_000_200);
-        let frame = GossipFrame { sender_node_id: 2, snapshot: snap };
+        let frame = GossipFrame {
+            sender_node_id: 2,
+            snapshot: snap,
+        };
         let result = reg.apply_gossip(&frame);
         assert_eq!(result, GossipResult::Inserted);
         assert_eq!(reg.session_count(), 1);
@@ -662,11 +698,17 @@ mod tests {
         let reg = SessionRegistry::new(1);
         let id = make_id(30);
         let snap_v1 = make_snap(id, 1, 1_700_000_300);
-        let frame_v1 = GossipFrame { sender_node_id: 2, snapshot: snap_v1 };
+        let frame_v1 = GossipFrame {
+            sender_node_id: 2,
+            snapshot: snap_v1,
+        };
         reg.apply_gossip(&frame_v1);
 
         let snap_v2 = make_snap(id, 2, 1_700_000_301);
-        let frame_v2 = GossipFrame { sender_node_id: 2, snapshot: snap_v2 };
+        let frame_v2 = GossipFrame {
+            sender_node_id: 2,
+            snapshot: snap_v2,
+        };
         let result = reg.apply_gossip(&frame_v2);
         assert_eq!(result, GossipResult::Updated);
     }
@@ -676,14 +718,23 @@ mod tests {
         let reg = SessionRegistry::new(1);
         let id = make_id(40);
         let snap_v2 = make_snap(id, 5, 1_700_000_400);
-        let frame_v2 = GossipFrame { sender_node_id: 2, snapshot: snap_v2 };
+        let frame_v2 = GossipFrame {
+            sender_node_id: 2,
+            snapshot: snap_v2,
+        };
         reg.apply_gossip(&frame_v2);
 
         // Send older epoch — must be rejected.
         let snap_old = make_snap(id, 3, 1_700_000_399);
-        let frame_old = GossipFrame { sender_node_id: 2, snapshot: snap_old };
+        let frame_old = GossipFrame {
+            sender_node_id: 2,
+            snapshot: snap_old,
+        };
         let result = reg.apply_gossip(&frame_old);
-        assert!(matches!(result, GossipResult::Rejected(RejectReason::StaleEpoch { .. })));
+        assert!(matches!(
+            result,
+            GossipResult::Rejected(RejectReason::StaleEpoch { .. })
+        ));
     }
 
     #[test]
@@ -691,7 +742,10 @@ mod tests {
         let reg = SessionRegistry::new(7);
         let id = make_id(50);
         let snap = make_snap(id, 1, 1_700_000_500);
-        let frame = GossipFrame { sender_node_id: 7, snapshot: snap }; // same node id
+        let frame = GossipFrame {
+            sender_node_id: 7,
+            snapshot: snap,
+        }; // same node id
         assert_eq!(reg.apply_gossip(&frame), GossipResult::Ignored);
         assert_eq!(reg.session_count(), 0);
     }
@@ -703,12 +757,21 @@ mod tests {
         let id = make_id(60);
         // Insert as shadow via gossip from node 2.
         let snap = make_snap(id, 2, 1_700_000_600);
-        let frame = GossipFrame { sender_node_id: 2, snapshot: snap };
+        let frame = GossipFrame {
+            sender_node_id: 2,
+            snapshot: snap,
+        };
         reg.apply_gossip(&frame);
 
         let migrated = reg.migrate_session(id, 1_700_000_601).unwrap();
         assert_eq!(migrated.migration_epoch, 3); // bumped by 1
-        assert!(reg.build_gossip_frame(&id).unwrap().snapshot.migration_epoch == 3);
+        assert!(
+            reg.build_gossip_frame(&id)
+                .unwrap()
+                .snapshot
+                .migration_epoch
+                == 3
+        );
     }
 
     #[test]
@@ -727,7 +790,10 @@ mod tests {
         let id = make_id(80);
         // Insert as shadow with captured_unix_secs = 1000 (ancient).
         let snap = make_snap(id, 1, 1000);
-        let frame = GossipFrame { sender_node_id: 2, snapshot: snap };
+        let frame = GossipFrame {
+            sender_node_id: 2,
+            snapshot: snap,
+        };
         reg.apply_gossip(&frame);
 
         // Attempt migration with now = 1_700_000_000 → age >> 5s.
@@ -762,11 +828,17 @@ mod tests {
         let id = make_id(200);
         let snap = make_snap(id, 1, 1_700_002_000);
         // Apply valid gossip → gossip_rx +1
-        let frame = GossipFrame { sender_node_id: 2, snapshot: snap };
+        let frame = GossipFrame {
+            sender_node_id: 2,
+            snapshot: snap,
+        };
         reg.apply_gossip(&frame);
         // Apply stale gossip → gossip_rx +1, rejected +1
         let snap_old = make_snap(id, 0, 1_700_001_999);
-        let frame_old = GossipFrame { sender_node_id: 2, snapshot: snap_old };
+        let frame_old = GossipFrame {
+            sender_node_id: 2,
+            snapshot: snap_old,
+        };
         reg.apply_gossip(&frame_old);
         // Migrate → migration_count +1
         reg.migrate_session(id, 1_700_002_001).unwrap();

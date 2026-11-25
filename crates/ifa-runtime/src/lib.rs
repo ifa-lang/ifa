@@ -10,8 +10,8 @@ pub mod header;
 pub mod io;
 pub mod panic;
 pub mod reactor;
-pub mod string;
 pub mod session_sync;
+pub mod string;
 pub mod telemetry;
 pub mod wasi;
 

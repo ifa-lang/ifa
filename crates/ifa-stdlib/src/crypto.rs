@@ -2879,7 +2879,9 @@ pub struct MlKemPoly {
 }
 
 impl MlKemPoly {
-    pub const ZERO: Self = Self { coeffs: [0; MLKEM_N] };
+    pub const ZERO: Self = Self {
+        coeffs: [0; MLKEM_N],
+    };
 
     pub fn add(&self, other: &Self) -> Self {
         let mut res = Self::ZERO;
@@ -3182,7 +3184,10 @@ pub fn ml_kem_768_keypair_from_seed(seed: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
 
 /// Encapsulate a shared secret against an ML-KEM-768 public key (1088 bytes ciphertext, 32 bytes secret).
 #[allow(clippy::needless_range_loop)]
-pub fn ml_kem_768_encapsulate(pk_bytes: &[u8], m_seed: &[u8; 32]) -> Result<(Vec<u8>, [u8; 32]), String> {
+pub fn ml_kem_768_encapsulate(
+    pk_bytes: &[u8],
+    m_seed: &[u8; 32],
+) -> Result<(Vec<u8>, [u8; 32]), String> {
     if pk_bytes.len() != MLKEM768_PUBLIC_KEY_BYTES {
         return Err("Invalid ML-KEM-768 public key length".to_string());
     }
@@ -3372,10 +3377,12 @@ impl PqcSessionKeys {
             .unwrap_or_else(|_| self.master_secret.to_vec());
         self.master_secret.copy_from_slice(&next_master[0..32]);
 
-        let c_key = hkdf_sha256_expand(&self.master_secret, b"capsule-pqc client write key", 32).unwrap();
+        let c_key =
+            hkdf_sha256_expand(&self.master_secret, b"capsule-pqc client write key", 32).unwrap();
         self.client_write_key.copy_from_slice(&c_key[0..32]);
 
-        let s_key = hkdf_sha256_expand(&self.master_secret, b"capsule-pqc server write key", 32).unwrap();
+        let s_key =
+            hkdf_sha256_expand(&self.master_secret, b"capsule-pqc server write key", 32).unwrap();
         self.server_write_key.copy_from_slice(&s_key[0..32]);
 
         let c_iv = hkdf_sha256_expand(&self.master_secret, b"capsule-pqc client iv", 12).unwrap();
@@ -4590,17 +4597,25 @@ mod tests {
         assert_eq!(sk.len(), MLKEM768_SECRET_KEY_BYTES);
 
         let bob_m_seed = [0xaau8; 32];
-        let (ct, ss_bob) = ml_kem_768_encapsulate(&pk, &bob_m_seed).expect("Encapsulation should succeed");
+        let (ct, ss_bob) =
+            ml_kem_768_encapsulate(&pk, &bob_m_seed).expect("Encapsulation should succeed");
         assert_eq!(ct.len(), MLKEM768_CIPHERTEXT_BYTES);
 
         let ss_alice = ml_kem_768_decapsulate(&sk, &ct).expect("Decapsulation should succeed");
-        assert_eq!(ss_alice, ss_bob, "Both sides must derive identical shared secret");
+        assert_eq!(
+            ss_alice, ss_bob,
+            "Both sides must derive identical shared secret"
+        );
 
         // Tamper test: corrupted ciphertext gives rejection secret
         let mut corrupted_ct = ct.clone();
         corrupted_ct[10] ^= 0x80;
-        let ss_tampered = ml_kem_768_decapsulate(&sk, &corrupted_ct).expect("Decapsulation handles rejection");
-        assert_ne!(ss_tampered, ss_bob, "Tampered ciphertext must not yield correct shared secret");
+        let ss_tampered =
+            ml_kem_768_decapsulate(&sk, &corrupted_ct).expect("Decapsulation handles rejection");
+        assert_ne!(
+            ss_tampered, ss_bob,
+            "Tampered ciphertext must not yield correct shared secret"
+        );
     }
 
     #[test]
@@ -4627,7 +4642,8 @@ mod tests {
             &server_classical_seed,
             &server_kem_m_seed,
             transcript,
-        ).expect("Server encapsulation must succeed");
+        )
+        .expect("Server encapsulation must succeed");
 
         // Client decapsulates server response
         let client_keys = HybridKeyExchange::client_decapsulate(
@@ -4635,7 +4651,8 @@ mod tests {
             &server_classical_pub,
             &kem_ct,
             transcript,
-        ).expect("Client decapsulation must succeed");
+        )
+        .expect("Client decapsulation must succeed");
 
         // Verify that client and server derived identical master & direction-specific keys
         assert_eq!(client_keys.master_secret, server_keys.master_secret);
@@ -4653,6 +4670,9 @@ mod tests {
 
         assert_eq!(client_ratchet.master_secret, server_ratchet.master_secret);
         assert_ne!(client_ratchet.master_secret, client_keys.master_secret);
-        assert_eq!(client_ratchet.client_write_key, server_ratchet.client_write_key);
+        assert_eq!(
+            client_ratchet.client_write_key,
+            server_ratchet.client_write_key
+        );
     }
 }

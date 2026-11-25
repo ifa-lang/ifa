@@ -11847,7 +11847,12 @@ pub struct PqcHandshakeInitPayload {
 impl PqcHandshakeInitPayload {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            2 + 32 + 1 + self.supported_suites.len() * 2 + 32 + 2 + self.client_kem_public_key.len(),
+            2 + 32
+                + 1
+                + self.supported_suites.len() * 2
+                + 32
+                + 2
+                + self.client_kem_public_key.len(),
         );
         buf.extend_from_slice(&self.version.to_be_bytes());
         buf.extend_from_slice(&self.client_random);
@@ -12867,7 +12872,10 @@ impl ExtendedConnectTunnel {
 
     /// Send a capsule with post-quantum authenticated encryption if a PQC session is active and established.
     /// Otherwise transmits the capsule in plaintext.
-    pub fn send_secure_capsule(&mut self, capsule: &crate::simd_parser::HttpCapsule) -> Result<(), String> {
+    pub fn send_secure_capsule(
+        &mut self,
+        capsule: &crate::simd_parser::HttpCapsule,
+    ) -> Result<(), String> {
         if let Some(session) = &mut self.pqc_session {
             if session.is_established() {
                 let encrypted = session.encrypt_capsule(capsule)?;
@@ -12881,7 +12889,9 @@ impl ExtendedConnectTunnel {
 
     /// Receive the next capsule, automatically decrypting PqcEncryptedRecord capsules and
     /// handling key update / rekey notifications transparently.
-    pub fn recv_secure_capsule(&mut self) -> Result<Option<crate::simd_parser::HttpCapsule>, String> {
+    pub fn recv_secure_capsule(
+        &mut self,
+    ) -> Result<Option<crate::simd_parser::HttpCapsule>, String> {
         let cap = match self.recv_capsule() {
             Some(c) => c,
             None => return Ok(None),
@@ -12944,7 +12954,9 @@ impl ExtendedConnectTunnel {
     /// Export current tunnel metrics in OpenTelemetry OTLP JSON format.
     pub fn export_otlp_metrics(&mut self, timestamp_nanos: u64) -> Option<String> {
         self.collect_composite_metrics();
-        self.telemetry.as_ref().map(|t| t.export_otlp_metrics_json(timestamp_nanos))
+        self.telemetry
+            .as_ref()
+            .map(|t| t.export_otlp_metrics_json(timestamp_nanos))
     }
 
     /// Send a distributed trace context capsule over this tunnel.
@@ -12987,7 +12999,10 @@ impl ExtendedConnectTunnel {
     }
 
     /// Send a distributed MASQUE link state advertisement capsule over this tunnel.
-    pub fn send_link_advertisement(&mut self, link: &GatewayLinkAdvertisement) -> Result<(), String> {
+    pub fn send_link_advertisement(
+        &mut self,
+        link: &GatewayLinkAdvertisement,
+    ) -> Result<(), String> {
         let capsule = link.to_capsule();
         self.send_secure_capsule(&capsule)
     }
@@ -13025,7 +13040,10 @@ impl ExtendedConnectTunnel {
     }
 
     /// Send a distributed MASQUE topology synchronization response capsule over this tunnel.
-    pub fn send_topology_sync_response(&mut self, resp: &TopologySyncResponse) -> Result<(), String> {
+    pub fn send_topology_sync_response(
+        &mut self,
+        resp: &TopologySyncResponse,
+    ) -> Result<(), String> {
         let capsule = resp.to_capsule();
         self.send_secure_capsule(&capsule)
     }
@@ -13082,7 +13100,10 @@ impl ExtendedConnectTunnel {
     }
 
     /// Send a distributed session state sync announce capsule over this tunnel.
-    pub fn send_session_state_sync(&mut self, announce: &SessionStateSyncAnnounce) -> Result<(), String> {
+    pub fn send_session_state_sync(
+        &mut self,
+        announce: &SessionStateSyncAnnounce,
+    ) -> Result<(), String> {
         let capsule = announce.to_capsule();
         self.send_secure_capsule(&capsule)
     }
@@ -13101,13 +13122,18 @@ impl ExtendedConnectTunnel {
     }
 
     /// Send a distributed session state sync request capsule over this tunnel.
-    pub fn send_session_state_request(&mut self, req: &SessionStateSyncRequest) -> Result<(), String> {
+    pub fn send_session_state_request(
+        &mut self,
+        req: &SessionStateSyncRequest,
+    ) -> Result<(), String> {
         let capsule = req.to_capsule();
         self.send_secure_capsule(&capsule)
     }
 
     /// Receive a distributed session state sync request capsule from this tunnel.
-    pub fn recv_session_state_request(&mut self) -> Result<Option<SessionStateSyncRequest>, String> {
+    pub fn recv_session_state_request(
+        &mut self,
+    ) -> Result<Option<SessionStateSyncRequest>, String> {
         if let Some(cap) = self.recv_secure_capsule()? {
             if cap.capsule_type == crate::simd_parser::CapsuleType::SessionStateSyncRequest {
                 let req = SessionStateSyncRequest::from_capsule(&cap)?;
@@ -13139,13 +13165,18 @@ impl ExtendedConnectTunnel {
     }
 
     /// Send a flow migration initiate capsule over this tunnel.
-    pub fn send_flow_migration_initiate(&mut self, init: &FlowMigrationInitiate) -> Result<(), String> {
+    pub fn send_flow_migration_initiate(
+        &mut self,
+        init: &FlowMigrationInitiate,
+    ) -> Result<(), String> {
         let capsule = init.to_capsule();
         self.send_secure_capsule(&capsule)
     }
 
     /// Receive a flow migration initiate capsule from this tunnel.
-    pub fn recv_flow_migration_initiate(&mut self) -> Result<Option<FlowMigrationInitiate>, String> {
+    pub fn recv_flow_migration_initiate(
+        &mut self,
+    ) -> Result<Option<FlowMigrationInitiate>, String> {
         if let Some(cap) = self.recv_secure_capsule()? {
             if cap.capsule_type == crate::simd_parser::CapsuleType::FlowMigrationInitiate {
                 let init = FlowMigrationInitiate::from_capsule(&cap)?;
@@ -13158,13 +13189,18 @@ impl ExtendedConnectTunnel {
     }
 
     /// Send a flow migration prepare ack capsule over this tunnel.
-    pub fn send_flow_migration_prepare_ack(&mut self, ack: &FlowMigrationPrepareAck) -> Result<(), String> {
+    pub fn send_flow_migration_prepare_ack(
+        &mut self,
+        ack: &FlowMigrationPrepareAck,
+    ) -> Result<(), String> {
         let capsule = ack.to_capsule();
         self.send_secure_capsule(&capsule)
     }
 
     /// Receive a flow migration prepare ack capsule from this tunnel.
-    pub fn recv_flow_migration_prepare_ack(&mut self) -> Result<Option<FlowMigrationPrepareAck>, String> {
+    pub fn recv_flow_migration_prepare_ack(
+        &mut self,
+    ) -> Result<Option<FlowMigrationPrepareAck>, String> {
         if let Some(cap) = self.recv_secure_capsule()? {
             if cap.capsule_type == crate::simd_parser::CapsuleType::FlowMigrationPrepareAck {
                 let ack = FlowMigrationPrepareAck::from_capsule(&cap)?;
@@ -13177,7 +13213,10 @@ impl ExtendedConnectTunnel {
     }
 
     /// Send a flow migration cutover capsule over this tunnel.
-    pub fn send_flow_migration_cutover(&mut self, cutover: &FlowMigrationCutover) -> Result<(), String> {
+    pub fn send_flow_migration_cutover(
+        &mut self,
+        cutover: &FlowMigrationCutover,
+    ) -> Result<(), String> {
         let capsule = cutover.to_capsule();
         self.send_secure_capsule(&capsule)
     }
@@ -13196,13 +13235,18 @@ impl ExtendedConnectTunnel {
     }
 
     /// Send a flow migration complete capsule over this tunnel.
-    pub fn send_flow_migration_complete(&mut self, complete: &FlowMigrationComplete) -> Result<(), String> {
+    pub fn send_flow_migration_complete(
+        &mut self,
+        complete: &FlowMigrationComplete,
+    ) -> Result<(), String> {
         let capsule = complete.to_capsule();
         self.send_secure_capsule(&capsule)
     }
 
     /// Receive a flow migration complete capsule from this tunnel.
-    pub fn recv_flow_migration_complete(&mut self) -> Result<Option<FlowMigrationComplete>, String> {
+    pub fn recv_flow_migration_complete(
+        &mut self,
+    ) -> Result<Option<FlowMigrationComplete>, String> {
         if let Some(cap) = self.recv_secure_capsule()? {
             if cap.capsule_type == crate::simd_parser::CapsuleType::FlowMigrationComplete {
                 let complete = FlowMigrationComplete::from_capsule(&cap)?;
@@ -14597,15 +14641,9 @@ pub enum ReorderIngestStatus {
         current_buffer_len: usize,
     },
     /// Duplicate datagram detected (seq < expected_seq or seq already buffered) and discarded.
-    Duplicate {
-        seq_num: u64,
-        expected_seq: u64,
-    },
+    Duplicate { seq_num: u64, expected_seq: u64 },
     /// Datagram discarded because its sequence is older than the sliding window floor.
-    StaleDropped {
-        seq_num: u64,
-        window_floor: u64,
-    },
+    StaleDropped { seq_num: u64, window_floor: u64 },
     /// Buffer reached capacity limit; window was forcibly advanced, skipping missing gaps
     /// and delivering queued forward packets to prevent deadlock.
     ForcedEvictionDeliver {
@@ -15007,7 +15045,8 @@ impl AdaptiveFlowReorderBuffer {
     /// Forcibly drain all buffered packets regardless of sequence gaps.
     pub fn force_drain_all(&mut self, now: std::time::Instant) -> Vec<DeliveredDatagram> {
         let mut delivered = Vec::with_capacity(self.buffer.len());
-        let entries: Vec<(u64, BufferedDatagram)> = std::mem::take(&mut self.buffer).into_iter().collect();
+        let entries: Vec<(u64, BufferedDatagram)> =
+            std::mem::take(&mut self.buffer).into_iter().collect();
         for (seq, buffered) in entries {
             let delay = now.saturating_duration_since(buffered.arrival_time);
             self.total_reordering_delay += delay;
@@ -15293,7 +15332,6 @@ impl CompositeDatagramReorderEngine {
         }
     }
 }
-
 
 /// Hierarchical Deficit Round Robin (DRR) arbitrator for multi-session HTTP/2 & HTTP/3 connection pools.
 ///
@@ -24845,8 +24883,8 @@ impl TraceContext {
         let mut span_id = [0u8; 8];
         span_id.copy_from_slice(&span_id_bytes);
 
-        let trace_flags = u8::from_str_radix(parts[3], 16)
-            .map_err(|e| format!("Invalid trace_flags: {}", e))?;
+        let trace_flags =
+            u8::from_str_radix(parts[3], 16).map_err(|e| format!("Invalid trace_flags: {}", e))?;
 
         Ok(Self {
             version,
@@ -25163,15 +25201,20 @@ impl CompositeTransportSnapshot {
         let smoothed_rtt_ms = f64::from_bits(u64::from_be_bytes(bytes[4..12].try_into().unwrap()));
         let jitter_ms = f64::from_bits(u64::from_be_bytes(bytes[12..20].try_into().unwrap()));
         let codel_last_sojourn_micros = u64::from_be_bytes(bytes[20..28].try_into().unwrap());
-        let codel_early_dropped_packets = u64::from_be_bytes(bytes[28..36].try_into().unwrap()) as usize;
-        let codel_ecn_marked_packets = u64::from_be_bytes(bytes[36..44].try_into().unwrap()) as usize;
+        let codel_early_dropped_packets =
+            u64::from_be_bytes(bytes[28..36].try_into().unwrap()) as usize;
+        let codel_ecn_marked_packets =
+            u64::from_be_bytes(bytes[36..44].try_into().unwrap()) as usize;
         let recovered_via_fec = u64::from_be_bytes(bytes[44..52].try_into().unwrap()) as usize;
-        let estimated_loss_rate = f64::from_bits(u64::from_be_bytes(bytes[52..60].try_into().unwrap()));
-        let reorder_average_delay_ms = f64::from_bits(u64::from_be_bytes(bytes[60..68].try_into().unwrap()));
+        let estimated_loss_rate =
+            f64::from_bits(u64::from_be_bytes(bytes[52..60].try_into().unwrap()));
+        let reorder_average_delay_ms =
+            f64::from_bits(u64::from_be_bytes(bytes[60..68].try_into().unwrap()));
         let reorder_total_out_of_order = u64::from_be_bytes(bytes[68..76].try_into().unwrap());
         let multipath_active_paths = u32::from_be_bytes(bytes[76..80].try_into().unwrap()) as usize;
         let multipath_total_failovers = u64::from_be_bytes(bytes[80..88].try_into().unwrap());
-        let pqc_handshakes_completed = u32::from_be_bytes(bytes[88..92].try_into().unwrap()) as usize;
+        let pqc_handshakes_completed =
+            u32::from_be_bytes(bytes[88..92].try_into().unwrap()) as usize;
         let pqc_auth_failures = u32::from_be_bytes(bytes[92..96].try_into().unwrap()) as usize;
 
         Ok(Self {
@@ -25225,7 +25268,8 @@ impl PrometheusTransportExporter {
 
     /// Add a default label applied to all exported metrics.
     pub fn with_label(mut self, key: &str, value: &str) -> Self {
-        self.default_labels.insert(key.to_string(), value.to_string());
+        self.default_labels
+            .insert(key.to_string(), value.to_string());
         self
     }
 
@@ -25237,7 +25281,10 @@ impl PrometheusTransportExporter {
         if all.is_empty() {
             String::new()
         } else {
-            let pairs: Vec<String> = all.iter().map(|(k, v)| format!("{}=\"{}\"", k, v)).collect();
+            let pairs: Vec<String> = all
+                .iter()
+                .map(|(k, v)| format!("{}=\"{}\"", k, v))
+                .collect();
             format!("{{{}}}", pairs.join(","))
         }
     }
@@ -25250,109 +25297,236 @@ impl PrometheusTransportExporter {
         // 1. RTT & Jitter
         out.push_str("# HELP ifa_transport_rtt_seconds Smoothed round-trip time in seconds.\n");
         out.push_str("# TYPE ifa_transport_rtt_seconds gauge\n");
-        out.push_str(&format!("ifa_transport_rtt_seconds{} {:.6}\n", base_lbl, s.smoothed_rtt_ms / 1000.0));
+        out.push_str(&format!(
+            "ifa_transport_rtt_seconds{} {:.6}\n",
+            base_lbl,
+            s.smoothed_rtt_ms / 1000.0
+        ));
 
-        out.push_str("# HELP ifa_transport_min_rtt_seconds Minimum observed round-trip time in seconds.\n");
+        out.push_str(
+            "# HELP ifa_transport_min_rtt_seconds Minimum observed round-trip time in seconds.\n",
+        );
         out.push_str("# TYPE ifa_transport_min_rtt_seconds gauge\n");
-        out.push_str(&format!("ifa_transport_min_rtt_seconds{} {:.6}\n", base_lbl, s.min_rtt_ms / 1000.0));
+        out.push_str(&format!(
+            "ifa_transport_min_rtt_seconds{} {:.6}\n",
+            base_lbl,
+            s.min_rtt_ms / 1000.0
+        ));
 
         out.push_str("# HELP ifa_transport_jitter_seconds Latency variation jitter in seconds.\n");
         out.push_str("# TYPE ifa_transport_jitter_seconds gauge\n");
-        out.push_str(&format!("ifa_transport_jitter_seconds{} {:.6}\n", base_lbl, s.jitter_ms / 1000.0));
+        out.push_str(&format!(
+            "ifa_transport_jitter_seconds{} {:.6}\n",
+            base_lbl,
+            s.jitter_ms / 1000.0
+        ));
 
         // 2. CoDel AQM & ECN
         out.push_str("# HELP ifa_transport_codel_sojourn_seconds Active Queue Management CoDel packet sojourn time in seconds.\n");
         out.push_str("# TYPE ifa_transport_codel_sojourn_seconds gauge\n");
-        out.push_str(&format!("ifa_transport_codel_sojourn_seconds{} {:.6}\n", base_lbl, s.codel_last_sojourn_micros as f64 / 1_000_000.0));
+        out.push_str(&format!(
+            "ifa_transport_codel_sojourn_seconds{} {:.6}\n",
+            base_lbl,
+            s.codel_last_sojourn_micros as f64 / 1_000_000.0
+        ));
 
         out.push_str("# HELP ifa_transport_codel_min_sojourn_seconds CoDel minimum sojourn time in current interval in seconds.\n");
         out.push_str("# TYPE ifa_transport_codel_min_sojourn_seconds gauge\n");
-        out.push_str(&format!("ifa_transport_codel_min_sojourn_seconds{} {:.6}\n", base_lbl, s.codel_min_sojourn_micros as f64 / 1_000_000.0));
+        out.push_str(&format!(
+            "ifa_transport_codel_min_sojourn_seconds{} {:.6}\n",
+            base_lbl,
+            s.codel_min_sojourn_micros as f64 / 1_000_000.0
+        ));
 
         out.push_str("# HELP ifa_transport_codel_drops_total Total packets dropped by Active Queue Management by reason.\n");
         out.push_str("# TYPE ifa_transport_codel_drops_total counter\n");
-        out.push_str(&format!("ifa_transport_codel_drops_total{} {}\n", self.format_labels(&[("reason", "early_drop")]), s.codel_early_dropped_packets));
-        out.push_str(&format!("ifa_transport_codel_drops_total{} {}\n", self.format_labels(&[("reason", "overflow")]), s.codel_buffer_overflow_drops));
+        out.push_str(&format!(
+            "ifa_transport_codel_drops_total{} {}\n",
+            self.format_labels(&[("reason", "early_drop")]),
+            s.codel_early_dropped_packets
+        ));
+        out.push_str(&format!(
+            "ifa_transport_codel_drops_total{} {}\n",
+            self.format_labels(&[("reason", "overflow")]),
+            s.codel_buffer_overflow_drops
+        ));
 
         out.push_str("# HELP ifa_transport_codel_ecn_marked_total Total packets marked with ECN Congestion Experienced.\n");
         out.push_str("# TYPE ifa_transport_codel_ecn_marked_total counter\n");
-        out.push_str(&format!("ifa_transport_codel_ecn_marked_total{} {}\n", base_lbl, s.codel_ecn_marked_packets));
+        out.push_str(&format!(
+            "ifa_transport_codel_ecn_marked_total{} {}\n",
+            base_lbl, s.codel_ecn_marked_packets
+        ));
 
-        out.push_str("# HELP ifa_transport_codel_queue_packets Current depth of CoDel queue in packets.\n");
+        out.push_str(
+            "# HELP ifa_transport_codel_queue_packets Current depth of CoDel queue in packets.\n",
+        );
         out.push_str("# TYPE ifa_transport_codel_queue_packets gauge\n");
-        out.push_str(&format!("ifa_transport_codel_queue_packets{} {}\n", base_lbl, s.codel_queue_packets));
+        out.push_str(&format!(
+            "ifa_transport_codel_queue_packets{} {}\n",
+            base_lbl, s.codel_queue_packets
+        ));
 
         // 3. Selective ACK & Hybrid FEC
         out.push_str("# HELP ifa_transport_packets_sent_total Total application datagram packets transmitted.\n");
         out.push_str("# TYPE ifa_transport_packets_sent_total counter\n");
-        out.push_str(&format!("ifa_transport_packets_sent_total{} {}\n", base_lbl, s.packets_sent));
+        out.push_str(&format!(
+            "ifa_transport_packets_sent_total{} {}\n",
+            base_lbl, s.packets_sent
+        ));
 
         out.push_str("# HELP ifa_transport_packets_received_total Total valid application datagram packets received.\n");
         out.push_str("# TYPE ifa_transport_packets_received_total counter\n");
-        out.push_str(&format!("ifa_transport_packets_received_total{} {}\n", base_lbl, s.packets_received));
+        out.push_str(&format!(
+            "ifa_transport_packets_received_total{} {}\n",
+            base_lbl, s.packets_received
+        ));
 
         out.push_str("# HELP ifa_transport_fec_recovered_total Total lost datagrams reconstructed via forward error correction.\n");
         out.push_str("# TYPE ifa_transport_fec_recovered_total counter\n");
-        out.push_str(&format!("ifa_transport_fec_recovered_total{} {}\n", base_lbl, s.recovered_via_fec));
+        out.push_str(&format!(
+            "ifa_transport_fec_recovered_total{} {}\n",
+            base_lbl, s.recovered_via_fec
+        ));
 
         out.push_str("# HELP ifa_transport_fec_retransmitted_total Total datagrams retransmitted via selective ACK.\n");
         out.push_str("# TYPE ifa_transport_fec_retransmitted_total counter\n");
-        out.push_str(&format!("ifa_transport_fec_retransmitted_total{} {}\n", base_lbl, s.retransmitted_via_sack));
+        out.push_str(&format!(
+            "ifa_transport_fec_retransmitted_total{} {}\n",
+            base_lbl, s.retransmitted_via_sack
+        ));
 
         out.push_str("# HELP ifa_transport_loss_rate Estimated transport packet loss rate between 0.0 and 1.0.\n");
         out.push_str("# TYPE ifa_transport_loss_rate gauge\n");
-        out.push_str(&format!("ifa_transport_loss_rate{} {:.4}\n", base_lbl, s.estimated_loss_rate));
+        out.push_str(&format!(
+            "ifa_transport_loss_rate{} {:.4}\n",
+            base_lbl, s.estimated_loss_rate
+        ));
 
         // 4. Adaptive Reordering Buffer
         out.push_str("# HELP ifa_transport_reorder_latency_seconds Average packet reordering latency in seconds.\n");
         out.push_str("# TYPE ifa_transport_reorder_latency_seconds gauge\n");
-        out.push_str(&format!("ifa_transport_reorder_latency_seconds{} {:.6}\n", base_lbl, s.reorder_average_delay_ms / 1000.0));
+        out.push_str(&format!(
+            "ifa_transport_reorder_latency_seconds{} {:.6}\n",
+            base_lbl,
+            s.reorder_average_delay_ms / 1000.0
+        ));
 
         out.push_str("# HELP ifa_transport_reorder_max_latency_seconds Maximum observed packet reordering latency in seconds.\n");
         out.push_str("# TYPE ifa_transport_reorder_max_latency_seconds gauge\n");
-        out.push_str(&format!("ifa_transport_reorder_max_latency_seconds{} {:.6}\n", base_lbl, s.reorder_max_delay_ms / 1000.0));
+        out.push_str(&format!(
+            "ifa_transport_reorder_max_latency_seconds{} {:.6}\n",
+            base_lbl,
+            s.reorder_max_delay_ms / 1000.0
+        ));
 
         out.push_str("# HELP ifa_transport_reorder_packets_total Total packets processed by reorder engine by disposition.\n");
         out.push_str("# TYPE ifa_transport_reorder_packets_total counter\n");
-        out.push_str(&format!("ifa_transport_reorder_packets_total{} {}\n", self.format_labels(&[("status", "in_order")]), s.reorder_total_in_order));
-        out.push_str(&format!("ifa_transport_reorder_packets_total{} {}\n", self.format_labels(&[("status", "out_of_order")]), s.reorder_total_out_of_order));
-        out.push_str(&format!("ifa_transport_reorder_packets_total{} {}\n", self.format_labels(&[("status", "duplicate")]), s.reorder_total_duplicates));
-        out.push_str(&format!("ifa_transport_reorder_packets_total{} {}\n", self.format_labels(&[("status", "gap_expired")]), s.reorder_gaps_expired));
-        out.push_str(&format!("ifa_transport_reorder_packets_total{} {}\n", self.format_labels(&[("status", "overflow")]), s.reorder_window_overflows));
+        out.push_str(&format!(
+            "ifa_transport_reorder_packets_total{} {}\n",
+            self.format_labels(&[("status", "in_order")]),
+            s.reorder_total_in_order
+        ));
+        out.push_str(&format!(
+            "ifa_transport_reorder_packets_total{} {}\n",
+            self.format_labels(&[("status", "out_of_order")]),
+            s.reorder_total_out_of_order
+        ));
+        out.push_str(&format!(
+            "ifa_transport_reorder_packets_total{} {}\n",
+            self.format_labels(&[("status", "duplicate")]),
+            s.reorder_total_duplicates
+        ));
+        out.push_str(&format!(
+            "ifa_transport_reorder_packets_total{} {}\n",
+            self.format_labels(&[("status", "gap_expired")]),
+            s.reorder_gaps_expired
+        ));
+        out.push_str(&format!(
+            "ifa_transport_reorder_packets_total{} {}\n",
+            self.format_labels(&[("status", "overflow")]),
+            s.reorder_window_overflows
+        ));
 
         // 5. Multipath Bonding
-        out.push_str("# HELP ifa_transport_multipath_active_paths Operational path count in bonding pool.\n");
+        out.push_str(
+            "# HELP ifa_transport_multipath_active_paths Operational path count in bonding pool.\n",
+        );
         out.push_str("# TYPE ifa_transport_multipath_active_paths gauge\n");
-        out.push_str(&format!("ifa_transport_multipath_active_paths{} {}\n", base_lbl, s.multipath_active_paths));
+        out.push_str(&format!(
+            "ifa_transport_multipath_active_paths{} {}\n",
+            base_lbl, s.multipath_active_paths
+        ));
 
         out.push_str("# HELP ifa_transport_multipath_failovers_total Total path failover events across bonding pool.\n");
         out.push_str("# TYPE ifa_transport_multipath_failovers_total counter\n");
-        out.push_str(&format!("ifa_transport_multipath_failovers_total{} {}\n", base_lbl, s.multipath_total_failovers));
+        out.push_str(&format!(
+            "ifa_transport_multipath_failovers_total{} {}\n",
+            base_lbl, s.multipath_total_failovers
+        ));
 
         if !s.multipath_paths.is_empty() {
             out.push_str("# HELP ifa_transport_multipath_path_bytes_total Total bytes transferred per bonded path.\n");
             out.push_str("# TYPE ifa_transport_multipath_path_bytes_total counter\n");
             for p in &s.multipath_paths {
                 let p_id = p.tunnel_id.to_string();
-                let sent_lbl = self.format_labels(&[("path_id", &p_id), ("name", &p.name), ("direction", "sent")]);
-                let recv_lbl = self.format_labels(&[("path_id", &p_id), ("name", &p.name), ("direction", "received")]);
-                out.push_str(&format!("ifa_transport_multipath_path_bytes_total{} {}\n", sent_lbl, p.bytes_sent));
-                out.push_str(&format!("ifa_transport_multipath_path_bytes_total{} {}\n", recv_lbl, p.bytes_received));
+                let sent_lbl = self.format_labels(&[
+                    ("path_id", &p_id),
+                    ("name", &p.name),
+                    ("direction", "sent"),
+                ]);
+                let recv_lbl = self.format_labels(&[
+                    ("path_id", &p_id),
+                    ("name", &p.name),
+                    ("direction", "received"),
+                ]);
+                out.push_str(&format!(
+                    "ifa_transport_multipath_path_bytes_total{} {}\n",
+                    sent_lbl, p.bytes_sent
+                ));
+                out.push_str(&format!(
+                    "ifa_transport_multipath_path_bytes_total{} {}\n",
+                    recv_lbl, p.bytes_received
+                ));
             }
         }
 
         // 6. Post-Quantum Security
         out.push_str("# HELP ifa_transport_pqc_security_events_total Post-quantum cryptographic session events.\n");
         out.push_str("# TYPE ifa_transport_pqc_security_events_total counter\n");
-        out.push_str(&format!("ifa_transport_pqc_security_events_total{} {}\n", self.format_labels(&[("event", "handshake_completed")]), s.pqc_handshakes_completed));
-        out.push_str(&format!("ifa_transport_pqc_security_events_total{} {}\n", self.format_labels(&[("event", "rekey_completed")]), s.pqc_rekeys_completed));
-        out.push_str(&format!("ifa_transport_pqc_security_events_total{} {}\n", self.format_labels(&[("event", "auth_failure")]), s.pqc_auth_failures));
-        out.push_str(&format!("ifa_transport_pqc_security_events_total{} {}\n", self.format_labels(&[("event", "replay_rejected")]), s.pqc_replay_attacks_rejected));
+        out.push_str(&format!(
+            "ifa_transport_pqc_security_events_total{} {}\n",
+            self.format_labels(&[("event", "handshake_completed")]),
+            s.pqc_handshakes_completed
+        ));
+        out.push_str(&format!(
+            "ifa_transport_pqc_security_events_total{} {}\n",
+            self.format_labels(&[("event", "rekey_completed")]),
+            s.pqc_rekeys_completed
+        ));
+        out.push_str(&format!(
+            "ifa_transport_pqc_security_events_total{} {}\n",
+            self.format_labels(&[("event", "auth_failure")]),
+            s.pqc_auth_failures
+        ));
+        out.push_str(&format!(
+            "ifa_transport_pqc_security_events_total{} {}\n",
+            self.format_labels(&[("event", "replay_rejected")]),
+            s.pqc_replay_attacks_rejected
+        ));
 
         out.push_str("# HELP ifa_transport_pqc_capsules_total Total capsules processed under post-quantum encryption.\n");
         out.push_str("# TYPE ifa_transport_pqc_capsules_total counter\n");
-        out.push_str(&format!("ifa_transport_pqc_capsules_total{} {}\n", self.format_labels(&[("direction", "encrypted")]), s.pqc_capsules_encrypted));
-        out.push_str(&format!("ifa_transport_pqc_capsules_total{} {}\n", self.format_labels(&[("direction", "decrypted")]), s.pqc_capsules_decrypted));
+        out.push_str(&format!(
+            "ifa_transport_pqc_capsules_total{} {}\n",
+            self.format_labels(&[("direction", "encrypted")]),
+            s.pqc_capsules_encrypted
+        ));
+        out.push_str(&format!(
+            "ifa_transport_pqc_capsules_total{} {}\n",
+            self.format_labels(&[("direction", "decrypted")]),
+            s.pqc_capsules_decrypted
+        ));
 
         out
     }
@@ -25440,7 +25614,8 @@ impl OtelTransportExporter {
 
     /// Add a resource attribute.
     pub fn with_attribute(mut self, key: &str, value: &str) -> Self {
-        self.default_attributes.insert(key.to_string(), value.to_string());
+        self.default_attributes
+            .insert(key.to_string(), value.to_string());
         self
     }
 
@@ -25784,8 +25959,10 @@ impl DistributedTransportTelemetry {
             scheduler_telemetry: None,
             pqc_telemetry: PqcCapsuleTelemetry::default(),
             recorded_spans: Vec::new(),
-            prometheus_exporter: PrometheusTransportExporter::new().with_label("service", service_name),
-            otel_exporter: OtelTransportExporter::new().with_attribute("service.name", service_name),
+            prometheus_exporter: PrometheusTransportExporter::new()
+                .with_label("service", service_name),
+            otel_exporter: OtelTransportExporter::new()
+                .with_attribute("service.name", service_name),
         }
     }
 
@@ -25858,15 +26035,26 @@ impl DistributedTransportTelemetry {
 
     /// Build a consolidated snapshot across all recorded transport telemetry.
     pub fn snapshot(&self) -> CompositeTransportSnapshot {
-        let (reorder_avg_delay, reorder_dyn_timeout) = if !self.reorder_telemetry.flow_telemetry.is_empty() {
-            let avg = self.reorder_telemetry.flow_telemetry.iter().map(|f| f.average_reordering_delay_ms).sum::<f64>()
-                / self.reorder_telemetry.flow_telemetry.len() as f64;
-            let timeout = self.reorder_telemetry.flow_telemetry.iter().map(|f| f.dynamic_gap_timeout_ms).sum::<f64>()
-                / self.reorder_telemetry.flow_telemetry.len() as f64;
-            (avg, timeout)
-        } else {
-            (0.0, 0.0)
-        };
+        let (reorder_avg_delay, reorder_dyn_timeout) =
+            if !self.reorder_telemetry.flow_telemetry.is_empty() {
+                let avg = self
+                    .reorder_telemetry
+                    .flow_telemetry
+                    .iter()
+                    .map(|f| f.average_reordering_delay_ms)
+                    .sum::<f64>()
+                    / self.reorder_telemetry.flow_telemetry.len() as f64;
+                let timeout = self
+                    .reorder_telemetry
+                    .flow_telemetry
+                    .iter()
+                    .map(|f| f.dynamic_gap_timeout_ms)
+                    .sum::<f64>()
+                    / self.reorder_telemetry.flow_telemetry.len() as f64;
+                (avg, timeout)
+            } else {
+                (0.0, 0.0)
+            };
 
         let mp = self.multipath_telemetry.as_ref();
 
@@ -25913,12 +26101,30 @@ impl DistributedTransportTelemetry {
             multipath_total_failovers: mp.map(|m| m.total_failover_events).unwrap_or(0),
             multipath_total_replications: mp.map(|m| m.total_replicated_packets).unwrap_or(0),
             multipath_paths: mp.map(|m| m.paths.clone()).unwrap_or_default(),
-            shaper_tokens_available: self.shaper_telemetry.map(|s| s.current_byte_tokens).unwrap_or(0.0),
-            shaper_conforming_packets: self.shaper_telemetry.map(|s| s.packets_admitted_immediate).unwrap_or(0),
-            shaper_throttled_packets: self.shaper_telemetry.map(|s| s.packets_delayed).unwrap_or(0),
-            scheduler_strict_served: self.scheduler_telemetry.map(|s| s.high_packets_serviced).unwrap_or(0),
-            scheduler_wdrr_served: self.scheduler_telemetry.map(|s| s.data_packets_serviced).unwrap_or(0),
-            scheduler_dropped_overflow: self.scheduler_telemetry.map(|s| s.packets_dropped_queue_full).unwrap_or(0),
+            shaper_tokens_available: self
+                .shaper_telemetry
+                .map(|s| s.current_byte_tokens)
+                .unwrap_or(0.0),
+            shaper_conforming_packets: self
+                .shaper_telemetry
+                .map(|s| s.packets_admitted_immediate)
+                .unwrap_or(0),
+            shaper_throttled_packets: self
+                .shaper_telemetry
+                .map(|s| s.packets_delayed)
+                .unwrap_or(0),
+            scheduler_strict_served: self
+                .scheduler_telemetry
+                .map(|s| s.high_packets_serviced)
+                .unwrap_or(0),
+            scheduler_wdrr_served: self
+                .scheduler_telemetry
+                .map(|s| s.data_packets_serviced)
+                .unwrap_or(0),
+            scheduler_dropped_overflow: self
+                .scheduler_telemetry
+                .map(|s| s.packets_dropped_queue_full)
+                .unwrap_or(0),
             pqc_handshakes_completed: self.pqc_telemetry.handshakes_completed,
             pqc_rekeys_completed: self.pqc_telemetry.rekeys_completed,
             pqc_capsules_encrypted: self.pqc_telemetry.capsules_encrypted,
@@ -25937,32 +26143,47 @@ impl DistributedTransportTelemetry {
     /// Export the current composite metrics in OpenTelemetry OTLP JSON format.
     pub fn export_otlp_metrics_json(&self, timestamp_nanos: u64) -> String {
         let snap = self.snapshot();
-        self.otel_exporter.export_metrics_json(&snap, &self.service_name, timestamp_nanos)
+        self.otel_exporter
+            .export_metrics_json(&snap, &self.service_name, timestamp_nanos)
     }
 
     /// Export recorded spans in OpenTelemetry OTLP JSON format.
     pub fn export_otlp_traces_json(&self) -> String {
-        self.otel_exporter.export_traces_json(&self.recorded_spans, &self.service_name)
+        self.otel_exporter
+            .export_traces_json(&self.recorded_spans, &self.service_name)
     }
 
     /// Handle an HTTP metrics endpoint request (e.g. `/metrics`, `/v1/metrics`, `/v1/traces`).
     /// Returns (HTTP status code, Content-Type, Body).
-    pub fn handle_http_metrics(&self, path: &str, accept_header: &str, timestamp_nanos: u64) -> (u16, &'static str, String) {
+    pub fn handle_http_metrics(
+        &self,
+        path: &str,
+        accept_header: &str,
+        timestamp_nanos: u64,
+    ) -> (u16, &'static str, String) {
         let clean_path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
         match clean_path {
             "/metrics" => {
                 if accept_header.contains("application/json") {
-                    (200, "application/json", self.export_otlp_metrics_json(timestamp_nanos))
+                    (
+                        200,
+                        "application/json",
+                        self.export_otlp_metrics_json(timestamp_nanos),
+                    )
                 } else {
-                    (200, "text/plain; version=0.0.4; charset=utf-8", self.export_prometheus())
+                    (
+                        200,
+                        "text/plain; version=0.0.4; charset=utf-8",
+                        self.export_prometheus(),
+                    )
                 }
             }
-            "/v1/metrics" => {
-                (200, "application/json", self.export_otlp_metrics_json(timestamp_nanos))
-            }
-            "/v1/traces" => {
-                (200, "application/json", self.export_otlp_traces_json())
-            }
+            "/v1/metrics" => (
+                200,
+                "application/json",
+                self.export_otlp_metrics_json(timestamp_nanos),
+            ),
+            "/v1/traces" => (200, "application/json", self.export_otlp_traces_json()),
             _ => (404, "text/plain", "Not Found\n".to_string()),
         }
     }
@@ -26011,7 +26232,12 @@ fn topo_get_u32(buf: &[u8], offset: &mut usize) -> Result<u32, String> {
     if *offset + 4 > buf.len() {
         return Err("Unexpected EOF reading u32 in topology payload".to_string());
     }
-    let val = u32::from_be_bytes([buf[*offset], buf[*offset + 1], buf[*offset + 2], buf[*offset + 3]]);
+    let val = u32::from_be_bytes([
+        buf[*offset],
+        buf[*offset + 1],
+        buf[*offset + 2],
+        buf[*offset + 3],
+    ]);
     *offset += 4;
     Ok(val)
 }
@@ -26069,13 +26295,27 @@ impl GatewayCapabilities {
     /// Pack capabilities into a 32-bit integer.
     pub fn to_bits(&self) -> u32 {
         let mut bits = 0u32;
-        if self.connect_udp { bits |= 1 << 0; }
-        if self.connect_ip { bits |= 1 << 1; }
-        if self.hybrid_pqc { bits |= 1 << 2; }
-        if self.multipath_bonding { bits |= 1 << 3; }
-        if self.fec_hybrid { bits |= 1 << 4; }
-        if self.l4s_ecn { bits |= 1 << 5; }
-        if self.relay_routing { bits |= 1 << 6; }
+        if self.connect_udp {
+            bits |= 1 << 0;
+        }
+        if self.connect_ip {
+            bits |= 1 << 1;
+        }
+        if self.hybrid_pqc {
+            bits |= 1 << 2;
+        }
+        if self.multipath_bonding {
+            bits |= 1 << 3;
+        }
+        if self.fec_hybrid {
+            bits |= 1 << 4;
+        }
+        if self.l4s_ecn {
+            bits |= 1 << 5;
+        }
+        if self.relay_routing {
+            bits |= 1 << 6;
+        }
         bits
     }
 
@@ -26685,7 +26925,10 @@ impl ComputedMultiPath {
 #[derive(Debug, Clone, Default)]
 pub struct GatewayTopologyGraph {
     nodes: std::collections::BTreeMap<String, GatewayNodeDescriptor>,
-    adjacency: std::collections::BTreeMap<String, std::collections::BTreeMap<String, GatewayLinkAdvertisement>>,
+    adjacency: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, GatewayLinkAdvertisement>,
+    >,
     flapping_counts: std::collections::HashMap<u64, (u32, u64)>, // link_id -> (flaps, last_ms)
 }
 
@@ -26725,7 +26968,10 @@ impl GatewayTopologyGraph {
             }
             // Check for link flapping: status changed back and forth within 30 seconds
             if existing.status != link.status {
-                let entry = self.flapping_counts.entry(link_id).or_insert((0, link.timestamp_ms));
+                let entry = self
+                    .flapping_counts
+                    .entry(link_id)
+                    .or_insert((0, link.timestamp_ms));
                 if link.timestamp_ms.saturating_sub(entry.1) <= 30_000 {
                     entry.0 += 1;
                 } else {
@@ -26835,7 +27081,12 @@ impl GatewayTopologyGraph {
     }
 
     /// Calculate edge cost based on the chosen optimization metric.
-    fn calculate_edge_cost(&self, link: &GatewayLinkAdvertisement, target_node: Option<&GatewayNodeDescriptor>, metric: PathOptimizationMetric) -> f64 {
+    fn calculate_edge_cost(
+        &self,
+        link: &GatewayLinkAdvertisement,
+        target_node: Option<&GatewayNodeDescriptor>,
+        metric: PathOptimizationMetric,
+    ) -> f64 {
         match metric {
             PathOptimizationMetric::LowestLatency => link.metrics.rtt_us as f64,
             PathOptimizationMetric::LowestLoss => {
@@ -26854,7 +27105,9 @@ impl GatewayTopologyGraph {
             } => {
                 let rtt_cost = (link.metrics.rtt_us as f64) / 1000.0;
                 let loss_cost = (link.metrics.loss_rate as f64) * 1000.0;
-                let load_cost = target_node.map(|n| (n.load_factor as f64) * 100.0).unwrap_or(0.0);
+                let load_cost = target_node
+                    .map(|n| (n.load_factor as f64) * 100.0)
+                    .unwrap_or(0.0);
                 (rtt_cost * latency_weight) + (loss_cost * loss_weight) + (load_cost * load_weight)
             }
         }
@@ -26867,7 +27120,13 @@ impl GatewayTopologyGraph {
         to: &str,
         metric: PathOptimizationMetric,
     ) -> Option<ComputedMultiPath> {
-        self.find_best_path_internal(from, to, metric, &std::collections::HashSet::new(), &std::collections::HashSet::new())
+        self.find_best_path_internal(
+            from,
+            to,
+            metric,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        )
     }
 
     fn find_best_path_internal(
@@ -26892,7 +27151,8 @@ impl GatewayTopologyGraph {
 
         // Dijkstra's algorithm
         let mut dist: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-        let mut prev: std::collections::HashMap<String, (String, GatewayLinkAdvertisement)> = std::collections::HashMap::new();
+        let mut prev: std::collections::HashMap<String, (String, GatewayLinkAdvertisement)> =
+            std::collections::HashMap::new();
         let mut unvisited: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for node_id in self.nodes.keys() {
@@ -26996,7 +27256,11 @@ impl GatewayTopologyGraph {
             links,
             total_rtt_us,
             cumulative_loss_rate,
-            bottleneck_bandwidth_bps: if bottleneck_bw == u64::MAX { 0 } else { bottleneck_bw },
+            bottleneck_bandwidth_bps: if bottleneck_bw == u64::MAX {
+                0
+            } else {
+                bottleneck_bw
+            },
             min_path_mtu: if min_mtu == u16::MAX { 1500 } else { min_mtu },
             total_cost,
         })
@@ -27059,17 +27323,23 @@ impl GatewayTopologyGraph {
             // Compute proportional dynamic weight: higher bandwidth & lower RTT gives higher weight
             let rtt_factor = (100_000.0 / (p.total_rtt_us.max(1000) as f64)).clamp(1.0, 50.0);
             let bw_mbps = (p.bottleneck_bandwidth_bps / 1_000_000).max(1) as f64;
-            let weight = ((bw_mbps.sqrt() * rtt_factor * (base_weight as f64)) / 100.0).clamp(1.0, 1000.0) as u32;
+            let weight = ((bw_mbps.sqrt() * rtt_factor * (base_weight as f64)) / 100.0)
+                .clamp(1.0, 1000.0) as u32;
 
-            let target = p.hops.last().cloned().unwrap_or_else(|| "target.gateway".to_string());
-            let mut tunnel = ExtendedConnectTunnel::new(path_id as u32, TunnelProtocol::ConnectUdp, &target);
+            let target = p
+                .hops
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "target.gateway".to_string());
+            let mut tunnel =
+                ExtendedConnectTunnel::new(path_id as u32, TunnelProtocol::ConnectUdp, &target);
             tunnel.mark_established();
 
             bonded.push(
                 BondedTunnelPath::new(path_id, p.display_route(), tunnel, weight, now)
                     .with_state(BondedPathState::Active)
                     .with_rtt(rtt)
-                    .with_loss_rate(loss_rate)
+                    .with_loss_rate(loss_rate),
             );
         }
         bonded
@@ -27111,7 +27381,9 @@ impl ActiveProbeStats {
         if self.total_probes_sent == 0 {
             return 0.0;
         }
-        let lost = self.total_probes_sent.saturating_sub(self.total_probes_received);
+        let lost = self
+            .total_probes_sent
+            .saturating_sub(self.total_probes_received);
         (lost as f32) / (self.total_probes_sent as f32)
     }
 }
@@ -27122,7 +27394,10 @@ pub enum TopologyDiscoveryAction {
     None,
     SendPong(TopologyProbePong),
     SendSyncResponse(TopologySyncResponse),
-    UpdatedGraph { nodes_added: usize, links_added: usize },
+    UpdatedGraph {
+        nodes_added: usize,
+        links_added: usize,
+    },
 }
 
 /// Distributed MASQUE Topology and Multi-Path Discovery Engine.
@@ -27183,7 +27458,8 @@ impl DistributedMasqueTopologyDiscoveryEngine {
     pub fn send_probe_ping(&mut self, target_node: &str, now_ns: u64) -> TopologyProbePing {
         let probe_id = self.next_probe_id;
         self.next_probe_id += 1;
-        self.pending_pings.insert(probe_id, (target_node.to_string(), now_ns));
+        self.pending_pings
+            .insert(probe_id, (target_node.to_string(), now_ns));
 
         let stats = self.probe_stats.entry(target_node.to_string()).or_default();
         stats.total_probes_sent += 1;
@@ -27206,7 +27482,12 @@ impl DistributedMasqueTopologyDiscoveryEngine {
     }
 
     /// Handle an incoming active probe pong reply and update latency/jitter metrics.
-    pub fn handle_probe_pong(&mut self, pong: &TopologyProbePong, now_ns: u64, now_ms: u64) -> Option<u32> {
+    pub fn handle_probe_pong(
+        &mut self,
+        pong: &TopologyProbePong,
+        now_ns: u64,
+        now_ms: u64,
+    ) -> Option<u32> {
         if let Some((target_node, start_ns)) = self.pending_pings.remove(&pong.probe_id) {
             let rtt_ns = now_ns.saturating_sub(start_ns);
             let rtt_us = (rtt_ns / 1000).max(1) as u32;
@@ -28116,7 +28397,9 @@ impl MultiNodeSessionSyncEngine {
                     session_id: s_id.clone(),
                     synced_epoch: existing.snapshot.state_epoch,
                     success: false,
-                    error_message: Some("Incoming epoch is older than current local epoch".to_string()),
+                    error_message: Some(
+                        "Incoming epoch is older than current local epoch".to_string(),
+                    ),
                 }
             }
         } else {
@@ -28162,11 +28445,17 @@ impl MultiNodeSessionSyncEngine {
     }
 
     pub fn primary_sessions_count(&self) -> usize {
-        self.sessions.values().filter(|s| s.role == SessionRole::Primary).count()
+        self.sessions
+            .values()
+            .filter(|s| s.role == SessionRole::Primary)
+            .count()
     }
 
     pub fn standby_sessions_count(&self) -> usize {
-        self.sessions.values().filter(|s| s.role == SessionRole::Standby).count()
+        self.sessions
+            .values()
+            .filter(|s| s.role == SessionRole::Standby)
+            .count()
     }
 }
 
@@ -28295,7 +28584,8 @@ impl SeamlessFlowMigrationManager {
         snapshot.updated_at_ms = now_ms;
         snapshot.migration_phase = SessionMigrationPhase::PreSyncing;
 
-        let mut record = SynchronizedSessionRecord::new(SessionRole::MigratingTarget, snapshot, now_ms);
+        let mut record =
+            SynchronizedSessionRecord::new(SessionRole::MigratingTarget, snapshot, now_ms);
         record.last_sync_time_ms = now_ms;
         let target_epoch = record.snapshot.state_epoch;
         sync_engine.sessions.insert(s_id.clone(), record);
@@ -28416,7 +28706,11 @@ impl SeamlessFlowMigrationManager {
         session.forwarding_buffer.push(datagram.clone());
         self.total_datagrams_forwarded += 1;
 
-        if let Some(ctx) = self.active_migrations.values_mut().find(|c| c.session_id == session_id) {
+        if let Some(ctx) = self
+            .active_migrations
+            .values_mut()
+            .find(|c| c.session_id == session_id)
+        {
             ctx.forwarded_count += 1;
         }
 
@@ -28439,7 +28733,11 @@ impl SeamlessFlowMigrationManager {
         let delivered = session.deliver_datagram(datagram.sequence, datagram.payload);
         if delivered {
             self.total_datagrams_forwarded += 1;
-            if let Some(ctx) = self.active_migrations.values_mut().find(|c| c.session_id == session_id) {
+            if let Some(ctx) = self
+                .active_migrations
+                .values_mut()
+                .find(|c| c.session_id == session_id)
+            {
                 ctx.forwarded_count += 1;
             }
         }
@@ -28588,7 +28886,10 @@ impl SeamlessFlowMigrationManager {
         let active = self
             .active_migrations
             .values()
-            .filter(|c| c.phase != SessionMigrationPhase::Completed && c.phase != SessionMigrationPhase::Aborted)
+            .filter(|c| {
+                c.phase != SessionMigrationPhase::Completed
+                    && c.phase != SessionMigrationPhase::Aborted
+            })
             .count();
 
         let avg_cutover = if self.total_migrations_completed > 0 {
@@ -28608,7 +28909,6 @@ impl SeamlessFlowMigrationManager {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -40546,7 +40846,10 @@ mod tls_alpn_tests {
                     assert!(!del[0].was_reordered);
                     assert!(!del[0].gap_skipped_before);
                 }
-                other => panic!("Expected Delivered for in-order packet {}, got {:?}", seq, other),
+                other => panic!(
+                    "Expected Delivered for in-order packet {}, got {:?}",
+                    seq, other
+                ),
             }
         }
 
@@ -40580,13 +40883,27 @@ mod tls_alpn_tests {
         // Packet 3 arrives out-of-order (gap at 2)
         let t3 = now + Duration::from_millis(5);
         let res3 = buf.ingest(3, b"P3".to_vec(), 2, 0, 300, t3);
-        assert!(matches!(res3, ReorderIngestStatus::Buffered { buffered_seq: 3, expected_seq: 2, current_buffer_len: 1 }));
+        assert!(matches!(
+            res3,
+            ReorderIngestStatus::Buffered {
+                buffered_seq: 3,
+                expected_seq: 2,
+                current_buffer_len: 1
+            }
+        ));
         assert!(buf.gap_deadline.is_some());
 
         // Packet 4 arrives out-of-order
         let t4 = now + Duration::from_millis(7);
         let res4 = buf.ingest(4, b"P4".to_vec(), 2, 0, 400, t4);
-        assert!(matches!(res4, ReorderIngestStatus::Buffered { buffered_seq: 4, expected_seq: 2, current_buffer_len: 2 }));
+        assert!(matches!(
+            res4,
+            ReorderIngestStatus::Buffered {
+                buffered_seq: 4,
+                expected_seq: 2,
+                current_buffer_len: 2
+            }
+        ));
 
         // Packet 2 arrives now! Must release 2, 3, 4 in strict order
         let t2 = now + Duration::from_millis(15);
@@ -40629,14 +40946,26 @@ mod tls_alpn_tests {
 
         // Duplicate of 1 (seq < next_expected_seq = 2)
         let dup1 = buf.ingest(1, b"P1_DUP".to_vec(), 1, 0, 100, now);
-        assert_eq!(dup1, ReorderIngestStatus::Duplicate { seq_num: 1, expected_seq: 2 });
+        assert_eq!(
+            dup1,
+            ReorderIngestStatus::Duplicate {
+                seq_num: 1,
+                expected_seq: 2
+            }
+        );
 
         // Packet 4 arrives (buffered)
         buf.ingest(4, b"P4".to_vec(), 2, 0, 400, now);
 
         // Duplicate of 4 (already buffered)
         let dup4 = buf.ingest(4, b"P4_DUP".to_vec(), 2, 0, 400, now);
-        assert_eq!(dup4, ReorderIngestStatus::Duplicate { seq_num: 4, expected_seq: 2 });
+        assert_eq!(
+            dup4,
+            ReorderIngestStatus::Duplicate {
+                seq_num: 4,
+                expected_seq: 2
+            }
+        );
 
         let telem = buf.telemetry();
         assert_eq!(telem.total_duplicates, 2);
@@ -40676,7 +41005,10 @@ mod tls_alpn_tests {
         let delivered = expired_check.unwrap();
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].seq_num, 4);
-        assert!(delivered[0].gap_skipped_before, "Must notify that gap 2..3 was skipped");
+        assert!(
+            delivered[0].gap_skipped_before,
+            "Must notify that gap 2..3 was skipped"
+        );
 
         assert_eq!(buf.next_expected_seq, 5);
         assert_eq!(buf.buffer.len(), 0);
@@ -40705,7 +41037,10 @@ mod tls_alpn_tests {
         // Ingest 5 -> triggers window overflow and forced eviction
         let res5 = buf.ingest(5, b"P5".to_vec(), 1, 0, 500, now);
         match res5 {
-            ReorderIngestStatus::ForcedEvictionDeliver { evicted_gaps, delivered } => {
+            ReorderIngestStatus::ForcedEvictionDeliver {
+                evicted_gaps,
+                delivered,
+            } => {
                 assert_eq!(evicted_gaps, 1, "Must evict gap at seq 1");
                 assert_eq!(delivered.len(), 4, "Must deliver 2, 3, 4, 5");
                 assert_eq!(delivered[0].seq_num, 2);
@@ -40790,7 +41125,10 @@ mod tls_alpn_tests {
         // 1. Init payload
         let init = PqcHandshakeInitPayload {
             version: 1,
-            supported_suites: vec![HybridKemSuite::X25519MlKem768, HybridKemSuite::Secp256r1MlKem768],
+            supported_suites: vec![
+                HybridKemSuite::X25519MlKem768,
+                HybridKemSuite::Secp256r1MlKem768,
+            ],
             client_random: [0x11; 32],
             client_classical_public_key: [0x22; 32],
             client_kem_public_key: vec![0x33; 1184],
@@ -40888,21 +41226,38 @@ mod tls_alpn_tests {
         let s_seed_kem = [0x44; 32];
 
         // 1. Client creates init
-        let init_capsule = client.create_client_init(&c_seed_classical, &c_seed_kem).expect("create init");
-        assert_eq!(init_capsule.capsule_type, crate::simd_parser::CapsuleType::PqcHandshakeInit);
+        let init_capsule = client
+            .create_client_init(&c_seed_classical, &c_seed_kem)
+            .expect("create init");
+        assert_eq!(
+            init_capsule.capsule_type,
+            crate::simd_parser::CapsuleType::PqcHandshakeInit
+        );
 
         // 2. Server processes init and returns response
-        let resp_capsule = server.process_client_init(&init_capsule, &s_seed_classical, &s_seed_kem).expect("process init");
-        assert_eq!(resp_capsule.capsule_type, crate::simd_parser::CapsuleType::PqcHandshakeResponse);
+        let resp_capsule = server
+            .process_client_init(&init_capsule, &s_seed_classical, &s_seed_kem)
+            .expect("process init");
+        assert_eq!(
+            resp_capsule.capsule_type,
+            crate::simd_parser::CapsuleType::PqcHandshakeResponse
+        );
         assert!(server.is_established());
 
         // 3. Client processes response and returns finished
-        let fin_capsule = client.process_server_response(&resp_capsule).expect("process response");
-        assert_eq!(fin_capsule.capsule_type, crate::simd_parser::CapsuleType::PqcHandshakeFinished);
+        let fin_capsule = client
+            .process_server_response(&resp_capsule)
+            .expect("process response");
+        assert_eq!(
+            fin_capsule.capsule_type,
+            crate::simd_parser::CapsuleType::PqcHandshakeFinished
+        );
         assert!(client.is_established());
 
         // 4. Server processes finished
-        server.process_client_finished(&fin_capsule).expect("process finished");
+        server
+            .process_client_finished(&fin_capsule)
+            .expect("process finished");
 
         // 5. Verify both derive identical session keys
         let c_keys = client.keys.as_ref().unwrap();
@@ -40924,19 +41279,31 @@ mod tls_alpn_tests {
         let mut server = PqcSecureTunnelSession::new_server(vec![HybridKemSuite::X25519MlKem768]);
 
         let init = client.create_client_init(&[1; 32], &[2; 32]).unwrap();
-        let resp = server.process_client_init(&init, &[3; 32], &[4; 32]).unwrap();
+        let resp = server
+            .process_client_init(&init, &[3; 32], &[4; 32])
+            .unwrap();
         let fin = client.process_server_response(&resp).unwrap();
         server.process_client_finished(&fin).unwrap();
 
         // Client encrypts a standard DATAGRAM capsule
         let raw_cap = crate::simd_parser::HttpCapsule::udp_datagram(0, b"CONFIDENTIAL_UDP_PAYLOAD");
-        let enc_cap = client.encrypt_capsule(&raw_cap).expect("encryption succeeds");
-        assert_eq!(enc_cap.capsule_type, crate::simd_parser::CapsuleType::PqcEncryptedRecord);
+        let enc_cap = client
+            .encrypt_capsule(&raw_cap)
+            .expect("encryption succeeds");
+        assert_eq!(
+            enc_cap.capsule_type,
+            crate::simd_parser::CapsuleType::PqcEncryptedRecord
+        );
         assert_ne!(enc_cap.payload, raw_cap.payload);
 
         // Server decrypts the record
-        let dec_cap = server.decrypt_capsule(&enc_cap).expect("decryption succeeds");
-        assert_eq!(dec_cap.capsule_type, crate::simd_parser::CapsuleType::Datagram);
+        let dec_cap = server
+            .decrypt_capsule(&enc_cap)
+            .expect("decryption succeeds");
+        assert_eq!(
+            dec_cap.capsule_type,
+            crate::simd_parser::CapsuleType::Datagram
+        );
         assert_eq!(dec_cap.payload, raw_cap.payload);
 
         let (ctx, pkt) = dec_cap.decode_udp_datagram().unwrap();
@@ -40944,12 +41311,18 @@ mod tls_alpn_tests {
         assert_eq!(pkt, b"CONFIDENTIAL_UDP_PAYLOAD");
 
         // Server encrypts an ADDRESS_ASSIGN control capsule
-        let addr_cap = crate::simd_parser::HttpCapsule::new(crate::simd_parser::CapsuleType::AddressAssign, vec![192, 168, 1, 100]);
+        let addr_cap = crate::simd_parser::HttpCapsule::new(
+            crate::simd_parser::CapsuleType::AddressAssign,
+            vec![192, 168, 1, 100],
+        );
         let enc_addr = server.encrypt_capsule(&addr_cap).unwrap();
 
         // Client decrypts it
         let dec_addr = client.decrypt_capsule(&enc_addr).unwrap();
-        assert_eq!(dec_addr.capsule_type, crate::simd_parser::CapsuleType::AddressAssign);
+        assert_eq!(
+            dec_addr.capsule_type,
+            crate::simd_parser::CapsuleType::AddressAssign
+        );
         assert_eq!(dec_addr.payload, vec![192, 168, 1, 100]);
 
         assert_eq!(client.telemetry.capsules_encrypted, 1);
@@ -40964,11 +41337,14 @@ mod tls_alpn_tests {
         let mut server = PqcSecureTunnelSession::new_server(vec![HybridKemSuite::X25519MlKem768]);
 
         let init = client.create_client_init(&[1; 32], &[2; 32]).unwrap();
-        let resp = server.process_client_init(&init, &[3; 32], &[4; 32]).unwrap();
+        let resp = server
+            .process_client_init(&init, &[3; 32], &[4; 32])
+            .unwrap();
         let fin = client.process_server_response(&resp).unwrap();
         server.process_client_finished(&fin).unwrap();
 
-        let raw_cap = crate::simd_parser::HttpCapsule::datagram(b"CRITICAL_FINANCIAL_TRANSACTION".to_vec());
+        let raw_cap =
+            crate::simd_parser::HttpCapsule::datagram(b"CRITICAL_FINANCIAL_TRANSACTION".to_vec());
         let enc_cap = client.encrypt_capsule(&raw_cap).unwrap();
 
         // Tamper test: modify ciphertext byte
@@ -40980,7 +41356,9 @@ mod tls_alpn_tests {
         assert_eq!(server.telemetry.auth_failures, 1);
 
         // Legitimate decrypt succeeds
-        let legitimate = server.decrypt_capsule(&enc_cap).expect("legitimate decrypt");
+        let legitimate = server
+            .decrypt_capsule(&enc_cap)
+            .expect("legitimate decrypt");
         assert_eq!(legitimate.payload, b"CRITICAL_FINANCIAL_TRANSACTION");
 
         // Replay attack test: feed same valid record again
@@ -40995,26 +41373,41 @@ mod tls_alpn_tests {
         let mut server = PqcSecureTunnelSession::new_server(vec![HybridKemSuite::X25519MlKem768]);
 
         let init = client.create_client_init(&[1; 32], &[2; 32]).unwrap();
-        let resp = server.process_client_init(&init, &[3; 32], &[4; 32]).unwrap();
+        let resp = server
+            .process_client_init(&init, &[3; 32], &[4; 32])
+            .unwrap();
         let fin = client.process_server_response(&resp).unwrap();
         server.process_client_finished(&fin).unwrap();
 
         // Transmit packet on epoch 0
-        let p0 = client.encrypt_capsule(&crate::simd_parser::HttpCapsule::datagram(b"EPOCH_0_MSG".to_vec())).unwrap();
+        let p0 = client
+            .encrypt_capsule(&crate::simd_parser::HttpCapsule::datagram(
+                b"EPOCH_0_MSG".to_vec(),
+            ))
+            .unwrap();
         let d0 = server.decrypt_capsule(&p0).unwrap();
         assert_eq!(d0.payload, b"EPOCH_0_MSG");
 
         // Client triggers rekey
         let rekey_cap = client.rekey().expect("rekey succeeds");
-        assert_eq!(rekey_cap.capsule_type, crate::simd_parser::CapsuleType::PqcKeyUpdate);
+        assert_eq!(
+            rekey_cap.capsule_type,
+            crate::simd_parser::CapsuleType::PqcKeyUpdate
+        );
         assert_eq!(client.current_epoch, 1);
 
         // Server receives rekey notification
-        server.process_rekey(&rekey_cap).expect("process rekey succeeds");
+        server
+            .process_rekey(&rekey_cap)
+            .expect("process rekey succeeds");
         assert_eq!(server.current_epoch, 1);
 
         // Transmit packet on epoch 1
-        let p1 = client.encrypt_capsule(&crate::simd_parser::HttpCapsule::datagram(b"EPOCH_1_FORWARD_SECURE_MSG".to_vec())).unwrap();
+        let p1 = client
+            .encrypt_capsule(&crate::simd_parser::HttpCapsule::datagram(
+                b"EPOCH_1_FORWARD_SECURE_MSG".to_vec(),
+            ))
+            .unwrap();
         let d1 = server.decrypt_capsule(&p1).unwrap();
         assert_eq!(d1.payload, b"EPOCH_1_FORWARD_SECURE_MSG");
 
@@ -41024,26 +41417,37 @@ mod tls_alpn_tests {
 
     #[test]
     fn test_extended_connect_tunnel_pqc_integration() {
-        let mut client_session = PqcSecureTunnelSession::new_client(vec![HybridKemSuite::X25519MlKem768]);
-        let mut server_session = PqcSecureTunnelSession::new_server(vec![HybridKemSuite::X25519MlKem768]);
+        let mut client_session =
+            PqcSecureTunnelSession::new_client(vec![HybridKemSuite::X25519MlKem768]);
+        let mut server_session =
+            PqcSecureTunnelSession::new_server(vec![HybridKemSuite::X25519MlKem768]);
 
         // Handshake setup
-        let init = client_session.create_client_init(&[10; 32], &[20; 32]).unwrap();
-        let resp = server_session.process_client_init(&init, &[30; 32], &[40; 32]).unwrap();
+        let init = client_session
+            .create_client_init(&[10; 32], &[20; 32])
+            .unwrap();
+        let resp = server_session
+            .process_client_init(&init, &[30; 32], &[40; 32])
+            .unwrap();
         let fin = client_session.process_server_response(&resp).unwrap();
         server_session.process_client_finished(&fin).unwrap();
 
-        let mut client_tunnel = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "target.vpn:443")
-            .with_pqc_session(client_session);
+        let mut client_tunnel =
+            ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "target.vpn:443")
+                .with_pqc_session(client_session);
         client_tunnel.mark_established();
 
-        let mut server_tunnel = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "target.vpn:443")
-            .with_pqc_session(server_session);
+        let mut server_tunnel =
+            ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "target.vpn:443")
+                .with_pqc_session(server_session);
         server_tunnel.mark_established();
 
         // Client sends secure capsule
-        let plain = crate::simd_parser::HttpCapsule::udp_datagram(0, b"END_TO_END_PQC_ENCRYPTED_TUNNEL");
-        client_tunnel.send_secure_capsule(&plain).expect("send secure capsule");
+        let plain =
+            crate::simd_parser::HttpCapsule::udp_datagram(0, b"END_TO_END_PQC_ENCRYPTED_TUNNEL");
+        client_tunnel
+            .send_secure_capsule(&plain)
+            .expect("send secure capsule");
 
         // Emulate transport transfer
         let egress = client_tunnel.drain_egress_data();
@@ -41053,8 +41457,14 @@ mod tls_alpn_tests {
         }
 
         // Server receives and transparently decrypts
-        let received = server_tunnel.recv_secure_capsule().expect("recv secure capsule").expect("capsule exists");
-        assert_eq!(received.capsule_type, crate::simd_parser::CapsuleType::Datagram);
+        let received = server_tunnel
+            .recv_secure_capsule()
+            .expect("recv secure capsule")
+            .expect("capsule exists");
+        assert_eq!(
+            received.capsule_type,
+            crate::simd_parser::CapsuleType::Datagram
+        );
         let (ctx, data) = received.decode_udp_datagram().unwrap();
         assert_eq!(ctx, 0);
         assert_eq!(data, b"END_TO_END_PQC_ENCRYPTED_TUNNEL");
@@ -41187,21 +41597,19 @@ mod tls_alpn_tests {
         s.reorder_average_delay_ms = 2.8;
         s.multipath_active_paths = 2;
         s.multipath_total_failovers = 1;
-        s.multipath_paths = vec![
-            PathTelemetrySnapshot {
-                tunnel_id: 101,
-                name: "wan0-5g".to_string(),
-                state: BondedPathState::Active,
-                weight: 10,
-                smoothed_rtt_ms: 22.0,
-                loss_rate: 0.001,
-                quality_score: 95.0,
-                packets_sent: 6000,
-                bytes_sent: 7800000,
-                packets_received: 5990,
-                bytes_received: 7780000,
-            },
-        ];
+        s.multipath_paths = vec![PathTelemetrySnapshot {
+            tunnel_id: 101,
+            name: "wan0-5g".to_string(),
+            state: BondedPathState::Active,
+            weight: 10,
+            smoothed_rtt_ms: 22.0,
+            loss_rate: 0.001,
+            quality_score: 95.0,
+            packets_sent: 6000,
+            bytes_sent: 7800000,
+            packets_received: 5990,
+            bytes_received: 7780000,
+        }];
         s.pqc_handshakes_completed = 1;
         s.pqc_rekeys_completed = 2;
         s.pqc_auth_failures = 0;
@@ -41217,14 +41625,18 @@ mod tls_alpn_tests {
         // Verification of Prometheus exposition standards
         assert!(text.contains("# HELP ifa_transport_rtt_seconds"));
         assert!(text.contains("# TYPE ifa_transport_rtt_seconds gauge"));
-        assert!(text.contains("ifa_transport_rtt_seconds{env=\"prod\",service=\"ifa_masque_gateway\"} 0.035000"));
+        assert!(text.contains(
+            "ifa_transport_rtt_seconds{env=\"prod\",service=\"ifa_masque_gateway\"} 0.035000"
+        ));
 
         assert!(text.contains("# HELP ifa_transport_codel_drops_total"));
         assert!(text.contains("# TYPE ifa_transport_codel_drops_total counter"));
         assert!(text.contains("ifa_transport_codel_drops_total{env=\"prod\",reason=\"early_drop\",service=\"ifa_masque_gateway\"} 5"));
         assert!(text.contains("ifa_transport_codel_drops_total{env=\"prod\",reason=\"overflow\",service=\"ifa_masque_gateway\"} 1"));
 
-        assert!(text.contains("ifa_transport_fec_recovered_total{env=\"prod\",service=\"ifa_masque_gateway\"} 15"));
+        assert!(text.contains(
+            "ifa_transport_fec_recovered_total{env=\"prod\",service=\"ifa_masque_gateway\"} 15"
+        ));
         assert!(text.contains("ifa_transport_multipath_path_bytes_total{direction=\"sent\",env=\"prod\",name=\"wan0-5g\",path_id=\"101\",service=\"ifa_masque_gateway\"} 7800000"));
         assert!(text.contains("ifa_transport_pqc_security_events_total{env=\"prod\",event=\"rekey_completed\",service=\"ifa_masque_gateway\"} 2"));
     }
@@ -41242,20 +41654,41 @@ mod tls_alpn_tests {
         s.reorder_average_delay_ms = 1.5;
         s.pqc_handshakes_completed = 1;
 
-        let exporter = OtelTransportExporter::new()
-            .with_attribute("host.name", "edge-router-42");
+        let exporter = OtelTransportExporter::new().with_attribute("host.name", "edge-router-42");
 
         let json_str = exporter.export_metrics_json(&s, "masque_gateway", 1700000000000000000);
         let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("parse otlp json");
 
-        assert_eq!(parsed["resourceMetrics"][0]["resource"]["attributes"][0]["key"], "service.name");
-        assert_eq!(parsed["resourceMetrics"][0]["resource"]["attributes"][0]["value"]["stringValue"], "masque_gateway");
+        assert_eq!(
+            parsed["resourceMetrics"][0]["resource"]["attributes"][0]["key"],
+            "service.name"
+        );
+        assert_eq!(
+            parsed["resourceMetrics"][0]["resource"]["attributes"][0]["value"]["stringValue"],
+            "masque_gateway"
+        );
 
         let metrics = &parsed["resourceMetrics"][0]["scopeMetrics"][0]["metrics"];
-        assert!(metrics.as_array().unwrap().iter().any(|m| m["name"] == "ifa.transport.rtt"));
-        assert!(metrics.as_array().unwrap().iter().any(|m| m["name"] == "ifa.transport.codel.sojourn"));
-        assert!(metrics.as_array().unwrap().iter().any(|m| m["name"] == "ifa.transport.fec.recovered"));
-        assert!(metrics.as_array().unwrap().iter().any(|m| m["name"] == "ifa.transport.pqc.security_events"));
+        assert!(metrics
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == "ifa.transport.rtt"));
+        assert!(metrics
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == "ifa.transport.codel.sojourn"));
+        assert!(metrics
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == "ifa.transport.fec.recovered"));
+        assert!(metrics
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == "ifa.transport.pqc.security_events"));
     }
 
     #[test]
@@ -41282,19 +41715,23 @@ mod tls_alpn_tests {
 
         let exporter = OtelTransportExporter::new();
         let traces_json = exporter.export_traces_json(&[span1, span2], "ifa_service");
-        let parsed: serde_json::Value = serde_json::from_str(&traces_json).expect("parse traces json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&traces_json).expect("parse traces json");
 
         let spans = &parsed["resourceSpans"][0]["scopeSpans"][0]["spans"];
         assert_eq!(spans.as_array().unwrap().len(), 2);
         assert_eq!(spans[0]["name"], "transport.pqc_handshake");
         assert_eq!(spans[1]["name"], "transport.fec_recovery");
-        assert_eq!(spans[1]["parentSpanId"], crate::crypto::hex_encode(&ctx.span_id));
+        assert_eq!(
+            spans[1]["parentSpanId"],
+            crate::crypto::hex_encode(&ctx.span_id)
+        );
     }
 
     #[test]
     fn test_distributed_transport_telemetry_registry_and_http_endpoints() {
-        let mut registry = DistributedTransportTelemetry::new("gateway-us-east")
-            .with_label("datacenter", "iad1");
+        let mut registry =
+            DistributedTransportTelemetry::new("gateway-us-east").with_label("datacenter", "iad1");
 
         // Record metrics
         registry.record_rtt_sample(25.0);
@@ -41332,7 +41769,8 @@ mod tls_alpn_tests {
         assert!(body.contains("datacenter=\"iad1\""));
 
         // 2. /metrics with application/json
-        let (code2, ctype2, body2) = registry.handle_http_metrics("/metrics", "application/json", 1000);
+        let (code2, ctype2, body2) =
+            registry.handle_http_metrics("/metrics", "application/json", 1000);
         assert_eq!(code2, 200);
         assert_eq!(ctype2, "application/json");
         assert!(body2.contains("resourceMetrics"));
@@ -41357,17 +41795,21 @@ mod tls_alpn_tests {
     #[test]
     fn test_extended_connect_tunnel_telemetry_integration() {
         let registry = DistributedTransportTelemetry::new("tunnel_worker");
-        let mut client_tunnel = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "target.proxy:443")
-            .with_telemetry(registry);
+        let mut client_tunnel =
+            ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "target.proxy:443")
+                .with_telemetry(registry);
         client_tunnel.mark_established();
 
-        let mut server_tunnel = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "target.proxy:443");
+        let mut server_tunnel =
+            ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "target.proxy:443");
         server_tunnel.mark_established();
 
         // 1. Send and receive W3C TraceContext capsule
         let mut trace = TraceContext::new([0x33; 16], [0x44; 8], true);
         trace.set_baggage("session_id", "s-990");
-        client_tunnel.send_trace_context(&trace).expect("send trace context");
+        client_tunnel
+            .send_trace_context(&trace)
+            .expect("send trace context");
 
         let frames = client_tunnel.drain_egress_data();
         assert!(!frames.is_empty());
@@ -41375,24 +41817,35 @@ mod tls_alpn_tests {
             server_tunnel.ingest_network_data(&frame);
         }
 
-        let recv_trace = server_tunnel.recv_trace_context().expect("recv trace context").expect("trace exists");
+        let recv_trace = server_tunnel
+            .recv_trace_context()
+            .expect("recv trace context")
+            .expect("trace exists");
         assert_eq!(recv_trace.trace_id, [0x33; 16]);
         assert_eq!(recv_trace.span_id, [0x44; 8]);
         assert_eq!(recv_trace.get_baggage("session_id"), Some("s-990"));
 
         // 2. Direct Prometheus and OTel export from tunnel
-        let prom = client_tunnel.export_prometheus().expect("export prometheus");
+        let prom = client_tunnel
+            .export_prometheus()
+            .expect("export prometheus");
         assert!(prom.contains("ifa_transport_rtt_seconds"));
 
-        let otel_json = client_tunnel.export_otlp_metrics(1700000000000).expect("export otlp");
+        let otel_json = client_tunnel
+            .export_otlp_metrics(1700000000000)
+            .expect("export otlp");
         assert!(otel_json.contains("resourceMetrics"));
     }
 
     #[test]
     fn test_masque_topology_binary_serialization_and_capsules() {
         // 1. GatewayNodeDescriptor roundtrip
-        let mut node = GatewayNodeDescriptor::new("gw-iad1-01", "iad1", "https://gw-iad1.masque.ifa:443");
-        node.data_endpoints = vec!["198.51.100.10:443".to_string(), "[2001:db8::10]:443".to_string()];
+        let mut node =
+            GatewayNodeDescriptor::new("gw-iad1-01", "iad1", "https://gw-iad1.masque.ifa:443");
+        node.data_endpoints = vec![
+            "198.51.100.10:443".to_string(),
+            "[2001:db8::10]:443".to_string(),
+        ];
         node.state = GatewayNodeState::Available;
         node.load_factor = 0.25;
         node.active_tunnels = 42;
@@ -41405,8 +41858,12 @@ mod tls_alpn_tests {
         assert_eq!(node, decoded_node);
 
         let cap_node = node.to_capsule();
-        assert_eq!(cap_node.capsule_type, crate::simd_parser::CapsuleType::TopologyNodeAdvertisement);
-        let from_cap_node = GatewayNodeDescriptor::from_capsule(&cap_node).expect("from capsule node");
+        assert_eq!(
+            cap_node.capsule_type,
+            crate::simd_parser::CapsuleType::TopologyNodeAdvertisement
+        );
+        let from_cap_node =
+            GatewayNodeDescriptor::from_capsule(&cap_node).expect("from capsule node");
         assert_eq!(node, from_cap_node);
 
         // 2. GatewayLinkAdvertisement roundtrip
@@ -41429,8 +41886,12 @@ mod tls_alpn_tests {
         assert_eq!(link, decoded_link);
 
         let cap_link = link.to_capsule();
-        assert_eq!(cap_link.capsule_type, crate::simd_parser::CapsuleType::TopologyLinkAdvertisement);
-        let from_cap_link = GatewayLinkAdvertisement::from_capsule(&cap_link).expect("from capsule link");
+        assert_eq!(
+            cap_link.capsule_type,
+            crate::simd_parser::CapsuleType::TopologyLinkAdvertisement
+        );
+        let from_cap_link =
+            GatewayLinkAdvertisement::from_capsule(&cap_link).expect("from capsule link");
         assert_eq!(link, from_cap_link);
 
         // 3. Probes and Sync roundtrips
@@ -41458,7 +41919,8 @@ mod tls_alpn_tests {
             since_sequence: 50,
         };
         let cap_sync_req = sync_req.to_capsule();
-        let from_cap_req = TopologySyncRequest::from_capsule(&cap_sync_req).expect("from capsule sync req");
+        let from_cap_req =
+            TopologySyncRequest::from_capsule(&cap_sync_req).expect("from capsule sync req");
         assert_eq!(sync_req, from_cap_req);
 
         let sync_resp = TopologySyncResponse {
@@ -41466,7 +41928,8 @@ mod tls_alpn_tests {
             links: vec![link],
         };
         let cap_sync_resp = sync_resp.to_capsule();
-        let from_cap_resp = TopologySyncResponse::from_capsule(&cap_sync_resp).expect("from capsule sync resp");
+        let from_cap_resp =
+            TopologySyncResponse::from_capsule(&cap_sync_resp).expect("from capsule sync resp");
         assert_eq!(sync_resp, from_cap_resp);
     }
 
@@ -41628,13 +42091,17 @@ mod tls_alpn_tests {
         add_link("gw2", "server", 100_000, 0.05, 1_000_000_000, 5);
 
         // 1. LowestLatency path should choose client -> gw1 -> gw3 -> server (30ms total)
-        let best_lat = graph.find_best_path("client", "server", PathOptimizationMetric::LowestLatency).expect("best lat");
+        let best_lat = graph
+            .find_best_path("client", "server", PathOptimizationMetric::LowestLatency)
+            .expect("best lat");
         assert_eq!(best_lat.hops, vec!["client", "gw1", "gw3", "server"]);
         assert_eq!(best_lat.total_rtt_us, 30_000);
         assert_eq!(best_lat.bottleneck_bandwidth_bps, 10_000_000_000);
 
         // 2. ShortestHops should choose client -> gw2 -> server (2 hops vs 3 hops)
-        let best_hops = graph.find_best_path("client", "server", PathOptimizationMetric::ShortestHops).expect("best hops");
+        let best_hops = graph
+            .find_best_path("client", "server", PathOptimizationMetric::ShortestHops)
+            .expect("best hops");
         assert_eq!(best_hops.hops, vec!["client", "gw2", "server"]);
 
         // 3. Mark GW1 as Maintenance -> traffic must automatically reroute via GW2
@@ -41643,7 +42110,9 @@ mod tls_alpn_tests {
         maint_gw1.sequence_number = 2;
         graph.insert_node(maint_gw1);
 
-        let rerouted = graph.find_best_path("client", "server", PathOptimizationMetric::LowestLatency).expect("rerouted");
+        let rerouted = graph
+            .find_best_path("client", "server", PathOptimizationMetric::LowestLatency)
+            .expect("rerouted");
         assert_eq!(rerouted.hops, vec!["client", "gw2", "server"]);
     }
 
@@ -41680,7 +42149,8 @@ mod tls_alpn_tests {
         add_link("B", "D", 25_000, 2_000_000_000, 202);
 
         // Find 2 Node-Disjoint paths between S and D
-        let disjoint_paths = graph.find_k_disjoint_multipaths("S", "D", 2, DisjointMode::NodeDisjoint);
+        let disjoint_paths =
+            graph.find_k_disjoint_multipaths("S", "D", 2, DisjointMode::NodeDisjoint);
         assert_eq!(disjoint_paths.len(), 2);
         assert_eq!(disjoint_paths[0].hops, vec!["S", "A", "D"]);
         assert_eq!(disjoint_paths[1].hops, vec!["S", "B", "D"]);
@@ -41694,7 +42164,8 @@ mod tls_alpn_tests {
         assert!(bonded_paths[0].weight >= bonded_paths[1].weight);
 
         // Feed directly into MultipathTunnelBondingEngine
-        let mut engine = MultipathTunnelBondingEngine::new(MultipathBalancingPolicy::WeightedRoundRobin);
+        let mut engine =
+            MultipathTunnelBondingEngine::new(MultipathBalancingPolicy::WeightedRoundRobin);
         for path in bonded_paths {
             engine.add_path(path);
         }
@@ -41713,14 +42184,18 @@ mod tls_alpn_tests {
         let mut server_engine = DistributedMasqueTopologyDiscoveryEngine::new(server_desc.clone());
 
         // Connect client and server via ExtendedConnectTunnel
-        let mut client_tunnel = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "gw-server:443");
+        let mut client_tunnel =
+            ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "gw-server:443");
         client_tunnel.mark_established();
-        let mut server_tunnel = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "gw-server:443");
+        let mut server_tunnel =
+            ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "gw-server:443");
         server_tunnel.mark_established();
 
         // 1. Announce node advertisements across tunnel
         let client_adv = client_engine.generate_node_advertisement(1_000_000);
-        client_tunnel.send_node_advertisement(&client_adv).expect("send node adv");
+        client_tunnel
+            .send_node_advertisement(&client_adv)
+            .expect("send node adv");
 
         let frames = client_tunnel.drain_egress_data();
         assert!(!frames.is_empty());
@@ -41728,7 +42203,10 @@ mod tls_alpn_tests {
             server_tunnel.ingest_network_data(&frame);
         }
 
-        let recv_node = server_tunnel.recv_node_advertisement().expect("recv node adv").expect("node exists");
+        let recv_node = server_tunnel
+            .recv_node_advertisement()
+            .expect("recv node adv")
+            .expect("node exists");
         assert_eq!(recv_node.node_id, "gw-client");
         server_engine.graph.insert_node(recv_node);
         assert_eq!(server_engine.graph.node_count(), 2);
@@ -41737,38 +42215,59 @@ mod tls_alpn_tests {
         let mut link_metrics = LinkMetrics::default();
         link_metrics.rtt_us = 85_000;
         link_metrics.bandwidth_bps = 10_000_000_000;
-        let client_link = client_engine.announce_link("gw-server", 555, LinkType::DirectQuic, link_metrics, 1_000_000);
-        client_tunnel.send_link_advertisement(&client_link).expect("send link adv");
+        let client_link = client_engine.announce_link(
+            "gw-server",
+            555,
+            LinkType::DirectQuic,
+            link_metrics,
+            1_000_000,
+        );
+        client_tunnel
+            .send_link_advertisement(&client_link)
+            .expect("send link adv");
 
         let frames2 = client_tunnel.drain_egress_data();
         for frame in frames2 {
             server_tunnel.ingest_network_data(&frame);
         }
 
-        let recv_link = server_tunnel.recv_link_advertisement().expect("recv link adv").expect("link exists");
+        let recv_link = server_tunnel
+            .recv_link_advertisement()
+            .expect("recv link adv")
+            .expect("link exists");
         assert_eq!(recv_link.source_node, "gw-client");
         assert_eq!(recv_link.target_node, "gw-server");
         server_engine.graph.insert_link(recv_link);
 
         // 3. Active path probe ping & pong
         let ping = client_engine.send_probe_ping("gw-server", 10_000_000);
-        client_tunnel.send_topology_probe_ping(&ping).expect("send ping");
+        client_tunnel
+            .send_topology_probe_ping(&ping)
+            .expect("send ping");
 
         let frames3 = client_tunnel.drain_egress_data();
         for frame in frames3 {
             server_tunnel.ingest_network_data(&frame);
         }
 
-        let recv_ping = server_tunnel.recv_topology_probe_ping().expect("recv ping").expect("ping exists");
+        let recv_ping = server_tunnel
+            .recv_topology_probe_ping()
+            .expect("recv ping")
+            .expect("ping exists");
         let pong = server_engine.handle_probe_ping(&recv_ping, 10_020_000);
-        server_tunnel.send_topology_probe_pong(&pong).expect("send pong");
+        server_tunnel
+            .send_topology_probe_pong(&pong)
+            .expect("send pong");
 
         let frames4 = server_tunnel.drain_egress_data();
         for frame in frames4 {
             client_tunnel.ingest_network_data(&frame);
         }
 
-        let recv_pong = client_tunnel.recv_topology_probe_pong().expect("recv pong").expect("pong exists");
+        let recv_pong = client_tunnel
+            .recv_topology_probe_pong()
+            .expect("recv pong")
+            .expect("pong exists");
         let measured_rtt_us = client_engine.handle_probe_pong(&recv_pong, 10_040_000, 1_000_000);
         assert_eq!(measured_rtt_us, Some(40)); // (10_040_000 - 10_000_000) ns / 1000 = 40 us
 
@@ -41777,23 +42276,35 @@ mod tls_alpn_tests {
             requester_node: "gw-client".to_string(),
             since_sequence: 0,
         };
-        client_tunnel.send_topology_sync_request(&sync_req).expect("send sync req");
+        client_tunnel
+            .send_topology_sync_request(&sync_req)
+            .expect("send sync req");
 
         let frames5 = client_tunnel.drain_egress_data();
         for frame in frames5 {
             server_tunnel.ingest_network_data(&frame);
         }
 
-        let recv_sync_req = server_tunnel.recv_topology_sync_request().expect("recv sync req").expect("req exists");
-        let sync_resp = server_engine.graph.generate_sync_response(recv_sync_req.since_sequence);
-        server_tunnel.send_topology_sync_response(&sync_resp).expect("send sync resp");
+        let recv_sync_req = server_tunnel
+            .recv_topology_sync_request()
+            .expect("recv sync req")
+            .expect("req exists");
+        let sync_resp = server_engine
+            .graph
+            .generate_sync_response(recv_sync_req.since_sequence);
+        server_tunnel
+            .send_topology_sync_response(&sync_resp)
+            .expect("send sync resp");
 
         let frames6 = server_tunnel.drain_egress_data();
         for frame in frames6 {
             client_tunnel.ingest_network_data(&frame);
         }
 
-        let recv_sync_resp = client_tunnel.recv_topology_sync_response().expect("recv sync resp").expect("resp exists");
+        let recv_sync_resp = client_tunnel
+            .recv_topology_sync_response()
+            .expect("recv sync resp")
+            .expect("resp exists");
         assert!(!recv_sync_resp.nodes.is_empty());
         assert!(!recv_sync_resp.links.is_empty());
     }
@@ -41804,7 +42315,8 @@ mod tls_alpn_tests {
         let mut node_b = MultiNodeSessionSyncEngine::new("gw-node-b");
 
         // 1. Register session on Primary node A
-        let session_rec = node_a.register_primary_session("sess-alpha-01", "client-99", 5001, 10_000);
+        let session_rec =
+            node_a.register_primary_session("sess-alpha-01", "client-99", 5001, 10_000);
         assert_eq!(session_rec.role, SessionRole::Primary);
         assert_eq!(session_rec.snapshot.state_epoch, 1);
 
@@ -41817,12 +42329,16 @@ mod tls_alpn_tests {
         assert_eq!(announce.snapshot.rx_highest_seq, 85);
 
         // 3. Transmit announcement across ExtendedConnectTunnel
-        let mut tunnel_a = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "gw-node-b:443");
+        let mut tunnel_a =
+            ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "gw-node-b:443");
         tunnel_a.mark_established();
-        let mut tunnel_b = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "gw-node-b:443");
+        let mut tunnel_b =
+            ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "gw-node-b:443");
         tunnel_b.mark_established();
 
-        tunnel_a.send_session_state_sync(&announce).expect("send sync");
+        tunnel_a
+            .send_session_state_sync(&announce)
+            .expect("send sync");
         for f in tunnel_a.drain_egress_data() {
             tunnel_b.ingest_network_data(&f);
         }
@@ -41850,7 +42366,9 @@ mod tls_alpn_tests {
             session_id: "sess-alpha-01".to_string(),
             known_epoch: 1,
         };
-        let sync_resp = node_a.handle_sync_request(&req).expect("sync snapshot returned");
+        let sync_resp = node_a
+            .handle_sync_request(&req)
+            .expect("sync snapshot returned");
         assert_eq!(sync_resp.snapshot.state_epoch, 2);
     }
 
@@ -41873,44 +42391,79 @@ mod tls_alpn_tests {
 
         // 2. Step 1: Initiate migration from Node A to Node B
         let init_cmd = mig_mgr_a
-            .initiate_migration(&mut engine_a, "sess-live-99", "gw-fra2", MigrationTriggerReason::LinkDegradation, 1_200)
+            .initiate_migration(
+                &mut engine_a,
+                "sess-live-99",
+                "gw-fra2",
+                MigrationTriggerReason::LinkDegradation,
+                1_200,
+            )
             .expect("initiate migration");
 
-        tunnel_a.send_flow_migration_initiate(&init_cmd).expect("send init");
+        tunnel_a
+            .send_flow_migration_initiate(&init_cmd)
+            .expect("send init");
         for f in tunnel_a.drain_egress_data() {
             tunnel_b.ingest_network_data(&f);
         }
-        let recv_init = tunnel_b.recv_flow_migration_initiate().expect("recv init").expect("exists");
+        let recv_init = tunnel_b
+            .recv_flow_migration_initiate()
+            .expect("recv init")
+            .expect("exists");
 
         // 3. Step 2: Handle initiate on Node B and respond with PrepareAck
         let prep_ack = mig_mgr_b
-            .handle_migration_initiate(&mut engine_b, &recv_init, "https://gw-fra2:8443/tunnel", 1_210)
+            .handle_migration_initiate(
+                &mut engine_b,
+                &recv_init,
+                "https://gw-fra2:8443/tunnel",
+                1_210,
+            )
             .expect("handle initiate");
         assert!(prep_ack.ready);
 
-        tunnel_b.send_flow_migration_prepare_ack(&prep_ack).expect("send prepare ack");
+        tunnel_b
+            .send_flow_migration_prepare_ack(&prep_ack)
+            .expect("send prepare ack");
         for f in tunnel_b.drain_egress_data() {
             tunnel_a.ingest_network_data(&f);
         }
-        let recv_prep_ack = tunnel_a.recv_flow_migration_prepare_ack().expect("recv prepare ack").expect("exists");
+        let recv_prep_ack = tunnel_a
+            .recv_flow_migration_prepare_ack()
+            .expect("recv prepare ack")
+            .expect("exists");
 
         // 4. Step 3: Handle prepare ack on Node A and issue Cutover
         let cutover_cmd = mig_mgr_a
             .handle_prepare_ack(&mut engine_a, &recv_prep_ack, 1_220)
             .expect("handle prepare ack");
 
-        tunnel_a.send_flow_migration_cutover(&cutover_cmd).expect("send cutover");
+        tunnel_a
+            .send_flow_migration_cutover(&cutover_cmd)
+            .expect("send cutover");
         for f in tunnel_a.drain_egress_data() {
             tunnel_b.ingest_network_data(&f);
         }
-        let recv_cutover = tunnel_b.recv_flow_migration_cutover().expect("recv cutover").expect("exists");
+        let recv_cutover = tunnel_b
+            .recv_flow_migration_cutover()
+            .expect("recv cutover")
+            .expect("exists");
 
-        mig_mgr_b.handle_cutover(&mut engine_b, &recv_cutover, 1_230).expect("handle cutover");
+        mig_mgr_b
+            .handle_cutover(&mut engine_b, &recv_cutover, 1_230)
+            .expect("handle cutover");
 
         // 5. Datagram forwarding in-flight (zero packet loss):
         // Datagram #51 arrives at old node A during cutover window
         let forwarded_dgram = mig_mgr_a
-            .forward_transit_datagram(&mut engine_a, "sess-live-99", 51, 1, b"in_flight_datagram_51".to_vec(), 1_235)
+            .forward_transit_datagram(
+                &mut engine_a,
+                "sess-live-99",
+                51,
+                1,
+                b"in_flight_datagram_51".to_vec(),
+                1_235,
+            )
             .expect("forward datagram");
 
         // Datagram ingested seamlessly on target Node B
@@ -41921,15 +42474,32 @@ mod tls_alpn_tests {
 
         // Direct datagram #52 arrives on target Node B
         let ingested_direct = mig_mgr_b
-            .ingest_direct_datagram(&mut engine_b, "sess-live-99", 52, 1, b"direct_datagram_52".to_vec(), 1_245)
+            .ingest_direct_datagram(
+                &mut engine_b,
+                "sess-live-99",
+                52,
+                1,
+                b"direct_datagram_52".to_vec(),
+                1_245,
+            )
             .expect("ingest direct");
         assert!(ingested_direct);
 
         // Deduplication test: re-injecting seq #51 is cleanly dropped
         let duplicate = mig_mgr_b
-            .ingest_direct_datagram(&mut engine_b, "sess-live-99", 51, 1, b"duplicate_51".to_vec(), 1_250)
+            .ingest_direct_datagram(
+                &mut engine_b,
+                "sess-live-99",
+                51,
+                1,
+                b"duplicate_51".to_vec(),
+                1_250,
+            )
             .expect("ingest direct duplicate");
-        assert!(!duplicate, "Duplicate datagram must be detected and rejected");
+        assert!(
+            !duplicate,
+            "Duplicate datagram must be detected and rejected"
+        );
 
         // 6. Step 4: Finalize migration from Node B
         let complete_cmd = mig_mgr_b
@@ -41937,25 +42507,37 @@ mod tls_alpn_tests {
             .expect("finalize migration");
         assert_eq!(complete_cmd.forwarded_packets_received, 1);
 
-        tunnel_b.send_flow_migration_complete(&complete_cmd).expect("send complete");
+        tunnel_b
+            .send_flow_migration_complete(&complete_cmd)
+            .expect("send complete");
         for f in tunnel_b.drain_egress_data() {
             tunnel_a.ingest_network_data(&f);
         }
-        let recv_complete = tunnel_a.recv_flow_migration_complete().expect("recv complete").expect("exists");
+        let recv_complete = tunnel_a
+            .recv_flow_migration_complete()
+            .expect("recv complete")
+            .expect("exists");
 
         mig_mgr_a
             .handle_migration_complete(&mut engine_a, &recv_complete, 1_270)
             .expect("handle complete on source");
 
         // 7. Verify end-state: Node B is Primary, Node A is Standby, packets delivered
-        let session_b = engine_b.get_session("sess-live-99").expect("session b exists");
+        let session_b = engine_b
+            .get_session("sess-live-99")
+            .expect("session b exists");
         assert_eq!(session_b.role, SessionRole::Primary);
-        assert_eq!(session_b.snapshot.migration_phase, SessionMigrationPhase::Completed);
+        assert_eq!(
+            session_b.snapshot.migration_phase,
+            SessionMigrationPhase::Completed
+        );
         assert_eq!(session_b.delivered_packets.len(), 2);
         assert_eq!(session_b.delivered_packets[0].0, 51);
         assert_eq!(session_b.delivered_packets[1].0, 52);
 
-        let session_a = engine_a.get_session("sess-live-99").expect("session a exists");
+        let session_a = engine_a
+            .get_session("sess-live-99")
+            .expect("session a exists");
         assert_eq!(session_a.role, SessionRole::Standby);
 
         // Telemetry checks
@@ -41974,7 +42556,13 @@ mod tls_alpn_tests {
         engine_a.register_primary_session("sess-abort-01", "client-7", 200, 5_000);
 
         let init = mig_mgr
-            .initiate_migration(&mut engine_a, "sess-abort-01", "gw-node-2", MigrationTriggerReason::OperatorManual, 5_100)
+            .initiate_migration(
+                &mut engine_a,
+                "sess-abort-01",
+                "gw-node-2",
+                MigrationTriggerReason::OperatorManual,
+                5_100,
+            )
             .expect("initiate");
 
         // Target initializes
@@ -41996,7 +42584,10 @@ mod tls_alpn_tests {
         // Primary role restored on source
         let restored = engine_a.get_session("sess-abort-01").expect("exists");
         assert_eq!(restored.role, SessionRole::Primary);
-        assert_eq!(restored.snapshot.migration_phase, SessionMigrationPhase::Aborted);
+        assert_eq!(
+            restored.snapshot.migration_phase,
+            SessionMigrationPhase::Aborted
+        );
 
         // Cleaned up from target
         assert!(engine_b.get_session("sess-abort-01").is_none());
