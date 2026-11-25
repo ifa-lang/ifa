@@ -1449,8 +1449,7 @@ mod tests {
         assert!(body.contains("interface=\"eth0-wan\""));
 
         // 2. /metrics with application/json (OTLP JSON)
-        let (code2, ctype2, body2) =
-            handler.handle_snapshot("/metrics", "application/json", &snap);
+        let (code2, ctype2, body2) = handler.handle_snapshot("/metrics", "application/json", &snap);
         assert_eq!(code2, 200);
         assert_eq!(ctype2, "application/json");
         assert!(body2.contains("\"resourceMetrics\""));
@@ -1512,8 +1511,10 @@ mod tests {
 
             // 2. GET /v1/metrics (OTLP JSON)
             let mut s2 = TcpStream::connect(addr).expect("connect to telemetry server 2");
-            s2.write_all(b"GET /v1/metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n")
-                .unwrap();
+            s2.write_all(
+                b"GET /v1/metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n",
+            )
+            .unwrap();
             let mut resp2 = String::new();
             s2.read_to_string(&mut resp2).unwrap();
             assert!(resp2.starts_with("HTTP/1.1 200 OK\r\n"));

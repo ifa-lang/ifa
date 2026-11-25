@@ -12971,16 +12971,16 @@ impl ExtendedConnectTunnel {
         if let Some(ref telem) = self.telemetry {
             telem.handle_http_metrics(path, accept_header, timestamp_nanos)
         } else {
-            (503, "text/plain; charset=utf-8", "Telemetry unconfigured\n".to_string())
+            (
+                503,
+                "text/plain; charset=utf-8",
+                "Telemetry unconfigured\n".to_string(),
+            )
         }
     }
 
     /// Process a raw HTTP request string and return the HTTP 1.1 formatted response with Prometheus/OTel payload.
-    pub fn handle_raw_http_metrics(
-        &mut self,
-        raw_request: &str,
-        timestamp_nanos: u64,
-    ) -> String {
+    pub fn handle_raw_http_metrics(&mut self, raw_request: &str, timestamp_nanos: u64) -> String {
         let mut path = "/metrics";
         let mut accept = "*/*";
         for line in raw_request.lines() {
@@ -42184,9 +42184,13 @@ mod tls_alpn_tests {
             .set_multipath_routing_policy(ifa_runtime::IsspRoutingPolicy::BandwidthAggregation)
             .unwrap();
         issp_reg
-            .add_multipath_route(ifa_runtime::IsspMultipathRoute::new(1, 2, "eth0-wan", 1, 100))
+            .add_multipath_route(ifa_runtime::IsspMultipathRoute::new(
+                1, 2, "eth0-wan", 1, 100,
+            ))
             .unwrap();
-        let issp_snap = issp_reg.multipath_balancing_snapshot(1700000000000).unwrap();
+        let issp_snap = issp_reg
+            .multipath_balancing_snapshot(1700000000000)
+            .unwrap();
 
         if let Some(ref mut t) = client_tunnel.telemetry {
             t.record_issp_multipath_balancing(&issp_snap);
