@@ -1195,5 +1195,52 @@ fn test_cli_net_session_list_inspect_migrate() {
     assert_eq!(agg_val["all_sessions_strictly_in_order"], true);
     assert_eq!(agg_val["paths"].as_array().unwrap().len(), 2);
 
+    // 16. Test `ifa net session probation` table output
+    let prob_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("probation")
+        .arg("--flaps")
+        .arg("2")
+        .arg("--duration-ms")
+        .arg("2000")
+        .arg("--probes")
+        .arg("4")
+        .output()
+        .expect("execute probation");
+    assert!(
+        prob_out.status.success(),
+        "probation failed: {}",
+        String::from_utf8_lossy(&prob_out.stderr)
+    );
+    let prob_str = String::from_utf8_lossy(&prob_out.stdout);
+    assert!(prob_str.contains("ISSP ROUTE FLAPPING DAMPING & PROGRESSIVE PROBATION"));
+    assert!(prob_str.contains("ROUTE FLAPPING DAMPING ESCALATION & SUPPRESSION"));
+    assert!(prob_str.contains("EXPONENTIAL DECAY & PROBATION PROGRESSION"));
+    assert!(prob_str.contains("PATH PROBATION GRADUATED & REINTEGRATED"));
+
+    // 17. Test `ifa net session probation --json`
+    let prob_json_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("probation")
+        .arg("--flaps")
+        .arg("2")
+        .arg("--duration-ms")
+        .arg("2000")
+        .arg("--probes")
+        .arg("4")
+        .arg("--json")
+        .output()
+        .expect("execute probation json");
+    assert!(prob_json_out.status.success());
+    let prob_val: serde_json::Value =
+        serde_json::from_slice(&prob_json_out.stdout).expect("valid JSON probation output");
+    assert_eq!(prob_val["flaps_requested"], 2);
+    assert_eq!(prob_val["entered_probation"], true);
+    assert_eq!(prob_val["graduated"], true);
+    assert_eq!(prob_val["probation_steps"].as_array().unwrap().len(), 4);
+    assert_eq!(prob_val["telemetry"]["total_paths"], 2);
+
     let _ = fs::remove_dir_all(&temp_dir);
 }

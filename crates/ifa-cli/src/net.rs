@@ -3,9 +3,9 @@
 use clap::Subcommand;
 use ifa_runtime::{
     run_issp_failover_benchmark_suite, run_issp_scenario, IsspCapsule,
-    IsspFailoverBenchmarkSuiteReport, IsspHeartbeatProbe, IsspMultipathRoute,
-    IsspMultipathTelemetry, IsspNetworkProfile, IsspPathState, IsspRoutingPolicy, SecurityPolicy,
-    SessionId, SessionRecord, SessionRegistry, SessionSnapshot,
+    IsspFailoverBenchmarkSuiteReport, IsspFlapDampingConfig, IsspHeartbeatProbe,
+    IsspMultipathRoute, IsspNetworkProfile, IsspPathState, IsspProbationConfig, IsspRoutingPolicy,
+    SecurityPolicy, SessionId, SessionRecord, SessionRegistry, SessionSnapshot,
 };
 use serde_json::json;
 use std::fs;
@@ -108,6 +108,24 @@ pub enum SessionCommand {
         /// Differential latency skew in milliseconds between primary and secondary paths
         #[arg(long, default_value = "35")]
         skew_ms: u64,
+        /// Path to persistent cluster state dump (.issp or binary dump)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+        /// Output formatted as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Benchmark route flapping damping and progressive path probation reintegration
+    Probation {
+        /// Number of route flaps to simulate
+        #[arg(long, default_value = "2")]
+        flaps: u32,
+        /// Probation duration in milliseconds
+        #[arg(long, default_value = "3000")]
+        duration_ms: u64,
+        /// Number of consecutive test probes to simulate during probation
+        #[arg(long, default_value = "4")]
+        probes: u32,
         /// Path to persistent cluster state dump (.issp or binary dump)
         #[arg(short, long)]
         file: Option<PathBuf>,
@@ -662,20 +680,7 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 }
             }
 
-            let telem = registry
-                .multipath_telemetry()
-                .unwrap_or(IsspMultipathTelemetry {
-                    total_paths: 0,
-                    active_paths: 0,
-                    standby_paths: 0,
-                    degraded_paths: 0,
-                    failed_paths: 0,
-                    total_failovers: 0,
-                    total_heartbeats_sent: 0,
-                    total_heartbeats_received: 0,
-                    total_sessions_bound: 0,
-                    routes: Vec::new(),
-                });
+            let telem = registry.multipath_telemetry().unwrap_or_default();
 
             if json {
                 let val = json!({
@@ -863,20 +868,7 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
 
             let reseq_telem = registry.resequencing_telemetry(None).unwrap_or(None);
 
-            let route_telem = registry
-                .multipath_telemetry()
-                .unwrap_or(IsspMultipathTelemetry {
-                    total_paths: 0,
-                    active_paths: 0,
-                    standby_paths: 0,
-                    degraded_paths: 0,
-                    failed_paths: 0,
-                    total_failovers: 0,
-                    total_heartbeats_sent: 0,
-                    total_heartbeats_received: 0,
-                    total_sessions_bound: 0,
-                    routes: Vec::new(),
-                });
+            let route_telem = registry.multipath_telemetry().unwrap_or_default();
 
             if json {
                 let val = json!({
@@ -964,6 +956,251 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                     println!("\nStatus: 100% IN-ORDER DELIVERY GUARANTEED (ZERO PACKET LOSS UNDER ASYMMETRIC SKEW)\n");
                 } else {
                     println!("\nStatus: RESEQUENCING INTEGRITY CHECK FAILED\n");
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        SessionCommand::Probation {
+            flaps,
+            duration_ms,
+            probes,
+            file,
+            json,
+        } => {
+            let registry = match resolve_state_file(file.as_ref()) {
+                Some(p) => SessionRegistry::load_from_file(&p).unwrap_or_else(|_| {
+                    eprintln!(
+                        "Warning: failed loading state from {:?}, using active registry",
+                        p
+                    );
+                    SessionRegistry::new(1)
+                }),
+                None => SessionRegistry::new(1),
+            };
+
+            let now_ms = current_unix_secs() * 1000;
+
+            // Configure Damping and Probation on the router
+            let mut r_fiber = IsspMultipathRoute::new(1, 10, "eth0-fiber-wan", 1, 100)
+                .with_state(IsspPathState::Active)
+                .with_heartbeat_config(500, 1500, 3);
+            r_fiber.metrics.last_heartbeat_recv_unix_ms = now_ms;
+
+            let mut r_5g = IsspMultipathRoute::new(2, 10, "wwan0-5g-edge", 2, 50)
+                .with_state(IsspPathState::Standby)
+                .with_heartbeat_config(500, 15000, 3);
+            r_5g.metrics.last_heartbeat_recv_unix_ms = now_ms;
+
+            let _ = registry.add_multipath_route(r_fiber);
+            let _ = registry.add_multipath_route(r_5g);
+
+            let damping_cfg = IsspFlapDampingConfig {
+                enabled: true,
+                flap_penalty: 1000.0,
+                suppress_threshold: 1800.0,
+                reuse_threshold: 750.0,
+                half_life_ms: 10_000,
+                max_suppress_penalty: 5000.0,
+            };
+            let probation_cfg = IsspProbationConfig {
+                enabled: true,
+                probation_duration_ms: duration_ms,
+                min_successful_probes: probes,
+                initial_weight_ratio: 0.20,
+                max_loss_ppm_tolerance: 10_000,
+            };
+
+            let _ = registry.configure_multipath_flap_damping(damping_cfg.clone());
+            let _ = registry.configure_multipath_probation(probation_cfg.clone());
+
+            let mut flap_simulation_events = Vec::new();
+            let mut probation_steps = Vec::new();
+            let mut graduation_event = None;
+
+            // 1. Simulate flaps
+            let flap_count = flaps.clamp(1, 10);
+            let mut sim_clock = now_ms;
+            for flap_idx in 1..=flap_count {
+                sim_clock += 1_000;
+                // Force failure
+                if let Ok(mut router) = registry.multipath_router.lock() {
+                    if let Some(r) = router.get_route_mut(1) {
+                        r.metrics.consecutive_missed_heartbeats = 3;
+                    }
+                    let evs = router.evaluate_heartbeats_and_failover(sim_clock);
+                    if let Some(r) = router.get_route(1) {
+                        flap_simulation_events.push((
+                            flap_idx,
+                            r.flap_state.penalty,
+                            r.flap_state.is_suppressed,
+                            r.state,
+                            evs.len(),
+                        ));
+                    }
+                }
+                // Try recovery pong immediately after each flap (except the last if suppressed)
+                if flap_idx < flap_count {
+                    sim_clock += 200;
+                    let pong =
+                        IsspHeartbeatProbe::new(10, 1, flap_idx as u64, sim_clock - 50, true);
+                    let _ = registry.handle_heartbeat_probe(&pong, sim_clock);
+                }
+            }
+
+            // 2. Check suppressed state
+            let suppressed_before_decay = registry
+                .multipath_router
+                .lock()
+                .ok()
+                .and_then(|r| r.get_route(1).map(|p| p.flap_state.is_suppressed))
+                .unwrap_or(false);
+
+            // 3. Fast-forward simulated decay time (25 seconds) to allow reuse
+            sim_clock += 25_000;
+
+            // 4. Recovery pong after decay -> enters Probation
+            let recovery_pong = IsspHeartbeatProbe::new(10, 1, 999, sim_clock - 30, true);
+            let _ = registry.handle_heartbeat_probe(&recovery_pong, sim_clock);
+
+            let entered_probation = registry
+                .multipath_router
+                .lock()
+                .ok()
+                .and_then(|r| r.get_route(1).map(|p| p.state == IsspPathState::Probation))
+                .unwrap_or(false);
+
+            // 5. Simulate probation probes and ramp-up
+            let probe_step = (duration_ms / probes.max(1) as u64).max(100);
+            for p_idx in 1..=probes {
+                sim_clock += probe_step;
+                let step_pong =
+                    IsspHeartbeatProbe::new(10, 1, 1000 + p_idx as u64, sim_clock - 20, true);
+                let _ = registry.handle_heartbeat_probe(&step_pong, sim_clock);
+
+                if let Ok(router) = registry.multipath_router.lock() {
+                    if let Some(r) = router.get_route(1) {
+                        probation_steps.push((
+                            p_idx,
+                            r.state,
+                            r.probation_state.weight_ratio * 100.0,
+                            r.effective_weight(),
+                            (r.metrics.smoothed_rtt_us as f64) / 1000.0,
+                        ));
+                    }
+                }
+            }
+
+            // Check final graduation
+            if let Ok(router) = registry.multipath_router.lock() {
+                graduation_event = router.reintegration_history().last().cloned();
+            }
+
+            let telem = registry.multipath_telemetry().unwrap_or_default();
+
+            if json {
+                let val = json!({
+                    "flaps_requested": flaps,
+                    "probation_duration_ms": duration_ms,
+                    "target_probes": probes,
+                    "suppressed_before_decay": suppressed_before_decay,
+                    "entered_probation": entered_probation,
+                    "flap_events": flap_simulation_events.iter().map(|(idx, pen, supp, state, fo)| json!({
+                        "flap_index": idx,
+                        "penalty": pen,
+                        "is_suppressed": supp,
+                        "state": format!("{:?}", state),
+                        "failover_triggered": fo > &0,
+                    })).collect::<Vec<_>>(),
+                    "probation_steps": probation_steps.iter().map(|(idx, st, ratio, eff_w, rtt)| json!({
+                        "probe": idx,
+                        "state": format!("{:?}", st),
+                        "weight_ratio_pct": ratio,
+                        "effective_weight": eff_w,
+                        "smoothed_rtt_ms": rtt,
+                    })).collect::<Vec<_>>(),
+                    "graduated": graduation_event.is_some(),
+                    "graduation_event": graduation_event.map(|g| json!({
+                        "path_id": g.path_id,
+                        "duration_ms": g.probation_duration_ms,
+                        "successful_probes": g.successful_probes,
+                        "final_rtt_us": g.final_rtt_us,
+                        "restored_state": format!("{:?}", g.restored_state),
+                    })),
+                    "telemetry": {
+                        "total_paths": telem.total_paths,
+                        "active_paths": telem.active_paths,
+                        "standby_paths": telem.standby_paths,
+                        "probation_paths": telem.probation_paths,
+                        "suppressed_paths": telem.suppressed_paths,
+                        "total_failovers": telem.total_failovers,
+                        "total_flaps": telem.total_flaps,
+                        "total_reintegrations": telem.total_reintegrations,
+                    }
+                });
+                println!("{}", serde_json::to_string_pretty(&val).unwrap());
+            } else {
+                println!("\n=== ISSP ROUTE FLAPPING DAMPING & PROGRESSIVE PROBATION ===");
+                println!(
+                    "Flaps: {} | Half-life: {}s | Suppress Threshold: {} | Reuse Threshold: {}",
+                    flaps,
+                    damping_cfg.half_life_ms / 1000,
+                    damping_cfg.suppress_threshold,
+                    damping_cfg.reuse_threshold
+                );
+
+                println!("\n[1. ROUTE FLAPPING DAMPING ESCALATION & SUPPRESSION]");
+                println!("| Flap # | Penalty Score | Damped/Suppressed | Path State | Failover Triggered |");
+                println!("| :---: | :---: | :---: | :---: | :---: |");
+                for (idx, pen, supp, state, fo) in &flap_simulation_events {
+                    println!(
+                        "| Flap {} | {:.1} / {:.0} | **{}** | {:?} | {} |",
+                        idx,
+                        pen,
+                        damping_cfg.suppress_threshold,
+                        if *supp {
+                            "YES (DAMPED)"
+                        } else {
+                            "NO (RECOVERABLE)"
+                        },
+                        state,
+                        if *fo > 0 { "YES" } else { "NO" }
+                    );
+                }
+
+                println!("\n[2. EXPONENTIAL DECAY & PROBATION PROGRESSION]");
+                println!(
+                    "- Decay Window:       25.0s (penalty reduced below reuse threshold {:.0})",
+                    damping_cfg.reuse_threshold
+                );
+                println!("- Probation Window:   {} ms", duration_ms);
+                println!("- Required Probes:    {}", probes);
+
+                println!("\n| Probe # | Path State | Progressive Traffic Ramp | Effective Weight | Smooth RTT |");
+                println!("| :---: | :---: | :---: | :---: | :---: |");
+                for (p_idx, st, ratio, eff_w, rtt) in &probation_steps {
+                    println!(
+                        "| Probe {} | **{:?}** | {:.1}% | {} / 100 | {:.2} ms |",
+                        p_idx, st, ratio, eff_w, rtt
+                    );
+                }
+
+                if let Some(ref g) = graduation_event {
+                    println!("\n[PATH PROBATION GRADUATED & REINTEGRATED]");
+                    println!("- Reintegrated Path: #{}", g.path_id);
+                    println!("- Verified Probes:   {} probes", g.successful_probes);
+                    println!(
+                        "- Stabilized RTT:    {:.2} ms",
+                        (g.final_rtt_us as f64) / 1000.0
+                    );
+                    println!(
+                        "- Restored Status:   {:?} (100% Nominal Traffic Restored)",
+                        g.restored_state
+                    );
+                    println!(
+                        "\nStatus: ROUTE FLAP DAMPING & PROGRESSIVE REINTEGRATION FULLY VALIDATED\n"
+                    );
+                } else {
+                    println!("\nStatus: PROBATION IN PROGRESS\n");
                 }
             }
             ExitCode::SUCCESS

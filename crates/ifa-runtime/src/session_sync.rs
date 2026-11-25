@@ -820,14 +820,16 @@ pub enum IsspPathState {
     Standby,
     /// Experiencing elevated packet loss or latency jitter, but still functional.
     Degraded,
-    /// Heartbeat timed out or link severed; excluded from routing.
+    /// In progressive probation phase following recovery, receiving ramping traffic.
+    Probation,
+    /// Heartbeat timed out, link severed, or suppressed by flap damping; excluded from routing.
     Failed,
 }
 
 impl IsspPathState {
     /// Whether this path is operational and eligible to carry datagram sessions.
     pub fn is_usable(&self) -> bool {
-        matches!(self, Self::Active | Self::Degraded)
+        matches!(self, Self::Active | Self::Degraded | Self::Probation)
     }
 }
 
@@ -888,6 +890,7 @@ impl IsspPathMetrics {
         let state_mult = match state {
             IsspPathState::Active => 1.0,
             IsspPathState::Degraded => 0.35,
+            IsspPathState::Probation => 0.40,
             IsspPathState::Standby => 0.1,
             IsspPathState::Failed => 0.0,
         };
@@ -916,6 +919,248 @@ impl IsspPathMetrics {
     }
 }
 
+/// Configuration for Route Flapping Damping (RFC 2439 adapted for multipath transport).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspFlapDampingConfig {
+    /// Whether route flap damping is active. Default: true.
+    pub enabled: bool,
+    /// Penalty points added on each path failure / flap. Default: 1000.0.
+    pub flap_penalty: f64,
+    /// Penalty threshold above which the route is suppressed/damped. Default: 2000.0.
+    pub suppress_threshold: f64,
+    /// Penalty threshold below which a suppressed route is eligible for reuse/probation. Default: 750.0.
+    pub reuse_threshold: f64,
+    /// Half-life in milliseconds for exponential penalty decay. Default: 15_000 ms.
+    pub half_life_ms: u64,
+    /// Maximum penalty ceiling to avoid indefinite suppression. Default: 6000.0.
+    pub max_suppress_penalty: f64,
+}
+
+impl Default for IsspFlapDampingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            flap_penalty: 1000.0,
+            suppress_threshold: 2000.0,
+            reuse_threshold: 750.0,
+            half_life_ms: 15_000,
+            max_suppress_penalty: 6000.0,
+        }
+    }
+}
+
+/// Dynamic flap damping tracking state per member path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspRouteFlapState {
+    /// Total cumulative route failover flap events recorded.
+    pub flap_count: u32,
+    /// Current decayed flapping penalty score.
+    pub penalty: f64,
+    /// Timestamp of the most recent flap event in unix ms.
+    pub last_flap_unix_ms: u64,
+    /// Timestamp of the last exponential decay evaluation in unix ms.
+    pub last_decay_unix_ms: u64,
+    /// Whether the route is currently suppressed/damped due to excessive flapping.
+    pub is_suppressed: bool,
+}
+
+impl Default for IsspRouteFlapState {
+    fn default() -> Self {
+        Self {
+            flap_count: 0,
+            penalty: 0.0,
+            last_flap_unix_ms: 0,
+            last_decay_unix_ms: 0,
+            is_suppressed: false,
+        }
+    }
+}
+
+impl IsspRouteFlapState {
+    /// Apply exponential decay to the flapping penalty based on elapsed time.
+    pub fn decay(&mut self, now_ms: u64, config: &IsspFlapDampingConfig) {
+        if !config.enabled || self.penalty <= 0.0 {
+            self.last_decay_unix_ms = now_ms;
+            return;
+        }
+        if self.last_decay_unix_ms == 0 {
+            self.last_decay_unix_ms = now_ms;
+            return;
+        }
+        if now_ms <= self.last_decay_unix_ms {
+            return;
+        }
+
+        let elapsed_ms = (now_ms - self.last_decay_unix_ms) as f64;
+        let half_life_ms = config.half_life_ms.max(1) as f64;
+        let decay_factor = (0.5f64).powf(elapsed_ms / half_life_ms);
+        self.penalty *= decay_factor;
+        self.last_decay_unix_ms = now_ms;
+
+        // If suppressed and penalty falls below reuse threshold, clear suppression
+        if self.is_suppressed && self.penalty <= config.reuse_threshold {
+            self.is_suppressed = false;
+        }
+    }
+
+    /// Record a new route flap (failure event) and update penalty and suppression state.
+    pub fn record_flap(&mut self, now_ms: u64, config: &IsspFlapDampingConfig) {
+        self.decay(now_ms, config);
+        if !config.enabled {
+            self.flap_count += 1;
+            self.last_flap_unix_ms = now_ms;
+            self.last_decay_unix_ms = now_ms;
+            return;
+        }
+
+        self.flap_count += 1;
+        self.penalty = (self.penalty + config.flap_penalty).min(config.max_suppress_penalty);
+        self.last_flap_unix_ms = now_ms;
+        self.last_decay_unix_ms = now_ms;
+
+        if self.penalty >= config.suppress_threshold {
+            self.is_suppressed = true;
+        }
+    }
+}
+
+/// Configuration for path probation and progressive traffic reintegration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspProbationConfig {
+    /// Whether progressive probation is enabled.
+    pub enabled: bool,
+    /// Duration in milliseconds a recovered path must spend in probation before full reintegration.
+    pub probation_duration_ms: u64,
+    /// Minimum consecutive successful heartbeat pongs required to graduate from probation.
+    pub min_successful_probes: u32,
+    /// Initial traffic weight ratio allocated upon entering probation (e.g. 0.20 = 20%).
+    pub initial_weight_ratio: f64,
+    /// Maximum tolerated packet loss rate (ppm) during probation. Default: 20_000 (2.0%).
+    pub max_loss_ppm_tolerance: u32,
+}
+
+impl Default for IsspProbationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            probation_duration_ms: 5_000,
+            min_successful_probes: 5,
+            initial_weight_ratio: 0.20,
+            max_loss_ppm_tolerance: 20_000,
+        }
+    }
+}
+
+/// Dynamic probation tracking state per member path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspProbationState {
+    /// Whether the path is actively undergoing progressive probation.
+    pub in_probation: bool,
+    /// Timestamp when probation started in unix ms.
+    pub entered_unix_ms: u64,
+    /// Timestamp of most recent successful probe in unix ms.
+    pub last_probe_unix_ms: u64,
+    /// Number of consecutive successful probes during this probation window.
+    pub successful_probes: u32,
+    /// Current progressive traffic weight ratio (ramping from initial_weight_ratio up to 1.0).
+    pub weight_ratio: f64,
+    /// Whether probation was successfully completed and graduated.
+    pub is_graduated: bool,
+}
+
+impl Default for IsspProbationState {
+    fn default() -> Self {
+        Self {
+            in_probation: false,
+            entered_unix_ms: 0,
+            last_probe_unix_ms: 0,
+            successful_probes: 0,
+            weight_ratio: 1.0,
+            is_graduated: false,
+        }
+    }
+}
+
+impl IsspProbationState {
+    /// Start progressive probation on a recovered path.
+    pub fn start(&mut self, now_ms: u64, initial_ratio: f64) {
+        self.in_probation = true;
+        self.entered_unix_ms = now_ms;
+        self.last_probe_unix_ms = now_ms;
+        self.successful_probes = 1;
+        self.weight_ratio = initial_ratio.clamp(0.05, 1.0);
+        self.is_graduated = false;
+    }
+
+    /// Record a successful heartbeat pong during probation and compute updated weight ratio.
+    pub fn record_success(&mut self, now_ms: u64, config: &IsspProbationConfig) {
+        if !self.in_probation {
+            return;
+        }
+        self.last_probe_unix_ms = now_ms;
+        self.successful_probes += 1;
+
+        let elapsed = now_ms.saturating_sub(self.entered_unix_ms);
+        let duration = config.probation_duration_ms.max(1);
+        let time_progress = (elapsed as f64 / duration as f64).min(1.0);
+        let probe_progress =
+            (self.successful_probes as f64 / config.min_successful_probes.max(1) as f64).min(1.0);
+        let progress = (time_progress * 0.6 + probe_progress * 0.4).min(1.0);
+
+        let start_ratio = config.initial_weight_ratio.clamp(0.05, 1.0);
+        self.weight_ratio = start_ratio + (1.0 - start_ratio) * progress;
+    }
+
+    /// Check if probation criteria are satisfied for graduation back to nominal status.
+    pub fn can_graduate(&self, now_ms: u64, config: &IsspProbationConfig, loss_ppm: u32) -> bool {
+        if !self.in_probation {
+            return false;
+        }
+        let elapsed = now_ms.saturating_sub(self.entered_unix_ms);
+        elapsed >= config.probation_duration_ms
+            && self.successful_probes >= config.min_successful_probes
+            && loss_ppm <= config.max_loss_ppm_tolerance
+    }
+
+    /// Mark probation as graduated.
+    pub fn graduate(&mut self) {
+        self.in_probation = false;
+        self.weight_ratio = 1.0;
+        self.is_graduated = true;
+    }
+
+    /// Reset probation state upon new failure.
+    pub fn reset(&mut self) {
+        self.in_probation = false;
+        self.entered_unix_ms = 0;
+        self.last_probe_unix_ms = 0;
+        self.successful_probes = 0;
+        self.weight_ratio = 1.0;
+        self.is_graduated = false;
+    }
+}
+
+/// Telemetry record of a route flapping event and penalty adjustment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspFlapEvent {
+    pub timestamp_unix_ms: u64,
+    pub path_id: u32,
+    pub flap_count: u32,
+    pub penalty: f64,
+    pub is_suppressed: bool,
+}
+
+/// Telemetry record of a path graduating from probation and being fully reintegrated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspReintegrationEvent {
+    pub timestamp_unix_ms: u64,
+    pub path_id: u32,
+    pub probation_duration_ms: u64,
+    pub successful_probes: u32,
+    pub final_rtt_us: u64,
+    pub restored_state: IsspPathState,
+}
+
 /// A member transport path within an ISSP dynamic multipath routing table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IsspMultipathRoute {
@@ -939,6 +1184,10 @@ pub struct IsspMultipathRoute {
     pub heartbeat_timeout_ms: u64,
     /// Maximum consecutive missed heartbeat probes allowed before marking path Failed.
     pub max_missed_heartbeats: u32,
+    /// Dynamic route flapping damping tracking state.
+    pub flap_state: IsspRouteFlapState,
+    /// Dynamic progressive probation state following recovery.
+    pub probation_state: IsspProbationState,
 }
 
 impl IsspMultipathRoute {
@@ -960,6 +1209,22 @@ impl IsspMultipathRoute {
             heartbeat_interval_ms: 1_000,
             heartbeat_timeout_ms: 3_000,
             max_missed_heartbeats: 3,
+            flap_state: IsspRouteFlapState::default(),
+            probation_state: IsspProbationState::default(),
+        }
+    }
+
+    /// Calculate current effective scheduling weight considering degradation and probation ramp.
+    pub fn effective_weight(&self) -> u32 {
+        match self.state {
+            IsspPathState::Active => self.weight.max(1),
+            IsspPathState::Standby => self.weight.max(1),
+            IsspPathState::Degraded => (self.weight / 2).max(1),
+            IsspPathState::Probation => {
+                let scaled = (self.weight as f64) * self.probation_state.weight_ratio;
+                scaled.round().max(1.0) as u32
+            }
+            IsspPathState::Failed => 0,
         }
     }
 
@@ -1439,14 +1704,18 @@ impl IsspResequencingBuffer {
 }
 
 /// Aggregated telemetry across all multipath links in the router.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct IsspMultipathTelemetry {
     pub total_paths: usize,
     pub active_paths: usize,
     pub standby_paths: usize,
     pub degraded_paths: usize,
     pub failed_paths: usize,
+    pub probation_paths: usize,
+    pub suppressed_paths: usize,
     pub total_failovers: u64,
+    pub total_flaps: u64,
+    pub total_reintegrations: u64,
     pub total_heartbeats_sent: u64,
     pub total_heartbeats_received: u64,
     pub total_sessions_bound: usize,
@@ -1465,6 +1734,12 @@ pub struct IsspDynamicMultipathRouter {
     resequencers: HashMap<SessionId, IsspResequencingBuffer>,
     pub total_failovers: u64,
     failover_history: Vec<IsspFailoverEvent>,
+    pub flap_damping_config: IsspFlapDampingConfig,
+    pub probation_config: IsspProbationConfig,
+    pub total_flaps: u64,
+    pub total_reintegrations: u64,
+    flap_history: Vec<IsspFlapEvent>,
+    reintegration_history: Vec<IsspReintegrationEvent>,
 }
 
 impl IsspDynamicMultipathRouter {
@@ -1480,7 +1755,25 @@ impl IsspDynamicMultipathRouter {
             resequencers: HashMap::new(),
             total_failovers: 0,
             failover_history: Vec::new(),
+            flap_damping_config: IsspFlapDampingConfig::default(),
+            probation_config: IsspProbationConfig::default(),
+            total_flaps: 0,
+            total_reintegrations: 0,
+            flap_history: Vec::new(),
+            reintegration_history: Vec::new(),
         }
+    }
+
+    /// Configure route flap damping parameters.
+    pub fn with_flap_damping_config(mut self, config: IsspFlapDampingConfig) -> Self {
+        self.flap_damping_config = config;
+        self
+    }
+
+    /// Configure path probation parameters.
+    pub fn with_probation_config(mut self, config: IsspProbationConfig) -> Self {
+        self.probation_config = config;
+        self
     }
 
     /// Register a new multipath route.
@@ -1570,8 +1863,8 @@ impl IsspDynamicMultipathRouter {
                 IsspRoutingPolicy::BestQuality => usable
                     .iter()
                     .max_by(|a, b| {
-                        let score_a = a.metrics.quality_score(a.state, a.weight);
-                        let score_b = b.metrics.quality_score(b.state, b.weight);
+                        let score_a = a.metrics.quality_score(a.state, a.effective_weight());
+                        let score_b = b.metrics.quality_score(b.state, b.effective_weight());
                         score_a
                             .partial_cmp(&score_b)
                             .unwrap_or(std::cmp::Ordering::Equal)
@@ -1585,7 +1878,7 @@ impl IsspDynamicMultipathRouter {
                     .unwrap(),
                 IsspRoutingPolicy::BandwidthAggregation => usable
                     .iter()
-                    .max_by_key(|r| r.weight)
+                    .max_by_key(|r| r.effective_weight())
                     .map(|r| r.path_id)
                     .unwrap(),
             };
@@ -1665,9 +1958,50 @@ impl IsspDynamicMultipathRouter {
                 route.metrics.update_rtt(rtt_sample_us);
             }
 
-            // Path recovery: if previously Failed, promote back to Standby
+            // Flap damping exponential penalty decay on pong
+            route.flap_state.decay(now_ms, &self.flap_damping_config);
+
+            // Path recovery & probation logic
             if route.state == IsspPathState::Failed {
-                route.state = IsspPathState::Standby;
+                // If route is damped/suppressed due to excessive flapping, it cannot recover yet
+                if !route.flap_state.is_suppressed {
+                    if self.probation_config.enabled
+                        && self.probation_config.probation_duration_ms > 0
+                    {
+                        route.state = IsspPathState::Probation;
+                        route
+                            .probation_state
+                            .start(now_ms, self.probation_config.initial_weight_ratio);
+                    } else {
+                        route.state = IsspPathState::Standby;
+                    }
+                }
+            } else if route.state == IsspPathState::Probation {
+                route
+                    .probation_state
+                    .record_success(now_ms, &self.probation_config);
+                if route.probation_state.can_graduate(
+                    now_ms,
+                    &self.probation_config,
+                    route.metrics.loss_rate_ppm,
+                ) {
+                    route.probation_state.graduate();
+                    let restored_state = if route.priority == 1 {
+                        IsspPathState::Active
+                    } else {
+                        IsspPathState::Standby
+                    };
+                    route.state = restored_state;
+                    self.total_reintegrations += 1;
+                    self.reintegration_history.push(IsspReintegrationEvent {
+                        timestamp_unix_ms: now_ms,
+                        path_id: route.path_id,
+                        probation_duration_ms: self.probation_config.probation_duration_ms,
+                        successful_probes: route.probation_state.successful_probes,
+                        final_rtt_us: route.metrics.smoothed_rtt_us,
+                        restored_state,
+                    });
+                }
             }
             Ok(None)
         }
@@ -1700,6 +2034,18 @@ impl IsspDynamicMultipathRouter {
 
                 if expired {
                     route.state = IsspPathState::Failed;
+                    route.probation_state.reset();
+                    route
+                        .flap_state
+                        .record_flap(now_ms, &self.flap_damping_config);
+                    self.total_flaps += 1;
+                    self.flap_history.push(IsspFlapEvent {
+                        timestamp_unix_ms: now_ms,
+                        path_id: route.path_id,
+                        flap_count: route.flap_state.flap_count,
+                        penalty: route.flap_state.penalty,
+                        is_suppressed: route.flap_state.is_suppressed,
+                    });
                     failed_paths.push((route.path_id, reason));
                 }
             }
@@ -1748,12 +2094,24 @@ impl IsspDynamicMultipathRouter {
         &self.failover_history
     }
 
+    /// Retrieve flap events history.
+    pub fn flap_history(&self) -> &[IsspFlapEvent] {
+        &self.flap_history
+    }
+
+    /// Retrieve reintegration events history.
+    pub fn reintegration_history(&self) -> &[IsspReintegrationEvent] {
+        &self.reintegration_history
+    }
+
     /// Generate an aggregated telemetry report across all paths.
     pub fn telemetry(&self) -> IsspMultipathTelemetry {
         let mut active = 0;
         let mut standby = 0;
         let mut degraded = 0;
         let mut failed = 0;
+        let mut probation = 0;
+        let mut suppressed = 0;
         let mut hb_sent = 0;
         let mut hb_recv = 0;
 
@@ -1762,7 +2120,11 @@ impl IsspDynamicMultipathRouter {
                 IsspPathState::Active => active += 1,
                 IsspPathState::Standby => standby += 1,
                 IsspPathState::Degraded => degraded += 1,
+                IsspPathState::Probation => probation += 1,
                 IsspPathState::Failed => failed += 1,
+            }
+            if r.flap_state.is_suppressed {
+                suppressed += 1;
             }
             hb_sent += r.metrics.total_heartbeats_sent;
             hb_recv += r.metrics.total_heartbeats_received;
@@ -1774,7 +2136,11 @@ impl IsspDynamicMultipathRouter {
             standby_paths: standby,
             degraded_paths: degraded,
             failed_paths: failed,
+            probation_paths: probation,
+            suppressed_paths: suppressed,
             total_failovers: self.total_failovers,
+            total_flaps: self.total_flaps,
+            total_reintegrations: self.total_reintegrations,
             total_heartbeats_sent: hb_sent,
             total_heartbeats_received: hb_recv,
             total_sessions_bound: self.session_bindings.len(),
@@ -1814,14 +2180,23 @@ impl IsspDynamicMultipathRouter {
                     // Smooth Weighted Round-Robin (SWRR) packet scheduling
                     let total_weight: i64 = usable_ids
                         .iter()
-                        .map(|&pid| self.paths.get(&pid).map(|r| r.weight as i64).unwrap_or(1))
+                        .map(|&pid| {
+                            self.paths
+                                .get(&pid)
+                                .map(|r| r.effective_weight() as i64)
+                                .unwrap_or(1)
+                        })
                         .sum();
 
                     let mut best_pid = usable_ids[0];
                     let mut max_current = i64::MIN;
 
                     for &pid in &usable_ids {
-                        let eff_w = self.paths.get(&pid).map(|r| r.weight as i64).unwrap_or(1);
+                        let eff_w = self
+                            .paths
+                            .get(&pid)
+                            .map(|r| r.effective_weight() as i64)
+                            .unwrap_or(1);
                         let cur = self.path_deficits.entry(pid).or_insert(0);
                         *cur += eff_w;
                         if *cur > max_current {
@@ -2797,6 +3172,52 @@ impl SessionRegistry {
             .lock()
             .map_err(|_| SyncError::LockPoisoned)?;
         Ok(router.resequencing_telemetry(session_id))
+    }
+
+    /// Configure route flap damping parameters.
+    pub fn configure_multipath_flap_damping(
+        &self,
+        config: IsspFlapDampingConfig,
+    ) -> Result<(), SyncError> {
+        let mut router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        router.flap_damping_config = config;
+        Ok(())
+    }
+
+    /// Configure path probation parameters.
+    pub fn configure_multipath_probation(
+        &self,
+        config: IsspProbationConfig,
+    ) -> Result<(), SyncError> {
+        let mut router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        router.probation_config = config;
+        Ok(())
+    }
+
+    /// Retrieve flap history events.
+    pub fn multipath_flap_history(&self) -> Result<Vec<IsspFlapEvent>, SyncError> {
+        let router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        Ok(router.flap_history().to_vec())
+    }
+
+    /// Retrieve path reintegration history events.
+    pub fn multipath_reintegration_history(
+        &self,
+    ) -> Result<Vec<IsspReintegrationEvent>, SyncError> {
+        let router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        Ok(router.reintegration_history().to_vec())
     }
 }
 
@@ -4266,5 +4687,202 @@ mod tests {
         assert!(telem.reorder_rate_percent > 0.0);
         assert_eq!(telem.duplicate_count, 0);
         assert_eq!(telem.gaps_expired_count, 0);
+    }
+
+    #[test]
+    fn test_route_flap_damping_suppression_and_decay() {
+        let mut router = IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::ActiveStandby);
+        // Half-life 10s (10_000ms), suppress at 1800, reuse at 750
+        router.flap_damping_config = IsspFlapDampingConfig {
+            enabled: true,
+            flap_penalty: 1000.0,
+            suppress_threshold: 1800.0,
+            reuse_threshold: 750.0,
+            half_life_ms: 10_000,
+            max_suppress_penalty: 5000.0,
+        };
+
+        let mut r1 = IsspMultipathRoute::new(1, 2, "eth0-wan", 1, 100)
+            .with_state(IsspPathState::Active)
+            .with_heartbeat_config(500, 1500, 3);
+        r1.metrics.last_heartbeat_recv_unix_ms = 1_000;
+
+        let mut r2 = IsspMultipathRoute::new(2, 2, "wwan0-5g", 2, 50)
+            .with_state(IsspPathState::Standby)
+            .with_heartbeat_config(500, 5000, 3);
+        r2.metrics.last_heartbeat_recv_unix_ms = 2_500;
+
+        router.add_route(r1);
+        router.add_route(r2);
+
+        // Flap 1 on Path 1 at t = 2_600ms (timeout)
+        let f1 = router.evaluate_heartbeats_and_failover(2_600);
+        assert_eq!(f1.len(), 1);
+        assert_eq!(router.get_route(1).unwrap().state, IsspPathState::Failed);
+        assert_eq!(router.get_route(1).unwrap().flap_state.flap_count, 1);
+        assert_eq!(router.get_route(1).unwrap().flap_state.penalty, 1000.0);
+        assert!(!router.get_route(1).unwrap().flap_state.is_suppressed);
+
+        // Pong arrives at t = 2_700ms -> recovers to Standby (not suppressed)
+        let pong = IsspHeartbeatProbe::new(2, 1, 1, 2_650, true);
+        router.process_heartbeat_probe(&pong, 2_700).unwrap();
+        assert_eq!(router.get_route(1).unwrap().state, IsspPathState::Standby);
+
+        // Flap 2 on Path 1 at t = 4_500ms (only 1.8s later)
+        // Set consecutive missed heartbeats
+        router
+            .get_route_mut(1)
+            .unwrap()
+            .metrics
+            .consecutive_missed_heartbeats = 3;
+        let f2 = router.evaluate_heartbeats_and_failover(4_500);
+        assert_eq!(f2.len(), 1);
+
+        let r1_route = router.get_route(1).unwrap();
+        assert_eq!(r1_route.state, IsspPathState::Failed);
+        assert_eq!(r1_route.flap_state.flap_count, 2);
+        // Penalty should be > 1800 (1000 decayed slightly + 1000) >= suppress_threshold 2000
+        assert!(r1_route.flap_state.penalty >= 1800.0);
+        assert!(r1_route.flap_state.is_suppressed);
+
+        // Now, another pong arrives at t = 4_600ms while still suppressed!
+        let pong_damped = IsspHeartbeatProbe::new(2, 1, 2, 4_550, true);
+        router.process_heartbeat_probe(&pong_damped, 4_600).unwrap();
+        // Crucial test: Route remains Failed because flap damping is suppressing it!
+        assert_eq!(router.get_route(1).unwrap().state, IsspPathState::Failed);
+        assert!(router.get_route(1).unwrap().flap_state.is_suppressed);
+
+        // Telemetry check
+        let telem = router.telemetry();
+        assert_eq!(telem.failed_paths, 1);
+        assert_eq!(telem.suppressed_paths, 1);
+        assert_eq!(telem.total_flaps, 2);
+
+        // Advance time by 20 seconds (2 half-lives: penalty / 4)
+        // t = 24_600ms
+        let pong_after_decay = IsspHeartbeatProbe::new(2, 1, 3, 24_550, true);
+        router
+            .process_heartbeat_probe(&pong_after_decay, 24_600)
+            .unwrap();
+
+        // Penalty has decayed below reuse_threshold (750), suppression is cleared and route recovers!
+        let r1_recovered = router.get_route(1).unwrap();
+        assert!(!r1_recovered.flap_state.is_suppressed);
+        assert!(r1_recovered.flap_state.penalty < 750.0);
+        assert_eq!(r1_recovered.state, IsspPathState::Standby);
+    }
+
+    #[test]
+    fn test_progressive_probation_ramping_and_graduation() {
+        let mut router =
+            IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::BandwidthAggregation);
+        // Enable progressive probation: 4_000ms duration, 4 probes, initial ratio 20%
+        router.probation_config = IsspProbationConfig {
+            enabled: true,
+            probation_duration_ms: 4_000,
+            min_successful_probes: 4,
+            initial_weight_ratio: 0.20,
+            max_loss_ppm_tolerance: 10_000,
+        };
+
+        let mut r1 =
+            IsspMultipathRoute::new(1, 2, "eth0-primary", 1, 100).with_state(IsspPathState::Failed);
+        r1.metrics.last_heartbeat_recv_unix_ms = 1_000;
+
+        let r2 =
+            IsspMultipathRoute::new(2, 2, "wwan0-backup", 2, 50).with_state(IsspPathState::Active);
+
+        router.add_route(r1);
+        router.add_route(r2);
+
+        // Initial state of r1 is Failed -> effective_weight = 0
+        assert_eq!(router.get_route(1).unwrap().effective_weight(), 0);
+
+        // Recovery pong #1 arrives at t = 10_000ms -> enters Probation!
+        let p1 = IsspHeartbeatProbe::new(2, 1, 1, 9_950, true);
+        router.process_heartbeat_probe(&p1, 10_000).unwrap();
+
+        let r1 = router.get_route(1).unwrap();
+        assert_eq!(r1.state, IsspPathState::Probation);
+        assert!(r1.state.is_usable());
+        // At 20% initial ratio of weight 100 -> effective weight is 20!
+        assert_eq!(r1.effective_weight(), 20);
+        assert_eq!(r1.probation_state.successful_probes, 1);
+
+        // Pong #2 at t = 11_000ms (+1s, 2 probes) -> ramp increases
+        let p2 = IsspHeartbeatProbe::new(2, 1, 2, 10_950, true);
+        router.process_heartbeat_probe(&p2, 11_000).unwrap();
+        let r1 = router.get_route(1).unwrap();
+        assert_eq!(r1.state, IsspPathState::Probation);
+        assert!(r1.effective_weight() > 20);
+        let weight_probe_2 = r1.effective_weight();
+
+        // Pong #3 at t = 12_500ms (+2.5s, 3 probes) -> ramp increases further
+        let p3 = IsspHeartbeatProbe::new(2, 1, 3, 12_450, true);
+        router.process_heartbeat_probe(&p3, 12_500).unwrap();
+        let r1 = router.get_route(1).unwrap();
+        assert_eq!(r1.state, IsspPathState::Probation);
+        assert!(r1.effective_weight() > weight_probe_2);
+
+        // Pong #4 at t = 14_100ms (+4.1s >= 4000ms duration, 4 probes >= 4 required)
+        let p4 = IsspHeartbeatProbe::new(2, 1, 4, 14_050, true);
+        router.process_heartbeat_probe(&p4, 14_100).unwrap();
+
+        // Path 1 graduates from probation back to Active (priority 1) with 100% nominal weight!
+        let r1 = router.get_route(1).unwrap();
+        assert_eq!(r1.state, IsspPathState::Active);
+        assert_eq!(r1.effective_weight(), 100);
+        assert!(r1.probation_state.is_graduated);
+
+        // Verify graduation event is logged in reintegration history
+        assert_eq!(router.reintegration_history().len(), 1);
+        let ev = &router.reintegration_history()[0];
+        assert_eq!(ev.path_id, 1);
+        assert_eq!(ev.probation_duration_ms, 4_000);
+        assert_eq!(ev.successful_probes, 4);
+        assert_eq!(ev.restored_state, IsspPathState::Active);
+        assert_eq!(router.total_reintegrations, 1);
+    }
+
+    #[test]
+    fn test_progressive_probation_aborted_on_flapping() {
+        let mut router = IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::ActiveStandby);
+        router.probation_config = IsspProbationConfig {
+            enabled: true,
+            probation_duration_ms: 5_000,
+            min_successful_probes: 5,
+            initial_weight_ratio: 0.25,
+            max_loss_ppm_tolerance: 10_000,
+        };
+
+        let mut r1 = IsspMultipathRoute::new(1, 2, "eth0-primary", 1, 100)
+            .with_state(IsspPathState::Failed)
+            .with_heartbeat_config(500, 1500, 3);
+        r1.metrics.last_heartbeat_recv_unix_ms = 1_000;
+
+        let mut r2 = IsspMultipathRoute::new(2, 2, "wwan0-backup", 2, 50)
+            .with_state(IsspPathState::Active)
+            .with_heartbeat_config(500, 5000, 3);
+        r2.metrics.last_heartbeat_recv_unix_ms = 10_000;
+
+        router.add_route(r1);
+        router.add_route(r2);
+
+        // Path 1 receives recovery pong -> enters probation
+        let p1 = IsspHeartbeatProbe::new(2, 1, 1, 9_950, true);
+        router.process_heartbeat_probe(&p1, 10_000).unwrap();
+        assert_eq!(router.get_route(1).unwrap().state, IsspPathState::Probation);
+        assert_eq!(router.get_route(1).unwrap().effective_weight(), 25);
+
+        // While in probation, path 1 misses heartbeats and times out at t = 11_600ms
+        let failovers = router.evaluate_heartbeats_and_failover(11_600);
+        assert_eq!(failovers.len(), 1);
+
+        let r1_aborted = router.get_route(1).unwrap();
+        assert_eq!(r1_aborted.state, IsspPathState::Failed);
+        assert!(!r1_aborted.probation_state.in_probation);
+        assert_eq!(r1_aborted.probation_state.successful_probes, 0);
+        assert_eq!(r1_aborted.effective_weight(), 0);
+        assert!(r1_aborted.flap_state.flap_count >= 1);
     }
 }

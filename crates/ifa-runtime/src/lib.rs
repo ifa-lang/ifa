@@ -64,14 +64,15 @@ pub use reactor::{
 };
 pub use session_sync::{
     ClusterPsk, GossipFrame, GossipResult, IsspCapsule, IsspDeliveredPacket,
-    IsspDynamicMultipathRouter, IsspFailoverEvent, IsspFailoverReason, IsspHeartbeatProbe,
-    IsspMultipathRoute, IsspMultipathTelemetry, IsspPathMetrics, IsspPathState,
-    IsspResequenceStatus, IsspResequencingBuffer, IsspResequencingTelemetry, IsspRoutingPolicy,
-    IsspScheduledPacket, RawGossipError, RejectReason, SecureGossipFrame, SecurityError,
-    SecurityPolicy, SessionId, SessionRecord, SessionRegistry, SessionSnapshot, SessionTickConfig,
-    SessionTickOutcome, SyncError, SyncTelemetry, GOSSIP_FRAME_SIZE, ISSP_CAPSULE_HEADER_SIZE,
-    ISSP_CAPSULE_MAGIC, ISSP_DUMP_HEADER_SIZE, ISSP_DUMP_MAGIC, ISSP_DUMP_VERSION_V1,
-    ISSP_HEARTBEAT_MAGIC, ISSP_HEARTBEAT_SIZE, ISSP_MAGIC, ISSP_VERSION_V1,
+    IsspDynamicMultipathRouter, IsspFailoverEvent, IsspFailoverReason, IsspFlapDampingConfig,
+    IsspFlapEvent, IsspHeartbeatProbe, IsspMultipathRoute, IsspMultipathTelemetry, IsspPathMetrics,
+    IsspPathState, IsspProbationConfig, IsspProbationState, IsspReintegrationEvent,
+    IsspResequenceStatus, IsspResequencingBuffer, IsspResequencingTelemetry, IsspRouteFlapState,
+    IsspRoutingPolicy, IsspScheduledPacket, RawGossipError, RejectReason, SecureGossipFrame,
+    SecurityError, SecurityPolicy, SessionId, SessionRecord, SessionRegistry, SessionSnapshot,
+    SessionTickConfig, SessionTickOutcome, SyncError, SyncTelemetry, GOSSIP_FRAME_SIZE,
+    ISSP_CAPSULE_HEADER_SIZE, ISSP_CAPSULE_MAGIC, ISSP_DUMP_HEADER_SIZE, ISSP_DUMP_MAGIC,
+    ISSP_DUMP_VERSION_V1, ISSP_HEARTBEAT_MAGIC, ISSP_HEARTBEAT_SIZE, ISSP_MAGIC, ISSP_VERSION_V1,
     ISSP_VERSION_V2_ENCRYPTED, MAX_PEER_NODES, MAX_SESSIONS, SECURE_GOSSIP_FRAME_SIZE,
     SNAPSHOT_MAX_AGE,
 };
