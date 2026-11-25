@@ -5428,6 +5428,18 @@ pub enum CapsuleType {
     TelemetryTraceContext,
     /// Distributed Telemetry Metrics Report Capsule (type 0x3151).
     TelemetryMetricsReport,
+    /// Distributed MASQUE Topology Gateway Node Advertisement Capsule (type 0x3160).
+    TopologyNodeAdvertisement,
+    /// Distributed MASQUE Topology Link State Advertisement Capsule (type 0x3161).
+    TopologyLinkAdvertisement,
+    /// Distributed MASQUE Topology Sync / LSDB Request Capsule (type 0x3162).
+    TopologySyncRequest,
+    /// Distributed MASQUE Topology Sync / LSDB Response Capsule (type 0x3163).
+    TopologySyncResponse,
+    /// Distributed MASQUE Topology Active Path Probe Ping Capsule (type 0x3164).
+    TopologyProbePing,
+    /// Distributed MASQUE Topology Active Path Probe Pong / Echo Reply Capsule (type 0x3165).
+    TopologyProbePong,
     /// Unknown or custom capsule type identified by its 62-bit VarInt value.
     Unknown(u64),
 }
@@ -5448,6 +5460,12 @@ impl From<u64> for CapsuleType {
             0x3144 => CapsuleType::PqcKeyUpdate,
             0x3150 => CapsuleType::TelemetryTraceContext,
             0x3151 => CapsuleType::TelemetryMetricsReport,
+            0x3160 => CapsuleType::TopologyNodeAdvertisement,
+            0x3161 => CapsuleType::TopologyLinkAdvertisement,
+            0x3162 => CapsuleType::TopologySyncRequest,
+            0x3163 => CapsuleType::TopologySyncResponse,
+            0x3164 => CapsuleType::TopologyProbePing,
+            0x3165 => CapsuleType::TopologyProbePong,
             other => CapsuleType::Unknown(other),
         }
     }
@@ -5469,6 +5487,12 @@ impl From<CapsuleType> for u64 {
             CapsuleType::PqcKeyUpdate => 0x3144,
             CapsuleType::TelemetryTraceContext => 0x3150,
             CapsuleType::TelemetryMetricsReport => 0x3151,
+            CapsuleType::TopologyNodeAdvertisement => 0x3160,
+            CapsuleType::TopologyLinkAdvertisement => 0x3161,
+            CapsuleType::TopologySyncRequest => 0x3162,
+            CapsuleType::TopologySyncResponse => 0x3163,
+            CapsuleType::TopologyProbePing => 0x3164,
+            CapsuleType::TopologyProbePong => 0x3165,
             CapsuleType::Unknown(other) => other,
         }
     }
@@ -5547,6 +5571,36 @@ impl HttpCapsule {
     /// Construct a distributed telemetry metrics report capsule.
     pub fn telemetry_metrics_report(payload: Vec<u8>) -> Self {
         Self::new(CapsuleType::TelemetryMetricsReport, payload)
+    }
+
+    /// Construct a distributed MASQUE topology node advertisement capsule.
+    pub fn topology_node_advertisement(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::TopologyNodeAdvertisement, payload)
+    }
+
+    /// Construct a distributed MASQUE topology link advertisement capsule.
+    pub fn topology_link_advertisement(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::TopologyLinkAdvertisement, payload)
+    }
+
+    /// Construct a distributed MASQUE topology sync request capsule.
+    pub fn topology_sync_request(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::TopologySyncRequest, payload)
+    }
+
+    /// Construct a distributed MASQUE topology sync response capsule.
+    pub fn topology_sync_response(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::TopologySyncResponse, payload)
+    }
+
+    /// Construct a distributed MASQUE topology probe ping capsule.
+    pub fn topology_probe_ping(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::TopologyProbePing, payload)
+    }
+
+    /// Construct a distributed MASQUE topology probe pong / reply capsule.
+    pub fn topology_probe_pong(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::TopologyProbePong, payload)
     }
 
     /// Encode this capsule into QUIC VarInt-framed wire format appended to `out`.

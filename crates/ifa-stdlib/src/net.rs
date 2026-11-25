@@ -12967,6 +12967,120 @@ impl ExtendedConnectTunnel {
         Ok(None)
     }
 
+    /// Send a distributed MASQUE gateway node advertisement capsule over this tunnel.
+    pub fn send_node_advertisement(&mut self, node: &GatewayNodeDescriptor) -> Result<(), String> {
+        let capsule = node.to_capsule();
+        self.send_secure_capsule(&capsule)
+    }
+
+    /// Receive a distributed MASQUE gateway node advertisement capsule from this tunnel.
+    pub fn recv_node_advertisement(&mut self) -> Result<Option<GatewayNodeDescriptor>, String> {
+        if let Some(cap) = self.recv_secure_capsule()? {
+            if cap.capsule_type == crate::simd_parser::CapsuleType::TopologyNodeAdvertisement {
+                let node = GatewayNodeDescriptor::from_capsule(&cap)?;
+                return Ok(Some(node));
+            } else {
+                self.capsule_queue.push_front(cap);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Send a distributed MASQUE link state advertisement capsule over this tunnel.
+    pub fn send_link_advertisement(&mut self, link: &GatewayLinkAdvertisement) -> Result<(), String> {
+        let capsule = link.to_capsule();
+        self.send_secure_capsule(&capsule)
+    }
+
+    /// Receive a distributed MASQUE link state advertisement capsule from this tunnel.
+    pub fn recv_link_advertisement(&mut self) -> Result<Option<GatewayLinkAdvertisement>, String> {
+        if let Some(cap) = self.recv_secure_capsule()? {
+            if cap.capsule_type == crate::simd_parser::CapsuleType::TopologyLinkAdvertisement {
+                let link = GatewayLinkAdvertisement::from_capsule(&cap)?;
+                return Ok(Some(link));
+            } else {
+                self.capsule_queue.push_front(cap);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Send a distributed MASQUE topology synchronization request capsule over this tunnel.
+    pub fn send_topology_sync_request(&mut self, req: &TopologySyncRequest) -> Result<(), String> {
+        let capsule = req.to_capsule();
+        self.send_secure_capsule(&capsule)
+    }
+
+    /// Receive a distributed MASQUE topology synchronization request capsule from this tunnel.
+    pub fn recv_topology_sync_request(&mut self) -> Result<Option<TopologySyncRequest>, String> {
+        if let Some(cap) = self.recv_secure_capsule()? {
+            if cap.capsule_type == crate::simd_parser::CapsuleType::TopologySyncRequest {
+                let req = TopologySyncRequest::from_capsule(&cap)?;
+                return Ok(Some(req));
+            } else {
+                self.capsule_queue.push_front(cap);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Send a distributed MASQUE topology synchronization response capsule over this tunnel.
+    pub fn send_topology_sync_response(&mut self, resp: &TopologySyncResponse) -> Result<(), String> {
+        let capsule = resp.to_capsule();
+        self.send_secure_capsule(&capsule)
+    }
+
+    /// Receive a distributed MASQUE topology synchronization response capsule from this tunnel.
+    pub fn recv_topology_sync_response(&mut self) -> Result<Option<TopologySyncResponse>, String> {
+        if let Some(cap) = self.recv_secure_capsule()? {
+            if cap.capsule_type == crate::simd_parser::CapsuleType::TopologySyncResponse {
+                let resp = TopologySyncResponse::from_capsule(&cap)?;
+                return Ok(Some(resp));
+            } else {
+                self.capsule_queue.push_front(cap);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Send an active path probe ping capsule over this tunnel.
+    pub fn send_topology_probe_ping(&mut self, ping: &TopologyProbePing) -> Result<(), String> {
+        let capsule = ping.to_capsule();
+        self.send_secure_capsule(&capsule)
+    }
+
+    /// Receive an active path probe ping capsule from this tunnel.
+    pub fn recv_topology_probe_ping(&mut self) -> Result<Option<TopologyProbePing>, String> {
+        if let Some(cap) = self.recv_secure_capsule()? {
+            if cap.capsule_type == crate::simd_parser::CapsuleType::TopologyProbePing {
+                let ping = TopologyProbePing::from_capsule(&cap)?;
+                return Ok(Some(ping));
+            } else {
+                self.capsule_queue.push_front(cap);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Send an active path probe pong reply capsule over this tunnel.
+    pub fn send_topology_probe_pong(&mut self, pong: &TopologyProbePong) -> Result<(), String> {
+        let capsule = pong.to_capsule();
+        self.send_secure_capsule(&capsule)
+    }
+
+    /// Receive an active path probe pong reply capsule from this tunnel.
+    pub fn recv_topology_probe_pong(&mut self) -> Result<Option<TopologyProbePong>, String> {
+        if let Some(cap) = self.recv_secure_capsule()? {
+            if cap.capsule_type == crate::simd_parser::CapsuleType::TopologyProbePong {
+                let pong = TopologyProbePong::from_capsule(&cap)?;
+                return Ok(Some(pong));
+            } else {
+                self.capsule_queue.push_front(cap);
+            }
+        }
+        Ok(None)
+    }
+
     /// Send a UDP datagram adaptively: if payload fits within path PMTU (accounting for RFC 9297
     /// Capsule & Context ID overhead), it is transmitted directly as a single DATAGRAM capsule.
     /// If payload exceeds PMTU, it is fragmented into RFC 9297/9298 compatible chunks.
@@ -13506,6 +13620,12 @@ impl BondedTunnelPath {
     /// Set initial baseline RTT.
     pub fn with_rtt(mut self, rtt: Duration) -> Self {
         self.smoothed_rtt = rtt;
+        self
+    }
+
+    /// Set initial baseline packet loss rate.
+    pub fn with_loss_rate(mut self, loss: f64) -> Self {
+        self.loss_rate = loss.clamp(0.0, 1.0);
         self
     }
 
@@ -25695,6 +25815,1335 @@ impl DistributedTransportTelemetry {
         }
     }
 }
+
+// ── Distributed MASQUE Multi-Path Topology & Link State Discovery ──────────
+
+fn topo_put_u8(buf: &mut Vec<u8>, val: u8) {
+    buf.push(val);
+}
+fn topo_put_u16(buf: &mut Vec<u8>, val: u16) {
+    buf.extend_from_slice(&val.to_be_bytes());
+}
+fn topo_put_u32(buf: &mut Vec<u8>, val: u32) {
+    buf.extend_from_slice(&val.to_be_bytes());
+}
+fn topo_put_u64(buf: &mut Vec<u8>, val: u64) {
+    buf.extend_from_slice(&val.to_be_bytes());
+}
+fn topo_put_f32(buf: &mut Vec<u8>, val: f32) {
+    buf.extend_from_slice(&val.to_bits().to_be_bytes());
+}
+fn topo_put_str(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    topo_put_u16(buf, bytes.len() as u16);
+    buf.extend_from_slice(bytes);
+}
+
+fn topo_get_u8(buf: &[u8], offset: &mut usize) -> Result<u8, String> {
+    if *offset >= buf.len() {
+        return Err("Unexpected EOF reading u8 in topology payload".to_string());
+    }
+    let val = buf[*offset];
+    *offset += 1;
+    Ok(val)
+}
+fn topo_get_u16(buf: &[u8], offset: &mut usize) -> Result<u16, String> {
+    if *offset + 2 > buf.len() {
+        return Err("Unexpected EOF reading u16 in topology payload".to_string());
+    }
+    let val = u16::from_be_bytes([buf[*offset], buf[*offset + 1]]);
+    *offset += 2;
+    Ok(val)
+}
+fn topo_get_u32(buf: &[u8], offset: &mut usize) -> Result<u32, String> {
+    if *offset + 4 > buf.len() {
+        return Err("Unexpected EOF reading u32 in topology payload".to_string());
+    }
+    let val = u32::from_be_bytes([buf[*offset], buf[*offset + 1], buf[*offset + 2], buf[*offset + 3]]);
+    *offset += 4;
+    Ok(val)
+}
+fn topo_get_u64(buf: &[u8], offset: &mut usize) -> Result<u64, String> {
+    if *offset + 8 > buf.len() {
+        return Err("Unexpected EOF reading u64 in topology payload".to_string());
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&buf[*offset..*offset + 8]);
+    *offset += 8;
+    Ok(u64::from_be_bytes(b))
+}
+fn topo_get_f32(buf: &[u8], offset: &mut usize) -> Result<f32, String> {
+    let bits = topo_get_u32(buf, offset)?;
+    Ok(f32::from_bits(bits))
+}
+fn topo_get_str(buf: &[u8], offset: &mut usize) -> Result<String, String> {
+    let len = topo_get_u16(buf, offset)? as usize;
+    if *offset + len > buf.len() {
+        return Err("Unexpected EOF reading string in topology payload".to_string());
+    }
+    let s = std::str::from_utf8(&buf[*offset..*offset + len])
+        .map_err(|e| format!("Invalid UTF-8 in topology string: {}", e))?
+        .to_string();
+    *offset += len;
+    Ok(s)
+}
+
+/// Bitfield capabilities advertised by a MASQUE gateway node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GatewayCapabilities {
+    pub connect_udp: bool,
+    pub connect_ip: bool,
+    pub hybrid_pqc: bool,
+    pub multipath_bonding: bool,
+    pub fec_hybrid: bool,
+    pub l4s_ecn: bool,
+    pub relay_routing: bool,
+}
+
+impl GatewayCapabilities {
+    /// Create capabilities with all standard features enabled.
+    pub fn all() -> Self {
+        Self {
+            connect_udp: true,
+            connect_ip: true,
+            hybrid_pqc: true,
+            multipath_bonding: true,
+            fec_hybrid: true,
+            l4s_ecn: true,
+            relay_routing: true,
+        }
+    }
+
+    /// Pack capabilities into a 32-bit integer.
+    pub fn to_bits(&self) -> u32 {
+        let mut bits = 0u32;
+        if self.connect_udp { bits |= 1 << 0; }
+        if self.connect_ip { bits |= 1 << 1; }
+        if self.hybrid_pqc { bits |= 1 << 2; }
+        if self.multipath_bonding { bits |= 1 << 3; }
+        if self.fec_hybrid { bits |= 1 << 4; }
+        if self.l4s_ecn { bits |= 1 << 5; }
+        if self.relay_routing { bits |= 1 << 6; }
+        bits
+    }
+
+    /// Unpack capabilities from a 32-bit integer.
+    pub fn from_bits(bits: u32) -> Self {
+        Self {
+            connect_udp: (bits & (1 << 0)) != 0,
+            connect_ip: (bits & (1 << 1)) != 0,
+            hybrid_pqc: (bits & (1 << 2)) != 0,
+            multipath_bonding: (bits & (1 << 3)) != 0,
+            fec_hybrid: (bits & (1 << 4)) != 0,
+            l4s_ecn: (bits & (1 << 5)) != 0,
+            relay_routing: (bits & (1 << 6)) != 0,
+        }
+    }
+}
+
+/// Operational state of a MASQUE gateway node in the topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayNodeState {
+    Available = 0,
+    Degraded = 1,
+    Overloaded = 2,
+    Draining = 3,
+    Maintenance = 4,
+    Unreachable = 5,
+}
+
+impl GatewayNodeState {
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            Self::Available => 0,
+            Self::Degraded => 1,
+            Self::Overloaded => 2,
+            Self::Draining => 3,
+            Self::Maintenance => 4,
+            Self::Unreachable => 5,
+        }
+    }
+
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            0 => Self::Available,
+            1 => Self::Degraded,
+            2 => Self::Overloaded,
+            3 => Self::Draining,
+            4 => Self::Maintenance,
+            _ => Self::Unreachable,
+        }
+    }
+
+    /// Whether this node can be used as a transit hop in path calculations.
+    pub fn is_routable(&self) -> bool {
+        matches!(self, Self::Available | Self::Degraded)
+    }
+}
+
+/// Node descriptor for a distributed MASQUE gateway node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewayNodeDescriptor {
+    pub node_id: String,
+    pub region: String,
+    pub control_endpoint: String,
+    pub data_endpoints: Vec<String>,
+    pub capabilities: GatewayCapabilities,
+    pub state: GatewayNodeState,
+    pub load_factor: f32,
+    pub capacity_bps: u64,
+    pub available_bw_bps: u64,
+    pub active_tunnels: u32,
+    pub sequence_number: u64,
+    pub timestamp_ms: u64,
+    pub ttl_seconds: u32,
+}
+
+impl GatewayNodeDescriptor {
+    /// Create a new gateway node descriptor with sensible defaults.
+    pub fn new(node_id: &str, region: &str, control_endpoint: &str) -> Self {
+        Self {
+            node_id: node_id.to_string(),
+            region: region.to_string(),
+            control_endpoint: control_endpoint.to_string(),
+            data_endpoints: Vec::new(),
+            capabilities: GatewayCapabilities::all(),
+            state: GatewayNodeState::Available,
+            load_factor: 0.0,
+            capacity_bps: 10_000_000_000,
+            available_bw_bps: 10_000_000_000,
+            active_tunnels: 0,
+            sequence_number: 1,
+            timestamp_ms: 0,
+            ttl_seconds: 60,
+        }
+    }
+
+    /// Serialize this gateway node descriptor to binary wire format.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(128);
+        topo_put_str(&mut buf, &self.node_id);
+        topo_put_str(&mut buf, &self.region);
+        topo_put_str(&mut buf, &self.control_endpoint);
+        topo_put_u16(&mut buf, self.data_endpoints.len() as u16);
+        for ep in &self.data_endpoints {
+            topo_put_str(&mut buf, ep);
+        }
+        topo_put_u32(&mut buf, self.capabilities.to_bits());
+        topo_put_u8(&mut buf, self.state.as_u8());
+        topo_put_f32(&mut buf, self.load_factor);
+        topo_put_u64(&mut buf, self.capacity_bps);
+        topo_put_u64(&mut buf, self.available_bw_bps);
+        topo_put_u32(&mut buf, self.active_tunnels);
+        topo_put_u64(&mut buf, self.sequence_number);
+        topo_put_u64(&mut buf, self.timestamp_ms);
+        topo_put_u32(&mut buf, self.ttl_seconds);
+        buf
+    }
+
+    /// Deserialize a gateway node descriptor from binary wire format.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        let node_id = topo_get_str(buf, &mut offset)?;
+        let region = topo_get_str(buf, &mut offset)?;
+        let control_endpoint = topo_get_str(buf, &mut offset)?;
+        let ep_count = topo_get_u16(buf, &mut offset)? as usize;
+        let mut data_endpoints = Vec::with_capacity(ep_count);
+        for _ in 0..ep_count {
+            data_endpoints.push(topo_get_str(buf, &mut offset)?);
+        }
+        let cap_bits = topo_get_u32(buf, &mut offset)?;
+        let state_byte = topo_get_u8(buf, &mut offset)?;
+        let load_factor = topo_get_f32(buf, &mut offset)?;
+        let capacity_bps = topo_get_u64(buf, &mut offset)?;
+        let available_bw_bps = topo_get_u64(buf, &mut offset)?;
+        let active_tunnels = topo_get_u32(buf, &mut offset)?;
+        let sequence_number = topo_get_u64(buf, &mut offset)?;
+        let timestamp_ms = topo_get_u64(buf, &mut offset)?;
+        let ttl_seconds = topo_get_u32(buf, &mut offset)?;
+
+        Ok(Self {
+            node_id,
+            region,
+            control_endpoint,
+            data_endpoints,
+            capabilities: GatewayCapabilities::from_bits(cap_bits),
+            state: GatewayNodeState::from_u8(state_byte),
+            load_factor,
+            capacity_bps,
+            available_bw_bps,
+            active_tunnels,
+            sequence_number,
+            timestamp_ms,
+            ttl_seconds,
+        })
+    }
+
+    /// Wrap into a RFC 9297 HTTP Capsule frame.
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::topology_node_advertisement(self.to_bytes())
+    }
+
+    /// Extract from a RFC 9297 HTTP Capsule frame.
+    pub fn from_capsule(cap: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        if cap.capsule_type != crate::simd_parser::CapsuleType::TopologyNodeAdvertisement {
+            return Err("Expected TopologyNodeAdvertisement capsule".to_string());
+        }
+        Self::from_bytes(&cap.payload)
+    }
+}
+
+/// Underlying transport medium / topology link type between MASQUE gateways.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkType {
+    DirectQuic = 0,
+    CrossConnect = 1,
+    InternetTransit = 2,
+    WireguardRelay = 3,
+    EncryptedCapsuleTunnel = 4,
+}
+
+impl LinkType {
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            Self::DirectQuic => 0,
+            Self::CrossConnect => 1,
+            Self::InternetTransit => 2,
+            Self::WireguardRelay => 3,
+            Self::EncryptedCapsuleTunnel => 4,
+        }
+    }
+
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            0 => Self::DirectQuic,
+            1 => Self::CrossConnect,
+            2 => Self::InternetTransit,
+            3 => Self::WireguardRelay,
+            _ => Self::EncryptedCapsuleTunnel,
+        }
+    }
+}
+
+/// Health and status of a link between two gateways.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkStatus {
+    Active = 0,
+    Congested = 1,
+    Degraded = 2,
+    Flapping = 3,
+    Down = 4,
+}
+
+impl LinkStatus {
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            Self::Active => 0,
+            Self::Congested => 1,
+            Self::Degraded => 2,
+            Self::Flapping => 3,
+            Self::Down => 4,
+        }
+    }
+
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            0 => Self::Active,
+            1 => Self::Congested,
+            2 => Self::Degraded,
+            3 => Self::Flapping,
+            _ => Self::Down,
+        }
+    }
+
+    /// Whether this link can carry active traffic.
+    pub fn is_usable(&self) -> bool {
+        matches!(self, Self::Active | Self::Congested | Self::Degraded)
+    }
+}
+
+/// Dynamic telemetry and physical characteristics of a network link.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkMetrics {
+    pub rtt_us: u32,
+    pub jitter_us: u32,
+    pub loss_rate: f32,
+    pub mtu: u16,
+    pub bandwidth_bps: u64,
+    pub cost_metric: u32,
+}
+
+impl Default for LinkMetrics {
+    fn default() -> Self {
+        Self {
+            rtt_us: 10_000,
+            jitter_us: 500,
+            loss_rate: 0.0,
+            mtu: 1420,
+            bandwidth_bps: 1_000_000_000,
+            cost_metric: 10,
+        }
+    }
+}
+
+/// Link State Advertisement (LSA) carrying link metrics and status between two MASQUE gateways.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewayLinkAdvertisement {
+    pub link_id: u64,
+    pub source_node: String,
+    pub target_node: String,
+    pub link_type: LinkType,
+    pub status: LinkStatus,
+    pub metrics: LinkMetrics,
+    pub sequence_number: u64,
+    pub timestamp_ms: u64,
+    pub ttl_seconds: u32,
+    pub bidirectional: bool,
+}
+
+impl GatewayLinkAdvertisement {
+    /// Create a new link advertisement.
+    pub fn new(source_node: &str, target_node: &str, link_id: u64) -> Self {
+        Self {
+            link_id,
+            source_node: source_node.to_string(),
+            target_node: target_node.to_string(),
+            link_type: LinkType::DirectQuic,
+            status: LinkStatus::Active,
+            metrics: LinkMetrics::default(),
+            sequence_number: 1,
+            timestamp_ms: 0,
+            ttl_seconds: 60,
+            bidirectional: true,
+        }
+    }
+
+    /// Serialize link advertisement to binary format.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(96);
+        topo_put_u64(&mut buf, self.link_id);
+        topo_put_str(&mut buf, &self.source_node);
+        topo_put_str(&mut buf, &self.target_node);
+        topo_put_u8(&mut buf, self.link_type.as_u8());
+        topo_put_u8(&mut buf, self.status.as_u8());
+        topo_put_u32(&mut buf, self.metrics.rtt_us);
+        topo_put_u32(&mut buf, self.metrics.jitter_us);
+        topo_put_f32(&mut buf, self.metrics.loss_rate);
+        topo_put_u16(&mut buf, self.metrics.mtu);
+        topo_put_u64(&mut buf, self.metrics.bandwidth_bps);
+        topo_put_u32(&mut buf, self.metrics.cost_metric);
+        topo_put_u64(&mut buf, self.sequence_number);
+        topo_put_u64(&mut buf, self.timestamp_ms);
+        topo_put_u32(&mut buf, self.ttl_seconds);
+        topo_put_u8(&mut buf, if self.bidirectional { 1 } else { 0 });
+        buf
+    }
+
+    /// Deserialize link advertisement from binary format.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        let link_id = topo_get_u64(buf, &mut offset)?;
+        let source_node = topo_get_str(buf, &mut offset)?;
+        let target_node = topo_get_str(buf, &mut offset)?;
+        let link_type = LinkType::from_u8(topo_get_u8(buf, &mut offset)?);
+        let status = LinkStatus::from_u8(topo_get_u8(buf, &mut offset)?);
+        let rtt_us = topo_get_u32(buf, &mut offset)?;
+        let jitter_us = topo_get_u32(buf, &mut offset)?;
+        let loss_rate = topo_get_f32(buf, &mut offset)?;
+        let mtu = topo_get_u16(buf, &mut offset)?;
+        let bandwidth_bps = topo_get_u64(buf, &mut offset)?;
+        let cost_metric = topo_get_u32(buf, &mut offset)?;
+        let sequence_number = topo_get_u64(buf, &mut offset)?;
+        let timestamp_ms = topo_get_u64(buf, &mut offset)?;
+        let ttl_seconds = topo_get_u32(buf, &mut offset)?;
+        let bidirectional = topo_get_u8(buf, &mut offset)? != 0;
+
+        Ok(Self {
+            link_id,
+            source_node,
+            target_node,
+            link_type,
+            status,
+            metrics: LinkMetrics {
+                rtt_us,
+                jitter_us,
+                loss_rate,
+                mtu,
+                bandwidth_bps,
+                cost_metric,
+            },
+            sequence_number,
+            timestamp_ms,
+            ttl_seconds,
+            bidirectional,
+        })
+    }
+
+    /// Wrap into a RFC 9297 HTTP Capsule frame.
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::topology_link_advertisement(self.to_bytes())
+    }
+
+    /// Extract from a RFC 9297 HTTP Capsule frame.
+    pub fn from_capsule(cap: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        if cap.capsule_type != crate::simd_parser::CapsuleType::TopologyLinkAdvertisement {
+            return Err("Expected TopologyLinkAdvertisement capsule".to_string());
+        }
+        Self::from_bytes(&cap.payload)
+    }
+}
+
+/// Active path probe ping request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopologyProbePing {
+    pub probe_id: u64,
+    pub timestamp_ns: u64,
+    pub source_node: String,
+}
+
+impl TopologyProbePing {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32);
+        topo_put_u64(&mut buf, self.probe_id);
+        topo_put_u64(&mut buf, self.timestamp_ns);
+        topo_put_str(&mut buf, &self.source_node);
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        let probe_id = topo_get_u64(buf, &mut offset)?;
+        let timestamp_ns = topo_get_u64(buf, &mut offset)?;
+        let source_node = topo_get_str(buf, &mut offset)?;
+        Ok(Self {
+            probe_id,
+            timestamp_ns,
+            source_node,
+        })
+    }
+
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::topology_probe_ping(self.to_bytes())
+    }
+
+    pub fn from_capsule(cap: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        if cap.capsule_type != crate::simd_parser::CapsuleType::TopologyProbePing {
+            return Err("Expected TopologyProbePing capsule".to_string());
+        }
+        Self::from_bytes(&cap.payload)
+    }
+}
+
+/// Active path probe pong / echo reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopologyProbePong {
+    pub probe_id: u64,
+    pub echo_timestamp_ns: u64,
+    pub reply_timestamp_ns: u64,
+    pub node_id: String,
+}
+
+impl TopologyProbePong {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(40);
+        topo_put_u64(&mut buf, self.probe_id);
+        topo_put_u64(&mut buf, self.echo_timestamp_ns);
+        topo_put_u64(&mut buf, self.reply_timestamp_ns);
+        topo_put_str(&mut buf, &self.node_id);
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        let probe_id = topo_get_u64(buf, &mut offset)?;
+        let echo_timestamp_ns = topo_get_u64(buf, &mut offset)?;
+        let reply_timestamp_ns = topo_get_u64(buf, &mut offset)?;
+        let node_id = topo_get_str(buf, &mut offset)?;
+        Ok(Self {
+            probe_id,
+            echo_timestamp_ns,
+            reply_timestamp_ns,
+            node_id,
+        })
+    }
+
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::topology_probe_pong(self.to_bytes())
+    }
+
+    pub fn from_capsule(cap: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        if cap.capsule_type != crate::simd_parser::CapsuleType::TopologyProbePong {
+            return Err("Expected TopologyProbePong capsule".to_string());
+        }
+        Self::from_bytes(&cap.payload)
+    }
+}
+
+/// Request to synchronize link state database (LSDB) from a peer gateway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopologySyncRequest {
+    pub requester_node: String,
+    pub since_sequence: u64,
+}
+
+impl TopologySyncRequest {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32);
+        topo_put_str(&mut buf, &self.requester_node);
+        topo_put_u64(&mut buf, self.since_sequence);
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        let requester_node = topo_get_str(buf, &mut offset)?;
+        let since_sequence = topo_get_u64(buf, &mut offset)?;
+        Ok(Self {
+            requester_node,
+            since_sequence,
+        })
+    }
+
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::topology_sync_request(self.to_bytes())
+    }
+
+    pub fn from_capsule(cap: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        if cap.capsule_type != crate::simd_parser::CapsuleType::TopologySyncRequest {
+            return Err("Expected TopologySyncRequest capsule".to_string());
+        }
+        Self::from_bytes(&cap.payload)
+    }
+}
+
+/// Full or incremental LSDB snapshot response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopologySyncResponse {
+    pub nodes: Vec<GatewayNodeDescriptor>,
+    pub links: Vec<GatewayLinkAdvertisement>,
+}
+
+impl TopologySyncResponse {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(512);
+        topo_put_u16(&mut buf, self.nodes.len() as u16);
+        for node in &self.nodes {
+            let b = node.to_bytes();
+            topo_put_u16(&mut buf, b.len() as u16);
+            buf.extend_from_slice(&b);
+        }
+        topo_put_u16(&mut buf, self.links.len() as u16);
+        for link in &self.links {
+            let b = link.to_bytes();
+            topo_put_u16(&mut buf, b.len() as u16);
+            buf.extend_from_slice(&b);
+        }
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        let node_count = topo_get_u16(buf, &mut offset)? as usize;
+        let mut nodes = Vec::with_capacity(node_count);
+        for _ in 0..node_count {
+            let len = topo_get_u16(buf, &mut offset)? as usize;
+            if offset + len > buf.len() {
+                return Err("Unexpected EOF reading node chunk in sync response".to_string());
+            }
+            let node = GatewayNodeDescriptor::from_bytes(&buf[offset..offset + len])?;
+            offset += len;
+            nodes.push(node);
+        }
+
+        let link_count = topo_get_u16(buf, &mut offset)? as usize;
+        let mut links = Vec::with_capacity(link_count);
+        for _ in 0..link_count {
+            let len = topo_get_u16(buf, &mut offset)? as usize;
+            if offset + len > buf.len() {
+                return Err("Unexpected EOF reading link chunk in sync response".to_string());
+            }
+            let link = GatewayLinkAdvertisement::from_bytes(&buf[offset..offset + len])?;
+            offset += len;
+            links.push(link);
+        }
+
+        Ok(Self { nodes, links })
+    }
+
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::topology_sync_response(self.to_bytes())
+    }
+
+    pub fn from_capsule(cap: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        if cap.capsule_type != crate::simd_parser::CapsuleType::TopologySyncResponse {
+            return Err("Expected TopologySyncResponse capsule".to_string());
+        }
+        Self::from_bytes(&cap.payload)
+    }
+}
+
+/// Optimization objective used by Dijkstra and path computation algorithms.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PathOptimizationMetric {
+    /// Minimize cumulative Round Trip Time.
+    LowestLatency,
+    /// Minimize end-to-end packet loss probability.
+    LowestLoss,
+    /// Maximize minimum bottleneck bandwidth along the path.
+    HighestBandwidth,
+    /// Minimize number of intermediate gateway hops.
+    ShortestHops,
+    /// Multi-objective weighted composite score.
+    Composite {
+        latency_weight: f64,
+        loss_weight: f64,
+        load_weight: f64,
+    },
+}
+
+/// Disjoint path requirement for multipath routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisjointMode {
+    /// Paths must not share any physical or logical edge/link.
+    EdgeDisjoint,
+    /// Paths must not share any intermediate gateway nodes (highest resilience).
+    NodeDisjoint,
+}
+
+/// An end-to-end computed routing path across distributed MASQUE gateways.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComputedMultiPath {
+    pub hops: Vec<String>,
+    pub links: Vec<GatewayLinkAdvertisement>,
+    pub total_rtt_us: u32,
+    pub cumulative_loss_rate: f32,
+    pub bottleneck_bandwidth_bps: u64,
+    pub min_path_mtu: u16,
+    pub total_cost: f64,
+}
+
+impl ComputedMultiPath {
+    /// Formats path as a human-readable hop chain: "gw-iad1 -> gw-ord1 -> gw-sfo1".
+    pub fn display_route(&self) -> String {
+        self.hops.join(" -> ")
+    }
+}
+
+/// In-memory Link State Database (LSDB) and dynamic graph topology manager for MASQUE.
+#[derive(Debug, Clone, Default)]
+pub struct GatewayTopologyGraph {
+    nodes: std::collections::BTreeMap<String, GatewayNodeDescriptor>,
+    adjacency: std::collections::BTreeMap<String, std::collections::BTreeMap<String, GatewayLinkAdvertisement>>,
+    flapping_counts: std::collections::HashMap<u64, (u32, u64)>, // link_id -> (flaps, last_ms)
+}
+
+impl GatewayTopologyGraph {
+    /// Initialize an empty topology graph.
+    pub fn new() -> Self {
+        Self {
+            nodes: std::collections::BTreeMap::new(),
+            adjacency: std::collections::BTreeMap::new(),
+            flapping_counts: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Insert or update a gateway node advertisement.
+    /// Returns `true` if inserted/updated, `false` if rejected due to stale sequence number.
+    pub fn insert_node(&mut self, node: GatewayNodeDescriptor) -> bool {
+        if let Some(existing) = self.nodes.get(&node.node_id) {
+            if node.sequence_number <= existing.sequence_number {
+                return false;
+            }
+        }
+        self.nodes.insert(node.node_id.clone(), node);
+        true
+    }
+
+    /// Insert or update a link state advertisement.
+    /// Handles bidirectional announcements automatically.
+    /// Returns `true` if inserted/updated, `false` if rejected due to stale sequence number.
+    pub fn insert_link(&mut self, mut link: GatewayLinkAdvertisement) -> bool {
+        let (src, dst) = (link.source_node.clone(), link.target_node.clone());
+        let link_id = link.link_id;
+
+        // Check freshness
+        if let Some(existing) = self.adjacency.get(&src).and_then(|m| m.get(&dst)) {
+            if link.sequence_number <= existing.sequence_number {
+                return false;
+            }
+            // Check for link flapping: status changed back and forth within 30 seconds
+            if existing.status != link.status {
+                let entry = self.flapping_counts.entry(link_id).or_insert((0, link.timestamp_ms));
+                if link.timestamp_ms.saturating_sub(entry.1) <= 30_000 {
+                    entry.0 += 1;
+                } else {
+                    entry.0 = 1;
+                }
+                entry.1 = link.timestamp_ms;
+
+                if entry.0 >= 3 && link.status == LinkStatus::Active {
+                    link.status = LinkStatus::Flapping;
+                    link.metrics.cost_metric = link.metrics.cost_metric.saturating_mul(10);
+                }
+            }
+        }
+
+        let is_bi = link.bidirectional;
+        self.adjacency
+            .entry(src.clone())
+            .or_default()
+            .insert(dst.clone(), link.clone());
+
+        if is_bi {
+            let mut reverse_link = link;
+            reverse_link.source_node = dst.clone();
+            reverse_link.target_node = src.clone();
+            self.adjacency
+                .entry(dst)
+                .or_default()
+                .insert(src, reverse_link);
+        }
+
+        true
+    }
+
+    /// Retrieve a node by ID.
+    pub fn get_node(&self, node_id: &str) -> Option<&GatewayNodeDescriptor> {
+        self.nodes.get(node_id)
+    }
+
+    /// Retrieve a link by source and target.
+    pub fn get_link(&self, source: &str, target: &str) -> Option<&GatewayLinkAdvertisement> {
+        self.adjacency.get(source).and_then(|m| m.get(target))
+    }
+
+    /// Total number of known gateway nodes.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Total number of directed links in the graph.
+    pub fn link_count(&self) -> usize {
+        self.adjacency.values().map(|m| m.len()).sum()
+    }
+
+    /// Prune nodes and links that have expired based on current timestamp and their TTL.
+    /// Returns `(pruned_nodes, pruned_links)`.
+    pub fn prune_stale(&mut self, now_ms: u64) -> (usize, usize) {
+        let mut expired_nodes = Vec::new();
+        for (id, node) in &self.nodes {
+            let expires_at = node.timestamp_ms + (node.ttl_seconds as u64) * 1000;
+            if now_ms >= expires_at {
+                expired_nodes.push(id.clone());
+            }
+        }
+
+        let pruned_nodes = expired_nodes.len();
+        let mut pruned_links = 0;
+        for id in &expired_nodes {
+            self.nodes.remove(id);
+            if let Some(removed_map) = self.adjacency.remove(id) {
+                pruned_links += removed_map.len();
+            }
+        }
+
+        for map in self.adjacency.values_mut() {
+            let initial = map.len();
+            map.retain(|target_id, link| {
+                let expires_at = link.timestamp_ms + (link.ttl_seconds as u64) * 1000;
+                let not_expired = now_ms < expires_at;
+                let target_alive = !expired_nodes.contains(target_id);
+                not_expired && target_alive
+            });
+            pruned_links += initial.saturating_sub(map.len());
+        }
+
+        (pruned_nodes, pruned_links)
+    }
+
+    /// Generate an incremental or full LSDB synchronization response for a peer.
+    pub fn generate_sync_response(&self, since_sequence: u64) -> TopologySyncResponse {
+        let nodes: Vec<GatewayNodeDescriptor> = self
+            .nodes
+            .values()
+            .filter(|n| n.sequence_number > since_sequence)
+            .cloned()
+            .collect();
+
+        let mut links: Vec<GatewayLinkAdvertisement> = Vec::new();
+        for map in self.adjacency.values() {
+            for link in map.values() {
+                if link.sequence_number > since_sequence {
+                    links.push(link.clone());
+                }
+            }
+        }
+
+        TopologySyncResponse { nodes, links }
+    }
+
+    /// Calculate edge cost based on the chosen optimization metric.
+    fn calculate_edge_cost(&self, link: &GatewayLinkAdvertisement, target_node: Option<&GatewayNodeDescriptor>, metric: PathOptimizationMetric) -> f64 {
+        match metric {
+            PathOptimizationMetric::LowestLatency => link.metrics.rtt_us as f64,
+            PathOptimizationMetric::LowestLoss => {
+                let loss = (link.metrics.loss_rate as f64).clamp(0.0, 0.9999);
+                -((1.0 - loss).max(1e-6)).ln() * 1000.0
+            }
+            PathOptimizationMetric::HighestBandwidth => {
+                let bw = link.metrics.bandwidth_bps.max(1_000_000) as f64;
+                1e12 / bw
+            }
+            PathOptimizationMetric::ShortestHops => 1.0,
+            PathOptimizationMetric::Composite {
+                latency_weight,
+                loss_weight,
+                load_weight,
+            } => {
+                let rtt_cost = (link.metrics.rtt_us as f64) / 1000.0;
+                let loss_cost = (link.metrics.loss_rate as f64) * 1000.0;
+                let load_cost = target_node.map(|n| (n.load_factor as f64) * 100.0).unwrap_or(0.0);
+                (rtt_cost * latency_weight) + (loss_cost * loss_weight) + (load_cost * load_weight)
+            }
+        }
+    }
+
+    /// Compute the optimal single path between source and target using Dijkstra's algorithm.
+    pub fn find_best_path(
+        &self,
+        from: &str,
+        to: &str,
+        metric: PathOptimizationMetric,
+    ) -> Option<ComputedMultiPath> {
+        self.find_best_path_internal(from, to, metric, &std::collections::HashSet::new(), &std::collections::HashSet::new())
+    }
+
+    fn find_best_path_internal(
+        &self,
+        from: &str,
+        to: &str,
+        metric: PathOptimizationMetric,
+        excluded_nodes: &std::collections::HashSet<String>,
+        excluded_edges: &std::collections::HashSet<(String, String)>,
+    ) -> Option<ComputedMultiPath> {
+        if from == to {
+            return Some(ComputedMultiPath {
+                hops: vec![from.to_string()],
+                links: Vec::new(),
+                total_rtt_us: 0,
+                cumulative_loss_rate: 0.0,
+                bottleneck_bandwidth_bps: 100_000_000_000,
+                min_path_mtu: 9000,
+                total_cost: 0.0,
+            });
+        }
+
+        // Dijkstra's algorithm
+        let mut dist: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        let mut prev: std::collections::HashMap<String, (String, GatewayLinkAdvertisement)> = std::collections::HashMap::new();
+        let mut unvisited: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for node_id in self.nodes.keys() {
+            if !excluded_nodes.contains(node_id) {
+                dist.insert(node_id.clone(), f64::INFINITY);
+                unvisited.insert(node_id.clone());
+            }
+        }
+
+        if !dist.contains_key(from) || !dist.contains_key(to) {
+            return None;
+        }
+
+        dist.insert(from.to_string(), 0.0);
+
+        while !unvisited.is_empty() {
+            // Pick vertex with minimum distance
+            let current = unvisited
+                .iter()
+                .min_by(|a, b| {
+                    let d_a = dist.get(*a).unwrap_or(&f64::INFINITY);
+                    let d_b = dist.get(*b).unwrap_or(&f64::INFINITY);
+                    d_a.partial_cmp(d_b).unwrap_or(std::cmp::Ordering::Equal)
+                })?
+                .clone();
+
+            let current_dist = *dist.get(&current).unwrap_or(&f64::INFINITY);
+            if current_dist.is_infinite() || current == to {
+                break;
+            }
+
+            unvisited.remove(&current);
+
+            if let Some(neighbors) = self.adjacency.get(&current) {
+                for (next_id, link) in neighbors {
+                    if !unvisited.contains(next_id) || excluded_nodes.contains(next_id) {
+                        continue;
+                    }
+                    if excluded_edges.contains(&(current.clone(), next_id.clone())) {
+                        continue;
+                    }
+                    if !link.status.is_usable() {
+                        continue;
+                    }
+                    let target_node = self.nodes.get(next_id);
+                    if let Some(tn) = target_node {
+                        if !tn.state.is_routable() && next_id != to {
+                            continue;
+                        }
+                    }
+
+                    let edge_cost = self.calculate_edge_cost(link, target_node, metric);
+                    let alt = current_dist + edge_cost;
+                    if alt < *dist.get(next_id).unwrap_or(&f64::INFINITY) {
+                        dist.insert(next_id.clone(), alt);
+                        prev.insert(next_id.clone(), (current.clone(), link.clone()));
+                    }
+                }
+            }
+        }
+
+        if !prev.contains_key(to) {
+            return None;
+        }
+
+        // Reconstruct path
+        let mut hops = vec![to.to_string()];
+        let mut links = Vec::new();
+        let mut curr = to.to_string();
+
+        while let Some((p, link)) = prev.get(&curr) {
+            links.push(link.clone());
+            hops.push(p.clone());
+            if p == from {
+                break;
+            }
+            curr = p.clone();
+        }
+
+        hops.reverse();
+        links.reverse();
+
+        let mut total_rtt_us = 0u32;
+        let mut survival_prob = 1.0f64;
+        let mut bottleneck_bw = u64::MAX;
+        let mut min_mtu = u16::MAX;
+
+        for l in &links {
+            total_rtt_us = total_rtt_us.saturating_add(l.metrics.rtt_us);
+            let link_loss = (l.metrics.loss_rate as f64).clamp(0.0, 1.0);
+            survival_prob *= 1.0 - link_loss;
+            bottleneck_bw = bottleneck_bw.min(l.metrics.bandwidth_bps);
+            min_mtu = min_mtu.min(l.metrics.mtu);
+        }
+
+        let cumulative_loss_rate = (1.0 - survival_prob).clamp(0.0, 1.0) as f32;
+        let total_cost = *dist.get(to).unwrap_or(&0.0);
+
+        Some(ComputedMultiPath {
+            hops,
+            links,
+            total_rtt_us,
+            cumulative_loss_rate,
+            bottleneck_bandwidth_bps: if bottleneck_bw == u64::MAX { 0 } else { bottleneck_bw },
+            min_path_mtu: if min_mtu == u16::MAX { 1500 } else { min_mtu },
+            total_cost,
+        })
+    }
+
+    /// Compute up to `k` diverse/disjoint multipaths between `from` and `to`.
+    pub fn find_k_disjoint_multipaths(
+        &self,
+        from: &str,
+        to: &str,
+        k: usize,
+        mode: DisjointMode,
+    ) -> Vec<ComputedMultiPath> {
+        let mut results = Vec::with_capacity(k);
+        let mut excluded_nodes = std::collections::HashSet::new();
+        let mut excluded_edges = std::collections::HashSet::new();
+
+        for _ in 0..k {
+            if let Some(path) = self.find_best_path_internal(
+                from,
+                to,
+                PathOptimizationMetric::LowestLatency,
+                &excluded_nodes,
+                &excluded_edges,
+            ) {
+                // Mask edges
+                for window in path.hops.windows(2) {
+                    excluded_edges.insert((window[0].clone(), window[1].clone()));
+                }
+
+                // If node-disjoint, also exclude intermediate nodes (exclude from and to)
+                if mode == DisjointMode::NodeDisjoint {
+                    for hop in &path.hops[1..path.hops.len().saturating_sub(1)] {
+                        excluded_nodes.insert(hop.clone());
+                    }
+                }
+
+                results.push(path);
+            } else {
+                break;
+            }
+        }
+
+        results
+    }
+
+    /// Convert computed multi-paths directly into bonded tunnel paths ready for `MultipathTunnelBondingEngine`.
+    pub fn convert_to_bonded_paths(
+        &self,
+        paths: &[ComputedMultiPath],
+        base_weight: u32,
+        now: std::time::Instant,
+    ) -> Vec<BondedTunnelPath> {
+        let mut bonded = Vec::with_capacity(paths.len());
+        for (idx, p) in paths.iter().enumerate() {
+            let path_id = (idx as u64) + 1;
+            let rtt = Duration::from_micros(p.total_rtt_us as u64);
+            let loss_rate = p.cumulative_loss_rate as f64;
+
+            // Compute proportional dynamic weight: higher bandwidth & lower RTT gives higher weight
+            let rtt_factor = (100_000.0 / (p.total_rtt_us.max(1000) as f64)).clamp(1.0, 50.0);
+            let bw_mbps = (p.bottleneck_bandwidth_bps / 1_000_000).max(1) as f64;
+            let weight = ((bw_mbps.sqrt() * rtt_factor * (base_weight as f64)) / 100.0).clamp(1.0, 1000.0) as u32;
+
+            let target = p.hops.last().cloned().unwrap_or_else(|| "target.gateway".to_string());
+            let mut tunnel = ExtendedConnectTunnel::new(path_id as u32, TunnelProtocol::ConnectUdp, &target);
+            tunnel.mark_established();
+
+            bonded.push(
+                BondedTunnelPath::new(path_id, p.display_route(), tunnel, weight, now)
+                    .with_state(BondedPathState::Active)
+                    .with_rtt(rtt)
+                    .with_loss_rate(loss_rate)
+            );
+        }
+        bonded
+    }
+}
+
+/// Dynamic active probing statistics tracking for a peer gateway.
+#[derive(Debug, Clone, Default)]
+pub struct ActiveProbeStats {
+    pub total_probes_sent: u64,
+    pub total_probes_received: u64,
+    pub smoothed_rtt_us: u32,
+    pub rtt_variance_us: u32,
+    pub min_rtt_us: u32,
+    pub last_probe_time_ms: u64,
+}
+
+impl ActiveProbeStats {
+    /// Update probe stats on receiving an echo pong reply (RFC 6298 / RFC 9002 EWMA).
+    pub fn record_sample(&mut self, sample_rtt_us: u32, now_ms: u64) {
+        self.total_probes_received += 1;
+        self.last_probe_time_ms = now_ms;
+        if self.min_rtt_us == 0 || sample_rtt_us < self.min_rtt_us {
+            self.min_rtt_us = sample_rtt_us;
+        }
+
+        if self.smoothed_rtt_us == 0 {
+            self.smoothed_rtt_us = sample_rtt_us;
+            self.rtt_variance_us = sample_rtt_us / 2;
+        } else {
+            let delta = (sample_rtt_us as i64 - self.smoothed_rtt_us as i64).unsigned_abs() as u32;
+            self.rtt_variance_us = (3 * self.rtt_variance_us + delta) / 4;
+            self.smoothed_rtt_us = (7 * self.smoothed_rtt_us + sample_rtt_us) / 8;
+        }
+    }
+
+    /// Calculated loss rate over probes.
+    pub fn loss_rate(&self) -> f32 {
+        if self.total_probes_sent == 0 {
+            return 0.0;
+        }
+        let lost = self.total_probes_sent.saturating_sub(self.total_probes_received);
+        (lost as f32) / (self.total_probes_sent as f32)
+    }
+}
+
+/// Action resulting from processing an incoming topology capsule.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TopologyDiscoveryAction {
+    None,
+    SendPong(TopologyProbePong),
+    SendSyncResponse(TopologySyncResponse),
+    UpdatedGraph { nodes_added: usize, links_added: usize },
+}
+
+/// Distributed MASQUE Topology and Multi-Path Discovery Engine.
+#[derive(Debug, Clone)]
+pub struct DistributedMasqueTopologyDiscoveryEngine {
+    pub local_node: GatewayNodeDescriptor,
+    pub graph: GatewayTopologyGraph,
+    pub probe_stats: std::collections::HashMap<String, ActiveProbeStats>,
+    pending_pings: std::collections::HashMap<u64, (String, u64)>, // probe_id -> (target_node, ping_ns)
+    next_probe_id: u64,
+    next_sequence: u64,
+}
+
+impl DistributedMasqueTopologyDiscoveryEngine {
+    /// Initialize the discovery engine with the local gateway node descriptor.
+    pub fn new(local_node: GatewayNodeDescriptor) -> Self {
+        let mut graph = GatewayTopologyGraph::new();
+        graph.insert_node(local_node.clone());
+        Self {
+            local_node,
+            graph,
+            probe_stats: std::collections::HashMap::new(),
+            pending_pings: std::collections::HashMap::new(),
+            next_probe_id: 1,
+            next_sequence: 100,
+        }
+    }
+
+    /// Generate a periodic local node advertisement with incremented sequence number.
+    pub fn generate_node_advertisement(&mut self, now_ms: u64) -> GatewayNodeDescriptor {
+        self.next_sequence += 1;
+        self.local_node.sequence_number = self.next_sequence;
+        self.local_node.timestamp_ms = now_ms;
+        self.graph.insert_node(self.local_node.clone());
+        self.local_node.clone()
+    }
+
+    /// Generate and announce a link state advertisement to a neighbor.
+    pub fn announce_link(
+        &mut self,
+        target_node: &str,
+        link_id: u64,
+        link_type: LinkType,
+        metrics: LinkMetrics,
+        now_ms: u64,
+    ) -> GatewayLinkAdvertisement {
+        self.next_sequence += 1;
+        let mut adv = GatewayLinkAdvertisement::new(&self.local_node.node_id, target_node, link_id);
+        adv.link_type = link_type;
+        adv.metrics = metrics;
+        adv.sequence_number = self.next_sequence;
+        adv.timestamp_ms = now_ms;
+        self.graph.insert_link(adv.clone());
+        adv
+    }
+
+    /// Prepare an active probe ping towards a peer gateway.
+    pub fn send_probe_ping(&mut self, target_node: &str, now_ns: u64) -> TopologyProbePing {
+        let probe_id = self.next_probe_id;
+        self.next_probe_id += 1;
+        self.pending_pings.insert(probe_id, (target_node.to_string(), now_ns));
+
+        let stats = self.probe_stats.entry(target_node.to_string()).or_default();
+        stats.total_probes_sent += 1;
+
+        TopologyProbePing {
+            probe_id,
+            timestamp_ns: now_ns,
+            source_node: self.local_node.node_id.clone(),
+        }
+    }
+
+    /// Handle an incoming active probe ping and generate an echo pong reply.
+    pub fn handle_probe_ping(&self, ping: &TopologyProbePing, now_ns: u64) -> TopologyProbePong {
+        TopologyProbePong {
+            probe_id: ping.probe_id,
+            echo_timestamp_ns: ping.timestamp_ns,
+            reply_timestamp_ns: now_ns,
+            node_id: self.local_node.node_id.clone(),
+        }
+    }
+
+    /// Handle an incoming active probe pong reply and update latency/jitter metrics.
+    pub fn handle_probe_pong(&mut self, pong: &TopologyProbePong, now_ns: u64, now_ms: u64) -> Option<u32> {
+        if let Some((target_node, start_ns)) = self.pending_pings.remove(&pong.probe_id) {
+            let rtt_ns = now_ns.saturating_sub(start_ns);
+            let rtt_us = (rtt_ns / 1000).max(1) as u32;
+
+            let stats = self.probe_stats.entry(target_node.clone()).or_default();
+            stats.record_sample(rtt_us, now_ms);
+
+            // Update graph link metrics if link exists
+            if let Some(link) = self.graph.get_link(&self.local_node.node_id, &target_node) {
+                let mut updated_link = link.clone();
+                updated_link.metrics.rtt_us = stats.smoothed_rtt_us;
+                updated_link.metrics.jitter_us = stats.rtt_variance_us;
+                updated_link.metrics.loss_rate = stats.loss_rate();
+                self.next_sequence += 1;
+                updated_link.sequence_number = self.next_sequence;
+                updated_link.timestamp_ms = now_ms;
+                self.graph.insert_link(updated_link);
+            }
+
+            Some(rtt_us)
+        } else {
+            None
+        }
+    }
+
+    /// Ingest an incoming HTTP capsule and dispatch it to discovery subsystems.
+    pub fn process_incoming_capsule(
+        &mut self,
+        capsule: &crate::simd_parser::HttpCapsule,
+        now_ns: u64,
+        now_ms: u64,
+    ) -> Result<TopologyDiscoveryAction, String> {
+        use crate::simd_parser::CapsuleType;
+        match capsule.capsule_type {
+            CapsuleType::TopologyNodeAdvertisement => {
+                let node = GatewayNodeDescriptor::from_capsule(capsule)?;
+                let inserted = self.graph.insert_node(node);
+                Ok(TopologyDiscoveryAction::UpdatedGraph {
+                    nodes_added: if inserted { 1 } else { 0 },
+                    links_added: 0,
+                })
+            }
+            CapsuleType::TopologyLinkAdvertisement => {
+                let link = GatewayLinkAdvertisement::from_capsule(capsule)?;
+                let inserted = self.graph.insert_link(link);
+                Ok(TopologyDiscoveryAction::UpdatedGraph {
+                    nodes_added: 0,
+                    links_added: if inserted { 1 } else { 0 },
+                })
+            }
+            CapsuleType::TopologyProbePing => {
+                let ping = TopologyProbePing::from_capsule(capsule)?;
+                let pong = self.handle_probe_ping(&ping, now_ns);
+                Ok(TopologyDiscoveryAction::SendPong(pong))
+            }
+            CapsuleType::TopologyProbePong => {
+                let pong = TopologyProbePong::from_capsule(capsule)?;
+                self.handle_probe_pong(&pong, now_ns, now_ms);
+                Ok(TopologyDiscoveryAction::None)
+            }
+            CapsuleType::TopologySyncRequest => {
+                let req = TopologySyncRequest::from_capsule(capsule)?;
+                let resp = self.graph.generate_sync_response(req.since_sequence);
+                Ok(TopologyDiscoveryAction::SendSyncResponse(resp))
+            }
+            CapsuleType::TopologySyncResponse => {
+                let resp = TopologySyncResponse::from_capsule(capsule)?;
+                let mut n_added = 0;
+                let mut l_added = 0;
+                for n in resp.nodes {
+                    if self.graph.insert_node(n) {
+                        n_added += 1;
+                    }
+                }
+                for l in resp.links {
+                    if self.graph.insert_link(l) {
+                        l_added += 1;
+                    }
+                }
+                Ok(TopologyDiscoveryAction::UpdatedGraph {
+                    nodes_added: n_added,
+                    links_added: l_added,
+                })
+            }
+            _ => Ok(TopologyDiscoveryAction::None),
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -38472,5 +39921,415 @@ mod tls_alpn_tests {
 
         let otel_json = client_tunnel.export_otlp_metrics(1700000000000).expect("export otlp");
         assert!(otel_json.contains("resourceMetrics"));
+    }
+
+    #[test]
+    fn test_masque_topology_binary_serialization_and_capsules() {
+        // 1. GatewayNodeDescriptor roundtrip
+        let mut node = GatewayNodeDescriptor::new("gw-iad1-01", "iad1", "https://gw-iad1.masque.ifa:443");
+        node.data_endpoints = vec!["198.51.100.10:443".to_string(), "[2001:db8::10]:443".to_string()];
+        node.state = GatewayNodeState::Available;
+        node.load_factor = 0.25;
+        node.active_tunnels = 42;
+        node.sequence_number = 105;
+        node.timestamp_ms = 1700000000000;
+        node.ttl_seconds = 120;
+
+        let node_bytes = node.to_bytes();
+        let decoded_node = GatewayNodeDescriptor::from_bytes(&node_bytes).expect("decode node");
+        assert_eq!(node, decoded_node);
+
+        let cap_node = node.to_capsule();
+        assert_eq!(cap_node.capsule_type, crate::simd_parser::CapsuleType::TopologyNodeAdvertisement);
+        let from_cap_node = GatewayNodeDescriptor::from_capsule(&cap_node).expect("from capsule node");
+        assert_eq!(node, from_cap_node);
+
+        // 2. GatewayLinkAdvertisement roundtrip
+        let mut link = GatewayLinkAdvertisement::new("gw-iad1-01", "gw-ord1-01", 9901);
+        link.link_type = LinkType::CrossConnect;
+        link.status = LinkStatus::Active;
+        link.metrics.rtt_us = 12_500;
+        link.metrics.jitter_us = 350;
+        link.metrics.loss_rate = 0.001;
+        link.metrics.mtu = 9000;
+        link.metrics.bandwidth_bps = 40_000_000_000;
+        link.metrics.cost_metric = 15;
+        link.sequence_number = 200;
+        link.timestamp_ms = 1700000001000;
+        link.ttl_seconds = 60;
+        link.bidirectional = true;
+
+        let link_bytes = link.to_bytes();
+        let decoded_link = GatewayLinkAdvertisement::from_bytes(&link_bytes).expect("decode link");
+        assert_eq!(link, decoded_link);
+
+        let cap_link = link.to_capsule();
+        assert_eq!(cap_link.capsule_type, crate::simd_parser::CapsuleType::TopologyLinkAdvertisement);
+        let from_cap_link = GatewayLinkAdvertisement::from_capsule(&cap_link).expect("from capsule link");
+        assert_eq!(link, from_cap_link);
+
+        // 3. Probes and Sync roundtrips
+        let ping = TopologyProbePing {
+            probe_id: 777,
+            timestamp_ns: 123456789,
+            source_node: "gw-iad1-01".to_string(),
+        };
+        let cap_ping = ping.to_capsule();
+        let from_cap_ping = TopologyProbePing::from_capsule(&cap_ping).expect("from capsule ping");
+        assert_eq!(ping, from_cap_ping);
+
+        let pong = TopologyProbePong {
+            probe_id: 777,
+            echo_timestamp_ns: 123456789,
+            reply_timestamp_ns: 123458900,
+            node_id: "gw-ord1-01".to_string(),
+        };
+        let cap_pong = pong.to_capsule();
+        let from_cap_pong = TopologyProbePong::from_capsule(&cap_pong).expect("from capsule pong");
+        assert_eq!(pong, from_cap_pong);
+
+        let sync_req = TopologySyncRequest {
+            requester_node: "gw-sfo1-01".to_string(),
+            since_sequence: 50,
+        };
+        let cap_sync_req = sync_req.to_capsule();
+        let from_cap_req = TopologySyncRequest::from_capsule(&cap_sync_req).expect("from capsule sync req");
+        assert_eq!(sync_req, from_cap_req);
+
+        let sync_resp = TopologySyncResponse {
+            nodes: vec![node],
+            links: vec![link],
+        };
+        let cap_sync_resp = sync_resp.to_capsule();
+        let from_cap_resp = TopologySyncResponse::from_capsule(&cap_sync_resp).expect("from capsule sync resp");
+        assert_eq!(sync_resp, from_cap_resp);
+    }
+
+    #[test]
+    fn test_masque_topology_graph_ingestion_and_anti_replay() {
+        let mut graph = GatewayTopologyGraph::new();
+
+        let mut node1 = GatewayNodeDescriptor::new("gw-a", "iad", "https://gw-a:443");
+        node1.sequence_number = 10;
+        assert!(graph.insert_node(node1.clone()));
+        assert_eq!(graph.node_count(), 1);
+
+        // Replay of older or identical sequence number must be rejected
+        let mut stale_node1 = node1.clone();
+        stale_node1.sequence_number = 9;
+        assert!(!graph.insert_node(stale_node1));
+
+        let same_seq_node1 = node1.clone();
+        assert!(!graph.insert_node(same_seq_node1));
+
+        // Newer sequence number is accepted
+        let mut newer_node1 = node1.clone();
+        newer_node1.sequence_number = 11;
+        newer_node1.load_factor = 0.5;
+        assert!(graph.insert_node(newer_node1));
+        assert_eq!(graph.get_node("gw-a").unwrap().load_factor, 0.5);
+
+        // Insert second node and link
+        let mut node2 = GatewayNodeDescriptor::new("gw-b", "ord", "https://gw-b:443");
+        node2.sequence_number = 20;
+        assert!(graph.insert_node(node2));
+
+        let mut link1 = GatewayLinkAdvertisement::new("gw-a", "gw-b", 1);
+        link1.sequence_number = 100;
+        link1.bidirectional = true;
+        assert!(graph.insert_link(link1.clone()));
+
+        // Bidirectional link creates 2 directed edges
+        assert_eq!(graph.link_count(), 2);
+        assert!(graph.get_link("gw-a", "gw-b").is_some());
+        assert!(graph.get_link("gw-b", "gw-a").is_some());
+
+        // Stale link advertisement rejected
+        let mut stale_link = link1.clone();
+        stale_link.sequence_number = 99;
+        assert!(!graph.insert_link(stale_link));
+    }
+
+    #[test]
+    fn test_masque_topology_stale_pruning_and_flapping() {
+        let mut graph = GatewayTopologyGraph::new();
+        let now = 100_000;
+
+        let mut node = GatewayNodeDescriptor::new("gw-exp", "iad", "https://gw-exp:443");
+        node.timestamp_ms = now;
+        node.ttl_seconds = 10; // expires at 110_000
+        graph.insert_node(node);
+
+        let mut link = GatewayLinkAdvertisement::new("gw-exp", "gw-other", 50);
+        link.timestamp_ms = now;
+        link.ttl_seconds = 10;
+        link.bidirectional = false;
+        graph.insert_link(link);
+
+        assert_eq!(graph.node_count(), 1);
+        assert_eq!(graph.link_count(), 1);
+
+        // Before TTL expiration: 0 pruned
+        let (p_nodes, p_links) = graph.prune_stale(now + 5_000);
+        assert_eq!(p_nodes, 0);
+        assert_eq!(p_links, 0);
+
+        // After TTL expiration: pruned
+        let (p_nodes, p_links) = graph.prune_stale(now + 12_000);
+        assert_eq!(p_nodes, 1);
+        assert_eq!(p_links, 1);
+        assert_eq!(graph.node_count(), 0);
+        assert_eq!(graph.link_count(), 0);
+
+        // Flapping test: multiple transitions between Active and Down within 30s
+        let mut node_a = GatewayNodeDescriptor::new("node-a", "iad", "https://a:443");
+        node_a.sequence_number = 1;
+        graph.insert_node(node_a);
+
+        let mut flap_link = GatewayLinkAdvertisement::new("node-a", "node-b", 999);
+        flap_link.sequence_number = 1;
+        flap_link.timestamp_ms = 1_000;
+        flap_link.status = LinkStatus::Active;
+        graph.insert_link(flap_link.clone());
+
+        flap_link.sequence_number = 2;
+        flap_link.timestamp_ms = 5_000;
+        flap_link.status = LinkStatus::Down;
+        graph.insert_link(flap_link.clone());
+
+        flap_link.sequence_number = 3;
+        flap_link.timestamp_ms = 10_000;
+        flap_link.status = LinkStatus::Active;
+        graph.insert_link(flap_link.clone());
+
+        flap_link.sequence_number = 4;
+        flap_link.timestamp_ms = 15_000;
+        flap_link.status = LinkStatus::Down;
+        graph.insert_link(flap_link.clone());
+
+        flap_link.sequence_number = 5;
+        flap_link.timestamp_ms = 20_000;
+        flap_link.status = LinkStatus::Active;
+        graph.insert_link(flap_link.clone());
+
+        // Should be flagged as Flapping with penalized cost
+        let retrieved = graph.get_link("node-a", "node-b").expect("retrieved link");
+        assert_eq!(retrieved.status, LinkStatus::Flapping);
+        assert!(retrieved.metrics.cost_metric >= 100);
+    }
+
+    #[test]
+    fn test_masque_topology_dijkstra_path_optimization() {
+        let mut graph = GatewayTopologyGraph::new();
+
+        // Build topology:
+        // Client -> GW1 -> GW3 -> Server
+        // Client -> GW2 -> Server
+        let mut add_node = |id: &str, state: GatewayNodeState, load: f32| {
+            let mut n = GatewayNodeDescriptor::new(id, "zone", &format!("https://{}:443", id));
+            n.state = state;
+            n.load_factor = load;
+            n.sequence_number = 1;
+            n.timestamp_ms = 1000;
+            n.ttl_seconds = 3600;
+            graph.insert_node(n);
+        };
+
+        add_node("client", GatewayNodeState::Available, 0.1);
+        add_node("gw1", GatewayNodeState::Available, 0.1);
+        add_node("gw2", GatewayNodeState::Available, 0.2);
+        add_node("gw3", GatewayNodeState::Available, 0.1);
+        add_node("server", GatewayNodeState::Available, 0.1);
+
+        let mut add_link = |src: &str, dst: &str, rtt: u32, loss: f32, bw: u64, id: u64| {
+            let mut l = GatewayLinkAdvertisement::new(src, dst, id);
+            l.metrics.rtt_us = rtt;
+            l.metrics.loss_rate = loss;
+            l.metrics.bandwidth_bps = bw;
+            l.sequence_number = 1;
+            l.timestamp_ms = 1000;
+            l.ttl_seconds = 3600;
+            l.bidirectional = false;
+            graph.insert_link(l);
+        };
+
+        // Path A via GW1 & GW3: low latency (10ms + 10ms = 20ms), high bandwidth (10G), low loss (0.0)
+        add_link("client", "gw1", 10_000, 0.0, 10_000_000_000, 1);
+        add_link("gw1", "gw3", 10_000, 0.0, 10_000_000_000, 2);
+        add_link("gw3", "server", 10_000, 0.0, 10_000_000_000, 3);
+
+        // Path B via GW2: high latency (100ms + 100ms = 200ms), low bandwidth (1G), high loss (5%)
+        add_link("client", "gw2", 100_000, 0.05, 1_000_000_000, 4);
+        add_link("gw2", "server", 100_000, 0.05, 1_000_000_000, 5);
+
+        // 1. LowestLatency path should choose client -> gw1 -> gw3 -> server (30ms total)
+        let best_lat = graph.find_best_path("client", "server", PathOptimizationMetric::LowestLatency).expect("best lat");
+        assert_eq!(best_lat.hops, vec!["client", "gw1", "gw3", "server"]);
+        assert_eq!(best_lat.total_rtt_us, 30_000);
+        assert_eq!(best_lat.bottleneck_bandwidth_bps, 10_000_000_000);
+
+        // 2. ShortestHops should choose client -> gw2 -> server (2 hops vs 3 hops)
+        let best_hops = graph.find_best_path("client", "server", PathOptimizationMetric::ShortestHops).expect("best hops");
+        assert_eq!(best_hops.hops, vec!["client", "gw2", "server"]);
+
+        // 3. Mark GW1 as Maintenance -> traffic must automatically reroute via GW2
+        let mut maint_gw1 = graph.get_node("gw1").unwrap().clone();
+        maint_gw1.state = GatewayNodeState::Maintenance;
+        maint_gw1.sequence_number = 2;
+        graph.insert_node(maint_gw1);
+
+        let rerouted = graph.find_best_path("client", "server", PathOptimizationMetric::LowestLatency).expect("rerouted");
+        assert_eq!(rerouted.hops, vec!["client", "gw2", "server"]);
+    }
+
+    #[test]
+    fn test_masque_topology_k_disjoint_multipaths_and_bonding() {
+        let mut graph = GatewayTopologyGraph::new();
+
+        // Diamond topology:
+        // S -> A -> D
+        // S -> B -> D
+        for n in ["S", "A", "B", "D"] {
+            let mut desc = GatewayNodeDescriptor::new(n, "us", &format!("https://{}:443", n));
+            desc.sequence_number = 1;
+            desc.timestamp_ms = 1000;
+            desc.ttl_seconds = 3600;
+            graph.insert_node(desc);
+        }
+
+        let mut add_link = |s: &str, d: &str, rtt: u32, bw: u64, id: u64| {
+            let mut l = GatewayLinkAdvertisement::new(s, d, id);
+            l.metrics.rtt_us = rtt;
+            l.metrics.bandwidth_bps = bw;
+            l.sequence_number = 1;
+            l.timestamp_ms = 1000;
+            l.ttl_seconds = 3600;
+            l.bidirectional = false;
+            graph.insert_link(l);
+        };
+
+        add_link("S", "A", 15_000, 5_000_000_000, 101);
+        add_link("A", "D", 15_000, 5_000_000_000, 102);
+
+        add_link("S", "B", 25_000, 2_000_000_000, 201);
+        add_link("B", "D", 25_000, 2_000_000_000, 202);
+
+        // Find 2 Node-Disjoint paths between S and D
+        let disjoint_paths = graph.find_k_disjoint_multipaths("S", "D", 2, DisjointMode::NodeDisjoint);
+        assert_eq!(disjoint_paths.len(), 2);
+        assert_eq!(disjoint_paths[0].hops, vec!["S", "A", "D"]);
+        assert_eq!(disjoint_paths[1].hops, vec!["S", "B", "D"]);
+
+        // Convert directly into BondedTunnelPath instances for MultipathTunnelBondingEngine
+        let now = std::time::Instant::now();
+        let bonded_paths = graph.convert_to_bonded_paths(&disjoint_paths, 100, now);
+        assert_eq!(bonded_paths.len(), 2);
+        assert_eq!(bonded_paths[0].tunnel_id, 1);
+        assert_eq!(bonded_paths[1].tunnel_id, 2);
+        assert!(bonded_paths[0].weight >= bonded_paths[1].weight);
+
+        // Feed directly into MultipathTunnelBondingEngine
+        let mut engine = MultipathTunnelBondingEngine::new(MultipathBalancingPolicy::WeightedRoundRobin);
+        for path in bonded_paths {
+            engine.add_path(path);
+        }
+
+        let telem = engine.telemetry();
+        assert_eq!(telem.active_paths, 2);
+    }
+
+    #[test]
+    fn test_masque_topology_distributed_discovery_and_tunnel_capsules() {
+        // Setup client gateway and server gateway discovery engines
+        let client_desc = GatewayNodeDescriptor::new("gw-client", "iad1", "https://gw-client:443");
+        let server_desc = GatewayNodeDescriptor::new("gw-server", "fra2", "https://gw-server:443");
+
+        let mut client_engine = DistributedMasqueTopologyDiscoveryEngine::new(client_desc.clone());
+        let mut server_engine = DistributedMasqueTopologyDiscoveryEngine::new(server_desc.clone());
+
+        // Connect client and server via ExtendedConnectTunnel
+        let mut client_tunnel = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "gw-server:443");
+        client_tunnel.mark_established();
+        let mut server_tunnel = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "gw-server:443");
+        server_tunnel.mark_established();
+
+        // 1. Announce node advertisements across tunnel
+        let client_adv = client_engine.generate_node_advertisement(1_000_000);
+        client_tunnel.send_node_advertisement(&client_adv).expect("send node adv");
+
+        let frames = client_tunnel.drain_egress_data();
+        assert!(!frames.is_empty());
+        for frame in frames {
+            server_tunnel.ingest_network_data(&frame);
+        }
+
+        let recv_node = server_tunnel.recv_node_advertisement().expect("recv node adv").expect("node exists");
+        assert_eq!(recv_node.node_id, "gw-client");
+        server_engine.graph.insert_node(recv_node);
+        assert_eq!(server_engine.graph.node_count(), 2);
+
+        // 2. Announce link advertisement across tunnel
+        let mut link_metrics = LinkMetrics::default();
+        link_metrics.rtt_us = 85_000;
+        link_metrics.bandwidth_bps = 10_000_000_000;
+        let client_link = client_engine.announce_link("gw-server", 555, LinkType::DirectQuic, link_metrics, 1_000_000);
+        client_tunnel.send_link_advertisement(&client_link).expect("send link adv");
+
+        let frames2 = client_tunnel.drain_egress_data();
+        for frame in frames2 {
+            server_tunnel.ingest_network_data(&frame);
+        }
+
+        let recv_link = server_tunnel.recv_link_advertisement().expect("recv link adv").expect("link exists");
+        assert_eq!(recv_link.source_node, "gw-client");
+        assert_eq!(recv_link.target_node, "gw-server");
+        server_engine.graph.insert_link(recv_link);
+
+        // 3. Active path probe ping & pong
+        let ping = client_engine.send_probe_ping("gw-server", 10_000_000);
+        client_tunnel.send_topology_probe_ping(&ping).expect("send ping");
+
+        let frames3 = client_tunnel.drain_egress_data();
+        for frame in frames3 {
+            server_tunnel.ingest_network_data(&frame);
+        }
+
+        let recv_ping = server_tunnel.recv_topology_probe_ping().expect("recv ping").expect("ping exists");
+        let pong = server_engine.handle_probe_ping(&recv_ping, 10_020_000);
+        server_tunnel.send_topology_probe_pong(&pong).expect("send pong");
+
+        let frames4 = server_tunnel.drain_egress_data();
+        for frame in frames4 {
+            client_tunnel.ingest_network_data(&frame);
+        }
+
+        let recv_pong = client_tunnel.recv_topology_probe_pong().expect("recv pong").expect("pong exists");
+        let measured_rtt_us = client_engine.handle_probe_pong(&recv_pong, 10_040_000, 1_000_000);
+        assert_eq!(measured_rtt_us, Some(40)); // (10_040_000 - 10_000_000) ns / 1000 = 40 us
+
+        // 4. LSDB Sync Request & Response
+        let sync_req = TopologySyncRequest {
+            requester_node: "gw-client".to_string(),
+            since_sequence: 0,
+        };
+        client_tunnel.send_topology_sync_request(&sync_req).expect("send sync req");
+
+        let frames5 = client_tunnel.drain_egress_data();
+        for frame in frames5 {
+            server_tunnel.ingest_network_data(&frame);
+        }
+
+        let recv_sync_req = server_tunnel.recv_topology_sync_request().expect("recv sync req").expect("req exists");
+        let sync_resp = server_engine.graph.generate_sync_response(recv_sync_req.since_sequence);
+        server_tunnel.send_topology_sync_response(&sync_resp).expect("send sync resp");
+
+        let frames6 = server_tunnel.drain_egress_data();
+        for frame in frames6 {
+            client_tunnel.ingest_network_data(&frame);
+        }
+
+        let recv_sync_resp = client_tunnel.recv_topology_sync_response().expect("recv sync resp").expect("resp exists");
+        assert!(!recv_sync_resp.nodes.is_empty());
+        assert!(!recv_sync_resp.links.is_empty());
     }
 }
