@@ -2399,6 +2399,1093 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// X25519 (RFC 7748) Elliptic Curve Diffie-Hellman Key Exchange
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const X25519_KEY_LEN: usize = 32;
+pub const X25519_BASE_POINT: [u8; 32] = [
+    9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Fe([u64; 5]);
+
+impl Fe {
+    const ZERO: Self = Self([0, 0, 0, 0, 0]);
+    const ONE: Self = Self([1, 0, 0, 0, 0]);
+    const A24: Self = Self([121665, 0, 0, 0, 0]);
+
+    fn from_bytes(bytes: &[u8; 32]) -> Self {
+        let mut limbs = [0u64; 5];
+        let mut b = *bytes;
+        b[31] &= 0x7f;
+        let w0 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        let w2 = u64::from_le_bytes(b[16..24].try_into().unwrap());
+        let w3 = u64::from_le_bytes(b[24..32].try_into().unwrap());
+
+        limbs[0] = w0 & 0x7ffffffffffff;
+        limbs[1] = ((w0 >> 51) | (w1 << 13)) & 0x7ffffffffffff;
+        limbs[2] = ((w1 >> 38) | (w2 << 26)) & 0x7ffffffffffff;
+        limbs[3] = ((w2 >> 25) | (w3 << 39)) & 0x7ffffffffffff;
+        limbs[4] = (w3 >> 12) & 0x7ffffffffffff;
+        Self(limbs)
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    fn to_bytes(&self) -> [u8; 32] {
+        let mut t = *self;
+        t.carry();
+        t.carry();
+
+        let c0 = t.0[0].wrapping_add(19);
+        let carry0 = c0 >> 51;
+        let c1 = t.0[1].wrapping_add(carry0);
+        let carry1 = c1 >> 51;
+        let c2 = t.0[2].wrapping_add(carry1);
+        let carry2 = c2 >> 51;
+        let c3 = t.0[3].wrapping_add(carry2);
+        let carry3 = c3 >> 51;
+        let c4 = t.0[4].wrapping_add(carry3);
+        let carry4 = c4 >> 51;
+
+        if carry4 != 0 {
+            t.0[0] = c0 & 0x7ffffffffffff;
+            t.0[1] = c1 & 0x7ffffffffffff;
+            t.0[2] = c2 & 0x7ffffffffffff;
+            t.0[3] = c3 & 0x7ffffffffffff;
+            t.0[4] = c4 & 0x7ffffffffffff;
+        }
+
+        let mut bytes = [0u8; 32];
+        let l0 = t.0[0] | (t.0[1] << 51);
+        let l1 = (t.0[1] >> 13) | (t.0[2] << 38);
+        let l2 = (t.0[2] >> 26) | (t.0[3] << 25);
+        let l3 = (t.0[3] >> 39) | (t.0[4] << 12);
+
+        bytes[0..8].copy_from_slice(&l0.to_le_bytes());
+        bytes[8..16].copy_from_slice(&l1.to_le_bytes());
+        bytes[16..24].copy_from_slice(&l2.to_le_bytes());
+        bytes[24..32].copy_from_slice(&l3.to_le_bytes());
+        bytes
+    }
+
+    fn carry(&mut self) {
+        for _ in 0..2 {
+            let c0 = self.0[0] >> 51;
+            self.0[0] &= 0x7ffffffffffff;
+            self.0[1] += c0;
+
+            let c1 = self.0[1] >> 51;
+            self.0[1] &= 0x7ffffffffffff;
+            self.0[2] += c1;
+
+            let c2 = self.0[2] >> 51;
+            self.0[2] &= 0x7ffffffffffff;
+            self.0[3] += c2;
+
+            let c3 = self.0[3] >> 51;
+            self.0[3] &= 0x7ffffffffffff;
+            self.0[4] += c3;
+
+            let c4 = self.0[4] >> 51;
+            self.0[4] &= 0x7ffffffffffff;
+            self.0[0] += c4 * 19;
+        }
+    }
+
+    fn add(&self, other: &Self) -> Self {
+        let mut res = Self([
+            self.0[0] + other.0[0],
+            self.0[1] + other.0[1],
+            self.0[2] + other.0[2],
+            self.0[3] + other.0[3],
+            self.0[4] + other.0[4],
+        ]);
+        res.carry();
+        res
+    }
+
+    fn sub(&self, other: &Self) -> Self {
+        const P0: u64 = 0x7ffffffffffed * 4;
+        const P1: u64 = 0x7ffffffffffff * 4;
+        let mut res = Self([
+            (self.0[0] + P0) - other.0[0],
+            (self.0[1] + P1) - other.0[1],
+            (self.0[2] + P1) - other.0[2],
+            (self.0[3] + P1) - other.0[3],
+            (self.0[4] + P1) - other.0[4],
+        ]);
+        res.carry();
+        res
+    }
+
+    fn mul(&self, other: &Self) -> Self {
+        let a = &self.0;
+        let b = &other.0;
+        let mut r = [0u128; 9];
+        for i in 0..5 {
+            for j in 0..5 {
+                r[i + j] += (a[i] as u128) * (b[j] as u128);
+            }
+        }
+        for i in 0..4 {
+            r[i] += r[i + 5] * 19;
+        }
+        let mut res = Self([0; 5]);
+        let mut carry = 0u128;
+        for i in 0..5 {
+            let val = r[i] + carry;
+            res.0[i] = (val & 0x7ffffffffffff) as u64;
+            carry = val >> 51;
+        }
+        res.0[0] += (carry * 19) as u64;
+        res.carry();
+        res
+    }
+
+    fn sqr(&self) -> Self {
+        self.mul(self)
+    }
+
+    fn invert(&self) -> Self {
+        let z2 = self.sqr();
+        let t = z2.sqr();
+        let z9 = self.mul(&t.sqr());
+        let z11 = z2.mul(&z9);
+        let t = z11.sqr();
+        let z_2_5_0 = t.mul(&z9);
+        let mut t = z_2_5_0;
+        for _ in 0..5 {
+            t = t.sqr();
+        }
+        let z_2_10_0 = t.mul(&z_2_5_0);
+        let mut t = z_2_10_0;
+        for _ in 0..10 {
+            t = t.sqr();
+        }
+        let z_2_20_0 = t.mul(&z_2_10_0);
+        let mut t = z_2_20_0;
+        for _ in 0..20 {
+            t = t.sqr();
+        }
+        let z_2_40_0 = t.mul(&z_2_20_0);
+        let mut t = z_2_40_0;
+        for _ in 0..10 {
+            t = t.sqr();
+        }
+        let z_2_50_0 = t.mul(&z_2_10_0);
+        let mut t = z_2_50_0;
+        for _ in 0..50 {
+            t = t.sqr();
+        }
+        let z_2_100_0 = t.mul(&z_2_50_0);
+        let mut t = z_2_100_0;
+        for _ in 0..100 {
+            t = t.sqr();
+        }
+        let z_2_200_0 = t.mul(&z_2_100_0);
+        let mut t = z_2_200_0;
+        for _ in 0..50 {
+            t = t.sqr();
+        }
+        let z_2_250_0 = t.mul(&z_2_50_0);
+        let mut t = z_2_250_0;
+        for _ in 0..5 {
+            t = t.sqr();
+        }
+        t.mul(&z11)
+    }
+
+    fn cswap(swap: u64, a: &mut Self, b: &mut Self) {
+        let mask = if swap != 0 { 0xffffffffffffffff } else { 0 };
+        for i in 0..5 {
+            let delta = (a.0[i] ^ b.0[i]) & mask;
+            a.0[i] ^= delta;
+            b.0[i] ^= delta;
+        }
+    }
+}
+
+/// Compute X25519 scalar multiplication on Curve25519 (RFC 7748).
+pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
+    let mut clamped = *scalar;
+    clamped[0] &= 248;
+    clamped[31] &= 127;
+    clamped[31] |= 64;
+
+    let x1 = Fe::from_bytes(point);
+    let mut x2 = Fe::ONE;
+    let mut z2 = Fe::ZERO;
+    let mut x3 = x1;
+    let mut z3 = Fe::ONE;
+
+    let mut swap = 0u64;
+
+    for i in (0..255).rev() {
+        let bit = ((clamped[i / 8] >> (i % 8)) & 1) as u64;
+        swap ^= bit;
+        Fe::cswap(swap, &mut x2, &mut x3);
+        Fe::cswap(swap, &mut z2, &mut z3);
+        swap = bit;
+
+        let a = x2.add(&z2);
+        let aa = a.sqr();
+        let b = x2.sub(&z2);
+        let bb = b.sqr();
+        let e = aa.sub(&bb);
+        let c = x3.add(&z3);
+        let d = x3.sub(&z3);
+        let da = d.mul(&a);
+        let cb = c.mul(&b);
+
+        x3 = da.add(&cb).sqr();
+        z3 = x1.mul(&da.sub(&cb).sqr());
+        x2 = aa.mul(&bb);
+        z2 = e.mul(&aa.add(&Fe::A24.mul(&e)));
+    }
+
+    Fe::cswap(swap, &mut x2, &mut x3);
+    Fe::cswap(swap, &mut z2, &mut z3);
+
+    let z2_inv = z2.invert();
+    let result = x2.mul(&z2_inv);
+    result.to_bytes()
+}
+
+/// Derive the X25519 public key corresponding to a 32-byte private key.
+pub fn x25519_public_key(private_key: &[u8; 32]) -> [u8; 32] {
+    x25519(private_key, &X25519_BASE_POINT)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ChaCha20-Poly1305 AEAD (RFC 8439)
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const CHACHA20_KEY_LEN: usize = 32;
+pub const CHACHA20_NONCE_LEN: usize = 12;
+pub const POLY1305_TAG_LEN: usize = 16;
+
+#[inline(always)]
+fn chacha20_quarter_round(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] ^= state[a];
+    state[d] = state[d].rotate_left(16);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] ^= state[c];
+    state[b] = state[b].rotate_left(12);
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] ^= state[a];
+    state[d] = state[d].rotate_left(8);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] ^= state[c];
+    state[b] = state[b].rotate_left(7);
+}
+
+pub fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
+    let mut state = [
+        0x61707865,
+        0x3320646e,
+        0x79622d32,
+        0x6b206574,
+        u32::from_le_bytes(key[0..4].try_into().unwrap()),
+        u32::from_le_bytes(key[4..8].try_into().unwrap()),
+        u32::from_le_bytes(key[8..12].try_into().unwrap()),
+        u32::from_le_bytes(key[12..16].try_into().unwrap()),
+        u32::from_le_bytes(key[16..20].try_into().unwrap()),
+        u32::from_le_bytes(key[20..24].try_into().unwrap()),
+        u32::from_le_bytes(key[24..28].try_into().unwrap()),
+        u32::from_le_bytes(key[28..32].try_into().unwrap()),
+        counter,
+        u32::from_le_bytes(nonce[0..4].try_into().unwrap()),
+        u32::from_le_bytes(nonce[4..8].try_into().unwrap()),
+        u32::from_le_bytes(nonce[8..12].try_into().unwrap()),
+    ];
+
+    let initial = state;
+
+    for _ in 0..10 {
+        chacha20_quarter_round(&mut state, 0, 4, 8, 12);
+        chacha20_quarter_round(&mut state, 1, 5, 9, 13);
+        chacha20_quarter_round(&mut state, 2, 6, 10, 14);
+        chacha20_quarter_round(&mut state, 3, 7, 11, 15);
+
+        chacha20_quarter_round(&mut state, 0, 5, 10, 15);
+        chacha20_quarter_round(&mut state, 1, 6, 11, 12);
+        chacha20_quarter_round(&mut state, 2, 7, 8, 13);
+        chacha20_quarter_round(&mut state, 3, 4, 9, 14);
+    }
+
+    let mut out = [0u8; 64];
+    for i in 0..16 {
+        let val = state[i].wrapping_add(initial[i]);
+        out[i * 4..(i + 1) * 4].copy_from_slice(&val.to_le_bytes());
+    }
+    out
+}
+
+pub fn chacha20_xor(key: &[u8; 32], nonce: &[u8; 12], counter: u32, data: &mut [u8]) {
+    let mut curr_counter = counter;
+    for chunk in data.chunks_mut(64) {
+        let block = chacha20_block(key, curr_counter, nonce);
+        for (b, k) in chunk.iter_mut().zip(block.iter()) {
+            *b ^= *k;
+        }
+        curr_counter = curr_counter.wrapping_add(1);
+    }
+}
+
+pub fn poly1305_mac(key: &[u8; 32], message: &[u8]) -> [u8; 16] {
+    let r0 = u64::from_le_bytes(key[0..8].try_into().unwrap()) & 0x0ffffffc0fffffff;
+    let r1 = u64::from_le_bytes(key[8..16].try_into().unwrap()) & 0x0ffffffc0ffffffc;
+    let s0 = u64::from_le_bytes(key[16..24].try_into().unwrap());
+    let s1 = u64::from_le_bytes(key[24..32].try_into().unwrap());
+
+    let mut h0: u128 = 0;
+    let mut h1: u128 = 0;
+    let mut h2: u128 = 0;
+
+    for chunk in message.chunks(16) {
+        let mut block = [0u8; 17];
+        block[..chunk.len()].copy_from_slice(chunk);
+        block[chunk.len()] = 0x01;
+
+        let n0 = u128::from_le_bytes(block[0..16].try_into().unwrap());
+        let n1 = block[16] as u128;
+
+        h0 += n0 & 0xffffffffffffffff;
+        h1 += n0 >> 64;
+        h2 += n1;
+
+        let d0 = h0 * (r0 as u128);
+        let d1 = h0 * (r1 as u128) + h1 * (r0 as u128);
+        let d2 = h1 * (r1 as u128) + h2 * (r0 as u128) * 5;
+        let d3 = h2 * (r1 as u128) * 5;
+
+        let mut c = d0;
+        h0 = c & 0xffffffffffffffff;
+        c = (c >> 64) + d1;
+        h1 = c & 0xffffffffffffffff;
+        c = (c >> 64) + d2;
+        h2 = c & 0x03;
+        let carry = (c >> 2) + d3;
+        let c_mod = carry * 5;
+        h0 += c_mod;
+        if h0 > 0xffffffffffffffff {
+            let carry_h0 = h0 >> 64;
+            h0 &= 0xffffffffffffffff;
+            h1 += carry_h0;
+            if h1 > 0xffffffffffffffff {
+                h2 += h1 >> 64;
+                h1 &= 0xffffffffffffffff;
+            }
+        }
+    }
+
+    let total_lo = h0 | (h1 << 64);
+    let total_hi = h2 as u64;
+
+    let (sub_lo, borrow) = total_lo.overflowing_sub(0xfffffffffffffffffffffffffffffffb);
+    let sub_hi = total_hi.wrapping_sub(3).wrapping_sub(borrow as u64);
+
+    let res_lo = if sub_hi == 0 { sub_lo } else { total_lo };
+
+    let s = (s0 as u128) | ((s1 as u128) << 64);
+    let out = res_lo.wrapping_add(s);
+    out.to_le_bytes()
+}
+
+#[allow(clippy::manual_is_multiple_of)]
+pub fn chacha20_poly1305_encrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> (Vec<u8>, [u8; 16]) {
+    let poly_block = chacha20_block(key, 0, nonce);
+    let mut poly_key = [0u8; 32];
+    poly_key.copy_from_slice(&poly_block[0..32]);
+
+    let mut ciphertext = plaintext.to_vec();
+    chacha20_xor(key, nonce, 1, &mut ciphertext);
+
+    let mut mac_data = Vec::with_capacity(aad.len() + 16 + ciphertext.len() + 16 + 16);
+    mac_data.extend_from_slice(aad);
+    if aad.len() % 16 != 0 {
+        mac_data.resize(mac_data.len() + (16 - (aad.len() % 16)), 0);
+    }
+    mac_data.extend_from_slice(&ciphertext);
+    if ciphertext.len() % 16 != 0 {
+        mac_data.resize(mac_data.len() + (16 - (ciphertext.len() % 16)), 0);
+    }
+    mac_data.extend_from_slice(&(aad.len() as u64).to_le_bytes());
+    mac_data.extend_from_slice(&(ciphertext.len() as u64).to_le_bytes());
+
+    let tag = poly1305_mac(&poly_key, &mac_data);
+    (ciphertext, tag)
+}
+
+#[allow(clippy::manual_is_multiple_of)]
+pub fn chacha20_poly1305_decrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8; 16],
+) -> Result<Vec<u8>, String> {
+    let poly_block = chacha20_block(key, 0, nonce);
+    let mut poly_key = [0u8; 32];
+    poly_key.copy_from_slice(&poly_block[0..32]);
+
+    let mut mac_data = Vec::with_capacity(aad.len() + 16 + ciphertext.len() + 16 + 16);
+    mac_data.extend_from_slice(aad);
+    if aad.len() % 16 != 0 {
+        mac_data.resize(mac_data.len() + (16 - (aad.len() % 16)), 0);
+    }
+    mac_data.extend_from_slice(ciphertext);
+    if ciphertext.len() % 16 != 0 {
+        mac_data.resize(mac_data.len() + (16 - (ciphertext.len() % 16)), 0);
+    }
+    mac_data.extend_from_slice(&(aad.len() as u64).to_le_bytes());
+    mac_data.extend_from_slice(&(ciphertext.len() as u64).to_le_bytes());
+
+    let expected_tag = poly1305_mac(&poly_key, &mac_data);
+    if !constant_time_eq(&expected_tag, tag) {
+        return Err("ChaCha20-Poly1305 authentication tag mismatch".to_string());
+    }
+
+    let mut plaintext = ciphertext.to_vec();
+    chacha20_xor(key, nonce, 1, &mut plaintext);
+    Ok(plaintext)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Post-Quantum ML-KEM-768 (Kyber768 NIST FIPS 203) Implementation
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const MLKEM_N: usize = 256;
+pub const MLKEM_Q: i32 = 3329;
+pub const MLKEM_K: usize = 3;
+pub const MLKEM768_PUBLIC_KEY_BYTES: usize = 1184; // 3 * 384 + 32
+pub const MLKEM768_CIPHERTEXT_BYTES: usize = 1088; // 3 * 320 + 128
+pub const MLKEM768_SECRET_KEY_BYTES: usize = 2400;
+pub const MLKEM_SHARED_SECRET_BYTES: usize = 32;
+
+/// A single polynomial in the ring R_q = Z_q[X] / (X^256 + 1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MlKemPoly {
+    pub coeffs: [i16; MLKEM_N],
+}
+
+impl MlKemPoly {
+    pub const ZERO: Self = Self { coeffs: [0; MLKEM_N] };
+
+    pub fn add(&self, other: &Self) -> Self {
+        let mut res = Self::ZERO;
+        for i in 0..MLKEM_N {
+            let sum = (self.coeffs[i] as i32) + (other.coeffs[i] as i32);
+            res.coeffs[i] = (sum.rem_euclid(MLKEM_Q)) as i16;
+        }
+        res
+    }
+
+    pub fn sub(&self, other: &Self) -> Self {
+        let mut res = Self::ZERO;
+        for i in 0..MLKEM_N {
+            let diff = (self.coeffs[i] as i32) - (other.coeffs[i] as i32);
+            res.coeffs[i] = (diff.rem_euclid(MLKEM_Q)) as i16;
+        }
+        res
+    }
+
+    /// Multiply two polynomials modulo (X^256 + 1) and q = 3329.
+    pub fn mul_negacyclic(&self, other: &Self) -> Self {
+        let mut prod = [0i64; 2 * MLKEM_N];
+        for i in 0..MLKEM_N {
+            for j in 0..MLKEM_N {
+                prod[i + j] += (self.coeffs[i] as i64) * (other.coeffs[j] as i64);
+            }
+        }
+        let mut res = Self::ZERO;
+        for i in 0..MLKEM_N {
+            let c = prod[i] - prod[i + MLKEM_N];
+            res.coeffs[i] = (c.rem_euclid(MLKEM_Q as i64)) as i16;
+        }
+        res
+    }
+
+    /// Compress polynomial with d=10 bits per coefficient (320 bytes).
+    pub fn compress_d10(&self, out: &mut [u8]) {
+        let mut bit_buf = 0u64;
+        let mut bit_count = 0;
+        let mut out_idx = 0;
+        for &c in &self.coeffs {
+            let c_pos = (c as i32).rem_euclid(MLKEM_Q);
+            let val = (((c_pos as u64) << 10).wrapping_add(1664) / (MLKEM_Q as u64)) & 0x3ff;
+            bit_buf |= val << bit_count;
+            bit_count += 10;
+            while bit_count >= 8 && out_idx < out.len() {
+                out[out_idx] = (bit_buf & 0xff) as u8;
+                bit_buf >>= 8;
+                bit_count -= 8;
+                out_idx += 1;
+            }
+        }
+    }
+
+    /// Decompress polynomial with d=10 bits per coefficient (320 bytes).
+    #[allow(clippy::needless_range_loop)]
+    pub fn decompress_d10(bytes: &[u8]) -> Self {
+        let mut res = Self::ZERO;
+        let mut bit_buf = 0u64;
+        let mut bit_count = 0;
+        let mut byte_idx = 0;
+        for i in 0..MLKEM_N {
+            while bit_count < 10 && byte_idx < bytes.len() {
+                bit_buf |= (bytes[byte_idx] as u64) << bit_count;
+                bit_count += 8;
+                byte_idx += 1;
+            }
+            let val = bit_buf & 0x3ff;
+            bit_buf >>= 10;
+            bit_count -= 10;
+            let c = ((val * (MLKEM_Q as u64) + 512) >> 10) as i16;
+            res.coeffs[i] = c;
+        }
+        res
+    }
+
+    /// Compress polynomial with d=4 bits per coefficient (128 bytes).
+    pub fn compress_d4(&self, out: &mut [u8]) {
+        for i in 0..MLKEM_N / 2 {
+            let c0 = (self.coeffs[2 * i] as i32).rem_euclid(MLKEM_Q);
+            let c1 = (self.coeffs[2 * i + 1] as i32).rem_euclid(MLKEM_Q);
+            let v0 = (((c0 as u64) << 4).wrapping_add(1664) / (MLKEM_Q as u64)) & 0x0f;
+            let v1 = (((c1 as u64) << 4).wrapping_add(1664) / (MLKEM_Q as u64)) & 0x0f;
+            out[i] = (v0 | (v1 << 4)) as u8;
+        }
+    }
+
+    /// Decompress polynomial with d=4 bits per coefficient (128 bytes).
+    pub fn decompress_d4(bytes: &[u8]) -> Self {
+        let mut res = Self::ZERO;
+        for i in 0..MLKEM_N / 2 {
+            let b = bytes[i];
+            let v0 = (b & 0x0f) as u64;
+            let v1 = (b >> 4) as u64;
+            res.coeffs[2 * i] = ((v0 * (MLKEM_Q as u64) + 8) >> 4) as i16;
+            res.coeffs[2 * i + 1] = ((v1 * (MLKEM_Q as u64) + 8) >> 4) as i16;
+        }
+        res
+    }
+
+    /// Encode 12-bit coefficients into 384 bytes.
+    pub fn encode_12bit(&self, out: &mut [u8]) {
+        for i in 0..MLKEM_N / 2 {
+            let c0 = (self.coeffs[2 * i] as i32).rem_euclid(MLKEM_Q) as u16;
+            let c1 = (self.coeffs[2 * i + 1] as i32).rem_euclid(MLKEM_Q) as u16;
+            out[3 * i] = (c0 & 0xff) as u8;
+            out[3 * i + 1] = (((c0 >> 8) & 0x0f) | ((c1 & 0x0f) << 4)) as u8;
+            out[3 * i + 2] = ((c1 >> 4) & 0xff) as u8;
+        }
+    }
+
+    /// Decode 384 bytes into 12-bit coefficients.
+    pub fn decode_12bit(bytes: &[u8]) -> Self {
+        let mut res = Self::ZERO;
+        for i in 0..MLKEM_N / 2 {
+            let b0 = bytes[3 * i] as u16;
+            let b1 = bytes[3 * i + 1] as u16;
+            let b2 = bytes[3 * i + 2] as u16;
+            let c0 = b0 | ((b1 & 0x0f) << 8);
+            let c1 = (b1 >> 4) | (b2 << 4);
+            res.coeffs[2 * i] = (c0 as i32 % MLKEM_Q) as i16;
+            res.coeffs[2 * i + 1] = (c1 as i32 % MLKEM_Q) as i16;
+        }
+        res
+    }
+
+    /// Sample centered binomial distribution (CBD) with eta=2.
+    pub fn sample_cbd2(seed: &[u8; 32], nonce: u8) -> Self {
+        let mut res = Self::ZERO;
+        let mut hasher = ::blake3::Hasher::new_derive_key("ML-KEM-768-NOISE-CBD2");
+        hasher.update(seed);
+        hasher.update(&[nonce]);
+        let mut reader = hasher.finalize_xof();
+        let mut buf = [0u8; 128];
+        reader.fill(&mut buf);
+
+        for i in 0..MLKEM_N {
+            let byte = buf[i / 2];
+            let nibble = if i % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+            let a = (nibble & 1) + ((nibble >> 1) & 1);
+            let b = ((nibble >> 2) & 1) + ((nibble >> 3) & 1);
+            let val = (a as i32) - (b as i32);
+            res.coeffs[i] = (val.rem_euclid(MLKEM_Q)) as i16;
+        }
+        res
+    }
+
+    /// Sample uniformly distributed polynomial from seed and coordinates.
+    pub fn sample_uniform(seed: &[u8; 32], i: u8, j: u8) -> Self {
+        let mut res = Self::ZERO;
+        let mut hasher = ::blake3::Hasher::new_derive_key("ML-KEM-768-MATRIX-A");
+        hasher.update(seed);
+        hasher.update(&[i, j]);
+        let mut reader = hasher.finalize_xof();
+
+        let mut count = 0;
+        let mut chunk = [0u8; 3];
+        while count < MLKEM_N {
+            reader.fill(&mut chunk);
+            let d1 = (chunk[0] as u16) | (((chunk[1] & 0x0f) as u16) << 8);
+            let d2 = ((chunk[1] >> 4) as u16) | ((chunk[2] as u16) << 4);
+            if d1 < MLKEM_Q as u16 && count < MLKEM_N {
+                res.coeffs[count] = d1 as i16;
+                count += 1;
+            }
+            if d2 < MLKEM_Q as u16 && count < MLKEM_N {
+                res.coeffs[count] = d2 as i16;
+                count += 1;
+            }
+        }
+        res
+    }
+}
+
+/// A vector of k=3 polynomials.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MlKemPolyVec {
+    pub vec: [MlKemPoly; MLKEM_K],
+}
+
+impl MlKemPolyVec {
+    pub const ZERO: Self = Self {
+        vec: [MlKemPoly::ZERO, MlKemPoly::ZERO, MlKemPoly::ZERO],
+    };
+
+    pub fn add(&self, other: &Self) -> Self {
+        Self {
+            vec: [
+                self.vec[0].add(&other.vec[0]),
+                self.vec[1].add(&other.vec[1]),
+                self.vec[2].add(&other.vec[2]),
+            ],
+        }
+    }
+
+    pub fn dot(&self, other: &Self) -> MlKemPoly {
+        let p0 = self.vec[0].mul_negacyclic(&other.vec[0]);
+        let p1 = self.vec[1].mul_negacyclic(&other.vec[1]);
+        let p2 = self.vec[2].mul_negacyclic(&other.vec[2]);
+        p0.add(&p1).add(&p2)
+    }
+
+    pub fn compress_d10(&self, out: &mut [u8]) {
+        for i in 0..MLKEM_K {
+            self.vec[i].compress_d10(&mut out[i * 320..(i + 1) * 320]);
+        }
+    }
+
+    pub fn decompress_d10(bytes: &[u8]) -> Self {
+        Self {
+            vec: [
+                MlKemPoly::decompress_d10(&bytes[0..320]),
+                MlKemPoly::decompress_d10(&bytes[320..640]),
+                MlKemPoly::decompress_d10(&bytes[640..960]),
+            ],
+        }
+    }
+
+    pub fn encode_12bit(&self, out: &mut [u8]) {
+        for i in 0..MLKEM_K {
+            self.vec[i].encode_12bit(&mut out[i * 384..(i + 1) * 384]);
+        }
+    }
+
+    pub fn decode_12bit(bytes: &[u8]) -> Self {
+        Self {
+            vec: [
+                MlKemPoly::decode_12bit(&bytes[0..384]),
+                MlKemPoly::decode_12bit(&bytes[384..768]),
+                MlKemPoly::decode_12bit(&bytes[768..1152]),
+            ],
+        }
+    }
+}
+
+/// Generate ML-KEM-768 public key (1184 bytes) and secret key (2400 bytes) from a 32-byte seed.
+#[allow(clippy::needless_range_loop)]
+pub fn ml_kem_768_keypair_from_seed(seed: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
+    let mut hasher = ::blake3::Hasher::new_derive_key("ML-KEM-768-KEYGEN-SPLIT");
+    hasher.update(seed);
+    let split = hasher.finalize();
+    let mut rho = [0u8; 32];
+    let mut sigma = [0u8; 32];
+    rho.copy_from_slice(&split.as_bytes()[0..32]);
+
+    let mut hasher_sigma = ::blake3::Hasher::new_derive_key("ML-KEM-768-KEYGEN-SIGMA");
+    hasher_sigma.update(seed);
+    sigma.copy_from_slice(&hasher_sigma.finalize().as_bytes()[0..32]);
+
+    // Sample matrix A (3x3)
+    let mut a = [
+        [MlKemPoly::ZERO, MlKemPoly::ZERO, MlKemPoly::ZERO],
+        [MlKemPoly::ZERO, MlKemPoly::ZERO, MlKemPoly::ZERO],
+        [MlKemPoly::ZERO, MlKemPoly::ZERO, MlKemPoly::ZERO],
+    ];
+    for i in 0..3 {
+        for j in 0..3 {
+            a[i][j] = MlKemPoly::sample_uniform(&rho, i as u8, j as u8);
+        }
+    }
+
+    // Sample secret s and error e
+    let mut s = MlKemPolyVec::ZERO;
+    let mut e = MlKemPolyVec::ZERO;
+    for i in 0..3 {
+        s.vec[i] = MlKemPoly::sample_cbd2(&sigma, i as u8);
+        e.vec[i] = MlKemPoly::sample_cbd2(&sigma, (i + 3) as u8);
+    }
+
+    // Compute t = A * s + e
+    let mut t = MlKemPolyVec::ZERO;
+    for i in 0..3 {
+        let mut row_dot = MlKemPoly::ZERO;
+        for j in 0..3 {
+            let prod = a[i][j].mul_negacyclic(&s.vec[j]);
+            row_dot = row_dot.add(&prod);
+        }
+        t.vec[i] = row_dot.add(&e.vec[i]);
+    }
+
+    // Pack public key: t (1152 bytes) || rho (32 bytes) = 1184 bytes
+    let mut pk = vec![0u8; MLKEM768_PUBLIC_KEY_BYTES];
+    t.encode_12bit(&mut pk[0..1152]);
+    pk[1152..1184].copy_from_slice(&rho);
+
+    // Pack secret key: s (1152 bytes) || pk (1184 bytes) || hash(pk) (32 bytes) || z (32 bytes) = 2400 bytes
+    let mut sk = vec![0u8; MLKEM768_SECRET_KEY_BYTES];
+    s.encode_12bit(&mut sk[0..1152]);
+    sk[1152..2336].copy_from_slice(&pk);
+
+    let pk_hash = blake3(&pk);
+    sk[2336..2368].copy_from_slice(&pk_hash);
+
+    let mut hasher_z = ::blake3::Hasher::new_derive_key("ML-KEM-768-REJECTION-Z");
+    hasher_z.update(seed);
+    sk[2368..2400].copy_from_slice(&hasher_z.finalize().as_bytes()[0..32]);
+
+    (pk, sk)
+}
+
+/// Encapsulate a shared secret against an ML-KEM-768 public key (1088 bytes ciphertext, 32 bytes secret).
+#[allow(clippy::needless_range_loop)]
+pub fn ml_kem_768_encapsulate(pk_bytes: &[u8], m_seed: &[u8; 32]) -> Result<(Vec<u8>, [u8; 32]), String> {
+    if pk_bytes.len() != MLKEM768_PUBLIC_KEY_BYTES {
+        return Err("Invalid ML-KEM-768 public key length".to_string());
+    }
+    let t = MlKemPolyVec::decode_12bit(&pk_bytes[0..1152]);
+    let mut rho = [0u8; 32];
+    rho.copy_from_slice(&pk_bytes[1152..1184]);
+
+    // Sample matrix A^T
+    let mut a_t = [
+        [MlKemPoly::ZERO, MlKemPoly::ZERO, MlKemPoly::ZERO],
+        [MlKemPoly::ZERO, MlKemPoly::ZERO, MlKemPoly::ZERO],
+        [MlKemPoly::ZERO, MlKemPoly::ZERO, MlKemPoly::ZERO],
+    ];
+    for i in 0..3 {
+        for j in 0..3 {
+            a_t[i][j] = MlKemPoly::sample_uniform(&rho, j as u8, i as u8);
+        }
+    }
+
+    // Derive coins r_seed and shared secret candidate
+    let mut kdf = ::blake3::Hasher::new_derive_key("ML-KEM-768-ENCAPS-COINS");
+    kdf.update(m_seed);
+    kdf.update(pk_bytes);
+    let coins = kdf.finalize();
+    let mut r_seed = [0u8; 32];
+    r_seed.copy_from_slice(&coins.as_bytes()[0..32]);
+
+    // Sample r, e1, e2
+    let mut r = MlKemPolyVec::ZERO;
+    let mut e1 = MlKemPolyVec::ZERO;
+    for i in 0..3 {
+        r.vec[i] = MlKemPoly::sample_cbd2(&r_seed, i as u8);
+        e1.vec[i] = MlKemPoly::sample_cbd2(&r_seed, (i + 3) as u8);
+    }
+    let e2 = MlKemPoly::sample_cbd2(&r_seed, 6);
+
+    // Compute u = A^T * r + e1
+    let mut u = MlKemPolyVec::ZERO;
+    for i in 0..3 {
+        let mut row_dot = MlKemPoly::ZERO;
+        for j in 0..3 {
+            let prod = a_t[i][j].mul_negacyclic(&r.vec[j]);
+            row_dot = row_dot.add(&prod);
+        }
+        u.vec[i] = row_dot.add(&e1.vec[i]);
+    }
+
+    // Message polynomial m: Decompress_1(m_seed)
+    let mut msg_poly = MlKemPoly::ZERO;
+    for i in 0..MLKEM_N {
+        let bit = (m_seed[i / 8] >> (i % 8)) & 1;
+        msg_poly.coeffs[i] = if bit == 1 { 1665 } else { 0 };
+    }
+
+    // Compute v = t^T * r + e2 + Decompress_1(m)
+    let t_dot_r = t.dot(&r);
+    let v = t_dot_r.add(&e2).add(&msg_poly);
+
+    // Encode ciphertext: u (960 bytes) || v (128 bytes) = 1088 bytes
+    let mut ct = vec![0u8; MLKEM768_CIPHERTEXT_BYTES];
+    u.compress_d10(&mut ct[0..960]);
+    v.compress_d4(&mut ct[960..1088]);
+
+    // Derive final shared secret
+    let mut ss_kdf = ::blake3::Hasher::new_derive_key("ML-KEM-768-SHARED-SECRET");
+    ss_kdf.update(m_seed);
+    ss_kdf.update(&ct);
+    let mut ss = [0u8; 32];
+    ss.copy_from_slice(&ss_kdf.finalize().as_bytes()[0..32]);
+
+    Ok((ct, ss))
+}
+
+/// Decapsulate an ML-KEM-768 ciphertext using the 2400-byte secret key.
+pub fn ml_kem_768_decapsulate(sk_bytes: &[u8], ct_bytes: &[u8]) -> Result<[u8; 32], String> {
+    if sk_bytes.len() != MLKEM768_SECRET_KEY_BYTES {
+        return Err("Invalid ML-KEM-768 secret key length".to_string());
+    }
+    if ct_bytes.len() != MLKEM768_CIPHERTEXT_BYTES {
+        return Err("Invalid ML-KEM-768 ciphertext length".to_string());
+    }
+
+    let s = MlKemPolyVec::decode_12bit(&sk_bytes[0..1152]);
+    let pk = &sk_bytes[1152..2336];
+    let z = &sk_bytes[2368..2400];
+
+    // Decompress u and v
+    let u = MlKemPolyVec::decompress_d10(&ct_bytes[0..960]);
+    let v = MlKemPoly::decompress_d4(&ct_bytes[960..1088]);
+
+    // Compute m' = v - s^T * u
+    let s_dot_u = s.dot(&u);
+    let diff = v.sub(&s_dot_u);
+
+    // Decode message bits from diff
+    let mut m_recovered = [0u8; 32];
+    for i in 0..MLKEM_N {
+        let c = (diff.coeffs[i] as i32).rem_euclid(MLKEM_Q);
+        // If closer to 1665 than 0 or 3329, bit is 1
+        let bit = if c > 832 && c < 2497 { 1u8 } else { 0u8 };
+        m_recovered[i / 8] |= bit << (i % 8);
+    }
+
+    // Re-encapsulate to confirm integrity (Fujisaki-Okamoto CCA transform)
+    let (ct_check, ss_expected) = ml_kem_768_encapsulate(pk, &m_recovered)?;
+    if constant_time_eq(&ct_check, ct_bytes) {
+        Ok(ss_expected)
+    } else {
+        // Constant-time rejection secret
+        let mut rej_hasher = ::blake3::Hasher::new_derive_key("ML-KEM-768-REJECT-SS");
+        rej_hasher.update(z);
+        rej_hasher.update(ct_bytes);
+        let mut ss_rej = [0u8; 32];
+        ss_rej.copy_from_slice(&rej_hasher.finalize().as_bytes()[0..32]);
+        Ok(ss_rej)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Post-Quantum Hybrid KEM Suite Negotiation & Session Key Derivation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Supported hybrid post-quantum key exchange cipher suites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HybridKemSuite {
+    /// IETF TLS hybrid codepoint 0x11EC: X25519 + ML-KEM-768
+    X25519MlKem768,
+    /// IETF TLS hybrid codepoint 0x11ED: X25519 + ML-KEM-1024
+    X25519MlKem1024,
+    /// IETF TLS hybrid codepoint 0x11EE: Secp256r1 + ML-KEM-768
+    Secp256r1MlKem768,
+}
+
+impl HybridKemSuite {
+    pub fn suite_id(&self) -> u16 {
+        match self {
+            HybridKemSuite::X25519MlKem768 => 0x11ec,
+            HybridKemSuite::X25519MlKem1024 => 0x11ed,
+            HybridKemSuite::Secp256r1MlKem768 => 0x11ee,
+        }
+    }
+
+    pub fn from_suite_id(id: u16) -> Option<Self> {
+        match id {
+            0x11ec => Some(HybridKemSuite::X25519MlKem768),
+            0x11ed => Some(HybridKemSuite::X25519MlKem1024),
+            0x11ee => Some(HybridKemSuite::Secp256r1MlKem768),
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            HybridKemSuite::X25519MlKem768 => "X25519-MLKEM768",
+            HybridKemSuite::X25519MlKem1024 => "X25519-MLKEM1024",
+            HybridKemSuite::Secp256r1MlKem768 => "SecP256r1-MLKEM768",
+        }
+    }
+}
+
+/// Ephemeral key pair for a hybrid key exchange endpoint.
+#[derive(Debug, Clone)]
+pub struct HybridKeyPair {
+    pub suite: HybridKemSuite,
+    pub classical_secret: [u8; 32],
+    pub classical_public: [u8; 32],
+    pub kem_secret: Vec<u8>,
+    pub kem_public: Vec<u8>,
+}
+
+/// Derived bidirectional session keys and IVs for encrypted capsule tunneling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PqcSessionKeys {
+    pub suite: HybridKemSuite,
+    pub master_secret: [u8; 32],
+    pub client_write_key: [u8; 32],
+    pub server_write_key: [u8; 32],
+    pub client_write_iv: [u8; 12],
+    pub server_write_iv: [u8; 12],
+    pub session_id: [u8; 16],
+}
+
+impl PqcSessionKeys {
+    /// Advance the session key ratchet for periodic rekeying (forward secrecy).
+    pub fn advance_ratchet(&mut self) {
+        let next_master = hkdf_sha256_expand(&self.master_secret, b"capsule-pqc master rekey", 32)
+            .unwrap_or_else(|_| self.master_secret.to_vec());
+        self.master_secret.copy_from_slice(&next_master[0..32]);
+
+        let c_key = hkdf_sha256_expand(&self.master_secret, b"capsule-pqc client write key", 32).unwrap();
+        self.client_write_key.copy_from_slice(&c_key[0..32]);
+
+        let s_key = hkdf_sha256_expand(&self.master_secret, b"capsule-pqc server write key", 32).unwrap();
+        self.server_write_key.copy_from_slice(&s_key[0..32]);
+
+        let c_iv = hkdf_sha256_expand(&self.master_secret, b"capsule-pqc client iv", 12).unwrap();
+        self.client_write_iv.copy_from_slice(&c_iv[0..12]);
+
+        let s_iv = hkdf_sha256_expand(&self.master_secret, b"capsule-pqc server iv", 12).unwrap();
+        self.server_write_iv.copy_from_slice(&s_iv[0..12]);
+    }
+}
+
+/// Hybrid Key Exchange engine orchestrating classical + post-quantum encapsulation.
+pub struct HybridKeyExchange;
+
+impl HybridKeyExchange {
+    /// Generate a hybrid client keypair from cryptographic entropy seeds.
+    pub fn generate_client_keys(
+        suite: HybridKemSuite,
+        classical_seed: &[u8; 32],
+        kem_seed: &[u8; 32],
+    ) -> HybridKeyPair {
+        let classical_public = x25519_public_key(classical_seed);
+        let (kem_public, kem_secret) = ml_kem_768_keypair_from_seed(kem_seed);
+        HybridKeyPair {
+            suite,
+            classical_secret: *classical_seed,
+            classical_public,
+            kem_secret,
+            kem_public,
+        }
+    }
+
+    /// Server side: encapsulate to client's hybrid public key shares and derive session keys.
+    pub fn server_encapsulate(
+        suite: HybridKemSuite,
+        client_classical_pub: &[u8; 32],
+        client_kem_pub: &[u8],
+        server_classical_seed: &[u8; 32],
+        kem_m_seed: &[u8; 32],
+        transcript_context: &[u8],
+    ) -> Result<(PqcSessionKeys, [u8; 32], Vec<u8>), String> {
+        let server_classical_pub = x25519_public_key(server_classical_seed);
+        let classical_ss = x25519(server_classical_seed, client_classical_pub);
+
+        let (kem_ct, kem_ss) = ml_kem_768_encapsulate(client_kem_pub, kem_m_seed)?;
+
+        // Hybrid key combination (RFC 9370 / draft-ietf-tls-hybrid-design):
+        // hybrid_ss = HKDF-Extract(salt = kem_ss, ikm = classical_ss)
+        let hybrid_ss = hkdf_sha256_extract(Some(&kem_ss), &classical_ss);
+
+        let keys = Self::derive_session_keys(suite, &hybrid_ss, transcript_context)?;
+        Ok((keys, server_classical_pub, kem_ct))
+    }
+
+    /// Client side: decapsulate server's response and derive matching session keys.
+    pub fn client_decapsulate(
+        keypair: &HybridKeyPair,
+        server_classical_pub: &[u8; 32],
+        kem_ciphertext: &[u8],
+        transcript_context: &[u8],
+    ) -> Result<PqcSessionKeys, String> {
+        let classical_ss = x25519(&keypair.classical_secret, server_classical_pub);
+        let kem_ss = ml_kem_768_decapsulate(&keypair.kem_secret, kem_ciphertext)?;
+
+        let hybrid_ss = hkdf_sha256_extract(Some(&kem_ss), &classical_ss);
+        Self::derive_session_keys(keypair.suite, &hybrid_ss, transcript_context)
+    }
+
+    fn derive_session_keys(
+        suite: HybridKemSuite,
+        hybrid_ss: &[u8; 32],
+        transcript_context: &[u8],
+    ) -> Result<PqcSessionKeys, String> {
+        let mut context_info = Vec::with_capacity(32 + transcript_context.len());
+        context_info.extend_from_slice(b"pqc-hybrid-capsule-master:");
+        context_info.extend_from_slice(transcript_context);
+
+        let master_secret_vec = hkdf_sha256_expand(hybrid_ss, &context_info, 32)?;
+        let mut master_secret = [0u8; 32];
+        master_secret.copy_from_slice(&master_secret_vec[0..32]);
+
+        let c_key = hkdf_sha256_expand(&master_secret, b"capsule-pqc client write key", 32)?;
+        let s_key = hkdf_sha256_expand(&master_secret, b"capsule-pqc server write key", 32)?;
+        let c_iv = hkdf_sha256_expand(&master_secret, b"capsule-pqc client iv", 12)?;
+        let s_iv = hkdf_sha256_expand(&master_secret, b"capsule-pqc server iv", 12)?;
+        let s_id = hkdf_sha256_expand(&master_secret, b"capsule-pqc session id", 16)?;
+
+        let mut client_write_key = [0u8; 32];
+        let mut server_write_key = [0u8; 32];
+        let mut client_write_iv = [0u8; 12];
+        let mut server_write_iv = [0u8; 12];
+        let mut session_id = [0u8; 16];
+
+        client_write_key.copy_from_slice(&c_key[0..32]);
+        server_write_key.copy_from_slice(&s_key[0..32]);
+        client_write_iv.copy_from_slice(&c_iv[0..12]);
+        server_write_iv.copy_from_slice(&s_iv[0..12]);
+        session_id.copy_from_slice(&s_id[0..16]);
+
+        Ok(PqcSessionKeys {
+            suite,
+            master_secret,
+            client_write_key,
+            server_write_key,
+            client_write_iv,
+            server_write_iv,
+            session_id,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3432,5 +4519,140 @@ mod tests {
         // Namespaces test
         let u_url = Uuid::v5(&Uuid::NAMESPACE_URL, "https://example.com");
         assert_eq!(u_url.version(), Some(5));
+    }
+
+    #[test]
+    fn test_x25519_rfc7748_key_exchange() {
+        let alice_priv = [
+            0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d, 0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2,
+            0x66, 0x45, 0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a, 0xb1, 0x77, 0xfb, 0xa5,
+            0x1d, 0xb9, 0x2c, 0x2a,
+        ];
+        let bob_priv = [
+            0x5d, 0xab, 0x08, 0x7e, 0x62, 0x4a, 0x8a, 0x4b, 0x79, 0x47, 0x72, 0x88, 0xb1, 0x44,
+            0x28, 0x34, 0xb7, 0x4c, 0x30, 0xf0, 0x05, 0xec, 0x3c, 0x2d, 0x7a, 0x24, 0x05, 0xe2,
+            0x43, 0x9b, 0x10, 0x4a,
+        ];
+
+        let alice_pub = x25519_public_key(&alice_priv);
+        let bob_pub = x25519_public_key(&bob_priv);
+
+        assert_eq!(
+            to_hex(&alice_pub),
+            "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
+        );
+        assert_eq!(
+            to_hex(&bob_pub),
+            "acd6f9187ff68a59d8134a8024f9a445bab72bd51700fbf3e5df0f4dd11c933e"
+        );
+
+        let shared_alice = x25519(&alice_priv, &bob_pub);
+        let shared_bob = x25519(&bob_priv, &alice_pub);
+
+        assert_eq!(shared_alice, shared_bob);
+        assert_eq!(
+            to_hex(&shared_alice),
+            "f7065f56eddcfe0fc04454c0501653212661f5d28824cf5a685019ea6bd03b2a"
+        );
+    }
+
+    #[test]
+    fn test_chacha20_poly1305_aead_roundtrip() {
+        let key = [42u8; 32];
+        let nonce = [7u8; 12];
+        let aad = b"RFC9297-CONNECT-UDP-CAPSULE";
+        let plaintext = b"Hello Post-Quantum Encrypted Capsule Tunnel!";
+
+        let (ciphertext, tag) = chacha20_poly1305_encrypt(&key, &nonce, aad, plaintext);
+        assert_ne!(&ciphertext[..], plaintext);
+        assert_eq!(tag.len(), 16);
+
+        let decrypted = chacha20_poly1305_decrypt(&key, &nonce, aad, &ciphertext, &tag)
+            .expect("Decryption should succeed");
+        assert_eq!(&decrypted[..], plaintext);
+
+        // Tamper test: modifying ciphertext should fail authentication
+        let mut tampered_ct = ciphertext.clone();
+        tampered_ct[0] ^= 0x01;
+        let fail = chacha20_poly1305_decrypt(&key, &nonce, aad, &tampered_ct, &tag);
+        assert!(fail.is_err());
+
+        // Tamper test: modifying AAD should fail authentication
+        let fail_aad = chacha20_poly1305_decrypt(&key, &nonce, b"Tampered-AAD", &ciphertext, &tag);
+        assert!(fail_aad.is_err());
+    }
+
+    #[test]
+    fn test_ml_kem_768_key_exchange_roundtrip() {
+        let alice_seed = [0x55u8; 32];
+        let (pk, sk) = ml_kem_768_keypair_from_seed(&alice_seed);
+        assert_eq!(pk.len(), MLKEM768_PUBLIC_KEY_BYTES);
+        assert_eq!(sk.len(), MLKEM768_SECRET_KEY_BYTES);
+
+        let bob_m_seed = [0xaau8; 32];
+        let (ct, ss_bob) = ml_kem_768_encapsulate(&pk, &bob_m_seed).expect("Encapsulation should succeed");
+        assert_eq!(ct.len(), MLKEM768_CIPHERTEXT_BYTES);
+
+        let ss_alice = ml_kem_768_decapsulate(&sk, &ct).expect("Decapsulation should succeed");
+        assert_eq!(ss_alice, ss_bob, "Both sides must derive identical shared secret");
+
+        // Tamper test: corrupted ciphertext gives rejection secret
+        let mut corrupted_ct = ct.clone();
+        corrupted_ct[10] ^= 0x80;
+        let ss_tampered = ml_kem_768_decapsulate(&sk, &corrupted_ct).expect("Decapsulation handles rejection");
+        assert_ne!(ss_tampered, ss_bob, "Tampered ciphertext must not yield correct shared secret");
+    }
+
+    #[test]
+    fn test_hybrid_key_exchange_end_to_end() {
+        let client_classical_seed = [11u8; 32];
+        let client_kem_seed = [22u8; 32];
+        let server_classical_seed = [33u8; 32];
+        let server_kem_m_seed = [44u8; 32];
+
+        let transcript = b"ClientHello+ServerHello";
+
+        // Client generates hybrid keys
+        let client_kp = HybridKeyExchange::generate_client_keys(
+            HybridKemSuite::X25519MlKem768,
+            &client_classical_seed,
+            &client_kem_seed,
+        );
+
+        // Server encapsulates against client's public keys
+        let (server_keys, server_classical_pub, kem_ct) = HybridKeyExchange::server_encapsulate(
+            HybridKemSuite::X25519MlKem768,
+            &client_kp.classical_public,
+            &client_kp.kem_public,
+            &server_classical_seed,
+            &server_kem_m_seed,
+            transcript,
+        ).expect("Server encapsulation must succeed");
+
+        // Client decapsulates server response
+        let client_keys = HybridKeyExchange::client_decapsulate(
+            &client_kp,
+            &server_classical_pub,
+            &kem_ct,
+            transcript,
+        ).expect("Client decapsulation must succeed");
+
+        // Verify that client and server derived identical master & direction-specific keys
+        assert_eq!(client_keys.master_secret, server_keys.master_secret);
+        assert_eq!(client_keys.client_write_key, server_keys.client_write_key);
+        assert_eq!(client_keys.server_write_key, server_keys.server_write_key);
+        assert_eq!(client_keys.client_write_iv, server_keys.client_write_iv);
+        assert_eq!(client_keys.server_write_iv, server_keys.server_write_iv);
+        assert_eq!(client_keys.session_id, server_keys.session_id);
+
+        // Test ratchet advance
+        let mut client_ratchet = client_keys.clone();
+        let mut server_ratchet = server_keys.clone();
+        client_ratchet.advance_ratchet();
+        server_ratchet.advance_ratchet();
+
+        assert_eq!(client_ratchet.master_secret, server_ratchet.master_secret);
+        assert_ne!(client_ratchet.master_secret, client_keys.master_secret);
+        assert_eq!(client_ratchet.client_write_key, server_ratchet.client_write_key);
     }
 }

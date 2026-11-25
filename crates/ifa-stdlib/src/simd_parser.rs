@@ -5414,6 +5414,16 @@ pub enum CapsuleType {
     AddressRequest,
     /// RFC 9298 / IP Proxying ROUTE_ADVERTISEMENT (type 0x3f).
     RouteAdvertisement,
+    /// Post-Quantum Hybrid Handshake Client Hello / KeyShare (type 0x3140).
+    PqcHandshakeInit,
+    /// Post-Quantum Hybrid Handshake Server Hello / KeyShare / Encapsulation (type 0x3141).
+    PqcHandshakeResponse,
+    /// Post-Quantum Hybrid Handshake Finished / Confirmation (type 0x3142).
+    PqcHandshakeFinished,
+    /// Post-Quantum Encrypted Capsule Record (type 0x3143).
+    PqcEncryptedRecord,
+    /// Post-Quantum Key Update / Ratchet (type 0x3144).
+    PqcKeyUpdate,
     /// Unknown or custom capsule type identified by its 62-bit VarInt value.
     Unknown(u64),
 }
@@ -5427,6 +5437,11 @@ impl From<u64> for CapsuleType {
             0x3f => CapsuleType::RouteAdvertisement,
             0x2843 => CapsuleType::CloseWebTransportSession,
             0x78ae => CapsuleType::DrainWebTransportSession,
+            0x3140 => CapsuleType::PqcHandshakeInit,
+            0x3141 => CapsuleType::PqcHandshakeResponse,
+            0x3142 => CapsuleType::PqcHandshakeFinished,
+            0x3143 => CapsuleType::PqcEncryptedRecord,
+            0x3144 => CapsuleType::PqcKeyUpdate,
             other => CapsuleType::Unknown(other),
         }
     }
@@ -5441,6 +5456,11 @@ impl From<CapsuleType> for u64 {
             CapsuleType::RouteAdvertisement => 0x3f,
             CapsuleType::CloseWebTransportSession => 0x2843,
             CapsuleType::DrainWebTransportSession => 0x78ae,
+            CapsuleType::PqcHandshakeInit => 0x3140,
+            CapsuleType::PqcHandshakeResponse => 0x3141,
+            CapsuleType::PqcHandshakeFinished => 0x3142,
+            CapsuleType::PqcEncryptedRecord => 0x3143,
+            CapsuleType::PqcKeyUpdate => 0x3144,
             CapsuleType::Unknown(other) => other,
         }
     }
@@ -5484,6 +5504,31 @@ impl HttpCapsule {
         }
         let (ctx_id, consumed) = quic_decode_varint(&self.payload)?;
         Ok((ctx_id, &self.payload[consumed..]))
+    }
+
+    /// Construct a Post-Quantum handshake init capsule.
+    pub fn pqc_handshake_init(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::PqcHandshakeInit, payload)
+    }
+
+    /// Construct a Post-Quantum handshake response capsule.
+    pub fn pqc_handshake_response(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::PqcHandshakeResponse, payload)
+    }
+
+    /// Construct a Post-Quantum handshake finished confirmation capsule.
+    pub fn pqc_handshake_finished(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::PqcHandshakeFinished, payload)
+    }
+
+    /// Construct a Post-Quantum encrypted capsule record.
+    pub fn pqc_encrypted_record(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::PqcEncryptedRecord, payload)
+    }
+
+    /// Construct a Post-Quantum key update capsule.
+    pub fn pqc_key_update(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::PqcKeyUpdate, payload)
     }
 
     /// Encode this capsule into QUIC VarInt-framed wire format appended to `out`.

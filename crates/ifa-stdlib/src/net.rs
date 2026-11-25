@@ -11825,6 +11825,741 @@ pub struct ExtendedConnectTelemetry {
     pub total_bytes_tunneled_ingress: usize,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Post-Quantum Hybrid Encryption & Key Derivation for Secure Capsule Tunnels
+// ─────────────────────────────────────────────────────────────────────────────
+
+use crate::crypto::{
+    chacha20_poly1305_decrypt, chacha20_poly1305_encrypt, constant_time_eq, hmac_sha256,
+    HybridKemSuite, HybridKeyExchange, HybridKeyPair, PqcSessionKeys,
+};
+
+/// Wire payload for PqcHandshakeInit capsule (Client Hello / KeyShare).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PqcHandshakeInitPayload {
+    pub version: u16,
+    pub supported_suites: Vec<HybridKemSuite>,
+    pub client_random: [u8; 32],
+    pub client_classical_public_key: [u8; 32],
+    pub client_kem_public_key: Vec<u8>,
+}
+
+impl PqcHandshakeInitPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(
+            2 + 32 + 1 + self.supported_suites.len() * 2 + 32 + 2 + self.client_kem_public_key.len(),
+        );
+        buf.extend_from_slice(&self.version.to_be_bytes());
+        buf.extend_from_slice(&self.client_random);
+        buf.push(self.supported_suites.len() as u8);
+        for s in &self.supported_suites {
+            buf.extend_from_slice(&s.suite_id().to_be_bytes());
+        }
+        buf.extend_from_slice(&self.client_classical_public_key);
+        buf.extend_from_slice(&(self.client_kem_public_key.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.client_kem_public_key);
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < 2 + 32 + 1 + 32 + 2 {
+            return Err("PqcHandshakeInitPayload too short".to_string());
+        }
+        let version = u16::from_be_bytes(bytes[0..2].try_into().unwrap());
+        let mut client_random = [0u8; 32];
+        client_random.copy_from_slice(&bytes[2..34]);
+
+        let num_suites = bytes[34] as usize;
+        let mut offset = 35;
+        if bytes.len() < offset + num_suites * 2 + 32 + 2 {
+            return Err("Invalid PqcHandshakeInitPayload length for suites".to_string());
+        }
+        let mut supported_suites = Vec::with_capacity(num_suites);
+        for _ in 0..num_suites {
+            let suite_id = u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap());
+            if let Some(s) = HybridKemSuite::from_suite_id(suite_id) {
+                supported_suites.push(s);
+            }
+            offset += 2;
+        }
+
+        let mut client_classical_public_key = [0u8; 32];
+        client_classical_public_key.copy_from_slice(&bytes[offset..offset + 32]);
+        offset += 32;
+
+        let kem_len = u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+        if bytes.len() < offset + kem_len {
+            return Err("Truncated KEM public key in PqcHandshakeInitPayload".to_string());
+        }
+        let client_kem_public_key = bytes[offset..offset + kem_len].to_vec();
+
+        Ok(Self {
+            version,
+            supported_suites,
+            client_random,
+            client_classical_public_key,
+            client_kem_public_key,
+        })
+    }
+}
+
+/// Wire payload for PqcHandshakeResponse capsule (Server Hello / KeyShare / Ciphertext).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PqcHandshakeResponsePayload {
+    pub version: u16,
+    pub selected_suite: HybridKemSuite,
+    pub server_random: [u8; 32],
+    pub server_classical_public_key: [u8; 32],
+    pub kem_ciphertext: Vec<u8>,
+}
+
+impl PqcHandshakeResponsePayload {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(2 + 2 + 32 + 32 + 2 + self.kem_ciphertext.len());
+        buf.extend_from_slice(&self.version.to_be_bytes());
+        buf.extend_from_slice(&self.selected_suite.suite_id().to_be_bytes());
+        buf.extend_from_slice(&self.server_random);
+        buf.extend_from_slice(&self.server_classical_public_key);
+        buf.extend_from_slice(&(self.kem_ciphertext.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.kem_ciphertext);
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < 2 + 2 + 32 + 32 + 2 {
+            return Err("PqcHandshakeResponsePayload too short".to_string());
+        }
+        let version = u16::from_be_bytes(bytes[0..2].try_into().unwrap());
+        let suite_id = u16::from_be_bytes(bytes[2..4].try_into().unwrap());
+        let selected_suite = HybridKemSuite::from_suite_id(suite_id)
+            .ok_or_else(|| format!("Unsupported HybridKemSuite ID: 0x{:04x}", suite_id))?;
+
+        let mut server_random = [0u8; 32];
+        server_random.copy_from_slice(&bytes[4..36]);
+
+        let mut server_classical_public_key = [0u8; 32];
+        server_classical_public_key.copy_from_slice(&bytes[36..68]);
+
+        let ct_len = u16::from_be_bytes(bytes[68..70].try_into().unwrap()) as usize;
+        if bytes.len() < 70 + ct_len {
+            return Err("Truncated KEM ciphertext in PqcHandshakeResponsePayload".to_string());
+        }
+        let kem_ciphertext = bytes[70..70 + ct_len].to_vec();
+
+        Ok(Self {
+            version,
+            selected_suite,
+            server_random,
+            server_classical_public_key,
+            kem_ciphertext,
+        })
+    }
+}
+
+/// Wire payload for PqcHandshakeFinished capsule (Confirmation verify data).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PqcHandshakeFinishedPayload {
+    pub verify_data: [u8; 32],
+}
+
+impl PqcHandshakeFinishedPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        self.verify_data.to_vec()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < 32 {
+            return Err("PqcHandshakeFinishedPayload too short".to_string());
+        }
+        let mut verify_data = [0u8; 32];
+        verify_data.copy_from_slice(&bytes[0..32]);
+        Ok(Self { verify_data })
+    }
+}
+
+/// Wire payload for PqcEncryptedRecord capsule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PqcEncryptedRecordPayload {
+    pub epoch: u32,
+    pub sequence_number: u64,
+    pub inner_capsule_type: u64,
+    pub ciphertext: Vec<u8>,
+    pub auth_tag: [u8; 16],
+}
+
+impl PqcEncryptedRecordPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(4 + 8 + 8 + 4 + self.ciphertext.len() + 16);
+        buf.extend_from_slice(&self.epoch.to_be_bytes());
+        buf.extend_from_slice(&self.sequence_number.to_be_bytes());
+        buf.extend_from_slice(&self.inner_capsule_type.to_be_bytes());
+        buf.extend_from_slice(&(self.ciphertext.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&self.ciphertext);
+        buf.extend_from_slice(&self.auth_tag);
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < 4 + 8 + 8 + 4 + 16 {
+            return Err("PqcEncryptedRecordPayload too short".to_string());
+        }
+        let epoch = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+        let sequence_number = u64::from_be_bytes(bytes[4..12].try_into().unwrap());
+        let inner_capsule_type = u64::from_be_bytes(bytes[12..20].try_into().unwrap());
+        let ct_len = u32::from_be_bytes(bytes[20..24].try_into().unwrap()) as usize;
+        if bytes.len() < 24 + ct_len + 16 {
+            return Err("Truncated ciphertext in PqcEncryptedRecordPayload".to_string());
+        }
+        let ciphertext = bytes[24..24 + ct_len].to_vec();
+        let mut auth_tag = [0u8; 16];
+        auth_tag.copy_from_slice(&bytes[24 + ct_len..24 + ct_len + 16]);
+
+        Ok(Self {
+            epoch,
+            sequence_number,
+            inner_capsule_type,
+            ciphertext,
+            auth_tag,
+        })
+    }
+}
+
+/// Wire payload for PqcKeyUpdate capsule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PqcKeyUpdatePayload {
+    pub epoch: u32,
+    pub request_ack: bool,
+}
+
+impl PqcKeyUpdatePayload {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(5);
+        buf.extend_from_slice(&self.epoch.to_be_bytes());
+        buf.push(if self.request_ack { 1 } else { 0 });
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < 5 {
+            return Err("PqcKeyUpdatePayload too short".to_string());
+        }
+        let epoch = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+        let request_ack = bytes[4] != 0;
+        Ok(Self { epoch, request_ack })
+    }
+}
+
+/// Sliding-window anti-replay filter for encapsulated secure capsules.
+/// Maintains a 128-packet bitmap to prevent packet injection and replay attacks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PqcAntiReplayWindow {
+    pub max_seq_received: u64,
+    pub bitmap: [u64; 2],
+    pub window_size: u64,
+}
+
+impl Default for PqcAntiReplayWindow {
+    fn default() -> Self {
+        Self::new(128)
+    }
+}
+
+impl PqcAntiReplayWindow {
+    pub fn new(window_size: u64) -> Self {
+        Self {
+            max_seq_received: 0,
+            bitmap: [0, 0],
+            window_size,
+        }
+    }
+
+    /// Check if a sequence number is acceptable (not replayed and not too old) without modifying state.
+    pub fn check(&self, seq: u64) -> bool {
+        if seq == 0 && self.max_seq_received == 0 && (self.bitmap[0] & 1) == 0 {
+            return true;
+        }
+
+        if seq > self.max_seq_received {
+            true
+        } else {
+            let diff = self.max_seq_received - seq;
+            if diff >= self.window_size {
+                false
+            } else {
+                let word_idx = (diff / 64) as usize;
+                let bit_idx = (diff % 64) as usize;
+                (self.bitmap[word_idx] & (1u64 << bit_idx)) == 0
+            }
+        }
+    }
+
+    /// Mark a verified sequence number as received.
+    pub fn update(&mut self, seq: u64) {
+        if seq == 0 && self.max_seq_received == 0 && (self.bitmap[0] & 1) == 0 {
+            self.bitmap[0] |= 1;
+            return;
+        }
+
+        if seq > self.max_seq_received {
+            let diff = seq - self.max_seq_received;
+            if diff >= 128 {
+                self.bitmap = [0, 0];
+            } else if diff >= 64 {
+                self.bitmap[1] = self.bitmap[0] << (diff - 64);
+                self.bitmap[0] = 0;
+            } else {
+                self.bitmap[1] = (self.bitmap[1] << diff) | (self.bitmap[0] >> (64 - diff));
+                self.bitmap[0] <<= diff;
+            }
+            self.bitmap[0] |= 1;
+            self.max_seq_received = seq;
+        } else {
+            let diff = self.max_seq_received - seq;
+            if diff < self.window_size {
+                let word_idx = (diff / 64) as usize;
+                let bit_idx = (diff % 64) as usize;
+                self.bitmap[word_idx] |= 1u64 << bit_idx;
+            }
+        }
+    }
+
+    /// Combined check and update in one atomic step.
+    pub fn check_and_update(&mut self, seq: u64) -> bool {
+        if self.check(seq) {
+            self.update(seq);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Role of endpoint in post-quantum handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PqcRole {
+    Client,
+    Server,
+}
+
+/// Lifecycle state of a Post-Quantum Encrypted Capsule Tunnel Session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PqcSessionState {
+    Uninitialized,
+    Handshaking,
+    Established,
+    Rekeying,
+    Closed,
+}
+
+/// Cumulative telemetry metrics for post-quantum hybrid encryption on capsule tunnels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PqcCapsuleTelemetry {
+    pub handshakes_initiated: usize,
+    pub handshakes_completed: usize,
+    pub capsules_encrypted: usize,
+    pub capsules_decrypted: usize,
+    pub bytes_encrypted: usize,
+    pub bytes_decrypted: usize,
+    pub rekeys_completed: usize,
+    pub replay_attacks_rejected: usize,
+    pub auth_failures: usize,
+}
+
+/// Post-Quantum Hybrid Encryption and Key Derivation Session Manager.
+#[derive(Debug, Clone)]
+pub struct PqcSecureTunnelSession {
+    pub role: PqcRole,
+    pub state: PqcSessionState,
+    pub supported_suites: Vec<HybridKemSuite>,
+    pub selected_suite: Option<HybridKemSuite>,
+    pub keys: Option<PqcSessionKeys>,
+    pub current_epoch: u32,
+    pub tx_sequence: u64,
+    pub rx_anti_replay: PqcAntiReplayWindow,
+    pub telemetry: PqcCapsuleTelemetry,
+    client_keypair: Option<HybridKeyPair>,
+    client_random: [u8; 32],
+    server_random: [u8; 32],
+    transcript_hash_accumulator: Vec<u8>,
+}
+
+impl PqcSecureTunnelSession {
+    /// Initialize a new client-side secure tunnel session.
+    pub fn new_client(supported_suites: Vec<HybridKemSuite>) -> Self {
+        Self {
+            role: PqcRole::Client,
+            state: PqcSessionState::Uninitialized,
+            supported_suites,
+            selected_suite: None,
+            keys: None,
+            current_epoch: 0,
+            tx_sequence: 0,
+            rx_anti_replay: PqcAntiReplayWindow::default(),
+            telemetry: PqcCapsuleTelemetry::default(),
+            client_keypair: None,
+            client_random: [0u8; 32],
+            server_random: [0u8; 32],
+            transcript_hash_accumulator: Vec::new(),
+        }
+    }
+
+    /// Initialize a new server-side secure tunnel session.
+    pub fn new_server(supported_suites: Vec<HybridKemSuite>) -> Self {
+        Self {
+            role: PqcRole::Server,
+            state: PqcSessionState::Uninitialized,
+            supported_suites,
+            selected_suite: None,
+            keys: None,
+            current_epoch: 0,
+            tx_sequence: 0,
+            rx_anti_replay: PqcAntiReplayWindow::default(),
+            telemetry: PqcCapsuleTelemetry::default(),
+            client_keypair: None,
+            client_random: [0u8; 32],
+            server_random: [0u8; 32],
+            transcript_hash_accumulator: Vec::new(),
+        }
+    }
+
+    pub fn is_established(&self) -> bool {
+        self.state == PqcSessionState::Established
+    }
+
+    /// Client: Generate ClientHello / KeyShare init capsule.
+    pub fn create_client_init(
+        &mut self,
+        classical_seed: &[u8; 32],
+        kem_seed: &[u8; 32],
+    ) -> Result<crate::simd_parser::HttpCapsule, String> {
+        if self.role != PqcRole::Client {
+            return Err("Only client can initiate handshake".to_string());
+        }
+        let suite = self
+            .supported_suites
+            .first()
+            .copied()
+            .unwrap_or(HybridKemSuite::X25519MlKem768);
+        self.selected_suite = Some(suite);
+
+        let kp = HybridKeyExchange::generate_client_keys(suite, classical_seed, kem_seed);
+        let mut cr = [0u8; 32];
+        cr.copy_from_slice(&crate::crypto::blake3(b"CLIENT-RANDOM-SEED")[0..32]);
+        self.client_random = cr;
+
+        let payload = PqcHandshakeInitPayload {
+            version: 1,
+            supported_suites: self.supported_suites.clone(),
+            client_random: cr,
+            client_classical_public_key: kp.classical_public,
+            client_kem_public_key: kp.kem_public.clone(),
+        };
+
+        let encoded = payload.encode();
+        self.transcript_hash_accumulator.extend_from_slice(&encoded);
+        self.client_keypair = Some(kp);
+        self.state = PqcSessionState::Handshaking;
+        self.telemetry.handshakes_initiated += 1;
+
+        Ok(crate::simd_parser::HttpCapsule::pqc_handshake_init(encoded))
+    }
+
+    /// Server: Process client's init capsule and produce server's response.
+    pub fn process_client_init(
+        &mut self,
+        init_capsule: &crate::simd_parser::HttpCapsule,
+        server_classical_seed: &[u8; 32],
+        server_kem_seed: &[u8; 32],
+    ) -> Result<crate::simd_parser::HttpCapsule, String> {
+        if self.role != PqcRole::Server {
+            return Err("Only server can process client init".to_string());
+        }
+        if init_capsule.capsule_type != crate::simd_parser::CapsuleType::PqcHandshakeInit {
+            return Err("Expected PqcHandshakeInit capsule".to_string());
+        }
+
+        let init_payload = PqcHandshakeInitPayload::decode(&init_capsule.payload)?;
+        self.client_random = init_payload.client_random;
+
+        let selected_suite = init_payload
+            .supported_suites
+            .iter()
+            .find(|s| self.supported_suites.contains(s))
+            .copied()
+            .ok_or_else(|| "No overlapping hybrid suite found".to_string())?;
+        self.selected_suite = Some(selected_suite);
+
+        let mut sr = [0u8; 32];
+        sr.copy_from_slice(&crate::crypto::blake3(b"SERVER-RANDOM-SEED")[0..32]);
+        self.server_random = sr;
+
+        self.transcript_hash_accumulator
+            .extend_from_slice(&init_capsule.payload);
+
+        let (keys, server_classical_pub, kem_ct) = HybridKeyExchange::server_encapsulate(
+            selected_suite,
+            &init_payload.client_classical_public_key,
+            &init_payload.client_kem_public_key,
+            server_classical_seed,
+            server_kem_seed,
+            &self.transcript_hash_accumulator,
+        )?;
+
+        let resp_payload = PqcHandshakeResponsePayload {
+            version: 1,
+            selected_suite,
+            server_random: sr,
+            server_classical_public_key: server_classical_pub,
+            kem_ciphertext: kem_ct,
+        };
+
+        let encoded_resp = resp_payload.encode();
+        self.transcript_hash_accumulator
+            .extend_from_slice(&encoded_resp);
+        self.keys = Some(keys);
+        self.state = PqcSessionState::Established;
+        self.telemetry.handshakes_completed += 1;
+
+        Ok(crate::simd_parser::HttpCapsule::pqc_handshake_response(
+            encoded_resp,
+        ))
+    }
+
+    /// Client: Process server's response capsule and produce finished capsule.
+    pub fn process_server_response(
+        &mut self,
+        resp_capsule: &crate::simd_parser::HttpCapsule,
+    ) -> Result<crate::simd_parser::HttpCapsule, String> {
+        if self.role != PqcRole::Client {
+            return Err("Only client can process server response".to_string());
+        }
+        if resp_capsule.capsule_type != crate::simd_parser::CapsuleType::PqcHandshakeResponse {
+            return Err("Expected PqcHandshakeResponse capsule".to_string());
+        }
+
+        let resp_payload = PqcHandshakeResponsePayload::decode(&resp_capsule.payload)?;
+        let kp = self
+            .client_keypair
+            .as_ref()
+            .ok_or_else(|| "Missing client keypair".to_string())?;
+
+        let keys = HybridKeyExchange::client_decapsulate(
+            kp,
+            &resp_payload.server_classical_public_key,
+            &resp_payload.kem_ciphertext,
+            &self.transcript_hash_accumulator,
+        )?;
+
+        self.transcript_hash_accumulator
+            .extend_from_slice(&resp_capsule.payload);
+        self.selected_suite = Some(resp_payload.selected_suite);
+        self.server_random = resp_payload.server_random;
+
+        let verify_data = hmac_sha256(&keys.master_secret, &self.transcript_hash_accumulator);
+        self.keys = Some(keys);
+        self.state = PqcSessionState::Established;
+        self.telemetry.handshakes_completed += 1;
+
+        let fin_payload = PqcHandshakeFinishedPayload { verify_data };
+        Ok(crate::simd_parser::HttpCapsule::pqc_handshake_finished(
+            fin_payload.encode(),
+        ))
+    }
+
+    /// Server: Process client finished confirmation.
+    pub fn process_client_finished(
+        &mut self,
+        fin_capsule: &crate::simd_parser::HttpCapsule,
+    ) -> Result<(), String> {
+        if self.role != PqcRole::Server {
+            return Err("Only server processes client finished".to_string());
+        }
+        if fin_capsule.capsule_type != crate::simd_parser::CapsuleType::PqcHandshakeFinished {
+            return Err("Expected PqcHandshakeFinished capsule".to_string());
+        }
+
+        let fin_payload = PqcHandshakeFinishedPayload::decode(&fin_capsule.payload)?;
+        let keys = self
+            .keys
+            .as_ref()
+            .ok_or_else(|| "Session keys not initialized".to_string())?;
+
+        let expected_verify = hmac_sha256(&keys.master_secret, &self.transcript_hash_accumulator);
+        if !constant_time_eq(&fin_payload.verify_data, &expected_verify) {
+            self.telemetry.auth_failures += 1;
+            return Err("Handshake finished verify data mismatch".to_string());
+        }
+        Ok(())
+    }
+
+    /// Encrypt a plain HTTP Capsule into an authenticated PqcEncryptedRecord capsule.
+    pub fn encrypt_capsule(
+        &mut self,
+        capsule: &crate::simd_parser::HttpCapsule,
+    ) -> Result<crate::simd_parser::HttpCapsule, String> {
+        let keys = self
+            .keys
+            .as_ref()
+            .ok_or_else(|| "Session keys not established".to_string())?;
+        let seq = self.tx_sequence;
+        self.tx_sequence = self.tx_sequence.wrapping_add(1);
+
+        let (write_key, write_iv) = match self.role {
+            PqcRole::Client => (&keys.client_write_key, &keys.client_write_iv),
+            PqcRole::Server => (&keys.server_write_key, &keys.server_write_iv),
+        };
+
+        let mut nonce = *write_iv;
+        let seq_bytes = seq.to_be_bytes();
+        for i in 0..8 {
+            nonce[4 + i] ^= seq_bytes[i];
+        }
+
+        let inner_type_num: u64 = capsule.capsule_type.into();
+        let mut aad = [0u8; 20];
+        aad[0..4].copy_from_slice(&self.current_epoch.to_be_bytes());
+        aad[4..12].copy_from_slice(&seq.to_be_bytes());
+        aad[12..20].copy_from_slice(&inner_type_num.to_be_bytes());
+
+        let (ciphertext, auth_tag) =
+            chacha20_poly1305_encrypt(write_key, &nonce, &aad, &capsule.payload);
+
+        let record_payload = PqcEncryptedRecordPayload {
+            epoch: self.current_epoch,
+            sequence_number: seq,
+            inner_capsule_type: inner_type_num,
+            ciphertext,
+            auth_tag,
+        };
+
+        self.telemetry.capsules_encrypted += 1;
+        self.telemetry.bytes_encrypted += capsule.payload.len();
+
+        Ok(crate::simd_parser::HttpCapsule::pqc_encrypted_record(
+            record_payload.encode(),
+        ))
+    }
+
+    /// Decrypt an authenticated PqcEncryptedRecord capsule back into the plain HTTP Capsule.
+    pub fn decrypt_capsule(
+        &mut self,
+        record_capsule: &crate::simd_parser::HttpCapsule,
+    ) -> Result<crate::simd_parser::HttpCapsule, String> {
+        let keys = self
+            .keys
+            .as_ref()
+            .ok_or_else(|| "Session keys not established".to_string())?;
+        if record_capsule.capsule_type != crate::simd_parser::CapsuleType::PqcEncryptedRecord {
+            return Err("Expected PqcEncryptedRecord capsule".to_string());
+        }
+
+        let record = PqcEncryptedRecordPayload::decode(&record_capsule.payload)?;
+        if record.epoch != self.current_epoch {
+            return Err(format!(
+                "Record epoch mismatch: got {}, expected {}",
+                record.epoch, self.current_epoch
+            ));
+        }
+
+        if !self.rx_anti_replay.check(record.sequence_number) {
+            self.telemetry.replay_attacks_rejected += 1;
+            return Err(format!(
+                "Replay attack detected for sequence {}",
+                record.sequence_number
+            ));
+        }
+
+        let (read_key, read_iv) = match self.role {
+            PqcRole::Client => (&keys.server_write_key, &keys.server_write_iv),
+            PqcRole::Server => (&keys.client_write_key, &keys.client_write_iv),
+        };
+
+        let mut nonce = *read_iv;
+        let seq_bytes = record.sequence_number.to_be_bytes();
+        for i in 0..8 {
+            nonce[4 + i] ^= seq_bytes[i];
+        }
+
+        let mut aad = [0u8; 20];
+        aad[0..4].copy_from_slice(&record.epoch.to_be_bytes());
+        aad[4..12].copy_from_slice(&record.sequence_number.to_be_bytes());
+        aad[12..20].copy_from_slice(&record.inner_capsule_type.to_be_bytes());
+
+        let plaintext = match chacha20_poly1305_decrypt(
+            read_key,
+            &nonce,
+            &aad,
+            &record.ciphertext,
+            &record.auth_tag,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                self.telemetry.auth_failures += 1;
+                return Err(format!("Capsule decryption failed: {}", e));
+            }
+        };
+
+        // Commit sequence number to anti-replay window only after successful decryption
+        self.rx_anti_replay.update(record.sequence_number);
+
+        self.telemetry.capsules_decrypted += 1;
+        self.telemetry.bytes_decrypted += plaintext.len();
+
+        let inner_type = crate::simd_parser::CapsuleType::from(record.inner_capsule_type);
+        Ok(crate::simd_parser::HttpCapsule::new(inner_type, plaintext))
+    }
+
+    /// Advance key ratchet (rekey) and return a PqcKeyUpdate notification capsule.
+    pub fn rekey(&mut self) -> Result<crate::simd_parser::HttpCapsule, String> {
+        let keys = self
+            .keys
+            .as_mut()
+            .ok_or_else(|| "Session not established".to_string())?;
+        keys.advance_ratchet();
+        self.current_epoch = self.current_epoch.wrapping_add(1);
+        self.tx_sequence = 0;
+        self.rx_anti_replay = PqcAntiReplayWindow::default();
+        self.telemetry.rekeys_completed += 1;
+
+        let payload = PqcKeyUpdatePayload {
+            epoch: self.current_epoch,
+            request_ack: false,
+        };
+        Ok(crate::simd_parser::HttpCapsule::pqc_key_update(
+            payload.encode(),
+        ))
+    }
+
+    /// Process peer's PqcKeyUpdate notification capsule.
+    pub fn process_rekey(
+        &mut self,
+        rekey_capsule: &crate::simd_parser::HttpCapsule,
+    ) -> Result<(), String> {
+        if rekey_capsule.capsule_type != crate::simd_parser::CapsuleType::PqcKeyUpdate {
+            return Err("Expected PqcKeyUpdate capsule".to_string());
+        }
+        let payload = PqcKeyUpdatePayload::decode(&rekey_capsule.payload)?;
+        if payload.epoch != self.current_epoch + 1 {
+            return Err(format!(
+                "Unexpected key update epoch: got {}, expected {}",
+                payload.epoch,
+                self.current_epoch + 1
+            ));
+        }
+        let keys = self
+            .keys
+            .as_mut()
+            .ok_or_else(|| "Session not established".to_string())?;
+        keys.advance_ratchet();
+        self.current_epoch = payload.epoch;
+        self.tx_sequence = 0;
+        self.rx_anti_replay = PqcAntiReplayWindow::default();
+        self.telemetry.rekeys_completed += 1;
+        Ok(())
+    }
+}
+
 /// Bidirectional tunnel running on an HTTP/2 or HTTP/3 stream (RFC 8441 / RFC 9297).
 #[derive(Debug, Clone)]
 pub struct ExtendedConnectTunnel {
@@ -11835,6 +12570,7 @@ pub struct ExtendedConnectTunnel {
     pub shaper: Option<AdaptiveTokenBucketShaper>,
     pub sp_wdrr_scheduler: Option<StrictPriorityWdrrScheduler>,
     pub aqm_codel: Option<AqmCodelQueue>,
+    pub pqc_session: Option<PqcSecureTunnelSession>,
     ingress_buffer: std::collections::VecDeque<u8>,
     egress_frames: std::collections::VecDeque<Vec<u8>>,
     capsule_queue: std::collections::VecDeque<crate::simd_parser::HttpCapsule>,
@@ -11856,6 +12592,7 @@ impl ExtendedConnectTunnel {
             shaper: None,
             sp_wdrr_scheduler: None,
             aqm_codel: None,
+            pqc_session: None,
             ingress_buffer: std::collections::VecDeque::with_capacity(4096),
             egress_frames: std::collections::VecDeque::new(),
             capsule_queue: std::collections::VecDeque::new(),
@@ -11882,6 +12619,12 @@ impl ExtendedConnectTunnel {
     /// Attach an Active Queue Management (CoDel) queue with ECN/L4S support.
     pub fn with_aqm_codel(mut self, aqm: AqmCodelQueue) -> Self {
         self.aqm_codel = Some(aqm);
+        self
+    }
+
+    /// Attach a Post-Quantum Hybrid Encryption session for end-to-end encrypted capsule tunneling.
+    pub fn with_pqc_session(mut self, session: PqcSecureTunnelSession) -> Self {
+        self.pqc_session = Some(session);
         self
     }
 
@@ -12112,6 +12855,50 @@ impl ExtendedConnectTunnel {
     /// Poll and dequeue the next incoming RFC 9297 capsule.
     pub fn recv_capsule(&mut self) -> Option<crate::simd_parser::HttpCapsule> {
         self.capsule_queue.pop_front()
+    }
+
+    /// Send a capsule with post-quantum authenticated encryption if a PQC session is active and established.
+    /// Otherwise transmits the capsule in plaintext.
+    pub fn send_secure_capsule(&mut self, capsule: &crate::simd_parser::HttpCapsule) -> Result<(), String> {
+        if let Some(session) = &mut self.pqc_session {
+            if session.is_established() {
+                let encrypted = session.encrypt_capsule(capsule)?;
+                self.send_capsule(&encrypted);
+                return Ok(());
+            }
+        }
+        self.send_capsule(capsule);
+        Ok(())
+    }
+
+    /// Receive the next capsule, automatically decrypting PqcEncryptedRecord capsules and
+    /// handling key update / rekey notifications transparently.
+    pub fn recv_secure_capsule(&mut self) -> Result<Option<crate::simd_parser::HttpCapsule>, String> {
+        let cap = match self.recv_capsule() {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        if let Some(session) = &mut self.pqc_session {
+            match cap.capsule_type {
+                crate::simd_parser::CapsuleType::PqcEncryptedRecord => {
+                    let decrypted = session.decrypt_capsule(&cap)?;
+                    return Ok(Some(decrypted));
+                }
+                crate::simd_parser::CapsuleType::PqcKeyUpdate => {
+                    session.process_rekey(&cap)?;
+                    return self.recv_secure_capsule();
+                }
+                _ => return Ok(Some(cap)),
+            }
+        }
+
+        Ok(Some(cap))
+    }
+
+    /// Retrieve the current post-quantum telemetry metrics for this tunnel session, if attached.
+    pub fn pqc_telemetry(&self) -> Option<PqcCapsuleTelemetry> {
+        self.pqc_session.as_ref().map(|s| s.telemetry)
     }
 
     /// Send a UDP datagram adaptively: if payload fits within path PMTU (accounting for RFC 9297
@@ -35783,5 +36570,286 @@ mod tls_alpn_tests {
         let pruned = engine.cleanup_idle_flows(now + Duration::from_secs(120));
         assert_eq!(pruned, 1);
         assert_eq!(engine.active_flows_count(), 0);
+    }
+
+    #[test]
+    fn test_pqc_handshake_payload_codec() {
+        // 1. Init payload
+        let init = PqcHandshakeInitPayload {
+            version: 1,
+            supported_suites: vec![HybridKemSuite::X25519MlKem768, HybridKemSuite::Secp256r1MlKem768],
+            client_random: [0x11; 32],
+            client_classical_public_key: [0x22; 32],
+            client_kem_public_key: vec![0x33; 1184],
+        };
+        let encoded_init = init.encode();
+        let decoded_init = PqcHandshakeInitPayload::decode(&encoded_init).expect("decode init");
+        assert_eq!(init, decoded_init);
+
+        // 2. Response payload
+        let resp = PqcHandshakeResponsePayload {
+            version: 1,
+            selected_suite: HybridKemSuite::X25519MlKem768,
+            server_random: [0x44; 32],
+            server_classical_public_key: [0x55; 32],
+            kem_ciphertext: vec![0x66; 1088],
+        };
+        let encoded_resp = resp.encode();
+        let decoded_resp = PqcHandshakeResponsePayload::decode(&encoded_resp).expect("decode resp");
+        assert_eq!(resp, decoded_resp);
+
+        // 3. Finished payload
+        let fin = PqcHandshakeFinishedPayload {
+            verify_data: [0x77; 32],
+        };
+        let encoded_fin = fin.encode();
+        let decoded_fin = PqcHandshakeFinishedPayload::decode(&encoded_fin).expect("decode fin");
+        assert_eq!(fin, decoded_fin);
+
+        // 4. Encrypted record payload
+        let rec = PqcEncryptedRecordPayload {
+            epoch: 2,
+            sequence_number: 42,
+            inner_capsule_type: 0x00,
+            ciphertext: b"ENCRYPTED_PAYLOAD_BYTES".to_vec(),
+            auth_tag: [0x88; 16],
+        };
+        let encoded_rec = rec.encode();
+        let decoded_rec = PqcEncryptedRecordPayload::decode(&encoded_rec).expect("decode rec");
+        assert_eq!(rec, decoded_rec);
+
+        // 5. Key update payload
+        let ku = PqcKeyUpdatePayload {
+            epoch: 3,
+            request_ack: true,
+        };
+        let encoded_ku = ku.encode();
+        let decoded_ku = PqcKeyUpdatePayload::decode(&encoded_ku).expect("decode key update");
+        assert_eq!(ku, decoded_ku);
+    }
+
+    #[test]
+    fn test_pqc_anti_replay_window() {
+        let mut window = PqcAntiReplayWindow::new(128);
+
+        // Initial packet 0
+        assert!(window.check_and_update(0));
+        // Duplicate packet 0 rejected
+        assert!(!window.check_and_update(0));
+
+        // In-order packets
+        assert!(window.check_and_update(1));
+        assert!(window.check_and_update(2));
+        assert!(window.check_and_update(5));
+
+        // Out-of-order packets inside window
+        assert!(window.check_and_update(3));
+        assert!(window.check_and_update(4));
+
+        // Replay of arrived packets
+        assert!(!window.check_and_update(1));
+        assert!(!window.check_and_update(3));
+        assert!(!window.check_and_update(5));
+
+        // Advance window forward
+        assert!(window.check_and_update(150));
+        assert_eq!(window.max_seq_received, 150);
+
+        // Old packet below (150 - 128 = 22) rejected
+        assert!(!window.check_and_update(10));
+        assert!(!window.check_and_update(20));
+
+        // Packet within new window (150 - 20 = 130) accepted once
+        assert!(window.check_and_update(130));
+        assert!(!window.check_and_update(130));
+    }
+
+    #[test]
+    fn test_pqc_hybrid_handshake_full_flow() {
+        let mut client = PqcSecureTunnelSession::new_client(vec![HybridKemSuite::X25519MlKem768]);
+        let mut server = PqcSecureTunnelSession::new_server(vec![HybridKemSuite::X25519MlKem768]);
+
+        let c_seed_classical = [0x11; 32];
+        let c_seed_kem = [0x22; 32];
+        let s_seed_classical = [0x33; 32];
+        let s_seed_kem = [0x44; 32];
+
+        // 1. Client creates init
+        let init_capsule = client.create_client_init(&c_seed_classical, &c_seed_kem).expect("create init");
+        assert_eq!(init_capsule.capsule_type, crate::simd_parser::CapsuleType::PqcHandshakeInit);
+
+        // 2. Server processes init and returns response
+        let resp_capsule = server.process_client_init(&init_capsule, &s_seed_classical, &s_seed_kem).expect("process init");
+        assert_eq!(resp_capsule.capsule_type, crate::simd_parser::CapsuleType::PqcHandshakeResponse);
+        assert!(server.is_established());
+
+        // 3. Client processes response and returns finished
+        let fin_capsule = client.process_server_response(&resp_capsule).expect("process response");
+        assert_eq!(fin_capsule.capsule_type, crate::simd_parser::CapsuleType::PqcHandshakeFinished);
+        assert!(client.is_established());
+
+        // 4. Server processes finished
+        server.process_client_finished(&fin_capsule).expect("process finished");
+
+        // 5. Verify both derive identical session keys
+        let c_keys = client.keys.as_ref().unwrap();
+        let s_keys = server.keys.as_ref().unwrap();
+        assert_eq!(c_keys.master_secret, s_keys.master_secret);
+        assert_eq!(c_keys.client_write_key, s_keys.client_write_key);
+        assert_eq!(c_keys.server_write_key, s_keys.server_write_key);
+        assert_eq!(c_keys.client_write_iv, s_keys.client_write_iv);
+        assert_eq!(c_keys.server_write_iv, s_keys.server_write_iv);
+        assert_eq!(c_keys.session_id, s_keys.session_id);
+
+        assert_eq!(client.telemetry.handshakes_completed, 1);
+        assert_eq!(server.telemetry.handshakes_completed, 1);
+    }
+
+    #[test]
+    fn test_pqc_secure_capsule_encryption_and_decryption() {
+        let mut client = PqcSecureTunnelSession::new_client(vec![HybridKemSuite::X25519MlKem768]);
+        let mut server = PqcSecureTunnelSession::new_server(vec![HybridKemSuite::X25519MlKem768]);
+
+        let init = client.create_client_init(&[1; 32], &[2; 32]).unwrap();
+        let resp = server.process_client_init(&init, &[3; 32], &[4; 32]).unwrap();
+        let fin = client.process_server_response(&resp).unwrap();
+        server.process_client_finished(&fin).unwrap();
+
+        // Client encrypts a standard DATAGRAM capsule
+        let raw_cap = crate::simd_parser::HttpCapsule::udp_datagram(0, b"CONFIDENTIAL_UDP_PAYLOAD");
+        let enc_cap = client.encrypt_capsule(&raw_cap).expect("encryption succeeds");
+        assert_eq!(enc_cap.capsule_type, crate::simd_parser::CapsuleType::PqcEncryptedRecord);
+        assert_ne!(enc_cap.payload, raw_cap.payload);
+
+        // Server decrypts the record
+        let dec_cap = server.decrypt_capsule(&enc_cap).expect("decryption succeeds");
+        assert_eq!(dec_cap.capsule_type, crate::simd_parser::CapsuleType::Datagram);
+        assert_eq!(dec_cap.payload, raw_cap.payload);
+
+        let (ctx, pkt) = dec_cap.decode_udp_datagram().unwrap();
+        assert_eq!(ctx, 0);
+        assert_eq!(pkt, b"CONFIDENTIAL_UDP_PAYLOAD");
+
+        // Server encrypts an ADDRESS_ASSIGN control capsule
+        let addr_cap = crate::simd_parser::HttpCapsule::new(crate::simd_parser::CapsuleType::AddressAssign, vec![192, 168, 1, 100]);
+        let enc_addr = server.encrypt_capsule(&addr_cap).unwrap();
+
+        // Client decrypts it
+        let dec_addr = client.decrypt_capsule(&enc_addr).unwrap();
+        assert_eq!(dec_addr.capsule_type, crate::simd_parser::CapsuleType::AddressAssign);
+        assert_eq!(dec_addr.payload, vec![192, 168, 1, 100]);
+
+        assert_eq!(client.telemetry.capsules_encrypted, 1);
+        assert_eq!(client.telemetry.capsules_decrypted, 1);
+        assert_eq!(server.telemetry.capsules_encrypted, 1);
+        assert_eq!(server.telemetry.capsules_decrypted, 1);
+    }
+
+    #[test]
+    fn test_pqc_tamper_and_replay_detection() {
+        let mut client = PqcSecureTunnelSession::new_client(vec![HybridKemSuite::X25519MlKem768]);
+        let mut server = PqcSecureTunnelSession::new_server(vec![HybridKemSuite::X25519MlKem768]);
+
+        let init = client.create_client_init(&[1; 32], &[2; 32]).unwrap();
+        let resp = server.process_client_init(&init, &[3; 32], &[4; 32]).unwrap();
+        let fin = client.process_server_response(&resp).unwrap();
+        server.process_client_finished(&fin).unwrap();
+
+        let raw_cap = crate::simd_parser::HttpCapsule::datagram(b"CRITICAL_FINANCIAL_TRANSACTION".to_vec());
+        let enc_cap = client.encrypt_capsule(&raw_cap).unwrap();
+
+        // Tamper test: modify ciphertext byte
+        let mut tampered_cap = enc_cap.clone();
+        let len = tampered_cap.payload.len();
+        tampered_cap.payload[len - 20] ^= 0x55;
+        let fail = server.decrypt_capsule(&tampered_cap);
+        assert!(fail.is_err());
+        assert_eq!(server.telemetry.auth_failures, 1);
+
+        // Legitimate decrypt succeeds
+        let legitimate = server.decrypt_capsule(&enc_cap).expect("legitimate decrypt");
+        assert_eq!(legitimate.payload, b"CRITICAL_FINANCIAL_TRANSACTION");
+
+        // Replay attack test: feed same valid record again
+        let replay_fail = server.decrypt_capsule(&enc_cap);
+        assert!(replay_fail.is_err());
+        assert_eq!(server.telemetry.replay_attacks_rejected, 1);
+    }
+
+    #[test]
+    fn test_pqc_rekey_and_ratchet() {
+        let mut client = PqcSecureTunnelSession::new_client(vec![HybridKemSuite::X25519MlKem768]);
+        let mut server = PqcSecureTunnelSession::new_server(vec![HybridKemSuite::X25519MlKem768]);
+
+        let init = client.create_client_init(&[1; 32], &[2; 32]).unwrap();
+        let resp = server.process_client_init(&init, &[3; 32], &[4; 32]).unwrap();
+        let fin = client.process_server_response(&resp).unwrap();
+        server.process_client_finished(&fin).unwrap();
+
+        // Transmit packet on epoch 0
+        let p0 = client.encrypt_capsule(&crate::simd_parser::HttpCapsule::datagram(b"EPOCH_0_MSG".to_vec())).unwrap();
+        let d0 = server.decrypt_capsule(&p0).unwrap();
+        assert_eq!(d0.payload, b"EPOCH_0_MSG");
+
+        // Client triggers rekey
+        let rekey_cap = client.rekey().expect("rekey succeeds");
+        assert_eq!(rekey_cap.capsule_type, crate::simd_parser::CapsuleType::PqcKeyUpdate);
+        assert_eq!(client.current_epoch, 1);
+
+        // Server receives rekey notification
+        server.process_rekey(&rekey_cap).expect("process rekey succeeds");
+        assert_eq!(server.current_epoch, 1);
+
+        // Transmit packet on epoch 1
+        let p1 = client.encrypt_capsule(&crate::simd_parser::HttpCapsule::datagram(b"EPOCH_1_FORWARD_SECURE_MSG".to_vec())).unwrap();
+        let d1 = server.decrypt_capsule(&p1).unwrap();
+        assert_eq!(d1.payload, b"EPOCH_1_FORWARD_SECURE_MSG");
+
+        assert_eq!(client.telemetry.rekeys_completed, 1);
+        assert_eq!(server.telemetry.rekeys_completed, 1);
+    }
+
+    #[test]
+    fn test_extended_connect_tunnel_pqc_integration() {
+        let mut client_session = PqcSecureTunnelSession::new_client(vec![HybridKemSuite::X25519MlKem768]);
+        let mut server_session = PqcSecureTunnelSession::new_server(vec![HybridKemSuite::X25519MlKem768]);
+
+        // Handshake setup
+        let init = client_session.create_client_init(&[10; 32], &[20; 32]).unwrap();
+        let resp = server_session.process_client_init(&init, &[30; 32], &[40; 32]).unwrap();
+        let fin = client_session.process_server_response(&resp).unwrap();
+        server_session.process_client_finished(&fin).unwrap();
+
+        let mut client_tunnel = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "target.vpn:443")
+            .with_pqc_session(client_session);
+        client_tunnel.mark_established();
+
+        let mut server_tunnel = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "target.vpn:443")
+            .with_pqc_session(server_session);
+        server_tunnel.mark_established();
+
+        // Client sends secure capsule
+        let plain = crate::simd_parser::HttpCapsule::udp_datagram(0, b"END_TO_END_PQC_ENCRYPTED_TUNNEL");
+        client_tunnel.send_secure_capsule(&plain).expect("send secure capsule");
+
+        // Emulate transport transfer
+        let egress = client_tunnel.drain_egress_data();
+        assert!(!egress.is_empty());
+        for frame in egress {
+            server_tunnel.ingest_network_data(&frame);
+        }
+
+        // Server receives and transparently decrypts
+        let received = server_tunnel.recv_secure_capsule().expect("recv secure capsule").expect("capsule exists");
+        assert_eq!(received.capsule_type, crate::simd_parser::CapsuleType::Datagram);
+        let (ctx, data) = received.decode_udp_datagram().unwrap();
+        assert_eq!(ctx, 0);
+        assert_eq!(data, b"END_TO_END_PQC_ENCRYPTED_TUNNEL");
+
+        // Telemetry check
+        let c_telem = client_tunnel.pqc_telemetry().unwrap();
+        let s_telem = server_tunnel.pqc_telemetry().unwrap();
+        assert_eq!(c_telem.capsules_encrypted, 1);
+        assert_eq!(s_telem.capsules_decrypted, 1);
     }
 }
