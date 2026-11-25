@@ -37,13 +37,13 @@ pub use benchmarks::{
     run_jitter_anomaly_and_threshold_benchmark, run_mesh_lsa_synchronization_benchmark,
     run_mtls_attestation_and_key_rotation_benchmark, run_simd_capsule_and_classification_benchmark,
     run_telemetry_streaming_vs_polling_benchmark, run_topological_convergence_benchmark,
-    run_zstd_trace_archive_benchmark, AllocatorEngine, AllocatorThroughputResult, BenchmarkReport,
-    BenchmarkResult, IsspBenchmarkScenarioResult, IsspFailoverBenchmarkSuiteReport,
-    IsspNetworkProfile, JitterAnomalyBenchmarkReport, MeshLsaSyncBenchmarkReport,
-    MtlsAttestationBenchmarkReport, MultithreadBenchmarkSuiteReport,
+    run_traffic_slicing_benchmark, run_zstd_trace_archive_benchmark, AllocatorEngine,
+    AllocatorThroughputResult, BenchmarkReport, BenchmarkResult, IsspBenchmarkScenarioResult,
+    IsspFailoverBenchmarkSuiteReport, IsspNetworkProfile, JitterAnomalyBenchmarkReport,
+    MeshLsaSyncBenchmarkReport, MtlsAttestationBenchmarkReport, MultithreadBenchmarkSuiteReport,
     SimdClassificationBenchmarkReport, SimdPhaseResult, TelemetryComparativeReport,
     TelemetryLoadResult, TelemetryTransportKind, TopologicalConvergenceBenchmarkReport,
-    ZstdTraceArchiveBenchmarkReport,
+    TrafficSlicingBenchmarkReport, ZstdTraceArchiveBenchmarkReport,
 };
 pub use blocking::{
     ifa_rt_blocking_call, ifa_rt_blocking_pool_active_workers, ifa_rt_blocking_pool_capacity,
