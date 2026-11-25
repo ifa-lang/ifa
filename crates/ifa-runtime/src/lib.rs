@@ -11,6 +11,7 @@ pub mod io;
 pub mod panic;
 pub mod reactor;
 pub mod string;
+pub mod session_sync;
 pub mod telemetry;
 pub mod wasi;
 
@@ -59,6 +60,10 @@ pub use reactor::{
     ifa_rt_async_udp_set_broadcast, ifa_rt_async_udp_set_ttl, ifa_rt_async_write, AsyncReactor,
     AsyncTcpListener, AsyncTcpStream, AsyncTimer, AsyncUdpSocket, IoUringConnector, IocpConnector,
     KernelTimespec, GLOBAL_REACTOR,
+};
+pub use session_sync::{
+    GossipFrame, GossipResult, RejectReason, SessionId, SessionRegistry, SessionSnapshot,
+    SyncError, SyncTelemetry, ISSP_MAGIC, MAX_PEER_NODES, MAX_SESSIONS, SNAPSHOT_MAX_AGE,
 };
 pub use string::IfaString;
 pub use telemetry::{supervise_command, ResourceAuditScope, ResourceUsage};
