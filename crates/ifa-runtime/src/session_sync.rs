@@ -2313,6 +2313,7 @@ pub struct IsspDynamicMultipathRouter {
     pub constraint_metrics: SubpathConstraintMetrics,
     pub flow_slicing: crate::traffic_slicing::FlowSliceNegotiator,
     pub cost_gradient_balancer: crate::cost_gradient::CostGradientLoadBalancer,
+    pub latency_drift_monitor: crate::latency_drift::LatencyDriftMonitor,
 }
 
 impl IsspDynamicMultipathRouter {
@@ -2343,6 +2344,7 @@ impl IsspDynamicMultipathRouter {
             constraint_metrics: SubpathConstraintMetrics::default(),
             flow_slicing: crate::traffic_slicing::FlowSliceNegotiator::new(),
             cost_gradient_balancer: crate::cost_gradient::CostGradientLoadBalancer::default(),
+            latency_drift_monitor: crate::latency_drift::LatencyDriftMonitor::default(),
         }
     }
 
@@ -3379,6 +3381,37 @@ impl IsspDynamicMultipathRouter {
     /// Read access to cost-gradient load balancer metrics.
     pub fn cost_gradient_metrics(&self) -> &crate::cost_gradient::CostGradientMetrics {
         self.cost_gradient_balancer.metrics()
+    }
+
+    /// Actively monitor inter-slice latency drift and preemptively reallocate priority flows
+    /// before hard SLA breaches occur.
+    pub fn evaluate_latency_drift_and_preempt(
+        &mut self,
+        now_ms: u64,
+        measured_throughput_bps: Option<&HashMap<u32, u64>>,
+    ) -> Vec<crate::latency_drift::PreemptiveMigrationAction> {
+        let caps = self.snapshot_subpath_qos_capabilities(measured_throughput_bps);
+        self.latency_drift_monitor
+            .update_from_subpaths(&caps, now_ms);
+        let actions = self
+            .latency_drift_monitor
+            .evaluate_preemptive_reallocations(&mut self.flow_slicing, &caps, now_ms);
+
+        for action in &actions {
+            self.session_bindings
+                .insert(action.session_id, action.to_path_id);
+            if let Some(r) = self.paths.get_mut(&action.to_path_id) {
+                if r.state == IsspPathState::Standby {
+                    r.state = IsspPathState::Active;
+                }
+            }
+        }
+        actions
+    }
+
+    /// Read access to latency drift monitor metrics.
+    pub fn latency_drift_metrics(&self) -> &crate::latency_drift::LatencyDriftMetrics {
+        self.latency_drift_monitor.metrics()
     }
 
     /// Return an iterator over all registered routes.
@@ -8005,5 +8038,67 @@ mod tests {
         assert_eq!(router.get_route(2).unwrap().state, IsspPathState::Active);
         assert_eq!(router.cost_gradient_metrics().total_flows_migrated, 1);
         assert!(plan.total_cost_reduction > 0.0);
+    }
+
+    #[test]
+    fn test_router_latency_drift_preemption_integration() {
+        let mut router = IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::LowestLatency);
+
+        // Path 1: Primary link with low baseline latency (8ms)
+        let mut r1 = IsspMultipathRoute::new(1, 2, "eth0", 1, 100);
+        r1.metrics.smoothed_rtt_us = 8_000;
+        r1.metrics.jitter_us = 500;
+        r1.congestion.bbr.estimated_bandwidth_bps = 100_000_000;
+
+        // Path 2: Clean backup link with steady 10ms latency
+        let mut r2 = IsspMultipathRoute::new(2, 2, "eth1", 2, 100);
+        r2.metrics.smoothed_rtt_us = 10_000;
+        r2.metrics.jitter_us = 600;
+        r2.congestion.bbr.estimated_bandwidth_bps = 100_000_000;
+        r2.state = IsspPathState::Standby;
+
+        router.add_route(r1);
+        router.add_route(r2);
+
+        let s_urllc = SessionId::new(777, 1, 0);
+        router.register_flow_qos_profile(
+            s_urllc,
+            crate::traffic_slicing::FlowQoSProfile::ultra_low_latency(), // max 20ms
+        );
+
+        router.bind_session(s_urllc, 1).expect("bind urllc");
+        router.flow_slicing.force_reassign_flow(&s_urllc, 1, 1000);
+
+        // Step 1: Initial sample at 1000ms
+        router.evaluate_latency_drift_and_preempt(1000, None);
+
+        // Step 2: Mild latency increase on Path 1 at 2000ms (within safe zone)
+        if let Some(route) = router.get_route_mut(1) {
+            route.metrics.smoothed_rtt_us = 9_500;
+            route.congestion.ledbat.queuing_delay_us = 1_000;
+        }
+        let mid_actions = router.evaluate_latency_drift_and_preempt(2000, None);
+        assert_eq!(mid_actions.len(), 0); // No preemption yet (still comfortable headroom)
+
+        // Step 3: Latency reaches 16.8ms at 3000ms (75% watermark is 15ms, SLA is 20ms, drift = 4400us/s)
+        if let Some(route) = router.get_route_mut(1) {
+            route.metrics.smoothed_rtt_us = 16_800;
+            route.congestion.ledbat.queuing_delay_us = 4_000;
+        }
+        let actions = router.evaluate_latency_drift_and_preempt(3000, None);
+
+        // Preemptive reallocation must trigger before hard SLA violation
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].session_id, s_urllc);
+        assert_eq!(actions[0].from_path_id, 1);
+        assert_eq!(actions[0].to_path_id, 2);
+        assert_eq!(router.get_session_path(&s_urllc), Some(2));
+        assert_eq!(router.get_route(2).unwrap().state, IsspPathState::Active);
+        assert_eq!(
+            router
+                .latency_drift_metrics()
+                .preemptive_reallocations_total,
+            1
+        );
     }
 }

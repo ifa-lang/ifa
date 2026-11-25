@@ -10,6 +10,7 @@ pub mod fiber;
 pub mod header;
 pub mod io;
 pub mod jitter_anomaly;
+pub mod latency_drift;
 pub mod mesh_lsa;
 pub mod mtls_attestation;
 pub mod panic;
@@ -69,6 +70,11 @@ pub use jitter_anomaly::{
     apply_dynamic_thresholds, AnomalySeverity, DynamicCongestionThresholds, JitterAnomalyDetector,
     JitterAnomalyKind, JitterDetectorConfig, JitterDetectorStats, JitterMitigationAction,
     JitterMultipathBridge, JitterSampleEvaluation,
+};
+pub use latency_drift::{
+    DriftSeverity, InterSliceDisparityReport, LatencyDriftConfig, LatencyDriftMetrics,
+    LatencyDriftMonitor, LatencyDriftSample, PreemptiveMigrationAction,
+    PreemptiveReallocationReason, SliceDriftState, SubpathDriftTracker,
 };
 pub use mesh_lsa::{
     lsa_phase_name, IsspLinkStateEntry, IsspLsaError, IsspLsaIngestSummary, IsspLsaLinkRecord,

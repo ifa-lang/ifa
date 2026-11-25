@@ -206,6 +206,8 @@ pub enum SliceMigrationReason {
     PathUnusable,
     /// Higher quality subpath became available (rebalancing).
     RebalanceOptimization,
+    /// Proactive migration triggered to avert predicted SLA latency or bufferbloat violation.
+    PreemptiveDriftMitigation,
 }
 
 impl SliceMigrationReason {
@@ -218,6 +220,7 @@ impl SliceMigrationReason {
             Self::PacketLossSpike => "packet_loss_spike",
             Self::PathUnusable => "path_unusable",
             Self::RebalanceOptimization => "rebalance_optimization",
+            Self::PreemptiveDriftMitigation => "preemptive_drift_mitigation",
         }
     }
 }
@@ -383,6 +386,22 @@ impl FlowSliceNegotiator {
         target_path_id: u32,
         now_ms: u64,
     ) -> Option<FlowSliceAssignment> {
+        self.force_reassign_flow_with_reason(
+            session_id,
+            target_path_id,
+            SliceMigrationReason::RebalanceOptimization,
+            now_ms,
+        )
+    }
+
+    /// Explicitly reassign a flow to a target subpath with an annotated migration reason.
+    pub fn force_reassign_flow_with_reason(
+        &mut self,
+        session_id: &SessionId,
+        target_path_id: u32,
+        reason: SliceMigrationReason,
+        now_ms: u64,
+    ) -> Option<FlowSliceAssignment> {
         let profile = self.profiles.get(session_id)?.clone();
         let prev_path_id = self
             .assignments
@@ -405,7 +424,7 @@ impl FlowSliceNegotiator {
                 slice_class: profile.slice_class,
                 from_path_id: prev_path_id,
                 to_path_id: target_path_id,
-                reason: SliceMigrationReason::RebalanceOptimization,
+                reason,
                 migration_timestamp_ms: now_ms,
                 cutover_latency_us: 100.0,
             };

@@ -355,6 +355,10 @@ pub struct IsspMultipathBalancingSnapshot {
     pub total_slice_migrations: u64,
     /// Total cost-gradient flow migrations across subpaths.
     pub total_cost_gradient_migrations: u64,
+    /// Total preemptive priority flow reallocations before SLA breach.
+    pub total_preemptive_reallocations: u64,
+    /// Total lower-priority flow evictions executed for contention relief.
+    pub total_priority_evictions: u64,
     /// Instantaneous variance of marginal gradients across subpaths.
     pub last_gradient_variance: f64,
     /// Active flows partitioned by slice class name.
@@ -566,6 +570,10 @@ impl IsspMultipathBalancingSnapshot {
             cspf_resilience: router.cspf_group().map(CspfResilienceSnapshot::from_group),
             total_slice_migrations: router.flow_slicing.metrics().total_slice_migrations,
             total_cost_gradient_migrations: router.cost_gradient_metrics().total_flows_migrated,
+            total_preemptive_reallocations: router
+                .latency_drift_metrics()
+                .preemptive_reallocations_total,
+            total_priority_evictions: router.latency_drift_metrics().priority_evictions_total,
             last_gradient_variance: router.cost_gradient_metrics().last_gradient_variance,
             active_flows_by_slice: {
                 let mut m = BTreeMap::new();
@@ -1476,6 +1484,25 @@ impl PrometheusMultipathBalancingExporter {
         out.push_str(&format!(
             "ifa_multipath_cost_gradient_variance{} {:.6}\n",
             base_lbl, s.last_gradient_variance
+        ));
+
+        // Latency Drift Preemption Metrics
+        out.push_str(
+            "# HELP ifa_slice_preemptive_reallocations_total Proactive flow migrations executed before SLA breach.\n",
+        );
+        out.push_str("# TYPE ifa_slice_preemptive_reallocations_total counter\n");
+        out.push_str(&format!(
+            "ifa_slice_preemptive_reallocations_total{} {}\n",
+            base_lbl, s.total_preemptive_reallocations
+        ));
+
+        out.push_str(
+            "# HELP ifa_slice_priority_evictions_total Lower priority flows evicted to protect priority slices.\n",
+        );
+        out.push_str("# TYPE ifa_slice_priority_evictions_total counter\n");
+        out.push_str(&format!(
+            "ifa_slice_priority_evictions_total{} {}\n",
+            base_lbl, s.total_priority_evictions
         ));
 
         out
