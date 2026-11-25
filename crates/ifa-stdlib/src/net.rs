@@ -7712,6 +7712,7 @@ impl AdaptiveDatagramReassembler {
 pub struct HybridDatagramTransport {
     pub pmtud: PathMtuDiscovery,
     pub reassembler: AdaptiveDatagramReassembler,
+    pub reliable_session: Option<AdaptiveReliableDatagramSession>,
     next_datagram_id: u64,
     transport_overhead: usize,
 }
@@ -7728,9 +7729,16 @@ impl HybridDatagramTransport {
         Self {
             pmtud: PathMtuDiscovery::new(config),
             reassembler: AdaptiveDatagramReassembler::new(256, Duration::from_secs(5)),
+            reliable_session: None,
             next_datagram_id: 1,
             transport_overhead: 28, // IP (20) + UDP (8) headers
         }
+    }
+
+    /// Enable adaptive reliable datagram transport with FEC redundancy group size.
+    pub fn with_reliable_session(mut self, fec_group_size: u16) -> Self {
+        self.reliable_session = Some(AdaptiveReliableDatagramSession::new(fec_group_size));
+        self
     }
 
     /// Current discovered Path MTU.
@@ -7805,10 +7813,14 @@ impl HybridDatagramTransport {
 
     /// Prune stale incomplete reassembly buffers.
     pub fn prune_stale(&mut self, now: std::time::Instant) -> usize {
-        self.reassembler.prune_stale(now)
+        let mut pruned = self.reassembler.prune_stale(now);
+        if let Some(ref mut rel) = self.reliable_session {
+            pruned += rel.prune_stale(now);
+        }
+        pruned
     }
 
-    /// Retrieve combined telemetry.
+    /// Retrieve combined PMTUD and reassembly telemetry.
     pub fn telemetry(&self) -> PmtudTelemetry {
         let mut telem = self.pmtud.telemetry();
         let reasm = self.reassembler.telemetry();
@@ -7816,6 +7828,933 @@ impl HybridDatagramTransport {
         telem.total_fragments_received = reasm.total_fragments_received;
         telem.checksum_errors = reasm.checksum_errors;
         telem.stale_fragments_pruned = reasm.stale_fragments_pruned;
+        telem
+    }
+
+    /// Send a reliable or semi-reliable datagram, generating FEC redundancy packets
+    /// and tracking in-flight packets for SACK recovery.
+    pub fn send_reliable(
+        &mut self,
+        payload: &[u8],
+        deadline: Option<Duration>,
+        high_priority: bool,
+        now: std::time::Instant,
+    ) -> Vec<Vec<u8>> {
+        if let Some(ref mut session) = self.reliable_session {
+            session.send_datagram(payload, true, deadline, high_priority, now)
+        } else {
+            self.send_adaptive(payload)
+        }
+    }
+
+    /// Ingest a wire packet through the reliable session (handling SACK frames, FEC packets,
+    /// or sequenced payload delivery) or fall back to standard adaptive reassembly.
+    pub fn recv_reliable(
+        &mut self,
+        packet: &[u8],
+        now: std::time::Instant,
+    ) -> Result<Option<ReceivedDatagramPayload>, DatagramReassemblyError> {
+        if let Some(ref mut session) = self.reliable_session {
+            session
+                .recv_wire(packet, now)
+                .map_err(|e| DatagramReassemblyError::InvalidFragment(format!("{:?}", e)))
+        } else {
+            let res = self.recv_adaptive(packet, now)?;
+            Ok(res.map(|payload| ReceivedDatagramPayload {
+                seq_num: 0,
+                payload,
+                was_recovered_via_fec: false,
+                is_retransmission: false,
+            }))
+        }
+    }
+
+    /// Retrieve reliable datagram session telemetry if enabled.
+    pub fn reliable_telemetry(&self) -> Option<ReliableDatagramTelemetry> {
+        self.reliable_session.as_ref().map(|s| s.telemetry())
+    }
+}
+
+// ── RFC 9221 / SACK & Hybrid FEC Engine ──────────────────────────────────
+
+/// Telemetry counters and performance indicators for reliable and semi-reliable datagram transports.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ReliableDatagramTelemetry {
+    /// Total application datagram packets generated for transmission.
+    pub packets_sent: usize,
+    /// Total valid application datagram packets delivered to the consumer.
+    pub packets_received: usize,
+    /// Packet loss events predicted by sequence gap detection.
+    pub lost_predicted: usize,
+    /// Packet losses confirmed by selective acknowledgment (SACK).
+    pub lost_confirmed: usize,
+    /// Lost datagrams seamlessly reconstructed via FEC without RTT delay.
+    pub recovered_via_fec: usize,
+    /// Retransmitted datagram packets triggered by selective ACKs.
+    pub retransmitted_via_sack: usize,
+    /// Retransmissions cancelled because application deadline expired.
+    pub retransmissions_dropped_expired: usize,
+    /// FEC parity packets transmitted.
+    pub fec_packets_sent: usize,
+    /// FEC parity packets received from remote peer.
+    pub fec_packets_received: usize,
+    /// Redundant duplicate packets dropped at the receiver.
+    pub duplicate_packets_dropped: usize,
+    /// Exponentially weighted moving average of packet loss rate (0.0 to 1.0).
+    pub estimated_loss_rate: f64,
+    /// Smoothed round-trip time in microseconds.
+    pub smoothed_rtt_micros: u64,
+}
+
+/// Classification of observed packet loss behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatagramLossPattern {
+    /// No abnormal packet loss observed.
+    None,
+    /// Isolated random drops (typical of wireless interference or buffer jitter).
+    Random,
+    /// Consecutive burst losses (typical of congestion collapse or queue overflow).
+    Burst(usize),
+}
+
+/// Forward Error Correction adaptation level dynamically tuned from loss telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FecAdaptationRecommendation {
+    /// Network path is clean (<2% loss): disable FEC overhead.
+    Disabled,
+    /// Mild loss (2-8%): 1 repair symbol per 8 packets.
+    LowRedundancy(u16),
+    /// Moderate loss (8-15%): 1 repair symbol per 5 packets.
+    ModerateRedundancy(u16),
+    /// Severe loss (>15%) or burst loss: 1 repair symbol per 3 packets.
+    HighRedundancy(u16),
+}
+
+/// Detects packet loss proactively using sequence jumps, reordering bounds, and RTT timers.
+#[derive(Debug, Clone)]
+pub struct PredictiveLossDetector {
+    /// Highest sequence number observed from peer.
+    largest_seq_observed: Option<u64>,
+    /// Number of packets threshold before declaring an out-of-order gap as lost (RFC 9002 default: 3).
+    pub reordering_threshold: u64,
+    /// EWMA smoothed loss rate (weight 0.2).
+    smoothed_loss_rate: f64,
+    /// Consecutive missing packet counter to identify bursts.
+    consecutive_loss_count: usize,
+    /// History of observed sequence numbers.
+    observed_seqs: std::collections::HashSet<u64>,
+    /// Recent loss timestamps for time-windowed rate calculation.
+    recent_loss_events: std::collections::VecDeque<(std::time::Instant, u64)>,
+    /// Total loss events detected.
+    pub total_losses_predicted: usize,
+}
+
+impl Default for PredictiveLossDetector {
+    fn default() -> Self {
+        Self::new(3)
+    }
+}
+
+impl PredictiveLossDetector {
+    /// Create a new predictive loss detector with a reordering packet threshold.
+    pub fn new(reordering_threshold: u64) -> Self {
+        Self {
+            largest_seq_observed: None,
+            reordering_threshold: reordering_threshold.max(1),
+            smoothed_loss_rate: 0.0,
+            consecutive_loss_count: 0,
+            observed_seqs: std::collections::HashSet::new(),
+            recent_loss_events: std::collections::VecDeque::new(),
+            total_losses_predicted: 0,
+        }
+    }
+
+    /// Ingest an incoming sequence number and evaluate whether any preceding unreceived
+    /// packets have exceeded the reordering threshold and are predicted lost.
+    pub fn observe_sequence(&mut self, seq_num: u64, now: std::time::Instant) -> Vec<u64> {
+        self.observed_seqs.insert(seq_num);
+
+        let mut predicted_lost = Vec::new();
+        match self.largest_seq_observed {
+            None => {
+                self.largest_seq_observed = Some(seq_num);
+            }
+            Some(largest) => {
+                if seq_num > largest {
+                    self.largest_seq_observed = Some(seq_num);
+                    // Check for sequence gaps between largest and seq_num
+                    let gap = seq_num.saturating_sub(largest);
+                    if gap > 1 {
+                        let potential_losses = gap - 1;
+                        if potential_losses >= self.reordering_threshold {
+                            for missing in (largest + 1)..seq_num {
+                                if !self.observed_seqs.contains(&missing) {
+                                    predicted_lost.push(missing);
+                                    self.recent_loss_events.push_back((now, missing));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !predicted_lost.is_empty() {
+            let count = predicted_lost.len();
+            self.consecutive_loss_count += count;
+            self.total_losses_predicted += count;
+            // Update EWMA loss rate: alpha = 0.2
+            let sample_loss = (count as f64).min(10.0) / 10.0;
+            self.smoothed_loss_rate = 0.2 * sample_loss + 0.8 * self.smoothed_loss_rate;
+        } else {
+            self.consecutive_loss_count = 0;
+            // Decay loss rate on successful in-order sequence
+            self.smoothed_loss_rate *= 0.95;
+        }
+
+        // Clean up old loss events exceeding 10 seconds
+        let ttl = Duration::from_secs(10);
+        while let Some((t, _)) = self.recent_loss_events.front() {
+            if now.duration_since(*t) > ttl {
+                self.recent_loss_events.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        predicted_lost
+    }
+
+    /// Current smoothed packet loss rate estimate in [0.0, 1.0].
+    pub fn loss_rate(&self) -> f64 {
+        self.smoothed_loss_rate
+    }
+
+    /// Classify packet loss pattern based on recent burstiness.
+    pub fn detect_loss_pattern(&self) -> DatagramLossPattern {
+        if self.consecutive_loss_count >= 3 {
+            DatagramLossPattern::Burst(self.consecutive_loss_count)
+        } else if self.smoothed_loss_rate > 0.02 {
+            DatagramLossPattern::Random
+        } else {
+            DatagramLossPattern::None
+        }
+    }
+
+    /// Dynamically recommend Forward Error Correction group redundancy based on loss conditions.
+    pub fn recommend_fec(&self) -> FecAdaptationRecommendation {
+        match self.detect_loss_pattern() {
+            DatagramLossPattern::Burst(_) => FecAdaptationRecommendation::HighRedundancy(3),
+            DatagramLossPattern::Random => {
+                if self.smoothed_loss_rate >= 0.15 {
+                    FecAdaptationRecommendation::HighRedundancy(3)
+                } else if self.smoothed_loss_rate >= 0.08 {
+                    FecAdaptationRecommendation::ModerateRedundancy(5)
+                } else {
+                    FecAdaptationRecommendation::LowRedundancy(8)
+                }
+            }
+            DatagramLossPattern::None => FecAdaptationRecommendation::Disabled,
+        }
+    }
+}
+
+/// Tracks received sequence blocks and generates compact Selective ACK (SACK) frames.
+#[derive(Debug, Clone)]
+pub struct SelectiveAckTracker {
+    /// Non-overlapping, sorted received ranges [start_seq, end_seq].
+    received_blocks: Vec<crate::simd_parser::DatagramSackBlock>,
+    /// Largest sequence number observed.
+    largest_observed: Option<u64>,
+    /// Timestamp when largest sequence number was observed.
+    largest_observed_at: Option<std::time::Instant>,
+    /// Unacknowledged changes flag.
+    has_unacked_changes: bool,
+    /// Maximum number of disjoint SACK blocks to maintain.
+    max_blocks: usize,
+}
+
+impl Default for SelectiveAckTracker {
+    fn default() -> Self {
+        Self::new(32)
+    }
+}
+
+impl SelectiveAckTracker {
+    /// Create a new SACK tracker with a capacity bound for non-contiguous blocks.
+    pub fn new(max_blocks: usize) -> Self {
+        Self {
+            received_blocks: Vec::new(),
+            largest_observed: None,
+            largest_observed_at: None,
+            has_unacked_changes: false,
+            max_blocks: max_blocks.max(8),
+        }
+    }
+
+    /// Record a received sequence number. Returns `true` if new, `false` if duplicate.
+    pub fn record_received(&mut self, seq_num: u64, now: std::time::Instant) -> bool {
+        // Check if already covered
+        for block in &self.received_blocks {
+            if block.contains(seq_num) {
+                return false;
+            }
+        }
+
+        // Update largest observed
+        match self.largest_observed {
+            Some(curr) if seq_num > curr => {
+                self.largest_observed = Some(seq_num);
+                self.largest_observed_at = Some(now);
+            }
+            None => {
+                self.largest_observed = Some(seq_num);
+                self.largest_observed_at = Some(now);
+            }
+            _ => {}
+        }
+
+        // Insert and coalesce into contiguous ranges
+        let mut new_block = crate::simd_parser::DatagramSackBlock::new(seq_num, seq_num);
+        let mut merged = Vec::with_capacity(self.received_blocks.len() + 1);
+
+        for block in &self.received_blocks {
+            if block.end_seq + 1 == new_block.start_seq {
+                new_block.start_seq = block.start_seq;
+            } else if new_block.end_seq + 1 == block.start_seq {
+                new_block.end_seq = block.end_seq;
+            } else if block.end_seq < new_block.start_seq || block.start_seq > new_block.end_seq {
+                merged.push(*block);
+            }
+        }
+        merged.push(new_block);
+        merged.sort_by_key(|a| std::cmp::Reverse(a.end_seq)); // descending order
+
+        if merged.len() > self.max_blocks {
+            merged.truncate(self.max_blocks);
+        }
+
+        self.received_blocks = merged;
+        self.has_unacked_changes = true;
+        true
+    }
+
+    /// Check if a sequence number is currently recorded as received.
+    pub fn is_received(&self, seq_num: u64) -> bool {
+        self.received_blocks.iter().any(|b| b.contains(seq_num))
+    }
+
+    /// Generate a compact Selective ACK (SACK) frame.
+    pub fn generate_sack(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<crate::simd_parser::DatagramSackFrame> {
+        let largest = self.largest_observed?;
+        let delay_micros = self
+            .largest_observed_at
+            .map(|t| now.duration_since(t).as_micros().min(u32::MAX as u128) as u32)
+            .unwrap_or(0);
+
+        self.has_unacked_changes = false;
+        Some(crate::simd_parser::DatagramSackFrame::new(
+            largest,
+            delay_micros,
+            self.received_blocks.clone(),
+        ))
+    }
+
+    /// Prune blocks strictly older than `min_seq` to reclaim memory.
+    pub fn prune_below(&mut self, min_seq: u64) {
+        self.received_blocks.retain(|b| b.end_seq >= min_seq);
+    }
+}
+
+/// Metadata for an in-flight unacknowledged datagram tracked for potential SACK retransmission.
+#[derive(Debug, Clone)]
+pub struct InFlightDatagram {
+    pub seq_num: u64,
+    pub wire_packet: Vec<u8>,
+    pub payload: Vec<u8>,
+    pub sent_at: std::time::Instant,
+    pub deadline: Option<std::time::Instant>,
+    pub is_reliable: bool,
+    pub is_high_priority: bool,
+    pub retransmissions: usize,
+}
+
+/// Encodes outgoing datagrams into Forward Error Correction (FEC) redundancy groups.
+#[derive(Debug, Clone)]
+pub struct HybridFecEncoder {
+    pub group_size: u16,
+    pub current_group_id: u64,
+    pub base_seq: u64,
+    buffered_payloads: Vec<Vec<u8>>,
+}
+
+impl Default for HybridFecEncoder {
+    fn default() -> Self {
+        Self::new(5)
+    }
+}
+
+impl HybridFecEncoder {
+    /// Create an FEC encoder with a target group size (e.g. 5 means 1 parity packet per 5 data packets).
+    pub fn new(group_size: u16) -> Self {
+        Self {
+            group_size: group_size.max(2),
+            current_group_id: 1,
+            base_seq: 1,
+            buffered_payloads: Vec::new(),
+        }
+    }
+
+    /// Adjust group size adaptively based on loss recommendations.
+    pub fn set_group_size(&mut self, group_size: u16) {
+        self.group_size = group_size.max(2);
+    }
+
+    /// Ingest an outbound datagram. Returns `Some(DatagramFecPacket)` when the group
+    /// reaches completion and the parity packet is generated.
+    pub fn ingest_packet(
+        &mut self,
+        seq_num: u64,
+        payload: &[u8],
+    ) -> Option<crate::simd_parser::DatagramFecPacket> {
+        if self.buffered_payloads.is_empty() {
+            self.base_seq = seq_num;
+        }
+
+        self.buffered_payloads.push(payload.to_vec());
+
+        if self.buffered_payloads.len() >= self.group_size as usize {
+            self.flush()
+        } else {
+            None
+        }
+    }
+
+    /// Flush the current partial buffer into an FEC repair packet if at least 2 packets exist.
+    pub fn flush(&mut self) -> Option<crate::simd_parser::DatagramFecPacket> {
+        if self.buffered_payloads.len() < 2 {
+            return None;
+        }
+
+        let slices: Vec<&[u8]> = self
+            .buffered_payloads
+            .iter()
+            .map(|p| p.as_slice())
+            .collect();
+        let parity = crate::simd_parser::fec_compute_parity(&slices);
+        let checksum = crate::io::crc32_digest(&parity);
+        let header = crate::simd_parser::DatagramFecHeader::new(
+            self.current_group_id,
+            self.base_seq,
+            self.buffered_payloads.len() as u16,
+            0,
+            parity.len() as u32,
+            checksum,
+        );
+
+        self.current_group_id = self.current_group_id.wrapping_add(1);
+        self.buffered_payloads.clear();
+
+        Some(crate::simd_parser::DatagramFecPacket::new(header, parity))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FecGroupState {
+    base_seq: u64,
+    group_size: u16,
+    received_packets: std::collections::HashMap<u64, Vec<u8>>,
+    fec_packet: Option<crate::simd_parser::DatagramFecPacket>,
+    recovered: bool,
+    created_at: std::time::Instant,
+}
+
+/// Decodes received datagrams and reconstructs lost packets seamlessly using hybrid FEC parity blocks.
+#[derive(Debug, Clone)]
+pub struct HybridFecDecoder {
+    groups: std::collections::HashMap<u64, FecGroupState>,
+    recent_packets: std::collections::HashMap<u64, (Vec<u8>, std::time::Instant)>,
+    ttl: std::time::Duration,
+}
+
+impl Default for HybridFecDecoder {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(5))
+    }
+}
+
+impl HybridFecDecoder {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            groups: std::collections::HashMap::new(),
+            recent_packets: std::collections::HashMap::new(),
+            ttl,
+        }
+    }
+
+    /// Ingest a data packet into an active FEC group state. Returns `Some((missing_seq, recovered_payload))`
+    /// if this packet was the missing link allowing FEC reconstruction of another lost sibling.
+    pub fn ingest_data(
+        &mut self,
+        group_id: u64,
+        base_seq: u64,
+        group_size: u16,
+        seq_num: u64,
+        payload: &[u8],
+        now: std::time::Instant,
+    ) -> Option<(u64, Vec<u8>)> {
+        self.recent_packets.insert(seq_num, (payload.to_vec(), now));
+
+        let entry = self
+            .groups
+            .entry(group_id)
+            .or_insert_with(|| FecGroupState {
+                base_seq,
+                group_size,
+                received_packets: std::collections::HashMap::new(),
+                fec_packet: None,
+                recovered: false,
+                created_at: now,
+            });
+
+        entry.received_packets.insert(seq_num, payload.to_vec());
+        if let Some(res) = Self::try_recover(entry) {
+            self.recent_packets.insert(res.0, (res.1.clone(), now));
+            return Some(res);
+        }
+
+        // Also check if any other pending FEC groups can now be resolved with this new packet
+        for (gid, state) in self.groups.iter_mut() {
+            if *gid == group_id || state.recovered || state.fec_packet.is_none() {
+                continue;
+            }
+            if seq_num >= state.base_seq && seq_num < state.base_seq + state.group_size as u64 {
+                state.received_packets.insert(seq_num, payload.to_vec());
+                if let Some(res) = Self::try_recover(state) {
+                    self.recent_packets.insert(res.0, (res.1.clone(), now));
+                    return Some(res);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Ingest a received FEC parity packet. If exactly one packet is missing in the group,
+    /// it is reconstructed immediately with zero RTT delay.
+    pub fn ingest_fec(
+        &mut self,
+        fec: crate::simd_parser::DatagramFecPacket,
+        now: std::time::Instant,
+    ) -> Option<(u64, Vec<u8>)> {
+        let group_id = fec.header.group_id;
+        let base_seq = fec.header.base_seq;
+        let group_size = fec.header.group_size;
+
+        let entry = self
+            .groups
+            .entry(group_id)
+            .or_insert_with(|| FecGroupState {
+                base_seq,
+                group_size,
+                received_packets: std::collections::HashMap::new(),
+                fec_packet: None,
+                recovered: false,
+                created_at: now,
+            });
+
+        // Synchronize with any packets already in recent_packets matching this group's range
+        for s in base_seq..(base_seq + group_size as u64) {
+            if let std::collections::hash_map::Entry::Vacant(vacant) =
+                entry.received_packets.entry(s)
+            {
+                if let Some((p, _)) = self.recent_packets.get(&s) {
+                    vacant.insert(p.clone());
+                }
+            }
+        }
+
+        entry.base_seq = base_seq;
+        entry.group_size = group_size;
+        entry.fec_packet = Some(fec);
+
+        let res = Self::try_recover(entry);
+        if let Some(ref r) = res {
+            self.recent_packets.insert(r.0, (r.1.clone(), now));
+        }
+        res
+    }
+
+    fn try_recover(state: &mut FecGroupState) -> Option<(u64, Vec<u8>)> {
+        if state.recovered {
+            return None;
+        }
+        let fec = state.fec_packet.as_ref()?;
+        let total_needed = state.group_size as usize;
+
+        let mut received_slices: Vec<&[u8]> = Vec::with_capacity(total_needed.saturating_sub(1));
+        let mut missing_seq = None;
+
+        for s in state.base_seq..(state.base_seq + state.group_size as u64) {
+            if let Some(p) = state.received_packets.get(&s) {
+                received_slices.push(p.as_slice());
+            } else if missing_seq.is_none() {
+                missing_seq = Some(s);
+            } else {
+                // More than one missing packet: cannot reconstruct via single parity
+                return None;
+            }
+        }
+
+        if let Some(missing) = missing_seq {
+            if received_slices.len() == total_needed.saturating_sub(1) {
+                let max_len = fec.header.max_payload_len as usize;
+                let recovered = crate::simd_parser::fec_recover_packet(
+                    &fec.parity_data,
+                    &received_slices,
+                    max_len,
+                );
+
+                state.recovered = true;
+                state.received_packets.insert(missing, recovered.clone());
+                return Some((missing, recovered));
+            }
+        }
+
+        None
+    }
+
+    /// Prune expired FEC group states exceeding the retention TTL.
+    pub fn prune_stale(&mut self, now: std::time::Instant) -> usize {
+        let ttl = self.ttl;
+        let before = self.groups.len();
+        self.groups
+            .retain(|_, state| now.duration_since(state.created_at) <= ttl);
+        self.recent_packets
+            .retain(|_, (_, ts)| now.duration_since(*ts) <= ttl);
+        before - self.groups.len()
+    }
+}
+
+/// A decoded datagram payload delivered to the application consumer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedDatagramPayload {
+    /// Sequence identifier.
+    pub seq_num: u64,
+    /// Delivered payload bytes.
+    pub payload: Vec<u8>,
+    /// Whether this datagram was recovered via FEC without RTT retransmission.
+    pub was_recovered_via_fec: bool,
+    /// Whether this datagram was delivered via SACK selective retransmission.
+    pub is_retransmission: bool,
+}
+
+/// Full-duplex session manager coordinating predictive loss detection, selective SACK retransmission,
+/// and hybrid Forward Error Correction over unreliable datagram streams.
+#[derive(Debug, Clone)]
+pub struct AdaptiveReliableDatagramSession {
+    pub loss_detector: PredictiveLossDetector,
+    pub ack_tracker: SelectiveAckTracker,
+    pub fec_encoder: HybridFecEncoder,
+    pub fec_decoder: HybridFecDecoder,
+    in_flight: std::collections::BTreeMap<u64, InFlightDatagram>,
+    retransmit_queue: std::collections::VecDeque<Vec<u8>>,
+    delivered_seqs: std::collections::HashSet<u64>,
+    next_seq_num: u64,
+    smoothed_rtt_micros: u64,
+    auto_adapt_fec: bool,
+    pub telemetry: ReliableDatagramTelemetry,
+}
+
+impl Default for AdaptiveReliableDatagramSession {
+    fn default() -> Self {
+        Self::new(5)
+    }
+}
+
+impl AdaptiveReliableDatagramSession {
+    /// Create a new adaptive reliable datagram session with an initial FEC group size.
+    pub fn new(fec_group_size: u16) -> Self {
+        Self {
+            loss_detector: PredictiveLossDetector::default(),
+            ack_tracker: SelectiveAckTracker::default(),
+            fec_encoder: HybridFecEncoder::new(fec_group_size),
+            fec_decoder: HybridFecDecoder::default(),
+            in_flight: std::collections::BTreeMap::new(),
+            retransmit_queue: std::collections::VecDeque::new(),
+            delivered_seqs: std::collections::HashSet::new(),
+            next_seq_num: 1,
+            smoothed_rtt_micros: 20_000, // 20ms baseline
+            auto_adapt_fec: true,
+            telemetry: ReliableDatagramTelemetry::default(),
+        }
+    }
+
+    /// Transmit a reliable or semi-reliable datagram. Returns the wire packets to send over
+    /// the network (the sequenced datagram packet, plus an optional FEC parity packet).
+    pub fn send_datagram(
+        &mut self,
+        payload: &[u8],
+        reliable: bool,
+        deadline: Option<Duration>,
+        high_priority: bool,
+        now: std::time::Instant,
+    ) -> Vec<Vec<u8>> {
+        let seq_num = self.next_seq_num;
+        self.next_seq_num = self.next_seq_num.wrapping_add(1);
+
+        let mut flags = 0u8;
+        if reliable {
+            flags |= crate::simd_parser::DATAGRAM_FLAG_RELIABLE;
+        }
+        if deadline.is_some() {
+            flags |= crate::simd_parser::DATAGRAM_FLAG_HAS_DEADLINE;
+        }
+        if high_priority {
+            flags |= crate::simd_parser::DATAGRAM_FLAG_HIGH_PRIORITY;
+        }
+
+        let deadline_micros = deadline
+            .map(|d| d.as_micros().min(u32::MAX as u128) as u32)
+            .unwrap_or(0);
+        let timestamp_micros = now.elapsed().as_micros() as u64;
+
+        let header = crate::simd_parser::DatagramSeqHeader::new(
+            flags,
+            seq_num,
+            timestamp_micros,
+            deadline_micros,
+        );
+        let packet = crate::simd_parser::DatagramSeqPacket::new(header, payload.to_vec());
+        let wire_bytes = packet.encode_to_vec();
+
+        if reliable {
+            self.in_flight.insert(
+                seq_num,
+                InFlightDatagram {
+                    seq_num,
+                    wire_packet: wire_bytes.clone(),
+                    payload: payload.to_vec(),
+                    sent_at: now,
+                    deadline: deadline.map(|d| now + d),
+                    is_reliable: true,
+                    is_high_priority: high_priority,
+                    retransmissions: 0,
+                },
+            );
+        }
+
+        self.telemetry.packets_sent += 1;
+
+        let mut out = vec![wire_bytes];
+
+        // Adapt FEC redundancy level dynamically from loss telemetry
+        if self.auto_adapt_fec {
+            match self.loss_detector.recommend_fec() {
+                FecAdaptationRecommendation::Disabled => {}
+                FecAdaptationRecommendation::LowRedundancy(sz)
+                | FecAdaptationRecommendation::ModerateRedundancy(sz)
+                | FecAdaptationRecommendation::HighRedundancy(sz) => {
+                    self.fec_encoder.set_group_size(sz);
+                }
+            }
+        }
+
+        // Feed into FEC encoder
+        if let Some(fec_packet) = self.fec_encoder.ingest_packet(seq_num, payload) {
+            self.telemetry.fec_packets_sent += 1;
+            out.push(fec_packet.encode_to_vec());
+        }
+
+        out
+    }
+
+    /// Ingest a wire packet received from peer. Handles SACK frames, FEC repair packets,
+    /// and sequenced data packets.
+    pub fn recv_wire(
+        &mut self,
+        wire: &[u8],
+        now: std::time::Instant,
+    ) -> Result<Option<ReceivedDatagramPayload>, crate::simd_parser::FastHttpError> {
+        // 1. Check for SACK frame
+        if crate::simd_parser::DatagramSackFrame::is_sack_header(wire) {
+            let (sack, _) = crate::simd_parser::DatagramSackFrame::decode(wire)?;
+            self.process_sack(&sack, now);
+            return Ok(None);
+        }
+
+        // 2. Check for FEC repair packet
+        if crate::simd_parser::DatagramFecHeader::is_fec_header(wire) {
+            let fec = crate::simd_parser::DatagramFecPacket::decode(wire)?;
+            self.telemetry.fec_packets_received += 1;
+            if let Some((missing_seq, recovered_payload)) = self.fec_decoder.ingest_fec(fec, now) {
+                if self.delivered_seqs.insert(missing_seq) {
+                    self.ack_tracker.record_received(missing_seq, now);
+                    self.telemetry.recovered_via_fec += 1;
+                    self.telemetry.packets_received += 1;
+                    return Ok(Some(ReceivedDatagramPayload {
+                        seq_num: missing_seq,
+                        payload: recovered_payload,
+                        was_recovered_via_fec: true,
+                        is_retransmission: false,
+                    }));
+                }
+            }
+            return Ok(None);
+        }
+
+        // 3. Check for Sequenced Datagram packet
+        if crate::simd_parser::DatagramSeqHeader::is_seq_header(wire) {
+            let pkt = crate::simd_parser::DatagramSeqPacket::decode(wire)?;
+            let seq = pkt.header.seq_num;
+
+            if !self.ack_tracker.record_received(seq, now) {
+                self.telemetry.duplicate_packets_dropped += 1;
+                return Ok(None);
+            }
+
+            // Predictive loss detection on out-of-order sequence jump
+            let predicted_losses = self.loss_detector.observe_sequence(seq, now);
+            if !predicted_losses.is_empty() {
+                self.telemetry.lost_predicted += predicted_losses.len();
+                self.telemetry.estimated_loss_rate = self.loss_detector.loss_rate();
+            }
+
+            // Register in FEC group
+            let group_size = self.fec_encoder.group_size;
+            let group_id = seq / (group_size as u64).max(1);
+            let base_seq = group_id * (group_size as u64);
+            let _ = self.fec_decoder.ingest_data(
+                group_id,
+                base_seq,
+                group_size,
+                seq,
+                &pkt.payload,
+                now,
+            );
+
+            self.delivered_seqs.insert(seq);
+            self.telemetry.packets_received += 1;
+
+            return Ok(Some(ReceivedDatagramPayload {
+                seq_num: seq,
+                payload: pkt.payload,
+                was_recovered_via_fec: false,
+                is_retransmission: false,
+            }));
+        }
+
+        // Raw fallback datagram
+        self.telemetry.packets_received += 1;
+        Ok(Some(ReceivedDatagramPayload {
+            seq_num: 0,
+            payload: wire.to_vec(),
+            was_recovered_via_fec: false,
+            is_retransmission: false,
+        }))
+    }
+
+    /// Process a received Selective ACK frame from remote peer, confirming delivery and
+    /// queuing retransmissions for lost packets.
+    pub fn process_sack(
+        &mut self,
+        sack: &crate::simd_parser::DatagramSackFrame,
+        now: std::time::Instant,
+    ) -> usize {
+        let mut confirmed_lost = Vec::new();
+        let mut acked_seqs = Vec::new();
+
+        for (&seq, inflight) in self.in_flight.iter_mut() {
+            if sack.is_acknowledged(seq) {
+                // RTT calculation on first ACK
+                if inflight.retransmissions == 0 {
+                    let sample_rtt = now.duration_since(inflight.sent_at).as_micros() as u64;
+                    self.smoothed_rtt_micros = (7 * self.smoothed_rtt_micros + sample_rtt) / 8;
+                    self.telemetry.smoothed_rtt_micros = self.smoothed_rtt_micros;
+                }
+                acked_seqs.push(seq);
+            } else if seq + self.loss_detector.reordering_threshold <= sack.largest_observed {
+                // Sequence gap exceeds threshold: confirmed lost
+                confirmed_lost.push(seq);
+            }
+        }
+
+        for seq in acked_seqs {
+            self.in_flight.remove(&seq);
+        }
+
+        let mut retransmitted = 0;
+        for seq in confirmed_lost {
+            if let Some(mut inflight) = self.in_flight.remove(&seq) {
+                self.telemetry.lost_confirmed += 1;
+
+                // Check if application deadline has expired
+                if let Some(deadline) = inflight.deadline {
+                    if now >= deadline {
+                        self.telemetry.retransmissions_dropped_expired += 1;
+                        continue;
+                    }
+                }
+
+                // Enqueue retransmission
+                inflight.retransmissions += 1;
+                inflight.sent_at = now;
+                self.retransmit_queue
+                    .push_back(inflight.wire_packet.clone());
+                self.in_flight.insert(seq, inflight);
+                self.telemetry.retransmitted_via_sack += 1;
+                retransmitted += 1;
+            }
+        }
+
+        retransmitted
+    }
+
+    /// Drain up to `max` queued retransmission packets to resend over wire.
+    pub fn drain_retransmissions(&mut self, max: usize) -> Vec<Vec<u8>> {
+        let mut drained = Vec::new();
+        for _ in 0..max {
+            if let Some(pkt) = self.retransmit_queue.pop_front() {
+                drained.push(pkt);
+            } else {
+                break;
+            }
+        }
+        drained
+    }
+
+    /// Generate an outbound SACK frame wire packet if there are unacknowledged sequences.
+    pub fn generate_sack_packet(&mut self, now: std::time::Instant) -> Option<Vec<u8>> {
+        self.ack_tracker
+            .generate_sack(now)
+            .map(|frame| frame.encode_to_vec())
+    }
+
+    /// Prune stale in-flight packets and expired FEC group decoders.
+    pub fn prune_stale(&mut self, now: std::time::Instant) -> usize {
+        let mut pruned = self.fec_decoder.prune_stale(now);
+        let timeout = Duration::from_secs(30);
+
+        self.in_flight.retain(|_, inflight| {
+            if now.duration_since(inflight.sent_at) > timeout {
+                pruned += 1;
+                false
+            } else {
+                true
+            }
+        });
+
+        pruned
+    }
+
+    /// Retrieve session telemetry snapshot.
+    pub fn telemetry(&self) -> ReliableDatagramTelemetry {
+        let mut telem = self.telemetry;
+        telem.estimated_loss_rate = self.loss_detector.loss_rate();
+        telem.smoothed_rtt_micros = self.smoothed_rtt_micros;
         telem
     }
 }
@@ -29433,5 +30372,203 @@ mod tls_alpn_tests {
         assert_eq!(telem.probes_acknowledged, 1);
         assert_eq!(telem.pmtu_raised_count, 1);
         assert_eq!(telem.blackhole_recoveries, 1);
+    }
+
+    #[test]
+    fn test_predictive_loss_detector_and_adaptation() {
+        let now = std::time::Instant::now();
+        let mut detector = PredictiveLossDetector::new(3);
+        assert_eq!(detector.loss_rate(), 0.0);
+        assert_eq!(detector.detect_loss_pattern(), DatagramLossPattern::None);
+        assert_eq!(
+            detector.recommend_fec(),
+            FecAdaptationRecommendation::Disabled
+        );
+
+        // Ingest sequential packets 1, 2, 3
+        assert!(detector.observe_sequence(1, now).is_empty());
+        assert!(detector.observe_sequence(2, now).is_empty());
+        assert!(detector.observe_sequence(3, now).is_empty());
+
+        // Sequence jump to 8 (missing 4, 5, 6, 7 -> 4 packets >= 3 threshold)
+        let predicted = detector.observe_sequence(8, now);
+        assert_eq!(predicted, vec![4, 5, 6, 7]);
+        assert_eq!(detector.total_losses_predicted, 4);
+        assert!(detector.loss_rate() > 0.0);
+        assert_eq!(
+            detector.detect_loss_pattern(),
+            DatagramLossPattern::Burst(4)
+        );
+        assert_eq!(
+            detector.recommend_fec(),
+            FecAdaptationRecommendation::HighRedundancy(3)
+        );
+    }
+
+    #[test]
+    fn test_selective_ack_tracker_coalescing() {
+        use crate::simd_parser::DatagramSackBlock;
+        let now = std::time::Instant::now();
+        let mut tracker = SelectiveAckTracker::new(8);
+
+        // Sequence numbers 1, 2, 3 coalesce into [1, 3]
+        assert!(tracker.record_received(1, now));
+        assert!(tracker.record_received(2, now));
+        assert!(tracker.record_received(3, now));
+        assert_eq!(tracker.received_blocks.len(), 1);
+        assert_eq!(tracker.received_blocks[0], DatagramSackBlock::new(1, 3));
+
+        // Duplicate returns false
+        assert!(!tracker.record_received(2, now));
+
+        // Out-of-order gap: receive 5, 6
+        assert!(tracker.record_received(5, now));
+        assert!(tracker.record_received(6, now));
+        assert_eq!(tracker.received_blocks.len(), 2);
+        assert_eq!(tracker.received_blocks[0], DatagramSackBlock::new(5, 6));
+        assert_eq!(tracker.received_blocks[1], DatagramSackBlock::new(1, 3));
+
+        // Receive missing 4: coalesces both ranges into single [1, 6]
+        assert!(tracker.record_received(4, now));
+        assert_eq!(tracker.received_blocks.len(), 1);
+        assert_eq!(tracker.received_blocks[0], DatagramSackBlock::new(1, 6));
+
+        // Generate SACK frame
+        let sack = tracker.generate_sack(now).expect("generate sack");
+        assert_eq!(sack.largest_observed, 6);
+        assert_eq!(sack.blocks.len(), 1);
+        assert!(sack.is_acknowledged(4));
+        assert!(!sack.is_acknowledged(7));
+    }
+
+    #[test]
+    fn test_hybrid_fec_recovery_without_rtt() {
+        let now = std::time::Instant::now();
+        let mut encoder = HybridFecEncoder::new(4);
+        let mut decoder = HybridFecDecoder::new(Duration::from_secs(5));
+
+        let p1 = b"PACKET_ONE_ALPHA".to_vec();
+        let p2 = b"PACKET_TWO_BRAVO".to_vec();
+        let p3 = b"PACKET_THREE_CHARLIE_SPECIAL".to_vec();
+        let p4 = b"PACKET_FOUR_DELTA".to_vec();
+
+        // Feed packets into encoder
+        assert!(encoder.ingest_packet(101, &p1).is_none());
+        assert!(encoder.ingest_packet(102, &p2).is_none());
+        assert!(encoder.ingest_packet(103, &p3).is_none());
+        // 4th packet completes the group and generates parity packet
+        let fec_pkt = encoder
+            .ingest_packet(104, &p4)
+            .expect("FEC packet generated");
+        assert_eq!(fec_pkt.header.group_size, 4);
+        assert_eq!(fec_pkt.header.base_seq, 101);
+
+        // Receiver receives p1, p2, p4 (p3 is LOST in transit)
+        assert!(decoder.ingest_data(1, 101, 4, 101, &p1, now).is_none());
+        assert!(decoder.ingest_data(1, 101, 4, 102, &p2, now).is_none());
+        assert!(decoder.ingest_data(1, 101, 4, 104, &p4, now).is_none());
+
+        // Receiver receives FEC parity packet -> triggers 0-RTT immediate reconstruction of p3!
+        let (recovered_seq, recovered_data) = decoder
+            .ingest_fec(fec_pkt, now)
+            .expect("p3 recovered via FEC");
+        assert_eq!(recovered_seq, 103);
+        assert_eq!(recovered_data, p3);
+    }
+
+    #[test]
+    fn test_adaptive_reliable_datagram_session_end_to_end() {
+        let now = std::time::Instant::now();
+        let mut sender = AdaptiveReliableDatagramSession::new(3);
+        let mut receiver = AdaptiveReliableDatagramSession::new(3);
+
+        // 1. Sender sends 3 packets
+        let pkts1 = sender.send_datagram(b"PAYLOAD_1", true, None, false, now);
+        let pkts2 = sender.send_datagram(b"PAYLOAD_2", true, None, false, now);
+        let pkts3 = sender.send_datagram(b"PAYLOAD_3", true, None, false, now);
+
+        assert_eq!(pkts1.len(), 1);
+        assert_eq!(pkts2.len(), 1);
+        // pkts3 completes group_size 3 and includes an FEC packet
+        assert_eq!(pkts3.len(), 2);
+
+        // 2. Receiver ingests packet 1
+        let res1 = receiver
+            .recv_wire(&pkts1[0], now)
+            .expect("recv 1")
+            .expect("payload 1");
+        assert_eq!(res1.seq_num, 1);
+        assert_eq!(res1.payload, b"PAYLOAD_1");
+
+        // Simulate packet 2 drop! Receiver does not see pkts2[0].
+        // 3. Receiver ingests packet 3
+        let res3 = receiver
+            .recv_wire(&pkts3[0], now)
+            .expect("recv 3")
+            .expect("payload 3");
+        assert_eq!(res3.seq_num, 3);
+        assert_eq!(res3.payload, b"PAYLOAD_3");
+
+        // 4. Receiver ingests FEC parity packet from pkts3[1] -> IMMEDIATELY recovers dropped packet 2!
+        let recovered = receiver
+            .recv_wire(&pkts3[1], now)
+            .expect("recv fec")
+            .expect("recovered 2");
+        assert_eq!(recovered.seq_num, 2);
+        assert_eq!(recovered.payload, b"PAYLOAD_2");
+        assert!(recovered.was_recovered_via_fec);
+
+        let rec_telem = receiver.telemetry();
+        assert_eq!(rec_telem.packets_received, 3);
+        assert_eq!(rec_telem.recovered_via_fec, 1);
+        assert_eq!(rec_telem.fec_packets_received, 1);
+    }
+
+    #[test]
+    fn test_deadline_expiration_suppresses_retransmission() {
+        use crate::simd_parser::{DatagramSackBlock, DatagramSackFrame};
+        let now = std::time::Instant::now();
+        let mut sender = AdaptiveReliableDatagramSession::new(5);
+
+        // Packet sent with 20ms deadline
+        let pkts = sender.send_datagram(
+            b"EXPIRED_SOON",
+            true,
+            Some(Duration::from_millis(20)),
+            false,
+            now,
+        );
+        assert_eq!(pkts.len(), 1);
+
+        // Simulate peer acknowledging sequence 5, meaning sequence 1 is lost (gap >= 3)
+        let later = now + Duration::from_millis(50); // 50ms later > 20ms deadline
+        let sack = DatagramSackFrame::new(5, 0, vec![DatagramSackBlock::new(5, 5)]);
+
+        let retransmitted = sender.process_sack(&sack, later);
+        assert_eq!(retransmitted, 0); // No retransmission enqueued
+        assert_eq!(sender.telemetry().retransmissions_dropped_expired, 1);
+        assert_eq!(sender.telemetry().lost_confirmed, 1);
+    }
+
+    #[test]
+    fn test_hybrid_datagram_transport_reliable_integration() {
+        let now = std::time::Instant::now();
+        let mut transport = HybridDatagramTransport::default().with_reliable_session(3);
+        assert!(transport.reliable_session.is_some());
+
+        let wire_pkts = transport.send_reliable(b"HYBRID_RELIABLE_PAYLOAD", None, true, now);
+        assert!(!wire_pkts.is_empty());
+
+        let mut peer = HybridDatagramTransport::default().with_reliable_session(3);
+        let recv_res = peer
+            .recv_reliable(&wire_pkts[0], now)
+            .expect("recv reliable");
+        assert!(recv_res.is_some());
+        let delivered = recv_res.unwrap();
+        assert_eq!(delivered.seq_num, 1);
+        assert_eq!(delivered.payload, b"HYBRID_RELIABLE_PAYLOAD");
+
+        let telem = transport.reliable_telemetry().expect("telemetry present");
+        assert_eq!(telem.packets_sent, 1);
     }
 }

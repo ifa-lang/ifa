@@ -5997,6 +5997,511 @@ impl DatagramFragment {
     }
 }
 
+// ── RFC 9221 / Datagram SACK & Hybrid FEC Framing ────────────────────────
+
+/// Magic byte prefix identifying a Selective ACK (SACK) frame: 0xFA.
+pub const DATAGRAM_SACK_MAGIC: u8 = 0xFA;
+/// SACK frame format version: 0x01.
+pub const DATAGRAM_SACK_VERSION: u8 = 0x01;
+
+/// Magic byte prefix identifying a Forward Error Correction (FEC) packet: 0xFE.
+pub const DATAGRAM_FEC_MAGIC: u8 = 0xFE;
+/// FEC packet format version: 0x01.
+pub const DATAGRAM_FEC_VERSION: u8 = 0x01;
+
+/// Magic byte prefix identifying a Reliable Sequenced Datagram frame: 0xFB.
+pub const DATAGRAM_SEQ_MAGIC: u8 = 0xFB;
+/// Reliable Sequenced Datagram format version: 0x01.
+pub const DATAGRAM_SEQ_VERSION: u8 = 0x01;
+
+/// Flags for sequenced reliable datagrams.
+pub const DATAGRAM_FLAG_RELIABLE: u8 = 1 << 0;
+pub const DATAGRAM_FLAG_HAS_DEADLINE: u8 = 1 << 1;
+pub const DATAGRAM_FLAG_HIGH_PRIORITY: u8 = 1 << 2;
+
+/// A contiguous range of acknowledged datagram sequence numbers `[start_seq, end_seq]` inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DatagramSackBlock {
+    /// Start sequence number (inclusive).
+    pub start_seq: u64,
+    /// End sequence number (inclusive).
+    pub end_seq: u64,
+}
+
+impl DatagramSackBlock {
+    pub const WIRE_LEN: usize = 16;
+
+    pub fn new(start_seq: u64, end_seq: u64) -> Self {
+        Self {
+            start_seq: start_seq.min(end_seq),
+            end_seq: start_seq.max(end_seq),
+        }
+    }
+
+    pub fn contains(&self, seq: u64) -> bool {
+        seq >= self.start_seq && seq <= self.end_seq
+    }
+
+    pub fn count(&self) -> u64 {
+        self.end_seq - self.start_seq + 1
+    }
+}
+
+/// Selective Acknowledgment (SACK) frame carrying received sequence ranges and delay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatagramSackFrame {
+    /// Highest datagram sequence number observed by the receiver so far.
+    pub largest_observed: u64,
+    /// Delay between observing largest packet and sending this ACK (microseconds).
+    pub ack_delay_micros: u32,
+    /// Non-overlapping SACK ranges ordered in descending sequence order.
+    pub blocks: Vec<DatagramSackBlock>,
+}
+
+impl DatagramSackFrame {
+    pub const BASE_HEADER_LEN: usize = 16; // magic(1) + ver(1) + largest(8) + delay(4) + num_blocks(2)
+
+    pub fn new(
+        largest_observed: u64,
+        ack_delay_micros: u32,
+        blocks: Vec<DatagramSackBlock>,
+    ) -> Self {
+        Self {
+            largest_observed,
+            ack_delay_micros,
+            blocks,
+        }
+    }
+
+    pub fn is_sack_header(bytes: &[u8]) -> bool {
+        bytes.len() >= 2 && bytes[0] == DATAGRAM_SACK_MAGIC && bytes[1] == DATAGRAM_SACK_VERSION
+    }
+
+    pub fn wire_size(&self) -> usize {
+        Self::BASE_HEADER_LEN + self.blocks.len() * DatagramSackBlock::WIRE_LEN
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.push(DATAGRAM_SACK_MAGIC);
+        out.push(DATAGRAM_SACK_VERSION);
+        out.extend_from_slice(&self.largest_observed.to_be_bytes());
+        out.extend_from_slice(&self.ack_delay_micros.to_be_bytes());
+        let num_blocks = self.blocks.len().min(u16::MAX as usize) as u16;
+        out.extend_from_slice(&num_blocks.to_be_bytes());
+        for block in self.blocks.iter().take(num_blocks as usize) {
+            out.extend_from_slice(&block.start_seq.to_be_bytes());
+            out.extend_from_slice(&block.end_seq.to_be_bytes());
+        }
+    }
+
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.wire_size());
+        self.encode(&mut out);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<(Self, usize), FastHttpError> {
+        if bytes.len() < Self::BASE_HEADER_LEN {
+            return Err(FastHttpError::Incomplete);
+        }
+        if bytes[0] != DATAGRAM_SACK_MAGIC || bytes[1] != DATAGRAM_SACK_VERSION {
+            return Err(FastHttpError::InvalidFrame);
+        }
+
+        let largest_observed = u64::from_be_bytes(
+            bytes[2..10]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let ack_delay_micros = u32::from_be_bytes(
+            bytes[10..14]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let num_blocks = u16::from_be_bytes(
+            bytes[14..16]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        ) as usize;
+
+        let total_expected = Self::BASE_HEADER_LEN + num_blocks * DatagramSackBlock::WIRE_LEN;
+        if bytes.len() < total_expected {
+            return Err(FastHttpError::Incomplete);
+        }
+
+        let mut blocks = Vec::with_capacity(num_blocks);
+        let mut offset = Self::BASE_HEADER_LEN;
+        for _ in 0..num_blocks {
+            let start_seq = u64::from_be_bytes(
+                bytes[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| FastHttpError::InvalidFrame)?,
+            );
+            let end_seq = u64::from_be_bytes(
+                bytes[offset + 8..offset + 16]
+                    .try_into()
+                    .map_err(|_| FastHttpError::InvalidFrame)?,
+            );
+            blocks.push(DatagramSackBlock::new(start_seq, end_seq));
+            offset += DatagramSackBlock::WIRE_LEN;
+        }
+
+        Ok((
+            Self {
+                largest_observed,
+                ack_delay_micros,
+                blocks,
+            },
+            offset,
+        ))
+    }
+
+    pub fn is_acknowledged(&self, seq: u64) -> bool {
+        self.blocks.iter().any(|b| b.contains(seq))
+    }
+}
+
+/// Header for Forward Error Correction (FEC) redundancy repair packets.
+///
+/// Wire layout (30 bytes):
+/// - `magic` (1 byte, 0xFE)
+/// - `version` (1 byte, 0x01)
+/// - `group_id` (8 bytes, Big-Endian u64)
+/// - `base_seq` (8 bytes, Big-Endian u64)
+/// - `group_size` (2 bytes, Big-Endian u16)
+/// - `repair_index` (2 bytes, Big-Endian u16)
+/// - `max_payload_len` (4 bytes, Big-Endian u32)
+/// - `fec_checksum` (4 bytes, Big-Endian u32 CRC32)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatagramFecHeader {
+    pub group_id: u64,
+    pub base_seq: u64,
+    pub group_size: u16,
+    pub repair_index: u16,
+    pub max_payload_len: u32,
+    pub fec_checksum: u32,
+}
+
+impl DatagramFecHeader {
+    pub const HEADER_LEN: usize = 30;
+
+    pub fn new(
+        group_id: u64,
+        base_seq: u64,
+        group_size: u16,
+        repair_index: u16,
+        max_payload_len: u32,
+        fec_checksum: u32,
+    ) -> Self {
+        Self {
+            group_id,
+            base_seq,
+            group_size,
+            repair_index,
+            max_payload_len,
+            fec_checksum,
+        }
+    }
+
+    pub fn is_fec_header(bytes: &[u8]) -> bool {
+        bytes.len() >= 2 && bytes[0] == DATAGRAM_FEC_MAGIC && bytes[1] == DATAGRAM_FEC_VERSION
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.push(DATAGRAM_FEC_MAGIC);
+        out.push(DATAGRAM_FEC_VERSION);
+        out.extend_from_slice(&self.group_id.to_be_bytes());
+        out.extend_from_slice(&self.base_seq.to_be_bytes());
+        out.extend_from_slice(&self.group_size.to_be_bytes());
+        out.extend_from_slice(&self.repair_index.to_be_bytes());
+        out.extend_from_slice(&self.max_payload_len.to_be_bytes());
+        out.extend_from_slice(&self.fec_checksum.to_be_bytes());
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<(Self, usize), FastHttpError> {
+        if bytes.len() < Self::HEADER_LEN {
+            return Err(FastHttpError::Incomplete);
+        }
+        if bytes[0] != DATAGRAM_FEC_MAGIC || bytes[1] != DATAGRAM_FEC_VERSION {
+            return Err(FastHttpError::InvalidFrame);
+        }
+
+        let group_id = u64::from_be_bytes(
+            bytes[2..10]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let base_seq = u64::from_be_bytes(
+            bytes[10..18]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let group_size = u16::from_be_bytes(
+            bytes[18..20]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let repair_index = u16::from_be_bytes(
+            bytes[20..22]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let max_payload_len = u32::from_be_bytes(
+            bytes[22..26]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let fec_checksum = u32::from_be_bytes(
+            bytes[26..30]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+
+        if group_size == 0 {
+            return Err(FastHttpError::InvalidFrame);
+        }
+
+        Ok((
+            Self {
+                group_id,
+                base_seq,
+                group_size,
+                repair_index,
+                max_payload_len,
+                fec_checksum,
+            },
+            Self::HEADER_LEN,
+        ))
+    }
+}
+
+/// A serialized FEC repair packet containing the parity symbols computed over a block of datagrams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatagramFecPacket {
+    pub header: DatagramFecHeader,
+    pub parity_data: Vec<u8>,
+}
+
+impl DatagramFecPacket {
+    pub fn new(header: DatagramFecHeader, parity_data: Vec<u8>) -> Self {
+        Self {
+            header,
+            parity_data,
+        }
+    }
+
+    pub fn wire_size(&self) -> usize {
+        DatagramFecHeader::HEADER_LEN + self.parity_data.len()
+    }
+
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.wire_size());
+        self.header.encode(&mut out);
+        out.extend_from_slice(&self.parity_data);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, FastHttpError> {
+        let (header, header_len) = DatagramFecHeader::decode(bytes)?;
+        let parity_data = bytes[header_len..].to_vec();
+        Ok(Self {
+            header,
+            parity_data,
+        })
+    }
+}
+
+/// Header for sequenced datagram frames supporting tracking, deadlines, and predictive loss recovery.
+///
+/// Wire layout (24 bytes):
+/// - `magic` (1 byte, 0xFB)
+/// - `version` (1 byte, 0x01)
+/// - `flags` (1 byte)
+/// - `reserved` (1 byte, 0x00)
+/// - `seq_num` (8 bytes, Big-Endian u64)
+/// - `timestamp_micros` (8 bytes, Big-Endian u64)
+/// - `deadline_micros` (4 bytes, Big-Endian u32)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatagramSeqHeader {
+    pub flags: u8,
+    pub seq_num: u64,
+    pub timestamp_micros: u64,
+    pub deadline_micros: u32,
+}
+
+impl DatagramSeqHeader {
+    pub const HEADER_LEN: usize = 24;
+
+    pub fn new(flags: u8, seq_num: u64, timestamp_micros: u64, deadline_micros: u32) -> Self {
+        Self {
+            flags,
+            seq_num,
+            timestamp_micros,
+            deadline_micros,
+        }
+    }
+
+    pub fn is_seq_header(bytes: &[u8]) -> bool {
+        bytes.len() >= 2 && bytes[0] == DATAGRAM_SEQ_MAGIC && bytes[1] == DATAGRAM_SEQ_VERSION
+    }
+
+    pub fn is_reliable(&self) -> bool {
+        (self.flags & DATAGRAM_FLAG_RELIABLE) != 0
+    }
+
+    pub fn has_deadline(&self) -> bool {
+        (self.flags & DATAGRAM_FLAG_HAS_DEADLINE) != 0 && self.deadline_micros > 0
+    }
+
+    pub fn is_high_priority(&self) -> bool {
+        (self.flags & DATAGRAM_FLAG_HIGH_PRIORITY) != 0
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.push(DATAGRAM_SEQ_MAGIC);
+        out.push(DATAGRAM_SEQ_VERSION);
+        out.push(self.flags);
+        out.push(0x00); // reserved
+        out.extend_from_slice(&self.seq_num.to_be_bytes());
+        out.extend_from_slice(&self.timestamp_micros.to_be_bytes());
+        out.extend_from_slice(&self.deadline_micros.to_be_bytes());
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<(Self, usize), FastHttpError> {
+        if bytes.len() < Self::HEADER_LEN {
+            return Err(FastHttpError::Incomplete);
+        }
+        if bytes[0] != DATAGRAM_SEQ_MAGIC || bytes[1] != DATAGRAM_SEQ_VERSION {
+            return Err(FastHttpError::InvalidFrame);
+        }
+
+        let flags = bytes[2];
+        let seq_num = u64::from_be_bytes(
+            bytes[4..12]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let timestamp_micros = u64::from_be_bytes(
+            bytes[12..20]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+        let deadline_micros = u32::from_be_bytes(
+            bytes[20..24]
+                .try_into()
+                .map_err(|_| FastHttpError::InvalidFrame)?,
+        );
+
+        Ok((
+            Self {
+                flags,
+                seq_num,
+                timestamp_micros,
+                deadline_micros,
+            },
+            Self::HEADER_LEN,
+        ))
+    }
+}
+
+/// A sequenced datagram carrying payload and delivery metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatagramSeqPacket {
+    pub header: DatagramSeqHeader,
+    pub payload: Vec<u8>,
+}
+
+impl DatagramSeqPacket {
+    pub fn new(header: DatagramSeqHeader, payload: Vec<u8>) -> Self {
+        Self { header, payload }
+    }
+
+    pub fn wire_size(&self) -> usize {
+        DatagramSeqHeader::HEADER_LEN + self.payload.len()
+    }
+
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.wire_size());
+        self.header.encode(&mut out);
+        out.extend_from_slice(&self.payload);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, FastHttpError> {
+        let (header, header_len) = DatagramSeqHeader::decode(bytes)?;
+        let payload = bytes[header_len..].to_vec();
+        Ok(Self { header, payload })
+    }
+}
+
+// ── High-Performance SIMD / Vectorized FEC Parity Computations ────────────
+
+/// In-place bitwise XOR accumulation `dest[i] ^= src[i]` using 128-bit and 64-bit vector registers.
+#[inline]
+pub fn fec_xor_accumulate(dest: &mut [u8], src: &[u8]) {
+    let len = dest.len().min(src.len());
+    let mut i = 0;
+
+    // 128-bit vector chunks
+    while i + 16 <= len {
+        let mut d_arr = [0u8; 16];
+        let mut s_arr = [0u8; 16];
+        d_arr.copy_from_slice(&dest[i..i + 16]);
+        s_arr.copy_from_slice(&src[i..i + 16]);
+        let d_val = u128::from_ne_bytes(d_arr);
+        let s_val = u128::from_ne_bytes(s_arr);
+        dest[i..i + 16].copy_from_slice(&(d_val ^ s_val).to_ne_bytes());
+        i += 16;
+    }
+
+    // 64-bit word chunks
+    while i + 8 <= len {
+        let mut d_arr = [0u8; 8];
+        let mut s_arr = [0u8; 8];
+        d_arr.copy_from_slice(&dest[i..i + 8]);
+        s_arr.copy_from_slice(&src[i..i + 8]);
+        let d_val = u64::from_ne_bytes(d_arr);
+        let s_val = u64::from_ne_bytes(s_arr);
+        dest[i..i + 8].copy_from_slice(&(d_val ^ s_val).to_ne_bytes());
+        i += 8;
+    }
+
+    // Remaining trailing bytes
+    while i < len {
+        dest[i] ^= src[i];
+        i += 1;
+    }
+}
+
+/// Compute single-parity FEC redundancy block across multiple variable-length packet slices.
+pub fn fec_compute_parity(packets: &[&[u8]]) -> Vec<u8> {
+    if packets.is_empty() {
+        return Vec::new();
+    }
+    let max_len = packets.iter().map(|p| p.len()).max().unwrap_or(0);
+    let mut parity = vec![0u8; max_len];
+    for packet in packets {
+        fec_xor_accumulate(&mut parity, packet);
+    }
+    parity
+}
+
+/// Reconstruct a single lost packet from the parity block and the received sibling packets.
+pub fn fec_recover_packet(
+    parity: &[u8],
+    received_packets: &[&[u8]],
+    missing_len: usize,
+) -> Vec<u8> {
+    let mut recovered = vec![0u8; missing_len];
+    let copy_len = parity.len().min(missing_len);
+    recovered[..copy_len].copy_from_slice(&parity[..copy_len]);
+
+    for packet in received_packets {
+        fec_xor_accumulate(&mut recovered, packet);
+    }
+    recovered
+}
+
 #[cfg(test)]
 mod http2_tests {
     use super::*;
@@ -7892,5 +8397,74 @@ mod http2_tests {
         let mut corrupted = wire.clone();
         corrupted[0] = 0xAA;
         assert!(DatagramFragment::decode(&corrupted).is_err());
+    }
+
+    #[test]
+    fn test_datagram_sack_frame_roundtrip() {
+        let blocks = vec![
+            DatagramSackBlock::new(100, 105),
+            DatagramSackBlock::new(90, 95),
+            DatagramSackBlock::new(80, 80),
+        ];
+        let sack = DatagramSackFrame::new(105, 1250, blocks);
+        assert_eq!(
+            sack.wire_size(),
+            DatagramSackFrame::BASE_HEADER_LEN + 3 * 16
+        );
+        assert!(sack.is_acknowledged(102));
+        assert!(sack.is_acknowledged(90));
+        assert!(sack.is_acknowledged(80));
+        assert!(!sack.is_acknowledged(96));
+
+        let wire = sack.encode_to_vec();
+        assert!(DatagramSackFrame::is_sack_header(&wire));
+
+        let (decoded, consumed) = DatagramSackFrame::decode(&wire).expect("decode sack");
+        assert_eq!(consumed, wire.len());
+        assert_eq!(decoded, sack);
+    }
+
+    #[test]
+    fn test_datagram_fec_and_recovery_parity() {
+        let p1 = b"Hello, World!".to_vec();
+        let p2 = b"QUIC & HTTP/3 Datagrams".to_vec();
+        let p3 = b"Loss Recovery with SACK and FEC".to_vec();
+
+        let packets = vec![p1.as_slice(), p2.as_slice(), p3.as_slice()];
+        let parity = fec_compute_parity(&packets);
+
+        // Simulate loss of p2
+        let received = vec![p1.as_slice(), p3.as_slice()];
+        let recovered_p2 = fec_recover_packet(&parity, &received, p2.len());
+        assert_eq!(recovered_p2, p2);
+
+        // Header and packet framing
+        let fec_hdr = DatagramFecHeader::new(1, 100, 3, 0, parity.len() as u32, 0xCAFEBABE);
+        let fec_pkt = DatagramFecPacket::new(fec_hdr, parity);
+        let wire = fec_pkt.encode_to_vec();
+        assert!(DatagramFecHeader::is_fec_header(&wire));
+
+        let decoded_pkt = DatagramFecPacket::decode(&wire).expect("decode fec pkt");
+        assert_eq!(decoded_pkt, fec_pkt);
+    }
+
+    #[test]
+    fn test_datagram_seq_header_and_wire_framing() {
+        let hdr = DatagramSeqHeader::new(
+            DATAGRAM_FLAG_RELIABLE | DATAGRAM_FLAG_HAS_DEADLINE,
+            42,
+            1_700_000_000,
+            50_000,
+        );
+        assert!(hdr.is_reliable());
+        assert!(hdr.has_deadline());
+        assert!(!hdr.is_high_priority());
+
+        let pkt = DatagramSeqPacket::new(hdr, b"RELIABLE_PAYLOAD".to_vec());
+        let wire = pkt.encode_to_vec();
+        assert!(DatagramSeqHeader::is_seq_header(&wire));
+
+        let decoded = DatagramSeqPacket::decode(&wire).expect("decode seq packet");
+        assert_eq!(decoded, pkt);
     }
 }
