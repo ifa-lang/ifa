@@ -3,10 +3,10 @@
 use clap::Subcommand;
 use ifa_runtime::{
     run_issp_failover_benchmark_suite, run_issp_scenario, IsspBandwidthEstimate, IsspCapsule,
-    IsspCongestionPhase, IsspFailoverBenchmarkSuiteReport, IsspFlapDampingConfig,
-    IsspHeartbeatProbe, IsspMultipathRoute, IsspNetworkProfile, IsspPathState, IsspProbationConfig,
-    IsspRoutingPolicy, IsspTelemetryServer, SecurityPolicy, SessionId, SessionRecord,
-    SessionRegistry, SessionSnapshot,
+    IsspClusterQuorumConfig, IsspCongestionPhase, IsspFailoverBenchmarkSuiteReport,
+    IsspFlapDampingConfig, IsspHeartbeatProbe, IsspMultipathRoute, IsspNetworkProfile,
+    IsspPathState, IsspProbationConfig, IsspRoutingPolicy, IsspTelemetryServer, SecurityPolicy,
+    SessionId, SessionRecord, SessionRegistry, SessionSnapshot,
 };
 use serde_json::json;
 use std::fs;
@@ -153,7 +153,7 @@ pub enum SessionCommand {
         json: bool,
     },
     /// Expose live multipath balancing telemetry over HTTP (Prometheus `/metrics` and OTLP `/v1/metrics`)
-    /// and streaming WebSocket (`/ws/metrics`)
+    /// and streaming WebSocket (`/ws/metrics`), with active health probes (`/livez`, `/readyz`)
     TelemetryServe {
         /// TCP address to bind the telemetry HTTP server (e.g. 127.0.0.1:9100)
         #[arg(short, long, default_value = "127.0.0.1:9100")]
@@ -173,6 +173,15 @@ pub enum SessionCommand {
         /// Node identifier included in exported metrics labels
         #[arg(long, default_value = "ifa-issp-node")]
         node_id: String,
+        /// Expected total cluster nodes for quorum health probe (/readyz)
+        #[arg(long, default_value = "1")]
+        expected_cluster_nodes: usize,
+        /// Minimum active subpaths required for readiness (/readyz)
+        #[arg(long, default_value = "1")]
+        min_active_paths: usize,
+        /// Quorum ratio threshold [0.0 - 1.0] below which cluster is degraded (/readyz)
+        #[arg(long, default_value = "0.5")]
+        quorum_ratio: f64,
     },
 }
 
@@ -1542,6 +1551,9 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
             ws_interval_ms,
             ws_max_frames,
             node_id,
+            expected_cluster_nodes,
+            min_active_paths,
+            quorum_ratio,
         } => {
             let registry = match resolve_state_file(file.as_ref()) {
                 Some(p) if p.exists() => match SessionRegistry::load_from_file(&p) {
@@ -1573,8 +1585,11 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 }
             }
 
+            let quorum_cfg = IsspClusterQuorumConfig::new(expected_cluster_nodes, min_active_paths)
+                .with_quorum_threshold_ratio(quorum_ratio);
+
             let server = match IsspTelemetryServer::bind(&addr, &node_id, registry) {
-                Ok(s) => s,
+                Ok(s) => s.with_quorum_config(quorum_cfg),
                 Err(e) => {
                     eprintln!("error: cannot bind telemetry server on {}: {}", addr, e);
                     return ExitCode::FAILURE;
@@ -1587,7 +1602,7 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 .unwrap_or_else(|_| addr.clone());
 
             eprintln!(
-                "Telemetry server listening on http://{} — Prometheus: /metrics | OTLP JSON: /v1/metrics | WebSocket: /ws/metrics",
+                "Telemetry server listening on http://{} — Prometheus: /metrics | OTLP JSON: /v1/metrics | WebSocket: /ws/metrics | Probes: /livez, /readyz",
                 local_addr
             );
 
@@ -1912,5 +1927,59 @@ mod tests {
         let (resp_str, frame_payload) = handle.join().unwrap();
         assert!(resp_str.contains("101 Switching Protocols"));
         assert!(frame_payload.contains("\"active_paths\""));
+    }
+
+    #[test]
+    fn test_telemetry_serve_binds_and_serves_livez_and_readyz_probes() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let registry = SessionRegistry::new(10);
+        let mut r1 =
+            IsspMultipathRoute::new(1, 10, "eth0-wan", 1, 100).with_state(IsspPathState::Active);
+        r1.metrics.smoothed_rtt_us = 12_000;
+        let _ = registry.add_multipath_route(r1);
+
+        let quorum_cfg = IsspClusterQuorumConfig::new(2, 1).with_quorum_threshold_ratio(0.5);
+        let server = IsspTelemetryServer::bind("127.0.0.1:0", "test-probes-cli", registry)
+            .expect("bind failed")
+            .with_quorum_config(quorum_cfg);
+        server.set_nonblocking(true).unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // 1. GET /livez
+            let mut s1 = TcpStream::connect(addr).unwrap();
+            s1.write_all(b"GET /livez HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut r1 = String::new();
+            s1.read_to_string(&mut r1).unwrap();
+
+            // 2. GET /readyz (1 node active, expected 2, ratio 1/2 = 0.50 >= 0.50 -> healthy)
+            let mut s2 = TcpStream::connect(addr).unwrap();
+            s2.write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut r2 = String::new();
+            s2.read_to_string(&mut r2).unwrap();
+
+            (r1, r2)
+        });
+
+        let mut served = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while served < 2 && std::time::Instant::now() < deadline {
+            if let Ok(Some(_)) = server.try_serve_one() {
+                served += 1;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        assert_eq!(served, 2);
+        let (r1, r2) = handle.join().unwrap();
+        assert!(r1.starts_with("HTTP/1.1 200 OK"));
+        assert!(r1.contains("OK\n"));
+        assert!(r2.starts_with("HTTP/1.1 200 OK"));
+        assert!(r2.contains("READY:"));
     }
 }

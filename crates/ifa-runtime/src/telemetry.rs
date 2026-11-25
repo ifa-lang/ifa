@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::process::{Command, ExitStatus};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Telemetry metrics capturing execution time, CPU utilization, and memory usage.
@@ -1603,6 +1603,180 @@ impl OtelMultipathBalancingExporter {
     }
 }
 
+// ─── Cluster Quorum Health & Degradation Probes ───────────────────────────
+
+/// Configuration for cluster quorum health and degradation threshold evaluation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspClusterQuorumConfig {
+    /// Expected total number of nodes in the cluster (including local node). Default is 1.
+    pub expected_cluster_nodes: usize,
+    /// Minimum quorum ratio required in `[0.0, 1.0]` to consider cluster quorum healthy.
+    /// Default is 0.50 (at least 50% of expected cluster nodes must be reachable).
+    pub quorum_threshold_ratio: f64,
+    /// Minimum number of active subpaths required on the local node to be ready. Default is 1.
+    pub min_active_paths: usize,
+    /// Maximum allowable aggregate retransmission ratio (e.g. 0.25 = 25%) before marking degraded.
+    /// If None, retransmission degradation check is omitted.
+    pub max_retransmit_ratio: Option<f64>,
+}
+
+impl Default for IsspClusterQuorumConfig {
+    fn default() -> Self {
+        Self {
+            expected_cluster_nodes: 1,
+            quorum_threshold_ratio: 0.50,
+            min_active_paths: 1,
+            max_retransmit_ratio: None,
+        }
+    }
+}
+
+impl IsspClusterQuorumConfig {
+    /// Create a new quorum configuration with expected cluster nodes and minimum active paths.
+    pub fn new(expected_cluster_nodes: usize, min_active_paths: usize) -> Self {
+        Self {
+            expected_cluster_nodes: expected_cluster_nodes.max(1),
+            quorum_threshold_ratio: 0.50,
+            min_active_paths,
+            max_retransmit_ratio: None,
+        }
+    }
+
+    /// Configure the quorum threshold ratio (e.g. 0.51 for majority quorum).
+    pub fn with_quorum_threshold_ratio(mut self, ratio: f64) -> Self {
+        self.quorum_threshold_ratio = ratio.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Configure maximum allowable retransmission ratio before declaring degradation.
+    pub fn with_max_retransmit_ratio(mut self, ratio: f64) -> Self {
+        self.max_retransmit_ratio = Some(ratio.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Evaluate the quorum status against an active snapshot and observed cluster node count.
+    pub fn evaluate(
+        &self,
+        snapshot: &IsspMultipathBalancingSnapshot,
+        cluster_nodes: usize,
+    ) -> IsspQuorumStatus {
+        let expected = self.expected_cluster_nodes.max(1);
+        let ratio = cluster_nodes as f64 / expected as f64;
+        let agg_retrans =
+            snapshot.aggregate_tcp_retrans_ratio + snapshot.aggregate_issp_retrans_ratio;
+
+        let quorum_ok = ratio >= self.quorum_threshold_ratio;
+        let paths_ok = snapshot.active_paths >= self.min_active_paths;
+        let retrans_ok = self
+            .max_retransmit_ratio
+            .map(|limit| agg_retrans <= limit)
+            .unwrap_or(true);
+
+        let is_ready = quorum_ok && paths_ok && retrans_ok;
+        let is_degraded = !is_ready;
+
+        let reason = if !quorum_ok {
+            format!(
+                "cluster quorum degraded: available nodes {}/{} (ratio {:.2}) below quorum threshold {:.2}",
+                cluster_nodes, expected, ratio, self.quorum_threshold_ratio
+            )
+        } else if !paths_ok {
+            format!(
+                "subpath starvation: {} active subpaths (minimum required: {})",
+                snapshot.active_paths, self.min_active_paths
+            )
+        } else if !retrans_ok {
+            format!(
+                "excessive retransmissions: {:.2}% exceeds threshold {:.2}%",
+                agg_retrans * 100.0,
+                self.max_retransmit_ratio.unwrap_or(1.0) * 100.0
+            )
+        } else {
+            format!(
+                "cluster quorum healthy: {}/{} nodes, {} active paths, {:.2} quorum ratio",
+                cluster_nodes, expected, snapshot.active_paths, ratio
+            )
+        };
+
+        IsspQuorumStatus {
+            is_ready,
+            is_degraded,
+            node_id: snapshot.node_id,
+            cluster_nodes,
+            expected_cluster_nodes: expected,
+            quorum_ratio: ratio,
+            quorum_threshold_ratio: self.quorum_threshold_ratio,
+            active_paths: snapshot.active_paths,
+            min_active_paths: self.min_active_paths,
+            aggregate_retrans_ratio: agg_retrans,
+            reason,
+        }
+    }
+}
+
+/// Operational status of cluster quorum evaluation for health probes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspQuorumStatus {
+    /// Whether the node and cluster are in a healthy, operational state meeting quorum.
+    pub is_ready: bool,
+    /// Whether cluster quorum is degraded below threshold.
+    pub is_degraded: bool,
+    /// Local cluster node ID.
+    pub node_id: u32,
+    /// Number of active nodes currently in the cluster (local node + reachable peers).
+    pub cluster_nodes: usize,
+    /// Expected number of cluster nodes from configuration.
+    pub expected_cluster_nodes: usize,
+    /// Current calculated quorum ratio: cluster_nodes / expected_cluster_nodes.
+    pub quorum_ratio: f64,
+    /// Minimum required quorum ratio.
+    pub quorum_threshold_ratio: f64,
+    /// Number of currently active/usable subpaths on this node.
+    pub active_paths: usize,
+    /// Minimum required active subpaths.
+    pub min_active_paths: usize,
+    /// Aggregate retransmission ratio observed across operational subpaths.
+    pub aggregate_retrans_ratio: f64,
+    /// Detailed diagnostic message describing the health or degradation cause.
+    pub reason: String,
+}
+
+impl IsspQuorumStatus {
+    /// Format this quorum status as compact JSON.
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{\n",
+                "  \"status\": \"{}\",\n",
+                "  \"ready\": {},\n",
+                "  \"degraded\": {},\n",
+                "  \"node_id\": {},\n",
+                "  \"cluster_nodes\": {},\n",
+                "  \"expected_cluster_nodes\": {},\n",
+                "  \"quorum_ratio\": {:.4},\n",
+                "  \"quorum_threshold_ratio\": {:.4},\n",
+                "  \"active_paths\": {},\n",
+                "  \"min_active_paths\": {},\n",
+                "  \"aggregate_retrans_ratio\": {:.4},\n",
+                "  \"reason\": \"{}\"\n",
+                "}}"
+            ),
+            if self.is_ready { "READY" } else { "DEGRADED" },
+            self.is_ready,
+            self.is_degraded,
+            self.node_id,
+            self.cluster_nodes,
+            self.expected_cluster_nodes,
+            self.quorum_ratio,
+            self.quorum_threshold_ratio,
+            self.active_paths,
+            self.min_active_paths,
+            self.aggregate_retrans_ratio,
+            self.reason.replace('\"', "\\\"")
+        )
+    }
+}
+
 // ─── HTTP Telemetry Handlers & Exposition Server ──────────────────────────
 
 /// HTTP request dispatcher for dynamic ISSP multipath balancing telemetry.
@@ -1611,9 +1785,11 @@ impl OtelMultipathBalancingExporter {
 /// - `/metrics`: Prometheus Exposition text format (or OpenTelemetry OTLP JSON if `Accept: application/json` is requested)
 /// - `/v1/metrics`: OpenTelemetry OTLP JSON payload conforming to OTLP v1/metrics specification
 /// - `/healthz` or `/livez`: Liveness probe returning HTTP 200 OK
+/// - `/readyz`: Readiness probe evaluating cluster quorum degradation threshold (HTTP 200 if quorum healthy, HTTP 503 if degraded)
 #[derive(Debug, Clone)]
 pub struct IsspTelemetryHttpHandler {
     service_name: String,
+    quorum_config: IsspClusterQuorumConfig,
 }
 
 impl IsspTelemetryHttpHandler {
@@ -1621,6 +1797,7 @@ impl IsspTelemetryHttpHandler {
     pub fn new(service_name: &str) -> Self {
         Self {
             service_name: service_name.to_string(),
+            quorum_config: IsspClusterQuorumConfig::default(),
         }
     }
 
@@ -1629,14 +1806,26 @@ impl IsspTelemetryHttpHandler {
         &self.service_name
     }
 
-    /// Dispatch an HTTP request against a provided snapshot.
+    /// Set a custom cluster quorum configuration for readiness checks.
+    pub fn with_quorum_config(mut self, config: IsspClusterQuorumConfig) -> Self {
+        self.quorum_config = config;
+        self
+    }
+
+    /// Retrieve the current cluster quorum configuration.
+    pub fn quorum_config(&self) -> &IsspClusterQuorumConfig {
+        &self.quorum_config
+    }
+
+    /// Dispatch an HTTP request against a provided snapshot and explicit cluster node count.
     ///
     /// Returns `(http_status_code, content_type_header, response_body_string)`.
-    pub fn handle_snapshot(
+    pub fn handle_snapshot_with_quorum(
         &self,
         path: &str,
         accept_header: &str,
         snapshot: &IsspMultipathBalancingSnapshot,
+        cluster_nodes: usize,
     ) -> (u16, &'static str, String) {
         let clean_path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
         match clean_path {
@@ -1660,9 +1849,59 @@ impl IsspTelemetryHttpHandler {
                 "application/json",
                 snapshot.export_otlp_json(&self.service_name),
             ),
-            "/healthz" | "/livez" => (200, "text/plain; charset=utf-8", "OK\n".to_string()),
+            "/healthz" | "/livez" => {
+                if accept_header.contains("application/json") {
+                    let json = format!(
+                        concat!(
+                            "{{\n",
+                            "  \"status\": \"ALIVE\",\n",
+                            "  \"node_id\": {},\n",
+                            "  \"active_paths\": {},\n",
+                            "  \"total_sessions\": {}\n",
+                            "}}"
+                        ),
+                        snapshot.node_id, snapshot.active_paths, snapshot.total_sessions
+                    );
+                    (200, "application/json", json)
+                } else {
+                    (200, "text/plain; charset=utf-8", "OK\n".to_string())
+                }
+            }
+            "/readyz" => {
+                let status = self.quorum_config.evaluate(snapshot, cluster_nodes);
+                let is_json = accept_header.contains("application/json");
+                if status.is_ready {
+                    if is_json {
+                        (200, "application/json", status.to_json())
+                    } else {
+                        (
+                            200,
+                            "text/plain; charset=utf-8",
+                            format!("READY: {}\n", status.reason),
+                        )
+                    }
+                } else if is_json {
+                    (503, "application/json", status.to_json())
+                } else {
+                    (
+                        503,
+                        "text/plain; charset=utf-8",
+                        format!("DEGRADED: {}\n", status.reason),
+                    )
+                }
+            }
             _ => (404, "text/plain; charset=utf-8", "Not Found\n".to_string()),
         }
+    }
+
+    /// Dispatch an HTTP request against a provided snapshot with single-node baseline quorum.
+    pub fn handle_snapshot(
+        &self,
+        path: &str,
+        accept_header: &str,
+        snapshot: &IsspMultipathBalancingSnapshot,
+    ) -> (u16, &'static str, String) {
+        self.handle_snapshot_with_quorum(path, accept_header, snapshot, 1)
     }
 
     /// Parse a raw HTTP GET request string and format a complete HTTP 1.1 wire response.
@@ -1670,6 +1909,16 @@ impl IsspTelemetryHttpHandler {
         &self,
         raw_request: &str,
         snapshot: &IsspMultipathBalancingSnapshot,
+    ) -> String {
+        self.handle_raw_http_request_with_quorum(raw_request, snapshot, 1)
+    }
+
+    /// Parse a raw HTTP GET request string with explicit cluster nodes count.
+    pub fn handle_raw_http_request_with_quorum(
+        &self,
+        raw_request: &str,
+        snapshot: &IsspMultipathBalancingSnapshot,
+        cluster_nodes: usize,
     ) -> String {
         let mut path = "/metrics";
         let mut accept = "*/*";
@@ -1686,12 +1935,15 @@ impl IsspTelemetryHttpHandler {
             }
         }
 
-        let (code, ctype, body) = self.handle_snapshot(path, accept, snapshot);
+        let (code, ctype, body) =
+            self.handle_snapshot_with_quorum(path, accept, snapshot, cluster_nodes);
         let status_text = match code {
             200 => "OK",
+            400 => "Bad Request",
             404 => "Not Found",
             500 => "Internal Server Error",
-            _ => "Unknown",
+            503 => "Service Unavailable",
+            _ => "Status",
         };
 
         format!(
@@ -1706,11 +1958,12 @@ impl IsspTelemetryHttpHandler {
 }
 
 /// Lightweight HTTP telemetry server exposing ISSP dynamic multipath balancing metrics
-/// over standard network sockets (`std::net::TcpListener`).
+/// and active health probes (`/livez`, `/readyz`) over standard network sockets (`std::net::TcpListener`).
 pub struct IsspTelemetryServer {
     listener: TcpListener,
     service_name: String,
     registry: Arc<crate::session_sync::SessionRegistry>,
+    quorum_config: RwLock<IsspClusterQuorumConfig>,
 }
 
 impl IsspTelemetryServer {
@@ -1725,7 +1978,43 @@ impl IsspTelemetryServer {
             listener,
             service_name: service_name.to_string(),
             registry,
+            quorum_config: RwLock::new(IsspClusterQuorumConfig::default()),
         })
+    }
+
+    /// Configure quorum evaluation parameters.
+    pub fn with_quorum_config(self, config: IsspClusterQuorumConfig) -> Self {
+        if let Ok(mut w) = self.quorum_config.write() {
+            *w = config;
+        }
+        self
+    }
+
+    /// Retrieve a copy of the current quorum configuration.
+    pub fn quorum_config(&self) -> IsspClusterQuorumConfig {
+        self.quorum_config
+            .read()
+            .map(|r| r.clone())
+            .unwrap_or_default()
+    }
+
+    /// Update the quorum configuration at runtime.
+    pub fn set_quorum_config(&self, config: IsspClusterQuorumConfig) {
+        if let Ok(mut w) = self.quorum_config.write() {
+            *w = config;
+        }
+    }
+
+    /// Evaluate current cluster quorum status directly against the registry state.
+    pub fn evaluate_quorum(&self) -> Result<IsspQuorumStatus, crate::session_sync::SyncError> {
+        let ts_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let snap = self.registry.multipath_balancing_snapshot(ts_ns)?;
+        let cluster_nodes = self.registry.cluster_nodes_count().unwrap_or(1);
+        let cfg = self.quorum_config();
+        Ok(cfg.evaluate(&snap, cluster_nodes))
     }
 
     /// Retrieve the local socket address on which the server is listening.
@@ -1773,21 +2062,42 @@ impl IsspTelemetryServer {
             .unwrap_or(0);
 
         let snap_res = self.registry.multipath_balancing_snapshot(timestamp_ns);
-        let handler = IsspTelemetryHttpHandler::new(&self.service_name);
+        let cluster_nodes = self.registry.cluster_nodes_count().unwrap_or(1);
+        let q_cfg = self.quorum_config();
+        let handler = IsspTelemetryHttpHandler::new(&self.service_name).with_quorum_config(q_cfg);
 
         let (code, ctype, body) = match snap_res {
-            Ok(ref snap) => handler.handle_snapshot(path, accept, snap),
-            Err(_) => (
-                500,
-                "text/plain; charset=utf-8",
-                "Error collecting multipath balancing telemetry\n".to_string(),
-            ),
+            Ok(ref snap) => handler.handle_snapshot_with_quorum(path, accept, snap, cluster_nodes),
+            Err(_) => {
+                let clean = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+                if clean == "/livez" || clean == "/healthz" {
+                    (
+                        500,
+                        "text/plain; charset=utf-8",
+                        "DEAD: registry or router lock poisoned\n".to_string(),
+                    )
+                } else if clean == "/readyz" {
+                    (
+                        503,
+                        "text/plain; charset=utf-8",
+                        "DEGRADED: cluster state inaccessible\n".to_string(),
+                    )
+                } else {
+                    (
+                        500,
+                        "text/plain; charset=utf-8",
+                        "Error collecting multipath balancing telemetry\n".to_string(),
+                    )
+                }
+            }
         };
 
         let status_text = match code {
             200 => "OK",
+            400 => "Bad Request",
             404 => "Not Found",
             500 => "Internal Server Error",
+            503 => "Service Unavailable",
             _ => "Unknown",
         };
 
@@ -2808,5 +3118,182 @@ mod tests {
         assert!(otlp.contains("\"ifa.session.total_sessions\""));
         assert!(otlp.contains("\"ifa.issp.subpath.tcp_retransmission_ratio\""));
         assert!(otlp.contains("\"ifa.issp.interface.latency\""));
+    }
+
+    #[test]
+    fn test_quorum_config_evaluation_healthy_and_degraded() {
+        use crate::session_sync::{
+            IsspDynamicMultipathRouter, IsspMultipathRoute, IsspRoutingPolicy,
+        };
+        let mut router =
+            IsspDynamicMultipathRouter::new(7, IsspRoutingPolicy::BandwidthAggregation);
+        let mut r1 = IsspMultipathRoute::new(1, 10, "eth0", 1, 100);
+        r1.metrics.total_frames_sent = 100;
+        r1.metrics.record_tcp_retransmit(2);
+        router.add_route(r1);
+
+        let snap = router.balancing_snapshot(0);
+
+        // 1. Single node default quorum -> healthy
+        let cfg1 = IsspClusterQuorumConfig::default();
+        let st1 = cfg1.evaluate(&snap, 1);
+        assert!(st1.is_ready);
+        assert!(!st1.is_degraded);
+        assert_eq!(st1.quorum_ratio, 1.0);
+        assert!(st1.reason.contains("cluster quorum healthy"));
+
+        // 2. 3-node cluster quorum, but only 1 node reachable -> degraded below 0.50 threshold
+        let cfg2 = IsspClusterQuorumConfig::new(3, 1).with_quorum_threshold_ratio(0.51);
+        let st2 = cfg2.evaluate(&snap, 1);
+        assert!(!st2.is_ready);
+        assert!(st2.is_degraded);
+        assert!(st2.reason.contains("cluster quorum degraded"));
+
+        // 3. 2 nodes reachable in 3-node cluster -> healthy quorum (2/3 = 0.667 >= 0.51)
+        let st3 = cfg2.evaluate(&snap, 2);
+        assert!(st3.is_ready);
+        assert!(!st3.is_degraded);
+
+        // 4. Subpath starvation: require 2 active paths but only 1 available -> degraded
+        let cfg4 = IsspClusterQuorumConfig::new(1, 2);
+        let st4 = cfg4.evaluate(&snap, 1);
+        assert!(!st4.is_ready);
+        assert!(st4.is_degraded);
+        assert!(st4.reason.contains("subpath starvation"));
+
+        // 5. Retransmission threshold: 2% retransmits, threshold set to 1% -> degraded
+        let cfg5 = IsspClusterQuorumConfig::new(1, 1).with_max_retransmit_ratio(0.01);
+        let st5 = cfg5.evaluate(&snap, 1);
+        assert!(!st5.is_ready);
+        assert!(st5.is_degraded);
+        assert!(st5.reason.contains("excessive retransmissions"));
+
+        // 6. JSON serialization check
+        let json = st1.to_json();
+        assert!(json.contains("\"status\": \"READY\""));
+        assert!(json.contains("\"ready\": true"));
+        assert!(json.contains("\"cluster_nodes\": 1"));
+    }
+
+    #[test]
+    fn test_telemetry_http_handler_livez_and_readyz_probes() {
+        use crate::session_sync::{
+            IsspDynamicMultipathRouter, IsspMultipathRoute, IsspRoutingPolicy,
+        };
+        let mut router =
+            IsspDynamicMultipathRouter::new(42, IsspRoutingPolicy::BandwidthAggregation);
+        router.add_route(IsspMultipathRoute::new(1, 10, "eth0", 1, 100));
+        let snap = router.balancing_snapshot(0);
+
+        let handler = IsspTelemetryHttpHandler::new("test-svc");
+
+        // GET /livez (plain text)
+        let (code, ctype, body) = handler.handle_snapshot("/livez", "*/*", &snap);
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "text/plain; charset=utf-8");
+        assert_eq!(body, "OK\n");
+
+        // GET /livez (JSON)
+        let (code_j, ctype_j, body_j) =
+            handler.handle_snapshot("/livez", "application/json", &snap);
+        assert_eq!(code_j, 200);
+        assert_eq!(ctype_j, "application/json");
+        assert!(body_j.contains("\"status\": \"ALIVE\""));
+        assert!(body_j.contains("\"node_id\": 42"));
+
+        // GET /readyz (default single-node: healthy)
+        let (code_r, _, body_r) = handler.handle_snapshot("/readyz", "*/*", &snap);
+        assert_eq!(code_r, 200);
+        assert!(body_r.starts_with("READY:"));
+
+        // GET /readyz (cluster quorum degraded: requires 3 nodes with 1 present)
+        let handler_degraded = handler.clone().with_quorum_config(
+            IsspClusterQuorumConfig::new(3, 1).with_quorum_threshold_ratio(0.51),
+        );
+        let (code_d, _, body_d) = handler_degraded.handle_snapshot("/readyz", "*/*", &snap);
+        assert_eq!(code_d, 503);
+        assert!(body_d.starts_with("DEGRADED:"));
+
+        // GET /readyz JSON when degraded
+        let (code_dj, ctype_dj, body_dj) =
+            handler_degraded.handle_snapshot("/readyz", "application/json", &snap);
+        assert_eq!(code_dj, 503);
+        assert_eq!(ctype_dj, "application/json");
+        assert!(body_dj.contains("\"status\": \"DEGRADED\""));
+        assert!(body_dj.contains("\"ready\": false"));
+        assert!(body_dj.contains("\"degraded\": true"));
+    }
+
+    #[test]
+    fn test_telemetry_server_livez_and_readyz_socket_probes() {
+        use crate::session_sync::{IsspMultipathRoute, IsspRoutingPolicy, SessionRegistry};
+
+        let reg = SessionRegistry::new(99);
+        reg.set_multipath_routing_policy(IsspRoutingPolicy::BandwidthAggregation)
+            .unwrap();
+        reg.add_multipath_route(IsspMultipathRoute::new(1, 10, "eth0-wan", 1, 100))
+            .unwrap();
+        reg.register_peer(100).unwrap(); // Peer registered
+
+        let server = IsspTelemetryServer::bind("127.0.0.1:0", "node-99", reg)
+            .expect("bind telemetry server");
+        let addr = server.local_addr().unwrap();
+
+        let client = std::thread::spawn(move || {
+            // 1. Check /livez
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.write_all(b"GET /livez HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            let mut resp = String::new();
+            s.read_to_string(&mut resp).unwrap();
+            assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(resp.contains("OK\n"));
+
+            // 2. Check /readyz (healthy)
+            let mut s2 = TcpStream::connect(addr).unwrap();
+            s2.write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            let mut resp2 = String::new();
+            s2.read_to_string(&mut resp2).unwrap();
+            assert!(resp2.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(resp2.contains("READY:"));
+
+            // 3. Check /readyz (JSON format)
+            let mut s3 = TcpStream::connect(addr).unwrap();
+            s3.write_all(
+                b"GET /readyz HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n",
+            )
+            .unwrap();
+            let mut resp3 = String::new();
+            s3.read_to_string(&mut resp3).unwrap();
+            assert!(resp3.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(resp3.contains("\"status\": \"READY\""));
+        });
+
+        for _ in 0..3 {
+            let (stream, _) = server.listener.accept().unwrap();
+            server.serve_one_connection(stream).unwrap();
+        }
+
+        client.join().unwrap();
+
+        // Now configure degraded quorum requiring 5 nodes (only 2 present: 99 and 100)
+        server.set_quorum_config(
+            IsspClusterQuorumConfig::new(5, 1).with_quorum_threshold_ratio(0.60),
+        );
+
+        let client_deg = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            let mut resp = String::new();
+            s.read_to_string(&mut resp).unwrap();
+            assert!(resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+            assert!(resp.contains("DEGRADED:"));
+        });
+
+        let (stream, _) = server.listener.accept().unwrap();
+        server.serve_one_connection(stream).unwrap();
+        client_deg.join().unwrap();
     }
 }

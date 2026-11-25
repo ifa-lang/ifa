@@ -3939,6 +3939,55 @@ impl SessionRegistry {
         router.record_issp_retransmit(path_id, count)
     }
 
+    /// Return the count of distinct active peer nodes tracked by this node.
+    pub fn peer_count(&self) -> Result<usize, SyncError> {
+        let peers = self
+            .peer_last_seq
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        Ok(peers.len())
+    }
+
+    /// Return the sorted list of distinct active peer node IDs tracked by this node.
+    pub fn peer_node_ids(&self) -> Result<Vec<u32>, SyncError> {
+        let peers = self
+            .peer_last_seq
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        let mut ids: Vec<u32> = peers.keys().copied().collect();
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    /// Explicitly register or touch an active cluster peer node ID.
+    pub fn register_peer(&self, peer_node_id: u32) -> Result<(), SyncError> {
+        let mut peers = self
+            .peer_last_seq
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        peers.entry(peer_node_id).or_insert(0);
+        Ok(())
+    }
+
+    /// Return total reachable cluster nodes including the local node (1 + peer_count).
+    pub fn cluster_nodes_count(&self) -> Result<usize, SyncError> {
+        Ok(1 + self.peer_count()?)
+    }
+
+    /// Evaluate cluster quorum health status using the provided configuration.
+    pub fn quorum_status(
+        &self,
+        config: &crate::telemetry::IsspClusterQuorumConfig,
+    ) -> Result<crate::telemetry::IsspQuorumStatus, SyncError> {
+        let ts_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let snap = self.multipath_balancing_snapshot(ts_ns)?;
+        let cluster_nodes = self.cluster_nodes_count()?;
+        Ok(config.evaluate(&snap, cluster_nodes))
+    }
+
     /// Retrieve real-time dynamic multipath balancing telemetry snapshot.
     pub fn multipath_balancing_snapshot(
         &self,
@@ -3947,7 +3996,8 @@ impl SessionRegistry {
         crate::telemetry::IsspMultipathBalancingSnapshot::from_registry(self, timestamp_unix_ns)
     }
 
-    /// Handle an HTTP metrics endpoint request (`/metrics`, `/v1/metrics`, `/healthz`) for dynamic multipath balancing telemetry.
+    /// Handle an HTTP metrics endpoint request (`/metrics`, `/v1/metrics`, `/healthz`, `/livez`, `/readyz`)
+    /// for dynamic multipath balancing telemetry and active cluster quorum health.
     ///
     /// Returns `(http_status_code, content_type_header, response_body_string)`.
     pub fn handle_multipath_http_metrics(
@@ -3958,13 +4008,33 @@ impl SessionRegistry {
         timestamp_unix_ns: u64,
     ) -> (u16, &'static str, String) {
         let handler = crate::telemetry::IsspTelemetryHttpHandler::new(service_name);
+        let cluster_nodes = self.cluster_nodes_count().unwrap_or(1);
         match self.multipath_balancing_snapshot(timestamp_unix_ns) {
-            Ok(snap) => handler.handle_snapshot(path, accept_header, &snap),
-            Err(_) => (
-                500,
-                "text/plain; charset=utf-8",
-                "Error collecting multipath balancing telemetry\n".to_string(),
-            ),
+            Ok(snap) => {
+                handler.handle_snapshot_with_quorum(path, accept_header, &snap, cluster_nodes)
+            }
+            Err(_) => {
+                let clean = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+                if clean == "/livez" || clean == "/healthz" {
+                    (
+                        500,
+                        "text/plain; charset=utf-8",
+                        "DEAD: registry or router lock poisoned\n".to_string(),
+                    )
+                } else if clean == "/readyz" {
+                    (
+                        503,
+                        "text/plain; charset=utf-8",
+                        "DEGRADED: cluster state inaccessible\n".to_string(),
+                    )
+                } else {
+                    (
+                        500,
+                        "text/plain; charset=utf-8",
+                        "Error collecting multipath balancing telemetry\n".to_string(),
+                    )
+                }
+            }
         }
     }
 

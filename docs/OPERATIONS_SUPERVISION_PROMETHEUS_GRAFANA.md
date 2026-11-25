@@ -150,11 +150,50 @@ All per-subpath metrics share the label set: `node_id`, `path_id`, `interface`, 
   }
   ```
 
-### 3.4 Liveness & Health Probes (`GET /healthz` & `GET /livez`)
+### 3.4 Liveness & Active Cluster Quorum Health Probes (`/livez` & `/readyz`)
 
+`IsspTelemetryServer` provides native, active health probes conforming to cloud-native orchestrator specifications (Kubernetes, Nomad, Envoy):
+
+#### 3.4.1 Liveness Probe (`GET /livez` & `GET /healthz`)
 - **Protocol**: HTTP/1.1
-- **Response**: `HTTP/1.1 200 OK`, body: `OK\n`
-- **Usage**: Kubernetes liveness/readiness probes or load balancer health checks.
+- **Status Code**: `200 OK` (when process and registry mutexes are intact) or `500 Internal Server Error` (if internal locks poisoned).
+- **Content-Type**: `text/plain; charset=utf-8` (default: `OK\n`) or `application/json` (if requested via `Accept: application/json`):
+  ```json
+  {
+    "status": "ALIVE",
+    "node_id": 1,
+    "active_paths": 2,
+    "total_sessions": 128
+  }
+  ```
+- **Usage**: Kubernetes `livenessProbe` to detect deadlocks or thread pool starvation.
+
+#### 3.4.2 Readiness Probe (`GET /readyz`) with Quorum Degradation Threshold
+- **Protocol**: HTTP/1.1
+- **Evaluation Criteria**:
+  1. **Cluster Quorum Ratio**: Fraction of reachable cluster nodes (`cluster_nodes / expected_cluster_nodes`) must meet or exceed `quorum_threshold_ratio` (default `0.50`).
+  2. **Active Subpaths**: Number of operational subpaths must be $\ge$ `min_active_paths` (default `1`).
+  3. **Retransmission Threshold (Optional)**: Aggregate retransmission ratio must not exceed `max_retransmit_ratio` when configured.
+- **Status Codes**:
+  - `200 OK`: Node is operational, traffic can be safely routed. Body: `READY: cluster quorum healthy (...)`.
+  - `503 Service Unavailable`: Cluster quorum degraded below threshold or zero subpaths available. Ingress routers/proxies remove node from rotation until recovery. Body: `DEGRADED: cluster quorum degraded (...)`.
+- **JSON Format (`Accept: application/json`)**:
+  ```json
+  {
+    "status": "READY",
+    "ready": true,
+    "degraded": false,
+    "node_id": 1,
+    "cluster_nodes": 3,
+    "expected_cluster_nodes": 3,
+    "quorum_ratio": 1.0000,
+    "quorum_threshold_ratio": 0.5000,
+    "active_paths": 2,
+    "min_active_paths": 1,
+    "aggregate_retrans_ratio": 0.0120,
+    "reason": "cluster quorum healthy: 3/3 nodes, 2 active paths, 1.00 quorum ratio"
+  }
+  ```
 
 ---
 
