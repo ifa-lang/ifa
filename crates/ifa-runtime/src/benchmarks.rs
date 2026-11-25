@@ -1198,6 +1198,11 @@ pub fn create_saturated_multipath_snapshot(
             issp_retrans_ratio: 0.000006,
             total_retrans_ratio: 0.000030,
             latency_histogram: eth0_hist.clone(),
+            bandwidth_saturation_ratio: 0.50,
+            jitter_us: 800,
+            rtt_variance_us: 400,
+            is_bandwidth_saturated: false,
+            is_jitter_exceeded: false,
         },
         IsspSubpathBalancingMetrics {
             path_id: 2,
@@ -1228,6 +1233,11 @@ pub fn create_saturated_multipath_snapshot(
             issp_retrans_ratio: 0.0004,
             total_retrans_ratio: 0.0020,
             latency_histogram: wwan0_hist.clone(),
+            bandwidth_saturation_ratio: 0.40,
+            jitter_us: 2_500,
+            rtt_variance_us: 1_200,
+            is_bandwidth_saturated: false,
+            is_jitter_exceeded: false,
         },
         IsspSubpathBalancingMetrics {
             path_id: 3,
@@ -1258,6 +1268,11 @@ pub fn create_saturated_multipath_snapshot(
             issp_retrans_ratio: 0.0016,
             total_retrans_ratio: 0.0080,
             latency_histogram: tun0_hist.clone(),
+            bandwidth_saturation_ratio: 0.70,
+            jitter_us: 5_000,
+            rtt_variance_us: 3_000,
+            is_bandwidth_saturated: false,
+            is_jitter_exceeded: false,
         },
         IsspSubpathBalancingMetrics {
             path_id: 4,
@@ -1288,6 +1303,11 @@ pub fn create_saturated_multipath_snapshot(
             issp_retrans_ratio: 0.012,
             total_retrans_ratio: 0.060,
             latency_histogram: wlan0_hist.clone(),
+            bandwidth_saturation_ratio: 0.95,
+            jitter_us: 18_000,
+            rtt_variance_us: 12_000,
+            is_bandwidth_saturated: true,
+            is_jitter_exceeded: true,
         },
     ];
 
@@ -1335,6 +1355,11 @@ pub fn create_saturated_multipath_snapshot(
         aggregate_tcp_retrans_ratio: agg_tcp,
         aggregate_issp_retrans_ratio: agg_issp,
         total_failovers: 0,
+        total_saturation_failovers: 0,
+        total_jitter_failovers: 0,
+        max_observed_saturation_ratio: 0.95,
+        max_observed_jitter_us: 18_000,
+        last_cutover_latency_us: 0.0,
         cspf_resilience: None,
     }
 }

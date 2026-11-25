@@ -339,6 +339,16 @@ pub struct IsspMultipathBalancingSnapshot {
     pub aggregate_issp_retrans_ratio: f64,
     /// Total automatic interface and subpath failovers recorded.
     pub total_failovers: u64,
+    /// Total subpath failovers triggered by bandwidth saturation.
+    pub total_saturation_failovers: u64,
+    /// Total subpath failovers triggered by excessive network jitter.
+    pub total_jitter_failovers: u64,
+    /// Peak observed bandwidth saturation ratio.
+    pub max_observed_saturation_ratio: f64,
+    /// Peak observed network jitter in microseconds.
+    pub max_observed_jitter_us: u64,
+    /// Duration of the last subpath cutover in microseconds.
+    pub last_cutover_latency_us: f64,
     /// Optional CSPF topological resilience snapshot.
     pub cspf_resilience: Option<CspfResilienceSnapshot>,
 }
@@ -458,6 +468,21 @@ impl IsspMultipathBalancingSnapshot {
             let total_ratio = route.metrics.total_retransmission_ratio();
             let lat_hist = route.metrics.latency_histogram.clone();
 
+            let capacity = router.subpath_capacity_bps(route.path_id);
+            let throughput = if route.congestion.bbr.estimated_bandwidth_bps > 0 {
+                route.congestion.bbr.estimated_bandwidth_bps / 8
+            } else {
+                0
+            };
+            let sat_ratio = if capacity > 0 {
+                (throughput as f64) / (capacity as f64)
+            } else {
+                0.0
+            };
+            let is_sat = sat_ratio >= router.subpath_constraint_config().max_bandwidth_saturation_ratio;
+            let is_jit = route.metrics.jitter_us >= router.subpath_constraint_config().max_jitter_us
+                || route.metrics.rtt_variance_us >= router.subpath_constraint_config().max_rtt_variance_us;
+
             subpaths.push(IsspSubpathBalancingMetrics {
                 path_id: route.path_id,
                 interface_name: route.interface_name.clone(),
@@ -487,6 +512,11 @@ impl IsspMultipathBalancingSnapshot {
                 issp_retrans_ratio: issp_ratio,
                 total_retrans_ratio: total_ratio,
                 latency_histogram: lat_hist,
+                bandwidth_saturation_ratio: sat_ratio,
+                jitter_us: route.metrics.jitter_us,
+                rtt_variance_us: route.metrics.rtt_variance_us,
+                is_bandwidth_saturated: is_sat,
+                is_jitter_exceeded: is_jit,
             });
         }
 
@@ -509,6 +539,11 @@ impl IsspMultipathBalancingSnapshot {
             aggregate_tcp_retrans_ratio: agg_tcp_ratio,
             aggregate_issp_retrans_ratio: agg_issp_ratio,
             total_failovers: router.total_failovers,
+            total_saturation_failovers: router.subpath_constraint_metrics().total_saturation_failovers,
+            total_jitter_failovers: router.subpath_constraint_metrics().total_jitter_failovers,
+            max_observed_saturation_ratio: router.subpath_constraint_metrics().max_observed_saturation_ratio,
+            max_observed_jitter_us: router.subpath_constraint_metrics().max_observed_jitter_us,
+            last_cutover_latency_us: router.subpath_constraint_metrics().last_cutover_latency_us,
             cspf_resilience: router.cspf_group().map(CspfResilienceSnapshot::from_group),
         }
     }
@@ -616,6 +651,16 @@ pub struct IsspSubpathBalancingMetrics {
     pub total_retrans_ratio: f64,
     /// Latency histogram distribution for this specific subpath.
     pub latency_histogram: LatencyHistogram,
+    /// Bandwidth saturation ratio (current throughput vs link capacity).
+    pub bandwidth_saturation_ratio: f64,
+    /// Instantaneous network jitter in microseconds.
+    pub jitter_us: u64,
+    /// Round-trip time variance in microseconds.
+    pub rtt_variance_us: u64,
+    /// Whether subpath exceeds the bandwidth saturation threshold.
+    pub is_bandwidth_saturated: bool,
+    /// Whether subpath exceeds the network jitter threshold.
+    pub is_jitter_exceeded: bool,
 }
 
 // ─── Prometheus Exposition Format 0.0.4 Exporter ────────────────────────────
@@ -1275,6 +1320,56 @@ impl PrometheusMultipathBalancingExporter {
                 ));
             }
         }
+
+        // Subpath bandwidth saturation and network jitter constraints
+        out.push_str("# HELP ifa_mesh_subpath_bandwidth_saturation_ratio Bandwidth utilization ratio against link bottleneck capacity.\n");
+        out.push_str("# TYPE ifa_mesh_subpath_bandwidth_saturation_ratio gauge\n");
+        for sub in &s.subpaths {
+            let p_lbl = self.format_labels(&[
+                ("iface", &sub.interface_name),
+                ("node_id", &node_str),
+                ("path_id", &sub.path_id.to_string()),
+            ]);
+            out.push_str(&format!(
+                "ifa_mesh_subpath_bandwidth_saturation_ratio{} {:.6}\n",
+                p_lbl, sub.bandwidth_saturation_ratio
+            ));
+        }
+
+        out.push_str("# HELP ifa_mesh_subpath_jitter_microseconds Instantaneous network jitter observed on subpath in microseconds.\n");
+        out.push_str("# TYPE ifa_mesh_subpath_jitter_microseconds gauge\n");
+        for sub in &s.subpaths {
+            let p_lbl = self.format_labels(&[
+                ("iface", &sub.interface_name),
+                ("node_id", &node_str),
+                ("path_id", &sub.path_id.to_string()),
+            ]);
+            out.push_str(&format!(
+                "ifa_mesh_subpath_jitter_microseconds{} {}\n",
+                p_lbl, sub.jitter_us
+            ));
+        }
+
+        out.push_str("# HELP ifa_mesh_subpath_saturation_failovers_total Total subpath failovers triggered by bandwidth saturation.\n");
+        out.push_str("# TYPE ifa_mesh_subpath_saturation_failovers_total counter\n");
+        out.push_str(&format!(
+            "ifa_mesh_subpath_saturation_failovers_total{} {}\n",
+            base_lbl, s.total_saturation_failovers
+        ));
+
+        out.push_str("# HELP ifa_mesh_subpath_jitter_failovers_total Total subpath failovers triggered by excessive network jitter.\n");
+        out.push_str("# TYPE ifa_mesh_subpath_jitter_failovers_total counter\n");
+        out.push_str(&format!(
+            "ifa_mesh_subpath_jitter_failovers_total{} {}\n",
+            base_lbl, s.total_jitter_failovers
+        ));
+
+        out.push_str("# HELP ifa_mesh_subpath_last_cutover_latency_microseconds Duration of the last subpath cutover in microseconds.\n");
+        out.push_str("# TYPE ifa_mesh_subpath_last_cutover_latency_microseconds gauge\n");
+        out.push_str(&format!(
+            "ifa_mesh_subpath_last_cutover_latency_microseconds{} {:.6}\n",
+            base_lbl, s.last_cutover_latency_us
+        ));
 
         out
     }
@@ -1936,6 +2031,132 @@ impl OtelMultipathBalancingExporter {
                 ts_str, cspf.total_failovers, node_str, src_str, dst_str
             ));
         }
+
+        // Subpath bandwidth saturation ratio gauge
+        let sat_dps: Vec<String> = s
+            .subpaths
+            .iter()
+            .map(|sp| {
+                format!(
+                    concat!(
+                        "                  {{\n",
+                        "                    \"timeUnixNano\": \"{}\",\n",
+                        "                    \"asDouble\": {:.6},\n",
+                        "                    \"attributes\": [\n{}\n",
+                        "                    ]\n",
+                        "                  }}"
+                    ),
+                    ts_str,
+                    sp.bandwidth_saturation_ratio,
+                    subpath_attrs(sp)
+                )
+            })
+            .collect();
+
+        if !sat_dps.is_empty() {
+            metric_entries.push(format!(
+                concat!(
+                    "            {{\n",
+                    "              \"name\": \"ifa.mesh.subpath.bandwidth_saturation_ratio\",\n",
+                    "              \"description\": \"Bandwidth utilization ratio against link bottleneck capacity\",\n",
+                    "              \"unit\": \"1\",\n",
+                    "              \"gauge\": {{\n",
+                    "                \"dataPoints\": [\n{}\n",
+                    "                ]\n",
+                    "              }}\n",
+                    "            }}"
+                ),
+                sat_dps.join(",\n")
+            ));
+        }
+
+        // Subpath jitter gauge
+        let jit_dps: Vec<String> = s
+            .subpaths
+            .iter()
+            .map(|sp| {
+                format!(
+                    concat!(
+                        "                  {{\n",
+                        "                    \"timeUnixNano\": \"{}\",\n",
+                        "                    \"asDouble\": {:.6},\n",
+                        "                    \"attributes\": [\n{}\n",
+                        "                    ]\n",
+                        "                  }}"
+                    ),
+                    ts_str,
+                    (sp.jitter_us as f64) / 1_000_000.0,
+                    subpath_attrs(sp)
+                )
+            })
+            .collect();
+
+        if !jit_dps.is_empty() {
+            metric_entries.push(format!(
+                concat!(
+                    "            {{\n",
+                    "              \"name\": \"ifa.mesh.subpath.jitter_microseconds\",\n",
+                    "              \"description\": \"Instantaneous network jitter observed on subpath\",\n",
+                    "              \"unit\": \"s\",\n",
+                    "              \"gauge\": {{\n",
+                    "                \"dataPoints\": [\n{}\n",
+                    "                ]\n",
+                    "              }}\n",
+                    "            }}"
+                ),
+                jit_dps.join(",\n")
+            ));
+        }
+
+        // Saturation failovers counter
+        metric_entries.push(format!(
+            concat!(
+                "            {{\n",
+                "              \"name\": \"ifa.mesh.subpath.saturation_failovers_total\",\n",
+                "              \"description\": \"Total subpath failovers triggered by bandwidth saturation\",\n",
+                "              \"unit\": \"1\",\n",
+                "              \"sum\": {{\n",
+                "                \"aggregationTemporality\": 2,\n",
+                "                \"isMonotonic\": true,\n",
+                "                \"dataPoints\": [\n",
+                "                  {{\n",
+                "                    \"timeUnixNano\": \"{}\",\n",
+                "                    \"asInt\": \"{}\",\n",
+                "                    \"attributes\": [\n",
+                "                      {{\"key\": \"node_id\", \"value\": {{\"stringValue\": \"{}\"}}}}\n",
+                "                    ]\n",
+                "                  }}\n",
+                "                ]\n",
+                "              }}\n",
+                "            }}"
+            ),
+            ts_str, s.total_saturation_failovers, node_str
+        ));
+
+        // Jitter failovers counter
+        metric_entries.push(format!(
+            concat!(
+                "            {{\n",
+                "              \"name\": \"ifa.mesh.subpath.jitter_failovers_total\",\n",
+                "              \"description\": \"Total subpath failovers triggered by excessive network jitter\",\n",
+                "              \"unit\": \"1\",\n",
+                "              \"sum\": {{\n",
+                "                \"aggregationTemporality\": 2,\n",
+                "                \"isMonotonic\": true,\n",
+                "                \"dataPoints\": [\n",
+                "                  {{\n",
+                "                    \"timeUnixNano\": \"{}\",\n",
+                "                    \"asInt\": \"{}\",\n",
+                "                    \"attributes\": [\n",
+                "                      {{\"key\": \"node_id\", \"value\": {{\"stringValue\": \"{}\"}}}}\n",
+                "                    ]\n",
+                "                  }}\n",
+                "                ]\n",
+                "              }}\n",
+                "            }}"
+            ),
+            ts_str, s.total_jitter_failovers, node_str
+        ));
 
         out.push_str(&metric_entries.join(",\n"));
         out.push_str("\n          ]\n");
@@ -7783,5 +8004,78 @@ mod tests {
         assert!(prom_failed.contains(
             "ifa_mesh_cspf_diversity_ratio{dst_node=\"4\",node_id=\"1\",src_node=\"1\"} 0.500000"
         ));
+    }
+
+    #[test]
+    fn test_subpath_qos_constraints_with_cspf_and_telemetry_export() {
+        use crate::session_sync::{
+            FailoverAction, IsspDynamicMultipathRouter, IsspRoutingPolicy, SessionId,
+            SubpathConstraintConfig,
+        };
+        use crate::topology_cspf::{
+            cspf_k_disjoint_paths, CspfConstraints, CspfMultipathGroup, DisjointMode, NodeId,
+            TopoEdge, TopologyGraph,
+        };
+        use std::collections::HashMap;
+
+        let mut graph = TopologyGraph::new();
+        // Path 1: 1 -> 2 -> 4 (bottleneck 10 MB/s, RTT 4ms)
+        graph.add_edge(TopoEdge { from: NodeId(1), to: NodeId(2), avail_bw_bps: 10_000_000, rtt_us: 2000, loss_millipct: 10, cost: 2 });
+        graph.add_edge(TopoEdge { from: NodeId(2), to: NodeId(4), avail_bw_bps: 10_000_000, rtt_us: 2000, loss_millipct: 10, cost: 2 });
+        // Path 2: 1 -> 3 -> 4 (bottleneck 20 MB/s, RTT 6ms)
+        graph.add_edge(TopoEdge { from: NodeId(1), to: NodeId(3), avail_bw_bps: 20_000_000, rtt_us: 3000, loss_millipct: 10, cost: 3 });
+        graph.add_edge(TopoEdge { from: NodeId(3), to: NodeId(4), avail_bw_bps: 20_000_000, rtt_us: 3000, loss_millipct: 10, cost: 3 });
+
+        let paths = cspf_k_disjoint_paths(
+            &graph,
+            NodeId(1),
+            NodeId(4),
+            &CspfConstraints::unconstrained(),
+            2,
+            DisjointMode::NodeDisjoint,
+        );
+        assert_eq!(paths.len(), 2);
+
+        let group = CspfMultipathGroup::new(NodeId(1), NodeId(4), paths);
+        let mut router = IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::ActiveStandby)
+            .with_cspf_group(group)
+            .with_subpath_constraint_config(SubpathConstraintConfig {
+                max_jitter_us: 10_000,
+                max_rtt_variance_us: 8_000,
+                max_bandwidth_saturation_ratio: 0.85,
+                max_queuing_delay_us: 20_000,
+                saturation_action: FailoverAction::SwitchToStandby,
+                jitter_action: FailoverAction::SwitchToStandby,
+            });
+
+        let s1 = SessionId { flow_hash: 1, origin_node: 1, nonce: 1 };
+        router.bind_session(s1, 1).expect("bind session");
+
+        // Simulate 9.2 MB/s throughput on Path 1 (92% saturation > 85% threshold)
+        let mut throughput_map = HashMap::new();
+        throughput_map.insert(1, 9_200_000u64);
+
+        let evs = router.evaluate_subpath_constraints(1000, Some(&throughput_map));
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].failed_path_id, 1);
+        assert_eq!(evs[0].target_path_id, 2);
+        assert_eq!(evs[0].reason, crate::session_sync::IsspFailoverReason::BandwidthSaturation);
+
+        // Snapshot and telemetry exports
+        let snap = IsspMultipathBalancingSnapshot::from_router(&router, 1_000_000_000);
+        assert_eq!(snap.total_saturation_failovers, 1);
+
+        let prom = snap.export_prometheus();
+        assert!(prom.contains("ifa_mesh_subpath_bandwidth_saturation_ratio"));
+        assert!(prom.contains("ifa_mesh_subpath_jitter_microseconds"));
+        assert!(prom.contains("ifa_mesh_subpath_saturation_failovers_total{node_id=\"1\",policy=\"ActiveStandby\"} 1"));
+        assert!(prom.contains("ifa_mesh_subpath_jitter_failovers_total{node_id=\"1\",policy=\"ActiveStandby\"} 0"));
+        assert!(prom.contains("ifa_mesh_subpath_last_cutover_latency_microseconds"));
+
+        let otlp = OtelMultipathBalancingExporter::new().export(&snap, "ifa-service");
+        assert!(otlp.contains("ifa.mesh.subpath.bandwidth_saturation_ratio"));
+        assert!(otlp.contains("ifa.mesh.subpath.jitter_microseconds"));
+        assert!(otlp.contains("ifa.mesh.subpath.saturation_failovers_total"));
+        assert!(otlp.contains("ifa.mesh.subpath.jitter_failovers_total"));
     }
 }

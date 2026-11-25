@@ -1731,6 +1731,10 @@ pub enum IsspFailoverReason {
     AlertmanagerRetransmissionSpike,
     /// Bufferbloat queuing delay gradient surge alert received via Alertmanager webhook.
     AlertmanagerQueuingDelayGradient,
+    /// Bandwidth saturation constraint exceeded on subpath.
+    BandwidthSaturation,
+    /// Network jitter tolerance constraint exceeded on subpath.
+    JitterExceeded,
 }
 
 impl IsspFailoverReason {
@@ -1743,6 +1747,8 @@ impl IsspFailoverReason {
             Self::AlertmanagerJitterSurge => "AlertmanagerJitterSurge",
             Self::AlertmanagerRetransmissionSpike => "AlertmanagerRetransmissionSpike",
             Self::AlertmanagerQueuingDelayGradient => "AlertmanagerQueuingDelayGradient",
+            Self::BandwidthSaturation => "BandwidthSaturation",
+            Self::JitterExceeded => "JitterExceeded",
         }
     }
 }
@@ -1839,6 +1845,70 @@ impl IsspFailoverEvent {
             session_ids_json
         )
     }
+}
+
+/// Configurable Quality of Service (QoS) constraints for subpaths.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubpathConstraintConfig {
+    /// Maximum acceptable network jitter in microseconds before violation. Default: 15_000 µs (15ms).
+    pub max_jitter_us: u64,
+    /// Maximum acceptable RTT variance in microseconds before violation. Default: 10_000 µs (10ms).
+    pub max_rtt_variance_us: u64,
+    /// Maximum allowable bandwidth saturation ratio in [0.0, 1.0]. Default: 0.90 (90%).
+    pub max_bandwidth_saturation_ratio: f64,
+    /// Maximum allowable queuing delay in microseconds before violation. Default: 20_000 µs (20ms).
+    pub max_queuing_delay_us: u64,
+    /// Action taken when bandwidth saturation threshold is exceeded. Default: SwitchToStandby.
+    pub saturation_action: FailoverAction,
+    /// Action taken when jitter threshold is exceeded. Default: SwitchToStandby.
+    pub jitter_action: FailoverAction,
+}
+
+impl Default for SubpathConstraintConfig {
+    fn default() -> Self {
+        Self {
+            max_jitter_us: 15_000,
+            max_rtt_variance_us: 10_000,
+            max_bandwidth_saturation_ratio: 0.90,
+            max_queuing_delay_us: 20_000,
+            saturation_action: FailoverAction::SwitchToStandby,
+            jitter_action: FailoverAction::SwitchToStandby,
+        }
+    }
+}
+
+/// Dynamic resilience and failover metrics recorded under subpath constraints.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SubpathConstraintMetrics {
+    /// Total subpath failovers triggered by bandwidth saturation.
+    pub total_saturation_failovers: u64,
+    /// Total subpath failovers triggered by excessive network jitter.
+    pub total_jitter_failovers: u64,
+    /// Total subpath demotions/failovers triggered by excessive queuing delay / bufferbloat.
+    pub total_queuing_delay_failovers: u64,
+    /// Peak observed bandwidth saturation ratio (0.0 to 1.0+).
+    pub max_observed_saturation_ratio: f64,
+    /// Peak observed network jitter in microseconds.
+    pub max_observed_jitter_us: u64,
+    /// Latency duration of the most recent failover cutover in microseconds.
+    pub last_cutover_latency_us: f64,
+}
+
+/// Instantaneous QoS evaluation of an individual subpath.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubpathConstraintEvaluation {
+    pub path_id: u32,
+    pub interface_name: String,
+    pub capacity_bps: u64,
+    pub throughput_bps: u64,
+    pub bandwidth_saturation_ratio: f64,
+    pub jitter_us: u64,
+    pub rtt_variance_us: u64,
+    pub queuing_delay_us: u64,
+    pub is_bandwidth_saturated: bool,
+    pub is_jitter_exceeded: bool,
+    pub is_queuing_delay_exceeded: bool,
+    pub action_required: Option<(FailoverAction, IsspFailoverReason)>,
 }
 
 /// Traffic steering and load-balancing strategy across dynamic multipath links.
@@ -2239,6 +2309,8 @@ pub struct IsspDynamicMultipathRouter {
     header_decompressor: IsspAdaptiveHeaderCompressor,
     subpath_seqs: HashMap<u32, u64>,
     pub cspf_group: Option<crate::topology_cspf::CspfMultipathGroup>,
+    pub constraint_config: SubpathConstraintConfig,
+    pub constraint_metrics: SubpathConstraintMetrics,
 }
 
 impl IsspDynamicMultipathRouter {
@@ -2265,6 +2337,8 @@ impl IsspDynamicMultipathRouter {
             header_decompressor: IsspAdaptiveHeaderCompressor::new(64),
             subpath_seqs: HashMap::new(),
             cspf_group: None,
+            constraint_config: SubpathConstraintConfig::default(),
+            constraint_metrics: SubpathConstraintMetrics::default(),
         }
     }
 
@@ -2278,6 +2352,27 @@ impl IsspDynamicMultipathRouter {
     pub fn with_probation_config(mut self, config: IsspProbationConfig) -> Self {
         self.probation_config = config;
         self
+    }
+
+    /// Configure subpath QoS constraint parameters.
+    pub fn with_subpath_constraint_config(mut self, config: SubpathConstraintConfig) -> Self {
+        self.constraint_config = config;
+        self
+    }
+
+    /// Update subpath QoS constraint parameters.
+    pub fn set_subpath_constraint_config(&mut self, config: SubpathConstraintConfig) {
+        self.constraint_config = config;
+    }
+
+    /// Access the active subpath QoS constraint configuration.
+    pub fn subpath_constraint_config(&self) -> &SubpathConstraintConfig {
+        &self.constraint_config
+    }
+
+    /// Access the subpath constraint resilience metrics.
+    pub fn subpath_constraint_metrics(&self) -> &SubpathConstraintMetrics {
+        &self.constraint_metrics
     }
 
     /// Register a new multipath route.
@@ -2935,6 +3030,212 @@ impl IsspDynamicMultipathRouter {
             .get(&path_id)
             .map(|r| r.bandwidth_estimate())
             .ok_or(SyncError::PathNotFound(path_id))
+    }
+
+    /// Calculate effective capacity in bytes per second for a given subpath.
+    pub fn subpath_capacity_bps(&self, path_id: u32) -> u64 {
+        if let Some(group) = &self.cspf_group {
+            let idx = (path_id.saturating_sub(1)) as usize;
+            if let Some(p) = group.paths.get(idx) {
+                if p.bottleneck_bw_bps > 0 {
+                    return p.bottleneck_bw_bps;
+                }
+            }
+        }
+        if let Some(r) = self.paths.get(&path_id) {
+            if r.congestion.bbr.estimated_bandwidth_bps > 0 {
+                return r.congestion.bbr.estimated_bandwidth_bps / 8;
+            }
+            // Fallback: 12.5 MB/s (~100 Mbps) per weight unit (or minimum 1.25 MB/s)
+            (r.weight as u64).saturating_mul(12_500_000).max(1_250_000)
+        } else {
+            12_500_000
+        }
+    }
+
+    /// Evaluate QoS constraint state across all operational subpaths without mutating router state.
+    pub fn evaluate_all_subpath_qos(
+        &self,
+        measured_throughput_bps: Option<&HashMap<u32, u64>>,
+    ) -> Vec<SubpathConstraintEvaluation> {
+        let mut evaluations = Vec::new();
+
+        for route in self.paths.values() {
+            let capacity = self.subpath_capacity_bps(route.path_id);
+            let throughput = measured_throughput_bps
+                .and_then(|m| m.get(&route.path_id).copied())
+                .unwrap_or(if route.congestion.bbr.estimated_bandwidth_bps > 0 {
+                    route.congestion.bbr.estimated_bandwidth_bps / 8
+                } else {
+                    0
+                });
+
+            let saturation_ratio = if capacity > 0 {
+                (throughput as f64) / (capacity as f64)
+            } else {
+                0.0
+            };
+
+            let jitter_us = route.metrics.jitter_us;
+            let rtt_variance_us = route.metrics.rtt_variance_us;
+            let queuing_delay_us = route.congestion.ledbat.queuing_delay_us;
+
+            let is_bandwidth_saturated =
+                saturation_ratio >= self.constraint_config.max_bandwidth_saturation_ratio;
+            let is_jitter_exceeded = jitter_us >= self.constraint_config.max_jitter_us
+                || rtt_variance_us >= self.constraint_config.max_rtt_variance_us;
+            let is_queuing_delay_exceeded =
+                queuing_delay_us >= self.constraint_config.max_queuing_delay_us;
+
+            let action_required = if route.state.is_usable() {
+                if is_bandwidth_saturated {
+                    Some((
+                        self.constraint_config.saturation_action,
+                        IsspFailoverReason::BandwidthSaturation,
+                    ))
+                } else if is_jitter_exceeded {
+                    Some((
+                        self.constraint_config.jitter_action,
+                        IsspFailoverReason::JitterExceeded,
+                    ))
+                } else if is_queuing_delay_exceeded {
+                    Some((
+                        self.constraint_config.saturation_action,
+                        IsspFailoverReason::QualityDegradation,
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            evaluations.push(SubpathConstraintEvaluation {
+                path_id: route.path_id,
+                interface_name: route.interface_name.clone(),
+                capacity_bps: capacity,
+                throughput_bps: throughput,
+                bandwidth_saturation_ratio: saturation_ratio,
+                jitter_us,
+                rtt_variance_us,
+                queuing_delay_us,
+                is_bandwidth_saturated,
+                is_jitter_exceeded,
+                is_queuing_delay_exceeded,
+                action_required,
+            });
+        }
+
+        evaluations
+    }
+
+    /// Evaluate subpath QoS constraints against live saturation and network jitter,
+    /// triggering automated subpath demotion or failover when thresholds are breached.
+    pub fn evaluate_subpath_constraints(
+        &mut self,
+        now_ms: u64,
+        measured_throughput_bps: Option<&HashMap<u32, u64>>,
+    ) -> Vec<IsspFailoverEvent> {
+        let evaluations = self.evaluate_all_subpath_qos(measured_throughput_bps);
+        let mut failovers = Vec::new();
+
+        for eval in evaluations {
+            // Update peak observed telemetry
+            if eval.bandwidth_saturation_ratio > self.constraint_metrics.max_observed_saturation_ratio {
+                self.constraint_metrics.max_observed_saturation_ratio = eval.bandwidth_saturation_ratio;
+            }
+            if eval.jitter_us > self.constraint_metrics.max_observed_jitter_us {
+                self.constraint_metrics.max_observed_jitter_us = eval.jitter_us;
+            }
+
+            if let Some((action, reason)) = eval.action_required {
+                let pid = eval.path_id;
+                match reason {
+                    IsspFailoverReason::BandwidthSaturation => {
+                        self.constraint_metrics.total_saturation_failovers += 1;
+                    }
+                    IsspFailoverReason::JitterExceeded => {
+                        self.constraint_metrics.total_jitter_failovers += 1;
+                    }
+                    IsspFailoverReason::QualityDegradation => {
+                        self.constraint_metrics.total_queuing_delay_failovers += 1;
+                    }
+                    _ => {}
+                }
+
+                let new_state = match action {
+                    FailoverAction::SwitchToStandby => IsspPathState::Standby,
+                    FailoverAction::DemoteToDegraded => IsspPathState::Degraded,
+                    FailoverAction::MarkFailed => IsspPathState::Failed,
+                };
+
+                if let Some(r) = self.paths.get_mut(&pid) {
+                    r.state = new_state;
+                    if new_state == IsspPathState::Failed {
+                        r.probation_state.reset();
+                    }
+                }
+
+                // If attached to a CSPF group, reflect degradation or failure in CSPF group
+                if let Some(group) = self.cspf_group.as_mut() {
+                    let idx = (pid.saturating_sub(1)) as usize;
+                    if idx < group.paths.len() {
+                        if new_state == IsspPathState::Failed {
+                            group.path_healthy[idx] = false;
+                            group.total_failovers += 1;
+                            group.recompute_weights();
+                        } else if new_state == IsspPathState::Degraded {
+                            let reduced = (group.traffic_weights[idx] / 2).max(1);
+                            group.traffic_weights[idx] = reduced;
+                        }
+                    }
+                }
+
+                // If path is no longer Active, migrate bound sessions to an alternative healthy path
+                if new_state != IsspPathState::Active {
+                    let bound_sessions: Vec<SessionId> = self
+                        .session_bindings
+                        .iter()
+                        .filter(|(_, &p)| p == pid)
+                        .map(|(s, _)| *s)
+                        .collect();
+
+                    if !bound_sessions.is_empty() {
+                        let cutover_start = Instant::now();
+                        let candidate = self.select_best_candidate_path(Some(pid));
+                        if let Ok(target_id) = candidate {
+                            if let Some(target) = self.paths.get_mut(&target_id) {
+                                if target.state == IsspPathState::Standby {
+                                    target.state = IsspPathState::Active;
+                                }
+                            }
+
+                            for sid in &bound_sessions {
+                                self.session_bindings.insert(*sid, target_id);
+                            }
+
+                            let cutover_us = cutover_start.elapsed().as_secs_f64() * 1_000_000.0;
+                            self.constraint_metrics.last_cutover_latency_us = cutover_us;
+                            self.total_failovers += 1;
+
+                            let event = IsspFailoverEvent {
+                                timestamp_unix_ms: now_ms,
+                                failed_path_id: pid,
+                                target_path_id: target_id,
+                                reason,
+                                sessions_rerouted: bound_sessions.len(),
+                                cutover_latency_us: cutover_us,
+                                rerouted_session_ids: bound_sessions,
+                            };
+                            self.failover_history.push(event.clone());
+                            failovers.push(event);
+                        }
+                    }
+                }
+            }
+        }
+
+        failovers
     }
 
     /// Return an iterator over all registered routes.
@@ -7410,5 +7711,76 @@ mod tests {
         router.handle_cspf_recovery();
         let r1_recovered = router.get_route(1).expect("route 1 recovered");
         assert_eq!(r1_recovered.state, IsspPathState::Active);
+    }
+
+    #[test]
+    fn test_subpath_constraint_bandwidth_saturation_and_jitter_failovers() {
+        let mut router = IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::ActiveStandby)
+            .with_subpath_constraint_config(SubpathConstraintConfig {
+                max_jitter_us: 10_000,
+                max_rtt_variance_us: 8_000,
+                max_bandwidth_saturation_ratio: 0.80,
+                max_queuing_delay_us: 20_000,
+                saturation_action: FailoverAction::SwitchToStandby,
+                jitter_action: FailoverAction::SwitchToStandby,
+            });
+
+        // Path 1 (primary, 100 Mbps = 12.5 MB/s)
+        let r1 = IsspMultipathRoute::new(1, 2, "eth0-wan", 1, 10);
+        // Path 2 (standby, 100 Mbps = 12.5 MB/s)
+        let mut r2 = IsspMultipathRoute::new(2, 2, "wwan0-5g", 2, 10);
+        r2.state = IsspPathState::Standby;
+
+        router.add_route(r1);
+        router.add_route(r2);
+
+        let s1 = SessionId { flow_hash: 111, origin_node: 1, nonce: 1 };
+        let s2 = SessionId { flow_hash: 222, origin_node: 1, nonce: 2 };
+        router.bind_session(s1, 1).expect("bind s1");
+        router.bind_session(s2, 1).expect("bind s2");
+
+        // 1. Nominal evaluation - no failover
+        let mut throughput_map = HashMap::new();
+        throughput_map.insert(1, 5_000_000u64); // 5 MB/s on 125 MB/s -> 4% saturation
+        let evs = router.evaluate_subpath_constraints(1000, Some(&throughput_map));
+        assert!(evs.is_empty());
+        assert_eq!(router.get_session_path(&s1), Some(1));
+
+        // 2. Bandwidth saturation injection (110 MB/s on 125 MB/s capacity -> 88% saturation > 80% threshold)
+        throughput_map.insert(1, 110_000_000u64);
+        let evs = router.evaluate_subpath_constraints(2000, Some(&throughput_map));
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].failed_path_id, 1);
+        assert_eq!(evs[0].target_path_id, 2);
+        assert_eq!(evs[0].reason, IsspFailoverReason::BandwidthSaturation);
+        assert_eq!(evs[0].sessions_rerouted, 2);
+
+        // Path 1 should now be Standby, Path 2 promoted to Active
+        assert_eq!(router.get_route(1).unwrap().state, IsspPathState::Standby);
+        assert_eq!(router.get_route(2).unwrap().state, IsspPathState::Active);
+        assert_eq!(router.get_session_path(&s1), Some(2));
+        assert_eq!(router.get_session_path(&s2), Some(2));
+        assert_eq!(router.subpath_constraint_metrics().total_saturation_failovers, 1);
+        assert!(router.subpath_constraint_metrics().max_observed_saturation_ratio >= 0.88);
+
+        // 3. Jitter exceedance on Path 2
+        // Restore Path 1 to Active, simulate severe jitter on Path 2
+        router.get_route_mut(1).unwrap().state = IsspPathState::Active;
+        let route2 = router.get_route_mut(2).unwrap();
+        route2.metrics.jitter_us = 16_000; // 16ms > 10ms threshold
+
+        throughput_map.insert(1, 2_000_000u64);
+        throughput_map.insert(2, 2_000_000u64);
+
+        let evs = router.evaluate_subpath_constraints(3000, Some(&throughput_map));
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].failed_path_id, 2);
+        assert_eq!(evs[0].target_path_id, 1);
+        assert_eq!(evs[0].reason, IsspFailoverReason::JitterExceeded);
+        assert_eq!(router.subpath_constraint_metrics().total_jitter_failovers, 1);
+        assert_eq!(router.subpath_constraint_metrics().max_observed_jitter_us, 16_000);
+
+        assert_eq!(router.get_session_path(&s1), Some(1));
+        assert_eq!(router.get_session_path(&s2), Some(1));
     }
 }
