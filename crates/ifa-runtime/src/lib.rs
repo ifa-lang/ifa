@@ -130,6 +130,10 @@ pub use telemetry_queue::{
     PriorityTelemetryRing, TelemetryEvent, TelemetryPriority, TierStats, CRITICAL_RING_CAPACITY,
     DEBUG_RING_CAPACITY, HIGH_RING_CAPACITY, NORMAL_RING_CAPACITY,
 };
+pub use topology_cspf::{
+    cspf_k_shortest_paths, topology_graph_from_snapshot, CspfConstraints, CspfPath, NodeId,
+    TopoEdge, TopologyGraph,
+};
 pub use wasi::*;
 pub use zstd_archive::{
     decode_zstd_stream, encode_zstd_chunk, encode_zstd_chunk_with_stats, IsspCongestionTraceRecord,
@@ -139,8 +143,4 @@ pub use zstd_archive::{
     PHASE_DRAIN, PHASE_PROBE_BW, PHASE_PROBE_RTT, PHASE_RECOVERY, PHASE_SLOW_START,
     TRACE_FLAG_CWND_REDUCED, TRACE_FLAG_ECN, TRACE_FLAG_LOSS, TRACE_FLAG_PROBE,
     TRACE_FLAG_RETRANSMIT, TRACE_FLAG_RTT_SURGE, ZSTD_BLOCK_SIZE_MAX, ZSTD_MAGIC,
-};
-pub use topology_cspf::{
-    cspf_k_shortest_paths, topology_graph_from_snapshot, CspfConstraints, CspfPath, NodeId,
-    TopoEdge, TopologyGraph,
 };

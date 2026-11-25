@@ -442,7 +442,11 @@ mod tests {
         // Shortest by cost: 0→2→3 has cost = compute_cost(2000,5000)+compute_cost(2000,0)
         // = (2+50)+(2+0) = 54; vs 0→1→3 = (10+0)+(5+0) = 15. So 0→1→3 wins.
         let best = &paths[0];
-        assert_eq!(best.nodes, vec![n(0), n(1), n(3)], "best unconstrained path");
+        assert_eq!(
+            best.nodes,
+            vec![n(0), n(1), n(3)],
+            "best unconstrained path"
+        );
         assert_eq!(best.total_cost, 15);
     }
 
@@ -474,7 +478,11 @@ mod tests {
         assert!(!paths.is_empty());
         // All returned paths must avoid node 2.
         for p in &paths {
-            assert!(!p.nodes.contains(&n(2)), "lossy path must be pruned: {:?}", p.nodes);
+            assert!(
+                !p.nodes.contains(&n(2)),
+                "lossy path must be pruned: {:?}",
+                p.nodes
+            );
         }
     }
 
@@ -508,7 +516,10 @@ mod tests {
         let g = diamond_graph();
         let paths = cspf_k_shortest_paths(&g, n(0), n(3), &CspfConstraints::unconstrained(), 1);
         let p = &paths[0];
-        assert!(p.bottleneck_bw_bps > 0, "bottleneck_bw_bps must be positive");
+        assert!(
+            p.bottleneck_bw_bps > 0,
+            "bottleneck_bw_bps must be positive"
+        );
         assert!(p.total_rtt_us > 0, "total_rtt_us must be positive");
         assert!(p.total_cost > 0, "total_cost must be positive");
     }
