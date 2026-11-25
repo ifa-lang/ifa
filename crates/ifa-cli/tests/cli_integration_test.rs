@@ -1526,3 +1526,103 @@ fn test_net_session_simd_bench_cli() {
     assert!(json_str.contains("capsule_decode_speedup"));
     assert!(json_str.contains("classification_speedup"));
 }
+
+#[test]
+fn test_net_session_trace_archive_cli() {
+    let ifa_bin = get_ifa_binary();
+
+    // 1. Bench mode table
+    let bench_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("trace-archive")
+        .arg("--bench")
+        .arg("--bench-records")
+        .arg("200")
+        .output()
+        .expect("exec trace-archive bench");
+
+    assert!(bench_out.status.success());
+    let stdout = String::from_utf8_lossy(&bench_out.stdout);
+    assert!(stdout.contains("ISSP Zstandard Streaming Trace Compression Pipeline Benchmark"));
+    assert!(stdout.contains("Zstd Streaming Ingest & Compress"));
+
+    // 2. Bench mode JSON
+    let bench_json = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("trace-archive")
+        .arg("--bench")
+        .arg("--bench-records")
+        .arg("200")
+        .arg("--json")
+        .output()
+        .expect("exec trace-archive bench json");
+
+    assert!(bench_json.status.success());
+    let json_str = String::from_utf8_lossy(&bench_json.stdout);
+    assert!(json_str.contains("\"record_count\":200"));
+    assert!(json_str.contains("\"verification_passed\":true"));
+
+    // 3. End-to-end trace archiving and decompression
+    let tmp_dir =
+        std::env::temp_dir().join(format!("ifa_cli_trace_archive_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let state_file = tmp_dir.join("state.issp");
+    let zst_file = tmp_dir.join("traces.zst");
+
+    let reg = ifa_runtime::SessionRegistry::new(10);
+    reg.register_peer(20).unwrap();
+    let sid = ifa_runtime::SessionId::new(0x2233_4455_6677_8899, 10, 1);
+    let mut snap = ifa_runtime::SessionSnapshot::new(sid, 1, 1_700_000_000);
+    snap.tx_seq = 200;
+    snap.rx_seq_high = 195;
+    reg.upsert_primary(snap).unwrap();
+    reg.save_to_file(&state_file).unwrap();
+
+    let archive_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("trace-archive")
+        .arg("--file")
+        .arg(&state_file)
+        .arg("--out")
+        .arg(&zst_file)
+        .output()
+        .expect("exec trace-archive out");
+
+    assert!(archive_out.status.success());
+    let arc_str = String::from_utf8_lossy(&archive_out.stdout);
+    assert!(arc_str.contains("Successfully archived"));
+    assert!(zst_file.exists());
+
+    let decomp_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("trace-archive")
+        .arg("--decompress")
+        .arg(&zst_file)
+        .output()
+        .expect("exec trace-archive decompress");
+
+    assert!(decomp_out.status.success());
+    let dec_str = String::from_utf8_lossy(&decomp_out.stdout);
+    assert!(dec_str.contains("Timestamp (ns)"));
+    assert!(dec_str.contains("CongestionAvoidance"));
+
+    let decomp_json = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("trace-archive")
+        .arg("--decompress")
+        .arg(&zst_file)
+        .arg("--json")
+        .output()
+        .expect("exec trace-archive decompress json");
+
+    assert!(decomp_json.status.success());
+    let dec_json_str = String::from_utf8_lossy(&decomp_json.stdout);
+    assert!(dec_json_str.contains("\"phase\":\"CongestionAvoidance\""));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

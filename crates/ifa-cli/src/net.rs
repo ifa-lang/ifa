@@ -4,11 +4,12 @@ use clap::Subcommand;
 use ifa_runtime::{
     run_issp_failover_benchmark_suite, run_issp_scenario,
     run_simd_capsule_and_classification_benchmark, run_telemetry_streaming_vs_polling_benchmark,
-    IsspBandwidthEstimate, IsspCapsule, IsspClusterQuorumConfig, IsspCongestionPhase,
-    IsspFailoverBenchmarkSuiteReport, IsspFlapDampingConfig, IsspHeartbeatProbe,
-    IsspMultipathRoute, IsspNetworkProfile, IsspPathState, IsspProbationConfig, IsspRoutingPolicy,
-    IsspTelemetryServer, SecurityPolicy, SessionId, SessionRecord, SessionRegistry,
-    SessionSnapshot,
+    run_zstd_trace_archive_benchmark, IsspBandwidthEstimate, IsspCapsule, IsspClusterQuorumConfig,
+    IsspCongestionPhase, IsspCongestionTraceRecord, IsspFailoverBenchmarkSuiteReport,
+    IsspFlapDampingConfig, IsspHeartbeatProbe, IsspMultipathRoute, IsspNetworkProfile,
+    IsspPathState, IsspProbationConfig, IsspRoutingPolicy, IsspTelemetryServer,
+    IsspZstdMemoryPipeline, IsspZstdStreamDecompressor, SecurityPolicy, SessionId, SessionRecord,
+    SessionRegistry, SessionSnapshot, PHASE_CONGESTION_AVOIDANCE,
 };
 use serde_json::json;
 use std::fs;
@@ -211,6 +212,27 @@ pub enum SessionCommand {
         /// Path to persistent cluster state dump (.issp or binary dump)
         #[arg(short, long)]
         file: Option<PathBuf>,
+        /// Output formatted as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Archive streaming congestion traces and multipath telemetry using RFC 8878 Zstandard compression pipeline
+    TraceArchive {
+        /// Output file path for the compressed Zstandard archive (.zst)
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Input Zstandard archive to decompress and inspect
+        #[arg(short, long)]
+        decompress: Option<PathBuf>,
+        /// Path to persistent cluster state dump (.issp or binary dump)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+        /// Run compression pipeline throughput benchmark
+        #[arg(long)]
+        bench: bool,
+        /// Number of benchmark trace records to compress
+        #[arg(long, default_value = "50000")]
+        bench_records: usize,
         /// Output formatted as JSON
         #[arg(long)]
         json: bool,
@@ -1780,6 +1802,202 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        SessionCommand::TraceArchive {
+            out,
+            decompress,
+            file,
+            bench,
+            bench_records,
+            json,
+        } => {
+            if bench {
+                let report = run_zstd_trace_archive_benchmark(bench_records);
+                if json {
+                    println!("{}", report.to_json());
+                } else {
+                    println!("{}", report.to_markdown_table());
+                }
+                return ExitCode::SUCCESS;
+            }
+
+            if let Some(in_path) = decompress {
+                let compressed = match std::fs::read(&in_path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!(
+                            "error: failed to read archive `{}`: {}",
+                            in_path.display(),
+                            e
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                };
+
+                let records =
+                    match IsspZstdStreamDecompressor::decompress_trace_records(&compressed) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("error: failed to decompress Zstandard trace archive: {}", e);
+                            return ExitCode::FAILURE;
+                        }
+                    };
+
+                if json {
+                    let items: Vec<String> = records.iter().map(|r| r.to_json_string()).collect();
+                    println!("[\n{}\n]", items.join(",\n"));
+                } else if records.is_empty() {
+                    println!("Zstandard archive contains 0 trace records.");
+                } else {
+                    println!(
+                        "{:<22} {:<6} {:<8} {:<10} {:<20} {:<10} {:<10} {:<12} {:<14} {:<12}",
+                        "Timestamp (ns)",
+                        "Node",
+                        "Subpath",
+                        "Seq",
+                        "Phase",
+                        "RTT (µs)",
+                        "Queue (µs)",
+                        "CWND",
+                        "Bandwidth",
+                        "Flags"
+                    );
+                    println!("{:-<130}", "");
+                    for r in &records {
+                        println!(
+                            "{:<22} {:<6} {:<8} {:<10} {:<20} {:<10} {:<10} {:<12} {:<14} {:<12}",
+                            r.timestamp_ns,
+                            r.node_id,
+                            r.subpath_id,
+                            r.seq_num,
+                            r.phase_name(),
+                            r.rtt_us,
+                            r.queuing_delay_us,
+                            r.cwnd_bytes,
+                            r.bandwidth_estimate_bps,
+                            r.flags_string()
+                        );
+                    }
+                }
+                return ExitCode::SUCCESS;
+            }
+
+            // Archiving active sessions from registry
+            let registry = match resolve_state_file(file.as_ref()) {
+                Some(p) if p.exists() => match SessionRegistry::load_from_file(&p) {
+                    Ok(reg) => reg,
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: failed loading state from {:?} ({}), starting with empty registry",
+                            p, e
+                        );
+                        SessionRegistry::new(1)
+                    }
+                },
+                _ => SessionRegistry::new(1),
+            };
+
+            let sessions = registry.list_sessions();
+            if sessions.is_empty() {
+                if json {
+                    println!(
+                        r#"{{"status":"empty","records_archived":0,"message":"No active sessions found in registry."}}"#
+                    );
+                } else {
+                    println!("No active datagram sessions found in registry.");
+                    println!(
+                        "Connect an ISSP service or specify a valid state dump with --file <path>."
+                    );
+                }
+                return ExitCode::SUCCESS;
+            }
+
+            let mut pipeline = IsspZstdMemoryPipeline::new(64 * 1024);
+            let now_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+
+            for (idx, s) in sessions.iter().enumerate() {
+                let rec = IsspCongestionTraceRecord {
+                    node_id: s.snapshot.id.origin_node,
+                    subpath_id: 1,
+                    congestion_phase: PHASE_CONGESTION_AVOIDANCE,
+                    flags: 0,
+                    pacing_gain_q8: 256,
+                    timestamp_ns: now_ns + idx as u64,
+                    flow_hash: s.snapshot.id.flow_hash,
+                    seq_num: s.snapshot.tx_seq,
+                    cwnd_bytes: 65536,
+                    bandwidth_estimate_bps: 100_000_000,
+                    rtt_us: 10000,
+                    queuing_delay_us: 1500,
+                };
+                pipeline.ingest_trace(&rec);
+            }
+
+            let (compressed_bytes, telem) = pipeline.finish();
+
+            if let Some(out_path) = out {
+                if let Err(e) = std::fs::write(&out_path, &compressed_bytes) {
+                    eprintln!(
+                        "error: failed writing archive to `{}`: {}",
+                        out_path.display(),
+                        e
+                    );
+                    return ExitCode::FAILURE;
+                }
+                if json {
+                    println!(
+                        r#"{{"status":"success","out":"{}","records_archived":{},"raw_bytes":{},"compressed_bytes":{},"compression_ratio_percent":{:.2}}}"#,
+                        out_path.display(),
+                        telem.total_records_ingested,
+                        telem.raw_bytes_in,
+                        telem.compressed_bytes_out,
+                        telem.compression_ratio_percent
+                    );
+                } else {
+                    println!(
+                        "Successfully archived {} trace records to `{}`.",
+                        telem.total_records_ingested,
+                        out_path.display()
+                    );
+                    println!("- Raw Size: {} bytes", telem.raw_bytes_in);
+                    println!(
+                        "- Compressed Size: {} bytes ({:.2}% reduction)",
+                        telem.compressed_bytes_out, telem.compression_ratio_percent
+                    );
+                    println!(
+                        "- Frames: {}, Raw Blocks: {}, RLE Blocks: {}",
+                        telem.frames_flushed, telem.blocks_raw, telem.blocks_rle
+                    );
+                }
+            } else if json {
+                println!(
+                    r#"{{"status":"success","records_archived":{},"raw_bytes":{},"compressed_bytes":{},"compression_ratio_percent":{:.2}}}"#,
+                    telem.total_records_ingested,
+                    telem.raw_bytes_in,
+                    telem.compressed_bytes_out,
+                    telem.compression_ratio_percent
+                );
+            } else {
+                println!(
+                    "Streaming compression pipeline processed {} trace records.",
+                    telem.total_records_ingested
+                );
+                println!("- Raw Size: {} bytes", telem.raw_bytes_in);
+                println!(
+                    "- Compressed Size: {} bytes ({:.2}% reduction)",
+                    telem.compressed_bytes_out, telem.compression_ratio_percent
+                );
+                println!(
+                    "- Frames: {}, Raw Blocks: {}, RLE Blocks: {}",
+                    telem.frames_flushed, telem.blocks_raw, telem.blocks_rle
+                );
+                println!("To save archive to disk, provide --out <file.zst>.");
+            }
+
+            ExitCode::SUCCESS
+        }
     }
 }
 
@@ -2135,5 +2353,110 @@ mod tests {
         };
         let code_json = execute_session_command(cmd_json);
         assert_eq!(code_json, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_session_command_trace_archive_execution() {
+        // 1. Bench mode (text & JSON)
+        let cmd_bench = SessionCommand::TraceArchive {
+            out: None,
+            decompress: None,
+            file: None,
+            bench: true,
+            bench_records: 200,
+            json: false,
+        };
+        assert_eq!(execute_session_command(cmd_bench), ExitCode::SUCCESS);
+
+        let cmd_bench_json = SessionCommand::TraceArchive {
+            out: None,
+            decompress: None,
+            file: None,
+            bench: true,
+            bench_records: 200,
+            json: true,
+        };
+        assert_eq!(execute_session_command(cmd_bench_json), ExitCode::SUCCESS);
+
+        // 2. Empty registry archive mode (clean empty state)
+        let cmd_archive_empty = SessionCommand::TraceArchive {
+            out: None,
+            decompress: None,
+            file: None,
+            bench: false,
+            bench_records: 0,
+            json: false,
+        };
+        assert_eq!(
+            execute_session_command(cmd_archive_empty),
+            ExitCode::SUCCESS
+        );
+
+        let cmd_archive_empty_json = SessionCommand::TraceArchive {
+            out: None,
+            decompress: None,
+            file: None,
+            bench: false,
+            bench_records: 0,
+            json: true,
+        };
+        assert_eq!(
+            execute_session_command(cmd_archive_empty_json),
+            ExitCode::SUCCESS
+        );
+
+        // 3. Create state with real sessions, archive to file, and decompress
+        let tmp_dir = std::env::temp_dir().join(format!("ifa_trace_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let state_file = tmp_dir.join("state.issp");
+        let zst_file = tmp_dir.join("traces.zst");
+
+        let reg = SessionRegistry::new(10);
+        reg.register_peer(20).unwrap();
+        let sid = SessionId::new(0x1122_3344_5566_7788, 10, 1);
+        let mut snap = SessionSnapshot::new(sid, 1, 1_700_000_000);
+        snap.tx_seq = 100;
+        snap.rx_seq_high = 95;
+        reg.upsert_primary(snap).unwrap();
+        reg.save_to_file(&state_file).unwrap();
+
+        // Archive to zst_file
+        let cmd_archive = SessionCommand::TraceArchive {
+            out: Some(zst_file.clone()),
+            decompress: None,
+            file: Some(state_file.clone()),
+            bench: false,
+            bench_records: 0,
+            json: false,
+        };
+        assert_eq!(execute_session_command(cmd_archive), ExitCode::SUCCESS);
+        assert!(zst_file.exists());
+        assert!(std::fs::metadata(&zst_file).unwrap().len() > 0);
+
+        // Decompress and inspect
+        let cmd_decompress = SessionCommand::TraceArchive {
+            out: None,
+            decompress: Some(zst_file.clone()),
+            file: None,
+            bench: false,
+            bench_records: 0,
+            json: false,
+        };
+        assert_eq!(execute_session_command(cmd_decompress), ExitCode::SUCCESS);
+
+        let cmd_decompress_json = SessionCommand::TraceArchive {
+            out: None,
+            decompress: Some(zst_file.clone()),
+            file: None,
+            bench: false,
+            bench_records: 0,
+            json: true,
+        };
+        assert_eq!(
+            execute_session_command(cmd_decompress_json),
+            ExitCode::SUCCESS
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

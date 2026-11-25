@@ -4463,6 +4463,13 @@ impl IsspTelemetryHttpHandler {
                     )
                 }
             }
+            "/api/traces/archive" | "/api/v1/traces/archive" => {
+                let json = format!(
+                    "{{\"status\":\"OK\",\"subpaths_tracked\":{},\"format\":\"zstd\",\"endpoint\":\"/api/traces/archive\"}}",
+                    snapshot.subpaths.len()
+                );
+                (200, "application/json", json)
+            }
             _ => (404, "text/plain; charset=utf-8", "Not Found\n".to_string()),
         }
     }
@@ -4495,6 +4502,9 @@ impl IsspTelemetryHttpHandler {
                 "application/x-protobuf",
                 snapshot.export_otlp_protobuf(&self.service_name),
             )
+        } else if clean_path == "/api/traces/archive" || clean_path == "/api/v1/traces/archive" {
+            let archive = self.export_zstd_traces_archive(snapshot);
+            (200, "application/zstd", archive)
         } else if clean_path.contains("MetricsService/Export")
             || accept_header.contains("application/grpc")
         {
@@ -4504,6 +4514,59 @@ impl IsspTelemetryHttpHandler {
                 self.handle_snapshot_with_quorum(path, accept_header, snapshot, 1);
             (code, ctype, body_str.into_bytes())
         }
+    }
+
+    /// Export all subpath congestion metrics and multipath telemetry as an RFC 8878 Zstandard compressed stream.
+    pub fn export_zstd_traces_archive(&self, snapshot: &IsspMultipathBalancingSnapshot) -> Vec<u8> {
+        let mut pipeline = crate::zstd_archive::IsspZstdMemoryPipeline::new(64 * 1024);
+
+        for sp in &snapshot.subpaths {
+            let phase = match sp.congestion_phase.as_str() {
+                "SlowStart" => crate::zstd_archive::PHASE_SLOW_START,
+                "Recovery" => crate::zstd_archive::PHASE_RECOVERY,
+                "Drain" => crate::zstd_archive::PHASE_DRAIN,
+                "ProbeBw" => crate::zstd_archive::PHASE_PROBE_BW,
+                "ProbeRtt" => crate::zstd_archive::PHASE_PROBE_RTT,
+                _ => crate::zstd_archive::PHASE_CONGESTION_AVOIDANCE,
+            };
+            let flags = if sp.congestion_events > 0 {
+                crate::zstd_archive::TRACE_FLAG_LOSS
+            } else {
+                0
+            };
+            let record = crate::zstd_archive::IsspCongestionTraceRecord {
+                node_id: snapshot.node_id,
+                subpath_id: sp.path_id,
+                congestion_phase: phase,
+                flags,
+                pacing_gain_q8: sp.bbr_pacing_gain_q8 as u16,
+                timestamp_ns: snapshot.timestamp_unix_ns,
+                flow_hash: sp.path_id as u64,
+                seq_num: sp.total_frames_sent,
+                cwnd_bytes: sp.ledbat_cwnd_bytes,
+                bandwidth_estimate_bps: sp.bbr_bw_bps,
+                rtt_us: sp.rtt_us as u32,
+                queuing_delay_us: sp.rtt_gradient_us as u32,
+            };
+            pipeline.ingest_trace(&record);
+        }
+
+        let telem_record = crate::zstd_archive::IsspMultipathTelemetryRecord {
+            node_id: snapshot.node_id,
+            active_subpaths: snapshot.active_paths as u32,
+            total_sessions: snapshot.total_sessions as u32,
+            avg_rtt_us: 10000,
+            max_queuing_delay_us: 2000,
+            timestamp_ns: snapshot.timestamp_unix_ns,
+            total_tx_bytes: 0,
+            total_rx_bytes: 0,
+            loss_events_count: 0,
+            effective_throughput_bps: 0,
+        };
+        pipeline.ingest_telemetry(&telem_record);
+
+        let (bytes, _) = pipeline.finish();
+        bytes
     }
 
     /// Parse a raw HTTP GET request string and format a complete HTTP 1.1 wire response.
@@ -6819,6 +6882,36 @@ mod tests {
         assert_eq!(code, 200);
         assert_eq!(ctype, "application/x-protobuf");
         assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn test_issp_telemetry_http_handler_zstd_traces_archive() {
+        let router = IsspDynamicMultipathRouter::new(10, IsspRoutingPolicy::LowestLatency);
+        let snap = router.balancing_snapshot(1_700_000_000_000_000_000);
+        let handler = IsspTelemetryHttpHandler::new("ifa-gateway");
+
+        // 1. Binary Zstandard archive export
+        let (code, ctype, bytes) =
+            handler.handle_snapshot_binary("/api/traces/archive", "application/zstd", &snap);
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "application/zstd");
+        assert!(!bytes.is_empty());
+
+        // Decompress raw stream
+        let raw = crate::zstd_archive::decode_zstd_stream(&bytes).unwrap();
+        assert!(!raw.is_empty());
+
+        // 2. JSON route discovery
+        let (code_json, ctype_json, json_body) = handler.handle_snapshot_with_quorum(
+            "/api/traces/archive",
+            "application/json",
+            &snap,
+            1,
+        );
+        assert_eq!(code_json, 200);
+        assert_eq!(ctype_json, "application/json");
+        assert!(json_body.contains("\"subpaths_tracked\""));
+        assert!(json_body.contains("\"format\":\"zstd\""));
     }
 
     #[test]

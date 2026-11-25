@@ -15,6 +15,7 @@ pub mod simd_classifier;
 pub mod string;
 pub mod telemetry;
 pub mod wasi;
+pub mod zstd_archive;
 
 pub use allocator::{
     call_arena_alloc, call_arena_capacity, call_arena_guard, call_arena_high_water_mark,
@@ -27,10 +28,11 @@ pub use benchmarks::{
     create_saturated_multipath_snapshot, profile_allocator_engine, run_allocator_multithread_suite,
     run_generational_benchmark_suite, run_issp_failover_benchmark_suite, run_issp_scenario,
     run_simd_capsule_and_classification_benchmark, run_telemetry_streaming_vs_polling_benchmark,
-    AllocatorEngine, AllocatorThroughputResult, BenchmarkReport, BenchmarkResult,
-    IsspBenchmarkScenarioResult, IsspFailoverBenchmarkSuiteReport, IsspNetworkProfile,
-    MultithreadBenchmarkSuiteReport, SimdClassificationBenchmarkReport, SimdPhaseResult,
-    TelemetryComparativeReport, TelemetryLoadResult, TelemetryTransportKind,
+    run_zstd_trace_archive_benchmark, AllocatorEngine, AllocatorThroughputResult, BenchmarkReport,
+    BenchmarkResult, IsspBenchmarkScenarioResult, IsspFailoverBenchmarkSuiteReport,
+    IsspNetworkProfile, MultithreadBenchmarkSuiteReport, SimdClassificationBenchmarkReport,
+    SimdPhaseResult, TelemetryComparativeReport, TelemetryLoadResult, TelemetryTransportKind,
+    ZstdTraceArchiveBenchmarkReport,
 };
 pub use blocking::{
     ifa_rt_blocking_call, ifa_rt_blocking_pool_active_workers, ifa_rt_blocking_pool_capacity,
@@ -105,3 +107,12 @@ pub use telemetry::{
     ResourceUsage, DEFAULT_LATENCY_BUCKETS_SECONDS,
 };
 pub use wasi::*;
+pub use zstd_archive::{
+    decode_zstd_stream, encode_zstd_chunk, encode_zstd_chunk_with_stats, IsspCongestionTraceRecord,
+    IsspMultipathTelemetryRecord, IsspZstdArchiveTelemetry, IsspZstdMemoryPipeline,
+    IsspZstdStreamDecompressor, IsspZstdStreamingPipeline, ZstdArchiveError,
+    ISSP_MULTIPATH_TELEMETRY_RECORD_SIZE, ISSP_TRACE_RECORD_SIZE, PHASE_CONGESTION_AVOIDANCE,
+    PHASE_DRAIN, PHASE_PROBE_BW, PHASE_PROBE_RTT, PHASE_RECOVERY, PHASE_SLOW_START,
+    TRACE_FLAG_CWND_REDUCED, TRACE_FLAG_ECN, TRACE_FLAG_LOSS, TRACE_FLAG_PROBE,
+    TRACE_FLAG_RETRANSMIT, TRACE_FLAG_RTT_SURGE, ZSTD_BLOCK_SIZE_MAX, ZSTD_MAGIC,
+};
