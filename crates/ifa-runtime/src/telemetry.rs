@@ -359,6 +359,14 @@ pub struct IsspMultipathBalancingSnapshot {
     pub total_preemptive_reallocations: u64,
     /// Total lower-priority flow evictions executed for contention relief.
     pub total_priority_evictions: u64,
+    /// Total automatic resilient failovers executed during network partitions.
+    pub total_resilience_partition_failovers: u64,
+    /// Total proactive reroutes away from asymmetrically degraded subpaths.
+    pub total_asymmetric_reroutes: u64,
+    /// Total elastic flows gracefully throttled to preserve priority slice headroom.
+    pub total_elastic_flows_throttled: u64,
+    /// Ratio of priority flows maintaining SLA under adverse conditions.
+    pub priority_sla_preservation_ratio: f64,
     /// Instantaneous variance of marginal gradients across subpaths.
     pub last_gradient_variance: f64,
     /// Active flows partitioned by slice class name.
@@ -574,6 +582,18 @@ impl IsspMultipathBalancingSnapshot {
                 .latency_drift_metrics()
                 .preemptive_reallocations_total,
             total_priority_evictions: router.latency_drift_metrics().priority_evictions_total,
+            total_resilience_partition_failovers: router
+                .slice_resilience_metrics()
+                .partition_failovers_executed,
+            total_asymmetric_reroutes: router
+                .slice_resilience_metrics()
+                .asymmetric_reroutes_executed,
+            total_elastic_flows_throttled: router
+                .slice_resilience_metrics()
+                .elastic_flows_throttled,
+            priority_sla_preservation_ratio: router
+                .slice_resilience_metrics()
+                .priority_sla_preservation_ratio,
             last_gradient_variance: router.cost_gradient_metrics().last_gradient_variance,
             active_flows_by_slice: {
                 let mut m = BTreeMap::new();
@@ -1503,6 +1523,42 @@ impl PrometheusMultipathBalancingExporter {
         out.push_str(&format!(
             "ifa_slice_priority_evictions_total{} {}\n",
             base_lbl, s.total_priority_evictions
+        ));
+
+        out.push_str(
+            "# HELP ifa_slice_resilience_partition_failovers_total Resilient failovers executed during network partitions.\n",
+        );
+        out.push_str("# TYPE ifa_slice_resilience_partition_failovers_total counter\n");
+        out.push_str(&format!(
+            "ifa_slice_resilience_partition_failovers_total{} {}\n",
+            base_lbl, s.total_resilience_partition_failovers
+        ));
+
+        out.push_str(
+            "# HELP ifa_slice_asymmetric_reroutes_total Proactive reroutes away from asymmetrically degraded subpaths.\n",
+        );
+        out.push_str("# TYPE ifa_slice_asymmetric_reroutes_total counter\n");
+        out.push_str(&format!(
+            "ifa_slice_asymmetric_reroutes_total{} {}\n",
+            base_lbl, s.total_asymmetric_reroutes
+        ));
+
+        out.push_str(
+            "# HELP ifa_slice_elastic_throttled_total Elastic flows throttled to protect priority slice headroom.\n",
+        );
+        out.push_str("# TYPE ifa_slice_elastic_throttled_total counter\n");
+        out.push_str(&format!(
+            "ifa_slice_elastic_throttled_total{} {}\n",
+            base_lbl, s.total_elastic_flows_throttled
+        ));
+
+        out.push_str(
+            "# HELP ifa_slice_priority_sla_ratio Ratio of priority flows maintaining SLA under adverse conditions.\n",
+        );
+        out.push_str("# TYPE ifa_slice_priority_sla_ratio gauge\n");
+        out.push_str(&format!(
+            "ifa_slice_priority_sla_ratio{} {:.4}\n",
+            base_lbl, s.priority_sla_preservation_ratio
         ));
 
         out

@@ -1369,6 +1369,10 @@ pub fn create_saturated_multipath_snapshot(
         total_cost_gradient_migrations: 0,
         total_preemptive_reallocations: 0,
         total_priority_evictions: 0,
+        total_resilience_partition_failovers: 0,
+        total_asymmetric_reroutes: 0,
+        total_elastic_flows_throttled: 0,
+        priority_sla_preservation_ratio: 1.0,
         last_gradient_variance: 0.0,
         active_flows_by_slice: BTreeMap::new(),
         sla_violations_by_slice: BTreeMap::new(),
@@ -3390,6 +3394,10 @@ pub fn run_mesh_lsa_synchronization_benchmark(
 }
 
 /// Comprehensive benchmark report evaluating dynamic traffic slicing performance under heterogeneous load (URLLC vs eMBB).
+pub use crate::slice_resilience::{
+    run_slice_resilience_benchmark, SliceResilienceBenchmarkReport,
+};
+
 #[derive(Debug, Clone)]
 pub struct TrafficSlicingBenchmarkReport {
     /// Total evaluated traffic flows.
@@ -4304,5 +4312,30 @@ mod tests {
         let json = report.to_json();
         assert!(json.contains("\"total_flows\": 100"));
         assert!(json.contains("\"verification_passed\": true"));
+    }
+
+    #[test]
+    fn test_slice_resilience_benchmark_suite_runs() {
+        let report = run_slice_resilience_benchmark(60, 4);
+        assert_eq!(report.total_flows, 60);
+        assert!(report.urllc_flows_count > 0);
+        assert!(report.mission_critical_flows_count > 0);
+        assert!(report.embb_flows_count > 0);
+        assert!(report.urllc_sla_compliance_pct >= 99.0);
+        assert!(report.mission_critical_sla_compliance_pct >= 99.0);
+        assert_eq!(report.flapping_violations, 0);
+        assert!(report.partition_failover_cutover_us > 0.0);
+        assert!(report.asymmetric_evasion_latency_us > 0.0);
+        assert!(report.throughput_evaluations_per_sec > 0.0);
+        assert!(report.verification_passed);
+
+        let md = report.to_markdown_table();
+        assert!(md.contains("Primary Subpath Severance (Partition)"));
+        assert!(md.contains("Reverse Bufferbloat Asymmetry"));
+        assert!(md.contains("PASSED"));
+
+        let json = report.to_json();
+        assert!(json.contains("\"total_flows\":60") || json.contains("\"total_flows\": 60"));
+        assert!(json.contains("\"verification_passed\":true") || json.contains("\"verification_passed\": true"));
     }
 }

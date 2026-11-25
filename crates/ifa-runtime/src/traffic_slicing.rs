@@ -208,6 +208,14 @@ pub enum SliceMigrationReason {
     RebalanceOptimization,
     /// Proactive migration triggered to avert predicted SLA latency or bufferbloat violation.
     PreemptiveDriftMitigation,
+    /// Subpath severed due to network partition or interface disconnect; failover to surviving subpath.
+    NetworkPartitionFailover,
+    /// Severe asymmetric degradation (e.g. reverse bufferbloat or unidirectional loss) on subpath.
+    AsymmetricDegradationEvasion,
+    /// Elastic bulk flow gracefully throttled or shed to protect high-priority slice headroom.
+    GracefulCapacityShedding,
+    /// Partition healed and subpath completed probation; flow safely restored to primary subpath.
+    PartitionHealingRestoration,
 }
 
 impl SliceMigrationReason {
@@ -221,6 +229,10 @@ impl SliceMigrationReason {
             Self::PathUnusable => "path_unusable",
             Self::RebalanceOptimization => "rebalance_optimization",
             Self::PreemptiveDriftMitigation => "preemptive_drift_mitigation",
+            Self::NetworkPartitionFailover => "network_partition_failover",
+            Self::AsymmetricDegradationEvasion => "asymmetric_degradation_evasion",
+            Self::GracefulCapacityShedding => "graceful_capacity_shedding",
+            Self::PartitionHealingRestoration => "partition_healing_restoration",
         }
     }
 }

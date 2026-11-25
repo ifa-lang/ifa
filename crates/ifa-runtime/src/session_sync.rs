@@ -2314,6 +2314,7 @@ pub struct IsspDynamicMultipathRouter {
     pub flow_slicing: crate::traffic_slicing::FlowSliceNegotiator,
     pub cost_gradient_balancer: crate::cost_gradient::CostGradientLoadBalancer,
     pub latency_drift_monitor: crate::latency_drift::LatencyDriftMonitor,
+    pub slice_resilience: crate::slice_resilience::SliceResilienceManager,
 }
 
 impl IsspDynamicMultipathRouter {
@@ -2345,6 +2346,7 @@ impl IsspDynamicMultipathRouter {
             flow_slicing: crate::traffic_slicing::FlowSliceNegotiator::new(),
             cost_gradient_balancer: crate::cost_gradient::CostGradientLoadBalancer::default(),
             latency_drift_monitor: crate::latency_drift::LatencyDriftMonitor::default(),
+            slice_resilience: crate::slice_resilience::SliceResilienceManager::default(),
         }
     }
 
@@ -3412,6 +3414,41 @@ impl IsspDynamicMultipathRouter {
     /// Read access to latency drift monitor metrics.
     pub fn latency_drift_metrics(&self) -> &crate::latency_drift::LatencyDriftMetrics {
         self.latency_drift_monitor.metrics()
+    }
+
+    /// Update directional telemetry for a subpath in the slice resilience manager.
+    pub fn update_subpath_directional_telemetry(
+        &mut self,
+        sample: crate::slice_resilience::DirectionalTelemetrySample,
+    ) {
+        self.slice_resilience.update_subpath_telemetry(sample);
+    }
+
+    /// Evaluate slice resilience under network partitions and asymmetric degradations,
+    /// synchronizing internal router bindings with resilient slice decisions.
+    pub fn evaluate_slice_resilience(
+        &mut self,
+        now_ms: u64,
+    ) -> Vec<crate::slice_resilience::ResilienceMigrationAction> {
+        let actions = self
+            .slice_resilience
+            .evaluate_and_enforce_resilience(&mut self.flow_slicing, now_ms);
+
+        for action in &actions {
+            self.session_bindings
+                .insert(action.session_id, action.to_path_id);
+            if let Some(r) = self.paths.get_mut(&action.to_path_id) {
+                if r.state == IsspPathState::Standby {
+                    r.state = IsspPathState::Active;
+                }
+            }
+        }
+        actions
+    }
+
+    /// Read access to slice resilience metrics.
+    pub fn slice_resilience_metrics(&self) -> &crate::slice_resilience::SliceResilienceMetrics {
+        self.slice_resilience.metrics()
     }
 
     /// Return an iterator over all registered routes.
@@ -8098,6 +8135,106 @@ mod tests {
             router
                 .latency_drift_metrics()
                 .preemptive_reallocations_total,
+            1
+        );
+    }
+
+    #[test]
+    fn test_router_slice_resilience_integration() {
+        let mut router =
+            IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::BandwidthAggregation);
+        router.add_route(IsspMultipathRoute::new(10, 2, "eth0-wan", 1, 100));
+        router.add_route(IsspMultipathRoute::new(20, 2, "wwan0-5g", 2, 50));
+
+        let s1 = SessionId::new(888, 1, 0);
+        router.register_flow_qos_profile(
+            s1,
+            crate::traffic_slicing::FlowQoSProfile::ultra_low_latency(),
+        );
+        router.bind_session(s1, 10).expect("bind s1");
+        router.flow_slicing.force_reassign_flow(&s1, 10, 1000);
+
+        let s_p10 = crate::slice_resilience::DirectionalTelemetrySample {
+            path_id: 10,
+            interface_name: "eth0-wan".to_string(),
+            forward_rtt_us: 1_000,
+            reverse_rtt_us: 1_000,
+            forward_queuing_delay_us: 200,
+            reverse_queuing_delay_us: 200,
+            forward_jitter_us: 100,
+            reverse_jitter_us: 100,
+            forward_loss_ppm: 0,
+            reverse_loss_ppm: 0,
+            forward_capacity_bps: 1_000_000_000,
+            reverse_capacity_bps: 1_000_000_000,
+            forward_throughput_bps: 10_000_000,
+            reverse_throughput_bps: 10_000_000,
+            is_forward_up: true,
+            is_reverse_up: true,
+            timestamp_ms: 1000,
+        };
+
+        let s_p20 = crate::slice_resilience::DirectionalTelemetrySample {
+            path_id: 20,
+            interface_name: "wwan0-5g".to_string(),
+            forward_rtt_us: 2_000,
+            reverse_rtt_us: 2_000,
+            forward_queuing_delay_us: 300,
+            reverse_queuing_delay_us: 300,
+            forward_jitter_us: 150,
+            reverse_jitter_us: 150,
+            forward_loss_ppm: 0,
+            reverse_loss_ppm: 0,
+            forward_capacity_bps: 500_000_000,
+            reverse_capacity_bps: 500_000_000,
+            forward_throughput_bps: 10_000_000,
+            reverse_throughput_bps: 10_000_000,
+            is_forward_up: true,
+            is_reverse_up: true,
+            timestamp_ms: 1000,
+        };
+
+        router.update_subpath_directional_telemetry(s_p10);
+        router.update_subpath_directional_telemetry(s_p20);
+
+        // Under normal symmetric conditions, no action needed
+        let initial_actions = router.evaluate_slice_resilience(1000);
+        assert_eq!(initial_actions.len(), 0);
+
+        // Induce severe reverse bufferbloat on Path 10
+        let s_p10_bloat = router
+            .slice_resilience
+            .diagnose_subpath_asymmetry(10);
+        assert_eq!(s_p10_bloat, crate::slice_resilience::AsymmetricDegradationKind::None);
+
+        let s_p10_degraded = crate::slice_resilience::DirectionalTelemetrySample {
+            path_id: 10,
+            interface_name: "eth0-wan".to_string(),
+            forward_rtt_us: 1_000,
+            reverse_rtt_us: 35_000, // 35ms reverse RTT
+            forward_queuing_delay_us: 200,
+            reverse_queuing_delay_us: 30_000, // 30ms reverse queue (150x asymmetry)
+            forward_jitter_us: 100,
+            reverse_jitter_us: 2_500,
+            forward_loss_ppm: 0,
+            reverse_loss_ppm: 0,
+            forward_capacity_bps: 1_000_000_000,
+            reverse_capacity_bps: 1_000_000_000,
+            forward_throughput_bps: 10_000_000,
+            reverse_throughput_bps: 10_000_000,
+            is_forward_up: true,
+            is_reverse_up: true,
+            timestamp_ms: 2000,
+        };
+        router.update_subpath_directional_telemetry(s_p10_degraded);
+
+        let actions = router.evaluate_slice_resilience(2000);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].session_id, s1);
+        assert_eq!(actions[0].to_path_id, 20);
+        assert_eq!(router.get_session_path(&s1), Some(20));
+        assert_eq!(
+            router.slice_resilience_metrics().asymmetric_reroutes_executed,
             1
         );
     }

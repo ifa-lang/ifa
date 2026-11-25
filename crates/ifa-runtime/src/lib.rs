@@ -17,6 +17,7 @@ pub mod panic;
 pub mod reactor;
 pub mod session_sync;
 pub mod simd_classifier;
+pub mod slice_resilience;
 pub mod string;
 pub mod telemetry;
 pub mod telemetry_queue;
@@ -137,6 +138,12 @@ pub use simd_classifier::{
     IsspCapsuleHeader, IsspCapsuleView, IsspClassifiedBatch, IsspPacketPriority,
     IsspSimdPacketClassifier, IsspTelemetryPacketClass, ISSP_FAMILY_PREFIX, ISSP_MIGRATION_MAGIC,
     ISSP_TELEMETRY_MAGIC, ISSP_TRACE_MAGIC,
+};
+pub use slice_resilience::{
+    run_slice_resilience_benchmark, AsymmetricDegradationKind, DirectionalTelemetrySample,
+    PartitionTopologyState, ResilienceActionKind, ResilienceMigrationAction,
+    SliceResilienceBenchmarkReport, SliceResilienceConfig, SliceResilienceManager,
+    SliceResilienceMetrics, SubpathProbationTracker,
 };
 pub use string::IfaString;
 pub use telemetry::{
