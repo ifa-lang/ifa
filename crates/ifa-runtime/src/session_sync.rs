@@ -1191,6 +1191,249 @@ pub enum OpportunisticSecurityLevel {
     Required,
 }
 
+// ─── Congestion Control: BBR / LEDBAT ────────────────────────────────────────
+
+/// High-level congestion phase that governs pacing and window scaling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IsspCongestionPhase {
+    /// Slow-start: exponential growth until first congestion signal.
+    #[default]
+    SlowStart,
+    /// Steady-state bandwidth probing and congestion avoidance.
+    CongestionAvoidance,
+    /// Loss recovery: retransmission without bandwidth probing.
+    Recovery,
+}
+
+/// Per-subpath congestion state: phase + unified bandwidth estimate.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct IsspCongestionState {
+    /// Current congestion phase.
+    pub phase: IsspCongestionPhase,
+    /// BBR model for this subpath.
+    pub bbr: IsspBbrState,
+    /// LEDBAT model for this subpath.
+    pub ledbat: IsspLedbatState,
+    /// Bytes transmitted since last congestion feedback update.
+    pub bytes_in_flight: u64,
+    /// Number of congestion events observed on this subpath.
+    pub congestion_events: u64,
+}
+
+impl IsspCongestionState {
+    /// Feed a new RTT sample (µs) and optional loss signal.
+    /// Returns the updated bandwidth-weighted route weight adjustment factor
+    /// in [0.0, 1.0] — 1.0 means no congestion, 0.0 means path fully blocked.
+    pub fn update(&mut self, rtt_us: u64, lost_bytes: u64, delivered_bytes: u64) -> f64 {
+        self.bbr.update(rtt_us, delivered_bytes);
+        self.ledbat.update(rtt_us);
+
+        if lost_bytes > 0 || self.ledbat.is_congested() {
+            self.congestion_events += 1;
+            self.phase = IsspCongestionPhase::Recovery;
+        } else if matches!(
+            self.phase,
+            IsspCongestionPhase::Recovery | IsspCongestionPhase::SlowStart
+        ) && (self.phase == IsspCongestionPhase::Recovery
+            || self.bbr.estimated_bandwidth_bps > 0)
+        {
+            self.phase = IsspCongestionPhase::CongestionAvoidance;
+        }
+
+        self.congestion_weight_factor()
+    }
+
+    /// Compute a [0.0, 1.0] weight factor based on current congestion state.
+    pub fn congestion_weight_factor(&self) -> f64 {
+        let phase_factor = match self.phase {
+            // SlowStart with no data yet → neutral (1.0); once BBR has estimate → 0.85
+            IsspCongestionPhase::SlowStart => {
+                if self.bbr.estimated_bandwidth_bps == 0 {
+                    1.0
+                } else {
+                    0.85
+                }
+            }
+            IsspCongestionPhase::CongestionAvoidance => 1.00,
+            IsspCongestionPhase::Recovery => 0.40,
+        };
+        // LEDBAT queuing pressure: reduce weight when queuing delay is large
+        let ledbat_factor = self.ledbat.weight_factor();
+        // BBR: if no bandwidth estimate yet, stay neutral
+        let bbr_factor = self.bbr.weight_factor();
+        (phase_factor * ledbat_factor * bbr_factor).clamp(0.05, 1.0)
+    }
+}
+
+// ─── BBR State ────────────────────────────────────────────────────────────────
+
+/// Simplified BBR (Bottleneck Bandwidth and RTT) model for per-subpath pacing.
+///
+/// Tracks `BtlBw` (bottleneck bandwidth) using a max-filter over a delivery
+/// window and `RTprop` (minimum propagation RTT) using a min-filter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspBbrState {
+    /// Estimated bottleneck bandwidth in bits per second.
+    pub estimated_bandwidth_bps: u64,
+    /// Minimum observed RTT (propagation delay) in microseconds.
+    pub rt_prop_us: u64,
+    /// Total bytes delivered since last estimate refresh.
+    delivered_bytes: u64,
+    /// Last RTT sample used for pacing gain calculation.
+    last_rtt_us: u64,
+    /// Sliding window of recent bandwidth samples (bytes/µs × 1e6 = bps).
+    bw_window: [u64; 8],
+    /// Current position in the sliding window.
+    bw_window_pos: usize,
+    /// Pacing gain (Q8.8 fixed-point: 256 = 1.0×, 288 = 1.125×, 204 = 0.8×).
+    pub pacing_gain_q8: u32,
+}
+
+impl Default for IsspBbrState {
+    fn default() -> Self {
+        Self {
+            estimated_bandwidth_bps: 0,
+            rt_prop_us: u64::MAX,
+            delivered_bytes: 0,
+            last_rtt_us: 0,
+            bw_window: [0u64; 8],
+            bw_window_pos: 0,
+            pacing_gain_q8: 288, // 1.125× — startup / slow-start pacing
+        }
+    }
+}
+
+impl IsspBbrState {
+    /// Update the BBR model with a new RTT sample and delivered byte count.
+    pub fn update(&mut self, rtt_us: u64, newly_delivered_bytes: u64) {
+        if rtt_us == 0 {
+            return;
+        }
+        self.last_rtt_us = rtt_us;
+        // Update RTprop (minimum RTT)
+        if rtt_us < self.rt_prop_us {
+            self.rt_prop_us = rtt_us;
+        }
+        self.delivered_bytes += newly_delivered_bytes;
+        // Bandwidth sample: bytes/µs → bps (× 8 × 1e6 / rtt_us)
+        if newly_delivered_bytes > 0 {
+            // bps = bytes * 8 * 1_000_000 / rtt_us
+            let bps = newly_delivered_bytes.saturating_mul(8_000_000) / rtt_us;
+            self.bw_window[self.bw_window_pos % 8] = bps;
+            self.bw_window_pos = self.bw_window_pos.wrapping_add(1);
+            // BtlBw = max over window
+            self.estimated_bandwidth_bps = *self.bw_window.iter().max().unwrap_or(&0);
+        }
+        // After gaining enough BW info, switch to 1.0× pacing
+        if self.estimated_bandwidth_bps > 0 {
+            self.pacing_gain_q8 = 256;
+        }
+    }
+
+    /// Weight factor based on BBR pacing gain: low gain → lower weight.
+    pub fn weight_factor(&self) -> f64 {
+        if self.estimated_bandwidth_bps == 0 {
+            return 1.0; // no info yet — neutral
+        }
+        // Normalise pacing gain: 256 (1.0) → 1.0, 204 (0.8) → 0.8
+        (self.pacing_gain_q8 as f64 / 256.0).clamp(0.5, 1.5)
+    }
+}
+
+// ─── LEDBAT State ─────────────────────────────────────────────────────────────
+
+/// LEDBAT (Low Extra Delay Background Transport, RFC 6817) delay-based
+/// congestion controller for per-subpath queuing estimation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspLedbatState {
+    /// Base one-way delay (minimum observed RTT/2), in microseconds.
+    pub base_delay_us: u64,
+    /// Current one-way delay estimate (RTT/2), in microseconds.
+    pub current_delay_us: u64,
+    /// Queuing delay = current_delay − base_delay (µs).
+    pub queuing_delay_us: u64,
+    /// LEDBAT target queuing delay (default: 25 ms per RFC 6817).
+    pub target_delay_us: u64,
+    /// CWND estimate in bytes.
+    pub cwnd_bytes: u64,
+    /// Gain factor for CWND adjustment (default: 1.0).
+    pub gain: f64,
+}
+
+impl Default for IsspLedbatState {
+    fn default() -> Self {
+        Self {
+            base_delay_us: u64::MAX,
+            current_delay_us: 0,
+            queuing_delay_us: 0,
+            target_delay_us: 25_000, // 25 ms
+            cwnd_bytes: 65_536,      // 64 KiB initial CWND
+            gain: 1.0,
+        }
+    }
+}
+
+impl IsspLedbatState {
+    /// Feed a new RTT sample and update queuing delay / CWND.
+    pub fn update(&mut self, rtt_us: u64) {
+        if rtt_us == 0 {
+            return;
+        }
+        // One-way delay approximation: RTT/2
+        let owd = rtt_us / 2;
+        self.current_delay_us = owd;
+
+        // Update base delay (min filter)
+        if owd < self.base_delay_us {
+            self.base_delay_us = owd;
+        }
+
+        // Queuing delay
+        self.queuing_delay_us = self.current_delay_us.saturating_sub(self.base_delay_us);
+
+        // CWND adjustment: RFC 6817 §5
+        //   off_target = (TARGET - queuing_delay) / TARGET
+        //   cwnd += GAIN * off_target * MSS
+        let mss: i64 = 1460; // bytes
+        let off_target = (self.target_delay_us as i64 - self.queuing_delay_us as i64) as f64
+            / self.target_delay_us as f64;
+        let delta = (self.gain * off_target * mss as f64).round() as i64;
+        self.cwnd_bytes = ((self.cwnd_bytes as i64).saturating_add(delta)).max(mss) as u64;
+    }
+
+    /// True when queuing delay exceeds the LEDBAT target — congestion signal.
+    pub fn is_congested(&self) -> bool {
+        self.queuing_delay_us > self.target_delay_us
+    }
+
+    /// Weight factor: 1.0 when no queuing, decreases towards 0 as queuing grows.
+    pub fn weight_factor(&self) -> f64 {
+        if self.base_delay_us == u64::MAX {
+            return 1.0; // not yet initialised
+        }
+        let ratio = self.queuing_delay_us as f64 / self.target_delay_us as f64;
+        // Smooth penalisation: 0 queuing → 1.0, 2× target → ~0.33
+        (1.0 / (1.0 + ratio)).clamp(0.1, 1.0)
+    }
+}
+
+// ─── Bandwidth Estimate ───────────────────────────────────────────────────────
+
+/// Aggregated per-subpath bandwidth and congestion estimate exposed to the router.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspBandwidthEstimate {
+    /// Estimated available bandwidth in bits per second (BBR BtlBw).
+    pub available_bps: u64,
+    /// Queuing delay estimate from LEDBAT (µs).
+    pub queuing_delay_us: u64,
+    /// Congestion weight factor in [0.05, 1.0].
+    pub weight_factor: f64,
+    /// Current congestion phase.
+    pub phase: IsspCongestionPhase,
+}
+
+// ─── IsspMultipathRoute (now includes congestion state) ───────────────────────
+
 /// A member transport path within an ISSP dynamic multipath routing table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IsspMultipathRoute {
@@ -1220,6 +1463,8 @@ pub struct IsspMultipathRoute {
     pub probation_state: IsspProbationState,
     /// Subpath opportunistic encryption level.
     pub security_level: OpportunisticSecurityLevel,
+    /// Per-subpath congestion control state (BBR + LEDBAT).
+    pub congestion: IsspCongestionState,
 }
 
 impl IsspMultipathRoute {
@@ -1244,20 +1489,37 @@ impl IsspMultipathRoute {
             flap_state: IsspRouteFlapState::default(),
             probation_state: IsspProbationState::default(),
             security_level: OpportunisticSecurityLevel::Plaintext,
+            congestion: IsspCongestionState::default(),
         }
     }
 
     /// Calculate current effective scheduling weight considering degradation and probation ramp.
     pub fn effective_weight(&self) -> u32 {
-        match self.state {
-            IsspPathState::Active => self.weight.max(1),
-            IsspPathState::Standby => self.weight.max(1),
-            IsspPathState::Degraded => (self.weight / 2).max(1),
+        if self.state == IsspPathState::Failed {
+            return 0;
+        }
+        let base = match self.state {
+            IsspPathState::Active => self.weight.max(1) as f64,
+            IsspPathState::Standby => self.weight.max(1) as f64,
+            IsspPathState::Degraded => (self.weight / 2).max(1) as f64,
             IsspPathState::Probation => {
                 let scaled = (self.weight as f64) * self.probation_state.weight_ratio;
-                scaled.round().max(1.0) as u32
+                scaled.round().max(1.0)
             }
-            IsspPathState::Failed => 0,
+            IsspPathState::Failed => 0.0,
+        };
+        // Apply congestion weight factor (BBR+LEDBAT) — clamp to at least 1
+        let cw = self.congestion.congestion_weight_factor();
+        ((base * cw).round() as u32).max(1)
+    }
+
+    /// Retrieve an aggregated bandwidth estimate for this subpath.
+    pub fn bandwidth_estimate(&self) -> IsspBandwidthEstimate {
+        IsspBandwidthEstimate {
+            available_bps: self.congestion.bbr.estimated_bandwidth_bps,
+            queuing_delay_us: self.congestion.ledbat.queuing_delay_us,
+            weight_factor: self.congestion.congestion_weight_factor(),
+            phase: self.congestion.phase,
         }
     }
 
@@ -2148,6 +2410,53 @@ impl IsspDynamicMultipathRouter {
     /// Retrieve reintegration events history.
     pub fn reintegration_history(&self) -> &[IsspReintegrationEvent] {
         &self.reintegration_history
+    }
+
+    // ─── Congestion feedback API ──────────────────────────────────────────────
+
+    /// Feed a congestion measurement for a specific subpath.
+    ///
+    /// `rtt_us`             — latest RTT sample in microseconds  
+    /// `lost_bytes`         — bytes confirmed lost in this feedback interval  
+    /// `delivered_bytes`    — bytes confirmed delivered in this feedback interval  
+    ///
+    /// Updates BBR and LEDBAT models, advances the congestion phase, and
+    /// adjusts the route's dynamic weight accordingly.
+    /// Returns the new congestion weight factor in [0.05, 1.0].
+    pub fn update_congestion_feedback(
+        &mut self,
+        path_id: u32,
+        rtt_us: u64,
+        lost_bytes: u64,
+        delivered_bytes: u64,
+    ) -> Result<f64, SyncError> {
+        let route = self
+            .paths
+            .get_mut(&path_id)
+            .ok_or(SyncError::PathNotFound(path_id))?;
+        // Also update path RTT metrics for unified visibility
+        route.metrics.update_rtt(rtt_us);
+        let factor = route.congestion.update(rtt_us, lost_bytes, delivered_bytes);
+        Ok(factor)
+    }
+
+    /// Return per-subpath bandwidth estimates for all registered paths.
+    pub fn bandwidth_estimates(&self) -> Vec<(u32, IsspBandwidthEstimate)> {
+        self.paths
+            .values()
+            .map(|r| (r.path_id, r.bandwidth_estimate()))
+            .collect()
+    }
+
+    /// Return the bandwidth estimate for a single path.
+    pub fn path_bandwidth_estimate(
+        &self,
+        path_id: u32,
+    ) -> Result<IsspBandwidthEstimate, SyncError> {
+        self.paths
+            .get(&path_id)
+            .map(|r| r.bandwidth_estimate())
+            .ok_or(SyncError::PathNotFound(path_id))
     }
 
     /// Generate an aggregated telemetry report across all paths.
@@ -4375,6 +4684,198 @@ pub struct SyncTelemetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Congestion Control Tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_ledbat_no_queuing_weight_is_one() {
+        let mut s = IsspLedbatState::default();
+        // Feed same RTT twice → queuing delay = 0
+        s.update(10_000);
+        s.update(10_000);
+        assert_eq!(s.queuing_delay_us, 0);
+        assert!(!s.is_congested());
+        let wf = s.weight_factor();
+        assert!(
+            (wf - 1.0).abs() < 1e-6,
+            "weight_factor should be 1.0, got {wf}"
+        );
+    }
+
+    #[test]
+    fn test_ledbat_congested_weight_decreases() {
+        let mut s = IsspLedbatState::default();
+        // Set low base delay then high current delay → congestion
+        s.update(10_000); // base = 5000 µs
+        s.update(80_000); // current = 40000 µs → queuing = 35000 µs > target(25000)
+        assert!(s.is_congested(), "should be congested");
+        let wf = s.weight_factor();
+        assert!(
+            wf < 1.0,
+            "weight_factor should decrease under congestion, got {wf}"
+        );
+        assert!(wf > 0.0, "weight_factor must stay positive, got {wf}");
+    }
+
+    #[test]
+    fn test_bbr_bandwidth_estimate_grows() {
+        let mut b = IsspBbrState::default();
+        // Feed several samples with 1 Mib delivered over 10ms RTT
+        for _ in 0..8 {
+            b.update(10_000, 125_000); // 125 KiB / 10ms ≈ 100 Mbps
+        }
+        assert!(
+            b.estimated_bandwidth_bps > 0,
+            "BBR should produce a BW estimate"
+        );
+        // 125_000 * 8_000_000 / 10_000 = 100_000_000 bps
+        assert_eq!(b.estimated_bandwidth_bps, 100_000_000);
+        assert_eq!(b.pacing_gain_q8, 256); // settled to 1.0×
+    }
+
+    #[test]
+    fn test_bbr_rt_prop_min_filter() {
+        let mut b = IsspBbrState::default();
+        b.update(50_000, 1000);
+        b.update(30_000, 1000); // new minimum
+        b.update(40_000, 1000);
+        assert_eq!(
+            b.rt_prop_us, 30_000,
+            "RTprop should be minimum observed RTT"
+        );
+    }
+
+    #[test]
+    fn test_congestion_state_phase_transitions() {
+        let mut cs = IsspCongestionState::default();
+        assert_eq!(cs.phase, IsspCongestionPhase::SlowStart);
+
+        // Deliver bytes → transitions to CongestionAvoidance once BBR has estimate
+        for _ in 0..8 {
+            cs.update(10_000, 0, 125_000);
+        }
+        assert_eq!(cs.phase, IsspCongestionPhase::CongestionAvoidance);
+
+        // Loss signal → Recovery
+        cs.update(10_000, 1000, 0);
+        assert_eq!(cs.phase, IsspCongestionPhase::Recovery);
+        assert_eq!(cs.congestion_events, 1);
+
+        // No further loss → back to CongestionAvoidance
+        cs.update(10_000, 0, 1000);
+        assert_eq!(cs.phase, IsspCongestionPhase::CongestionAvoidance);
+    }
+
+    #[test]
+    fn test_congestion_weight_factor_recovery_reduces_weight() {
+        let mut cs = IsspCongestionState::default();
+        // Establish baseline
+        for _ in 0..8 {
+            cs.update(10_000, 0, 125_000);
+        }
+        let normal_wf = cs.congestion_weight_factor();
+
+        // Inject loss to enter Recovery
+        cs.update(10_000, 500, 0);
+        let recovery_wf = cs.congestion_weight_factor();
+        assert!(
+            recovery_wf < normal_wf,
+            "Recovery weight_factor ({recovery_wf}) should be less than normal ({normal_wf})"
+        );
+    }
+
+    #[test]
+    fn test_effective_weight_reduced_by_congestion() {
+        let mut route = IsspMultipathRoute::new(1, 2, "eth0", 1, 100);
+
+        // Establish CongestionAvoidance baseline (phase_factor = 1.0, LEDBAT neutral)
+        for _ in 0..8 {
+            route.congestion.update(10_000, 0, 125_000);
+        }
+        assert_eq!(
+            route.congestion.phase,
+            IsspCongestionPhase::CongestionAvoidance
+        );
+        let baseline = route.effective_weight();
+        // Should be 100 × 1.0 (phase) × ~1.0 (LEDBAT no queuing) × 1.0 (BBR settled)
+        assert_eq!(
+            baseline, 100,
+            "CongestionAvoidance with no queuing → full weight"
+        );
+
+        // Simulate loss → Recovery phase (phase_factor = 0.4)
+        route.congestion.update(10_000, 1000, 0);
+        assert_eq!(route.congestion.phase, IsspCongestionPhase::Recovery);
+        let recovery_weight = route.effective_weight();
+        assert!(
+            recovery_weight < baseline,
+            "effective_weight ({recovery_weight}) should drop under congestion vs baseline ({baseline})"
+        );
+        assert!(recovery_weight >= 1, "effective_weight must be at least 1");
+    }
+
+    #[test]
+    fn test_bandwidth_estimate_accessors() {
+        let mut route = IsspMultipathRoute::new(1, 2, "eth0", 1, 100);
+        // Feed BBR data
+        for _ in 0..8 {
+            route.congestion.update(10_000, 0, 125_000);
+        }
+        let est = route.bandwidth_estimate();
+        assert_eq!(est.available_bps, 100_000_000);
+        assert_eq!(est.phase, IsspCongestionPhase::CongestionAvoidance);
+        assert!(
+            (est.weight_factor - 1.0).abs() < 0.1,
+            "weight_factor should be near 1.0"
+        );
+    }
+
+    #[test]
+    fn test_router_update_congestion_feedback_and_bandwidth_estimates() {
+        let mut router =
+            IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::BandwidthAggregation);
+        router.add_route(IsspMultipathRoute::new(1, 2, "eth0", 1, 100));
+        router.add_route(IsspMultipathRoute::new(2, 2, "wlan0", 2, 50));
+
+        // Feed good conditions on path 1
+        for _ in 0..8 {
+            let f = router
+                .update_congestion_feedback(1, 10_000, 0, 125_000)
+                .unwrap();
+            assert!(f > 0.0 && f <= 1.0);
+        }
+        // Feed loss on path 2
+        router
+            .update_congestion_feedback(2, 50_000, 500, 0)
+            .unwrap();
+
+        let estimates = router.bandwidth_estimates();
+        assert_eq!(estimates.len(), 2);
+
+        let est1 = router.path_bandwidth_estimate(1).unwrap();
+        assert_eq!(est1.available_bps, 100_000_000);
+        assert_eq!(est1.phase, IsspCongestionPhase::CongestionAvoidance);
+
+        let est2 = router.path_bandwidth_estimate(2).unwrap();
+        assert_eq!(est2.phase, IsspCongestionPhase::Recovery);
+
+        // path 1 effective_weight should be much higher than path 2 under congestion
+        let r1 = router.get_route(1).unwrap();
+        let r2 = router.get_route(2).unwrap();
+        assert!(
+            r1.effective_weight() > r2.effective_weight(),
+            "path 1 ({}w) should outweigh path 2 ({}w) under congestion",
+            r1.effective_weight(),
+            r2.effective_weight()
+        );
+    }
+
+    #[test]
+    fn test_router_unknown_path_congestion_feedback_errors() {
+        let mut router = IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::ActiveStandby);
+        let result = router.update_congestion_feedback(99, 10_000, 0, 1000);
+        assert_eq!(result, Err(SyncError::PathNotFound(99)));
+    }
 
     fn make_id(flow: u64) -> SessionId {
         SessionId::new(flow, 1, 0xDEAD)

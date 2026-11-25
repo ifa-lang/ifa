@@ -63,10 +63,11 @@ pub use reactor::{
     KernelTimespec, GLOBAL_REACTOR,
 };
 pub use session_sync::{
-    ClusterPsk, GossipFrame, GossipResult, IsspAdaptiveHeaderCompressor, IsspCapsule,
-    IsspDeliveredPacket, IsspDynamicMultipathRouter, IsspFailoverEvent, IsspFailoverReason,
-    IsspFlapDampingConfig, IsspFlapEvent, IsspHeaderCompressionTelemetry, IsspHeaderContextEntry,
-    IsspHeartbeatProbe, IsspMultipathRoute, IsspMultipathTelemetry, IsspPathMetrics, IsspPathState,
+    ClusterPsk, GossipFrame, GossipResult, IsspAdaptiveHeaderCompressor, IsspBandwidthEstimate,
+    IsspBbrState, IsspCapsule, IsspCongestionPhase, IsspCongestionState, IsspDeliveredPacket,
+    IsspDynamicMultipathRouter, IsspFailoverEvent, IsspFailoverReason, IsspFlapDampingConfig,
+    IsspFlapEvent, IsspHeaderCompressionTelemetry, IsspHeaderContextEntry, IsspHeartbeatProbe,
+    IsspLedbatState, IsspMultipathRoute, IsspMultipathTelemetry, IsspPathMetrics, IsspPathState,
     IsspProbationConfig, IsspProbationState, IsspReintegrationEvent, IsspResequenceStatus,
     IsspResequencingBuffer, IsspResequencingTelemetry, IsspRouteFlapState, IsspRoutingPolicy,
     IsspScheduledPacket, IsspSessionHeader, IsspSubpathCryptoTunnel, IsspSubpathKey,
