@@ -2063,10 +2063,40 @@ mod tests {
                   Sec-WebSocket-Version: 13\r\n\r\n",
             )
             .unwrap();
-            let mut header = [0u8; 128];
-            let n = s.read(&mut header).unwrap();
-            let resp = std::str::from_utf8(&header[..n]).unwrap();
+            // Read 101 handshake response until delimiter
+            let mut resp_bytes: Vec<u8> = Vec::with_capacity(256);
+            let mut one = [0u8; 1];
+            loop {
+                s.read_exact(&mut one).unwrap();
+                resp_bytes.push(one[0]);
+                if resp_bytes.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let resp = std::str::from_utf8(&resp_bytes).unwrap();
             assert!(resp.starts_with("HTTP/1.1 101 Switching Protocols"));
+
+            // Read the 1 streamed text frame
+            let mut frame_hdr = [0u8; 2];
+            s.read_exact(&mut frame_hdr).unwrap();
+            assert_eq!(frame_hdr[0], 0x81);
+            let payload_len: usize = match frame_hdr[1] & 0x7F {
+                126 => {
+                    let mut ext = [0u8; 2];
+                    s.read_exact(&mut ext).unwrap();
+                    u16::from_be_bytes(ext) as usize
+                }
+                127 => {
+                    let mut ext = [0u8; 8];
+                    s.read_exact(&mut ext).unwrap();
+                    u64::from_be_bytes(ext) as usize
+                }
+                n => n as usize,
+            };
+            let mut payload = vec![0u8; payload_len];
+            s.read_exact(&mut payload).unwrap();
+            let json = std::str::from_utf8(&payload).unwrap();
+            assert!(json.contains("\"active_paths\""));
         });
 
         let mut res2 = None;
