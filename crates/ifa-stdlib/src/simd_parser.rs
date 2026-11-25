@@ -5424,6 +5424,10 @@ pub enum CapsuleType {
     PqcEncryptedRecord,
     /// Post-Quantum Key Update / Ratchet (type 0x3144).
     PqcKeyUpdate,
+    /// Distributed Telemetry W3C Trace Context Capsule (type 0x3150).
+    TelemetryTraceContext,
+    /// Distributed Telemetry Metrics Report Capsule (type 0x3151).
+    TelemetryMetricsReport,
     /// Unknown or custom capsule type identified by its 62-bit VarInt value.
     Unknown(u64),
 }
@@ -5442,6 +5446,8 @@ impl From<u64> for CapsuleType {
             0x3142 => CapsuleType::PqcHandshakeFinished,
             0x3143 => CapsuleType::PqcEncryptedRecord,
             0x3144 => CapsuleType::PqcKeyUpdate,
+            0x3150 => CapsuleType::TelemetryTraceContext,
+            0x3151 => CapsuleType::TelemetryMetricsReport,
             other => CapsuleType::Unknown(other),
         }
     }
@@ -5461,6 +5467,8 @@ impl From<CapsuleType> for u64 {
             CapsuleType::PqcHandshakeFinished => 0x3142,
             CapsuleType::PqcEncryptedRecord => 0x3143,
             CapsuleType::PqcKeyUpdate => 0x3144,
+            CapsuleType::TelemetryTraceContext => 0x3150,
+            CapsuleType::TelemetryMetricsReport => 0x3151,
             CapsuleType::Unknown(other) => other,
         }
     }
@@ -5529,6 +5537,16 @@ impl HttpCapsule {
     /// Construct a Post-Quantum key update capsule.
     pub fn pqc_key_update(payload: Vec<u8>) -> Self {
         Self::new(CapsuleType::PqcKeyUpdate, payload)
+    }
+
+    /// Construct a distributed telemetry W3C trace context capsule.
+    pub fn telemetry_trace_context(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::TelemetryTraceContext, payload)
+    }
+
+    /// Construct a distributed telemetry metrics report capsule.
+    pub fn telemetry_metrics_report(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::TelemetryMetricsReport, payload)
     }
 
     /// Encode this capsule into QUIC VarInt-framed wire format appended to `out`.

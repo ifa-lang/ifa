@@ -12571,6 +12571,7 @@ pub struct ExtendedConnectTunnel {
     pub sp_wdrr_scheduler: Option<StrictPriorityWdrrScheduler>,
     pub aqm_codel: Option<AqmCodelQueue>,
     pub pqc_session: Option<PqcSecureTunnelSession>,
+    pub telemetry: Option<DistributedTransportTelemetry>,
     ingress_buffer: std::collections::VecDeque<u8>,
     egress_frames: std::collections::VecDeque<Vec<u8>>,
     capsule_queue: std::collections::VecDeque<crate::simd_parser::HttpCapsule>,
@@ -12593,6 +12594,7 @@ impl ExtendedConnectTunnel {
             sp_wdrr_scheduler: None,
             aqm_codel: None,
             pqc_session: None,
+            telemetry: None,
             ingress_buffer: std::collections::VecDeque::with_capacity(4096),
             egress_frames: std::collections::VecDeque::new(),
             capsule_queue: std::collections::VecDeque::new(),
@@ -12625,6 +12627,12 @@ impl ExtendedConnectTunnel {
     /// Attach a Post-Quantum Hybrid Encryption session for end-to-end encrypted capsule tunneling.
     pub fn with_pqc_session(mut self, session: PqcSecureTunnelSession) -> Self {
         self.pqc_session = Some(session);
+        self
+    }
+
+    /// Attach a distributed transport telemetry collector and exporter registry.
+    pub fn with_telemetry(mut self, telemetry: DistributedTransportTelemetry) -> Self {
+        self.telemetry = Some(telemetry);
         self
     }
 
@@ -12899,6 +12907,64 @@ impl ExtendedConnectTunnel {
     /// Retrieve the current post-quantum telemetry metrics for this tunnel session, if attached.
     pub fn pqc_telemetry(&self) -> Option<PqcCapsuleTelemetry> {
         self.pqc_session.as_ref().map(|s| s.telemetry)
+    }
+
+    /// Synchronize and refresh composite telemetry metrics from all attached tunnel subsystems.
+    pub fn collect_composite_metrics(&mut self) -> Option<CompositeTransportSnapshot> {
+        let codel_telem = self.aqm_codel.as_ref().map(|aqm| aqm.telemetry());
+        let shaper_telem = self.shaper.as_ref().map(|s| s.telemetry());
+        let sched_telem = self.sp_wdrr_scheduler.as_ref().map(|s| s.telemetry());
+        let pqc_telem = self.pqc_session.as_ref().map(|s| s.telemetry);
+
+        if let Some(telem) = &mut self.telemetry {
+            if let Some(c) = codel_telem {
+                telem.record_codel(&c);
+            }
+            if let Some(s) = shaper_telem {
+                telem.record_shaper(&s);
+            }
+            if let Some(sc) = sched_telem {
+                telem.record_scheduler(&sc);
+            }
+            if let Some(p) = pqc_telem {
+                telem.record_pqc(&p);
+            }
+            Some(telem.snapshot())
+        } else {
+            None
+        }
+    }
+
+    /// Export current tunnel metrics in Prometheus Exposition format.
+    pub fn export_prometheus(&mut self) -> Option<String> {
+        self.collect_composite_metrics();
+        self.telemetry.as_ref().map(|t| t.export_prometheus())
+    }
+
+    /// Export current tunnel metrics in OpenTelemetry OTLP JSON format.
+    pub fn export_otlp_metrics(&mut self, timestamp_nanos: u64) -> Option<String> {
+        self.collect_composite_metrics();
+        self.telemetry.as_ref().map(|t| t.export_otlp_metrics_json(timestamp_nanos))
+    }
+
+    /// Send a distributed trace context capsule over this tunnel.
+    pub fn send_trace_context(&mut self, ctx: &TraceContext) -> Result<(), String> {
+        let capsule = ctx.to_capsule();
+        self.send_secure_capsule(&capsule)
+    }
+
+    /// Receive a distributed trace context capsule from this tunnel, if available.
+    pub fn recv_trace_context(&mut self) -> Result<Option<TraceContext>, String> {
+        if let Some(cap) = self.recv_secure_capsule()? {
+            if cap.capsule_type == crate::simd_parser::CapsuleType::TelemetryTraceContext {
+                let ctx = TraceContext::from_capsule(&cap)?;
+                return Ok(Some(ctx));
+            } else {
+                // Not a trace context capsule, push back into capsule queue
+                self.capsule_queue.push_front(cap);
+            }
+        }
+        Ok(None)
     }
 
     /// Send a UDP datagram adaptively: if payload fits within path PMTU (accounting for RFC 9297
@@ -24394,6 +24460,1239 @@ pub fn run_net_benchmark_suite(iterations_per_test: usize) -> NetBenchmarkReport
     NetBenchmarkReport {
         total_duration_ms: elapsed.as_secs_f64() * 1000.0,
         benchmarks,
+    }
+}
+
+// ── Distributed Telemetry & OpenTelemetry / Prometheus Exporters ────────────
+
+/// W3C Distributed Trace Context and Baggage container (W3C Trace Context recommendation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceContext {
+    pub version: u8,
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub trace_flags: u8,
+    pub tracestate: String,
+    pub baggage: std::collections::BTreeMap<String, String>,
+}
+
+impl TraceContext {
+    /// Create a new TraceContext with explicit trace ID, span ID, and sampled flag.
+    pub fn new(trace_id: [u8; 16], span_id: [u8; 8], sampled: bool) -> Self {
+        Self {
+            version: 0,
+            trace_id,
+            span_id,
+            trace_flags: if sampled { 0x01 } else { 0x00 },
+            tracestate: String::new(),
+            baggage: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Generate a pseudorandom TraceContext with non-zero IDs using secure random material.
+    pub fn new_random() -> Self {
+        let mut trace_id = [0u8; 16];
+        let mut span_id = [0u8; 8];
+        let _ = crate::crypto::secure_random_fill(&mut trace_id);
+        let _ = crate::crypto::secure_random_fill(&mut span_id);
+        if trace_id == [0u8; 16] {
+            trace_id[0] = 0x01;
+        }
+        if span_id == [0u8; 8] {
+            span_id[0] = 0x01;
+        }
+        Self::new(trace_id, span_id, true)
+    }
+
+    /// Derive a child span context under the same trace ID, preserving sampled flags and baggage.
+    pub fn child_span(&self) -> Self {
+        let mut new_span_id = [0u8; 8];
+        let _ = crate::crypto::secure_random_fill(&mut new_span_id);
+        if new_span_id == [0u8; 8] {
+            new_span_id[0] = 0x02;
+        }
+        Self {
+            version: self.version,
+            trace_id: self.trace_id,
+            span_id: new_span_id,
+            trace_flags: self.trace_flags,
+            tracestate: self.tracestate.clone(),
+            baggage: self.baggage.clone(),
+        }
+    }
+
+    /// Whether this trace is marked for sampling.
+    pub fn is_sampled(&self) -> bool {
+        (self.trace_flags & 0x01) != 0
+    }
+
+    /// Set sampling flag.
+    pub fn set_sampled(&mut self, sampled: bool) {
+        if sampled {
+            self.trace_flags |= 0x01;
+        } else {
+            self.trace_flags &= !0x01;
+        }
+    }
+
+    /// Format traceparent header value: "00-{trace_id_hex:032x}-{span_id_hex:016x}-{trace_flags:02x}".
+    pub fn to_traceparent(&self) -> String {
+        format!(
+            "{:02x}-{}-{}-{:02x}",
+            self.version,
+            crate::crypto::hex_encode(&self.trace_id),
+            crate::crypto::hex_encode(&self.span_id),
+            self.trace_flags
+        )
+    }
+
+    /// Parse W3C traceparent header value.
+    pub fn from_traceparent(header: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = header.trim().split('-').collect();
+        if parts.len() != 4 {
+            return Err("Invalid traceparent format: expected 4 segments".to_string());
+        }
+        let version = u8::from_str_radix(parts[0], 16)
+            .map_err(|e| format!("Invalid traceparent version: {}", e))?;
+        if version == 0xff {
+            return Err("Invalid traceparent version 0xff".to_string());
+        }
+        let trace_id_bytes = crate::crypto::hex_decode(parts[1])
+            .map_err(|e| format!("Invalid traceparent trace_id: {:?}", e))?;
+        if trace_id_bytes.len() != 16 || trace_id_bytes == [0u8; 16] {
+            return Err("Invalid trace_id length or zero value".to_string());
+        }
+        let mut trace_id = [0u8; 16];
+        trace_id.copy_from_slice(&trace_id_bytes);
+
+        let span_id_bytes = crate::crypto::hex_decode(parts[2])
+            .map_err(|e| format!("Invalid traceparent span_id: {:?}", e))?;
+        if span_id_bytes.len() != 8 || span_id_bytes == [0u8; 8] {
+            return Err("Invalid span_id length or zero value".to_string());
+        }
+        let mut span_id = [0u8; 8];
+        span_id.copy_from_slice(&span_id_bytes);
+
+        let trace_flags = u8::from_str_radix(parts[3], 16)
+            .map_err(|e| format!("Invalid trace_flags: {}", e))?;
+
+        Ok(Self {
+            version,
+            trace_id,
+            span_id,
+            trace_flags,
+            tracestate: String::new(),
+            baggage: std::collections::BTreeMap::new(),
+        })
+    }
+
+    /// Set a baggage key-value pair.
+    pub fn set_baggage(&mut self, key: &str, value: &str) {
+        self.baggage.insert(key.to_string(), value.to_string());
+    }
+
+    /// Retrieve a baggage value by key.
+    pub fn get_baggage(&self, key: &str) -> Option<&str> {
+        self.baggage.get(key).map(|s| s.as_str())
+    }
+
+    /// Format baggage as standard W3C baggage header (comma-separated key=value).
+    pub fn to_baggage_header(&self) -> String {
+        self.baggage
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Parse baggage header into the context.
+    pub fn parse_baggage_header(&mut self, header: &str) {
+        for item in header.split(',') {
+            let item = item.trim();
+            if let Some((k, v)) = item.split_once('=') {
+                let k = k.trim();
+                let v = v.trim();
+                if !k.is_empty() {
+                    self.baggage.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+    }
+
+    /// Encode to compact wire binary for in-band datagram encapsulation.
+    pub fn encode_to_wire(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(self.version);
+        buf.extend_from_slice(&self.trace_id);
+        buf.extend_from_slice(&self.span_id);
+        buf.push(self.trace_flags);
+
+        let ts_bytes = self.tracestate.as_bytes();
+        buf.extend_from_slice(&(ts_bytes.len() as u16).to_be_bytes());
+        buf.extend_from_slice(ts_bytes);
+
+        buf.extend_from_slice(&(self.baggage.len() as u16).to_be_bytes());
+        for (k, v) in &self.baggage {
+            let kb = k.as_bytes();
+            buf.extend_from_slice(&(kb.len() as u16).to_be_bytes());
+            buf.extend_from_slice(kb);
+            let vb = v.as_bytes();
+            buf.extend_from_slice(&(vb.len() as u16).to_be_bytes());
+            buf.extend_from_slice(vb);
+        }
+        buf
+    }
+
+    /// Decode from wire binary format.
+    pub fn decode_from_wire(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < 28 {
+            return Err("TraceContext wire buffer too short".to_string());
+        }
+        let version = bytes[0];
+        let mut trace_id = [0u8; 16];
+        trace_id.copy_from_slice(&bytes[1..17]);
+        let mut span_id = [0u8; 8];
+        span_id.copy_from_slice(&bytes[17..25]);
+        let trace_flags = bytes[25];
+
+        let mut offset = 26;
+        if offset + 2 > bytes.len() {
+            return Err("Truncated tracestate length".to_string());
+        }
+        let ts_len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+        offset += 2;
+        if offset + ts_len > bytes.len() {
+            return Err("Truncated tracestate payload".to_string());
+        }
+        let tracestate = String::from_utf8_lossy(&bytes[offset..offset + ts_len]).to_string();
+        offset += ts_len;
+
+        let mut baggage = std::collections::BTreeMap::new();
+        if offset + 2 <= bytes.len() {
+            let bg_count = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+            offset += 2;
+            for _ in 0..bg_count {
+                if offset + 2 > bytes.len() {
+                    break;
+                }
+                let k_len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+                offset += 2;
+                if offset + k_len > bytes.len() {
+                    break;
+                }
+                let k = String::from_utf8_lossy(&bytes[offset..offset + k_len]).to_string();
+                offset += k_len;
+
+                if offset + 2 > bytes.len() {
+                    break;
+                }
+                let v_len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+                offset += 2;
+                if offset + v_len > bytes.len() {
+                    break;
+                }
+                let v = String::from_utf8_lossy(&bytes[offset..offset + v_len]).to_string();
+                offset += v_len;
+
+                baggage.insert(k, v);
+            }
+        }
+
+        Ok(Self {
+            version,
+            trace_id,
+            span_id,
+            trace_flags,
+            tracestate,
+            baggage,
+        })
+    }
+
+    /// Convert into an RFC 9297 TelemetryTraceContext HTTP capsule.
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::telemetry_trace_context(self.encode_to_wire())
+    }
+
+    /// Parse from an RFC 9297 TelemetryTraceContext HTTP capsule.
+    pub fn from_capsule(capsule: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        if capsule.capsule_type != crate::simd_parser::CapsuleType::TelemetryTraceContext {
+            return Err(format!(
+                "Expected TelemetryTraceContext capsule, got {:?}",
+                capsule.capsule_type
+            ));
+        }
+        Self::decode_from_wire(&capsule.payload)
+    }
+}
+
+/// Comprehensive multi-layer composite transport metrics snapshot across transport layers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompositeTransportSnapshot {
+    // 1. RTT & Jitter
+    pub smoothed_rtt_ms: f64,
+    pub min_rtt_ms: f64,
+    pub latest_rtt_ms: f64,
+    pub jitter_ms: f64,
+
+    // 2. Active Queue Management (CoDel & DualQ ECN/L4S)
+    pub codel_last_sojourn_micros: u64,
+    pub codel_min_sojourn_micros: u64,
+    pub codel_early_dropped_packets: usize,
+    pub codel_buffer_overflow_drops: usize,
+    pub codel_ecn_marked_packets: usize,
+    pub codel_queue_packets: usize,
+    pub codel_queue_bytes: usize,
+    pub codel_is_dropping: bool,
+
+    // 3. Selective ACK & Hybrid FEC
+    pub packets_sent: usize,
+    pub packets_received: usize,
+    pub lost_predicted: usize,
+    pub lost_confirmed: usize,
+    pub recovered_via_fec: usize,
+    pub retransmitted_via_sack: usize,
+    pub retransmissions_dropped_expired: usize,
+    pub fec_packets_sent: usize,
+    pub fec_packets_received: usize,
+    pub duplicate_packets_dropped: usize,
+    pub estimated_loss_rate: f64,
+
+    // 4. Adaptive Reordering Buffer
+    pub reorder_total_in_order: u64,
+    pub reorder_total_out_of_order: u64,
+    pub reorder_total_duplicates: u64,
+    pub reorder_gaps_expired: u64,
+    pub reorder_window_overflows: u64,
+    pub reorder_buffered_packets: usize,
+    pub reorder_average_delay_ms: f64,
+    pub reorder_max_delay_ms: f64,
+    pub reorder_dynamic_gap_timeout_ms: f64,
+
+    // 5. Multipath Bonding
+    pub multipath_active_paths: usize,
+    pub multipath_degraded_paths: usize,
+    pub multipath_failed_paths: usize,
+    pub multipath_total_packets_sent: u64,
+    pub multipath_total_bytes_sent: u64,
+    pub multipath_total_packets_received: u64,
+    pub multipath_total_bytes_received: u64,
+    pub multipath_total_failovers: u64,
+    pub multipath_total_replications: u64,
+    pub multipath_paths: Vec<PathTelemetrySnapshot>,
+
+    // 6. Rate Limiting & Scheduling
+    pub shaper_tokens_available: f64,
+    pub shaper_conforming_packets: usize,
+    pub shaper_throttled_packets: usize,
+    pub scheduler_strict_served: usize,
+    pub scheduler_wdrr_served: usize,
+    pub scheduler_dropped_overflow: usize,
+
+    // 7. Post-Quantum Security
+    pub pqc_handshakes_completed: usize,
+    pub pqc_rekeys_completed: usize,
+    pub pqc_capsules_encrypted: usize,
+    pub pqc_capsules_decrypted: usize,
+    pub pqc_auth_failures: usize,
+    pub pqc_replay_attacks_rejected: usize,
+}
+
+impl Default for CompositeTransportSnapshot {
+    fn default() -> Self {
+        Self {
+            smoothed_rtt_ms: 0.0,
+            min_rtt_ms: 0.0,
+            latest_rtt_ms: 0.0,
+            jitter_ms: 0.0,
+            codel_last_sojourn_micros: 0,
+            codel_min_sojourn_micros: 0,
+            codel_early_dropped_packets: 0,
+            codel_buffer_overflow_drops: 0,
+            codel_ecn_marked_packets: 0,
+            codel_queue_packets: 0,
+            codel_queue_bytes: 0,
+            codel_is_dropping: false,
+            packets_sent: 0,
+            packets_received: 0,
+            lost_predicted: 0,
+            lost_confirmed: 0,
+            recovered_via_fec: 0,
+            retransmitted_via_sack: 0,
+            retransmissions_dropped_expired: 0,
+            fec_packets_sent: 0,
+            fec_packets_received: 0,
+            duplicate_packets_dropped: 0,
+            estimated_loss_rate: 0.0,
+            reorder_total_in_order: 0,
+            reorder_total_out_of_order: 0,
+            reorder_total_duplicates: 0,
+            reorder_gaps_expired: 0,
+            reorder_window_overflows: 0,
+            reorder_buffered_packets: 0,
+            reorder_average_delay_ms: 0.0,
+            reorder_max_delay_ms: 0.0,
+            reorder_dynamic_gap_timeout_ms: 0.0,
+            multipath_active_paths: 0,
+            multipath_degraded_paths: 0,
+            multipath_failed_paths: 0,
+            multipath_total_packets_sent: 0,
+            multipath_total_bytes_sent: 0,
+            multipath_total_packets_received: 0,
+            multipath_total_bytes_received: 0,
+            multipath_total_failovers: 0,
+            multipath_total_replications: 0,
+            multipath_paths: Vec::new(),
+            shaper_tokens_available: 0.0,
+            shaper_conforming_packets: 0,
+            shaper_throttled_packets: 0,
+            scheduler_strict_served: 0,
+            scheduler_wdrr_served: 0,
+            scheduler_dropped_overflow: 0,
+            pqc_handshakes_completed: 0,
+            pqc_rekeys_completed: 0,
+            pqc_capsules_encrypted: 0,
+            pqc_capsules_decrypted: 0,
+            pqc_auth_failures: 0,
+            pqc_replay_attacks_rejected: 0,
+        }
+    }
+}
+
+impl CompositeTransportSnapshot {
+    /// Encode summary metrics into binary format for in-band report capsules.
+    pub fn encode_to_wire(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Magic header 0x54454C4D ('TELM')
+        buf.extend_from_slice(b"TELM");
+        buf.extend_from_slice(&self.smoothed_rtt_ms.to_bits().to_be_bytes());
+        buf.extend_from_slice(&self.jitter_ms.to_bits().to_be_bytes());
+        buf.extend_from_slice(&self.codel_last_sojourn_micros.to_be_bytes());
+        buf.extend_from_slice(&(self.codel_early_dropped_packets as u64).to_be_bytes());
+        buf.extend_from_slice(&(self.codel_ecn_marked_packets as u64).to_be_bytes());
+        buf.extend_from_slice(&(self.recovered_via_fec as u64).to_be_bytes());
+        buf.extend_from_slice(&self.estimated_loss_rate.to_bits().to_be_bytes());
+        buf.extend_from_slice(&self.reorder_average_delay_ms.to_bits().to_be_bytes());
+        buf.extend_from_slice(&self.reorder_total_out_of_order.to_be_bytes());
+        buf.extend_from_slice(&(self.multipath_active_paths as u32).to_be_bytes());
+        buf.extend_from_slice(&self.multipath_total_failovers.to_be_bytes());
+        buf.extend_from_slice(&(self.pqc_handshakes_completed as u32).to_be_bytes());
+        buf.extend_from_slice(&(self.pqc_auth_failures as u32).to_be_bytes());
+        buf
+    }
+
+    /// Decode summary metrics from in-band wire bytes.
+    pub fn decode_from_wire(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < 96 {
+            return Err("Binary telemetry wire buffer too short".to_string());
+        }
+        if &bytes[0..4] != b"TELM" {
+            return Err("Invalid telemetry wire magic".to_string());
+        }
+        let smoothed_rtt_ms = f64::from_bits(u64::from_be_bytes(bytes[4..12].try_into().unwrap()));
+        let jitter_ms = f64::from_bits(u64::from_be_bytes(bytes[12..20].try_into().unwrap()));
+        let codel_last_sojourn_micros = u64::from_be_bytes(bytes[20..28].try_into().unwrap());
+        let codel_early_dropped_packets = u64::from_be_bytes(bytes[28..36].try_into().unwrap()) as usize;
+        let codel_ecn_marked_packets = u64::from_be_bytes(bytes[36..44].try_into().unwrap()) as usize;
+        let recovered_via_fec = u64::from_be_bytes(bytes[44..52].try_into().unwrap()) as usize;
+        let estimated_loss_rate = f64::from_bits(u64::from_be_bytes(bytes[52..60].try_into().unwrap()));
+        let reorder_average_delay_ms = f64::from_bits(u64::from_be_bytes(bytes[60..68].try_into().unwrap()));
+        let reorder_total_out_of_order = u64::from_be_bytes(bytes[68..76].try_into().unwrap());
+        let multipath_active_paths = u32::from_be_bytes(bytes[76..80].try_into().unwrap()) as usize;
+        let multipath_total_failovers = u64::from_be_bytes(bytes[80..88].try_into().unwrap());
+        let pqc_handshakes_completed = u32::from_be_bytes(bytes[88..92].try_into().unwrap()) as usize;
+        let pqc_auth_failures = u32::from_be_bytes(bytes[92..96].try_into().unwrap()) as usize;
+
+        Ok(Self {
+            smoothed_rtt_ms,
+            jitter_ms,
+            codel_last_sojourn_micros,
+            codel_early_dropped_packets,
+            codel_ecn_marked_packets,
+            recovered_via_fec,
+            estimated_loss_rate,
+            reorder_average_delay_ms,
+            reorder_total_out_of_order,
+            multipath_active_paths,
+            multipath_total_failovers,
+            pqc_handshakes_completed,
+            pqc_auth_failures,
+            ..Default::default()
+        })
+    }
+
+    /// Convert into an RFC 9297 TelemetryMetricsReport HTTP capsule.
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::telemetry_metrics_report(self.encode_to_wire())
+    }
+
+    /// Parse from an RFC 9297 TelemetryMetricsReport HTTP capsule.
+    pub fn from_capsule(capsule: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        if capsule.capsule_type != crate::simd_parser::CapsuleType::TelemetryMetricsReport {
+            return Err(format!(
+                "Expected TelemetryMetricsReport capsule, got {:?}",
+                capsule.capsule_type
+            ));
+        }
+        Self::decode_from_wire(&capsule.payload)
+    }
+}
+
+/// Prometheus Exposition Format 0.0.4 text exporter for composite transport metrics.
+#[derive(Debug, Clone, Default)]
+pub struct PrometheusTransportExporter {
+    pub default_labels: std::collections::BTreeMap<String, String>,
+}
+
+impl PrometheusTransportExporter {
+    /// Create a new Prometheus transport exporter.
+    pub fn new() -> Self {
+        Self {
+            default_labels: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Add a default label applied to all exported metrics.
+    pub fn with_label(mut self, key: &str, value: &str) -> Self {
+        self.default_labels.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    fn format_labels(&self, extra: &[(&str, &str)]) -> String {
+        let mut all = self.default_labels.clone();
+        for (k, v) in extra {
+            all.insert(k.to_string(), v.to_string());
+        }
+        if all.is_empty() {
+            String::new()
+        } else {
+            let pairs: Vec<String> = all.iter().map(|(k, v)| format!("{}=\"{}\"", k, v)).collect();
+            format!("{{{}}}", pairs.join(","))
+        }
+    }
+
+    /// Export a CompositeTransportSnapshot into standard Prometheus 0.0.4 text format.
+    pub fn export(&self, s: &CompositeTransportSnapshot) -> String {
+        let mut out = String::with_capacity(4096);
+        let base_lbl = self.format_labels(&[]);
+
+        // 1. RTT & Jitter
+        out.push_str("# HELP ifa_transport_rtt_seconds Smoothed round-trip time in seconds.\n");
+        out.push_str("# TYPE ifa_transport_rtt_seconds gauge\n");
+        out.push_str(&format!("ifa_transport_rtt_seconds{} {:.6}\n", base_lbl, s.smoothed_rtt_ms / 1000.0));
+
+        out.push_str("# HELP ifa_transport_min_rtt_seconds Minimum observed round-trip time in seconds.\n");
+        out.push_str("# TYPE ifa_transport_min_rtt_seconds gauge\n");
+        out.push_str(&format!("ifa_transport_min_rtt_seconds{} {:.6}\n", base_lbl, s.min_rtt_ms / 1000.0));
+
+        out.push_str("# HELP ifa_transport_jitter_seconds Latency variation jitter in seconds.\n");
+        out.push_str("# TYPE ifa_transport_jitter_seconds gauge\n");
+        out.push_str(&format!("ifa_transport_jitter_seconds{} {:.6}\n", base_lbl, s.jitter_ms / 1000.0));
+
+        // 2. CoDel AQM & ECN
+        out.push_str("# HELP ifa_transport_codel_sojourn_seconds Active Queue Management CoDel packet sojourn time in seconds.\n");
+        out.push_str("# TYPE ifa_transport_codel_sojourn_seconds gauge\n");
+        out.push_str(&format!("ifa_transport_codel_sojourn_seconds{} {:.6}\n", base_lbl, s.codel_last_sojourn_micros as f64 / 1_000_000.0));
+
+        out.push_str("# HELP ifa_transport_codel_min_sojourn_seconds CoDel minimum sojourn time in current interval in seconds.\n");
+        out.push_str("# TYPE ifa_transport_codel_min_sojourn_seconds gauge\n");
+        out.push_str(&format!("ifa_transport_codel_min_sojourn_seconds{} {:.6}\n", base_lbl, s.codel_min_sojourn_micros as f64 / 1_000_000.0));
+
+        out.push_str("# HELP ifa_transport_codel_drops_total Total packets dropped by Active Queue Management by reason.\n");
+        out.push_str("# TYPE ifa_transport_codel_drops_total counter\n");
+        out.push_str(&format!("ifa_transport_codel_drops_total{} {}\n", self.format_labels(&[("reason", "early_drop")]), s.codel_early_dropped_packets));
+        out.push_str(&format!("ifa_transport_codel_drops_total{} {}\n", self.format_labels(&[("reason", "overflow")]), s.codel_buffer_overflow_drops));
+
+        out.push_str("# HELP ifa_transport_codel_ecn_marked_total Total packets marked with ECN Congestion Experienced.\n");
+        out.push_str("# TYPE ifa_transport_codel_ecn_marked_total counter\n");
+        out.push_str(&format!("ifa_transport_codel_ecn_marked_total{} {}\n", base_lbl, s.codel_ecn_marked_packets));
+
+        out.push_str("# HELP ifa_transport_codel_queue_packets Current depth of CoDel queue in packets.\n");
+        out.push_str("# TYPE ifa_transport_codel_queue_packets gauge\n");
+        out.push_str(&format!("ifa_transport_codel_queue_packets{} {}\n", base_lbl, s.codel_queue_packets));
+
+        // 3. Selective ACK & Hybrid FEC
+        out.push_str("# HELP ifa_transport_packets_sent_total Total application datagram packets transmitted.\n");
+        out.push_str("# TYPE ifa_transport_packets_sent_total counter\n");
+        out.push_str(&format!("ifa_transport_packets_sent_total{} {}\n", base_lbl, s.packets_sent));
+
+        out.push_str("# HELP ifa_transport_packets_received_total Total valid application datagram packets received.\n");
+        out.push_str("# TYPE ifa_transport_packets_received_total counter\n");
+        out.push_str(&format!("ifa_transport_packets_received_total{} {}\n", base_lbl, s.packets_received));
+
+        out.push_str("# HELP ifa_transport_fec_recovered_total Total lost datagrams reconstructed via forward error correction.\n");
+        out.push_str("# TYPE ifa_transport_fec_recovered_total counter\n");
+        out.push_str(&format!("ifa_transport_fec_recovered_total{} {}\n", base_lbl, s.recovered_via_fec));
+
+        out.push_str("# HELP ifa_transport_fec_retransmitted_total Total datagrams retransmitted via selective ACK.\n");
+        out.push_str("# TYPE ifa_transport_fec_retransmitted_total counter\n");
+        out.push_str(&format!("ifa_transport_fec_retransmitted_total{} {}\n", base_lbl, s.retransmitted_via_sack));
+
+        out.push_str("# HELP ifa_transport_loss_rate Estimated transport packet loss rate between 0.0 and 1.0.\n");
+        out.push_str("# TYPE ifa_transport_loss_rate gauge\n");
+        out.push_str(&format!("ifa_transport_loss_rate{} {:.4}\n", base_lbl, s.estimated_loss_rate));
+
+        // 4. Adaptive Reordering Buffer
+        out.push_str("# HELP ifa_transport_reorder_latency_seconds Average packet reordering latency in seconds.\n");
+        out.push_str("# TYPE ifa_transport_reorder_latency_seconds gauge\n");
+        out.push_str(&format!("ifa_transport_reorder_latency_seconds{} {:.6}\n", base_lbl, s.reorder_average_delay_ms / 1000.0));
+
+        out.push_str("# HELP ifa_transport_reorder_max_latency_seconds Maximum observed packet reordering latency in seconds.\n");
+        out.push_str("# TYPE ifa_transport_reorder_max_latency_seconds gauge\n");
+        out.push_str(&format!("ifa_transport_reorder_max_latency_seconds{} {:.6}\n", base_lbl, s.reorder_max_delay_ms / 1000.0));
+
+        out.push_str("# HELP ifa_transport_reorder_packets_total Total packets processed by reorder engine by disposition.\n");
+        out.push_str("# TYPE ifa_transport_reorder_packets_total counter\n");
+        out.push_str(&format!("ifa_transport_reorder_packets_total{} {}\n", self.format_labels(&[("status", "in_order")]), s.reorder_total_in_order));
+        out.push_str(&format!("ifa_transport_reorder_packets_total{} {}\n", self.format_labels(&[("status", "out_of_order")]), s.reorder_total_out_of_order));
+        out.push_str(&format!("ifa_transport_reorder_packets_total{} {}\n", self.format_labels(&[("status", "duplicate")]), s.reorder_total_duplicates));
+        out.push_str(&format!("ifa_transport_reorder_packets_total{} {}\n", self.format_labels(&[("status", "gap_expired")]), s.reorder_gaps_expired));
+        out.push_str(&format!("ifa_transport_reorder_packets_total{} {}\n", self.format_labels(&[("status", "overflow")]), s.reorder_window_overflows));
+
+        // 5. Multipath Bonding
+        out.push_str("# HELP ifa_transport_multipath_active_paths Operational path count in bonding pool.\n");
+        out.push_str("# TYPE ifa_transport_multipath_active_paths gauge\n");
+        out.push_str(&format!("ifa_transport_multipath_active_paths{} {}\n", base_lbl, s.multipath_active_paths));
+
+        out.push_str("# HELP ifa_transport_multipath_failovers_total Total path failover events across bonding pool.\n");
+        out.push_str("# TYPE ifa_transport_multipath_failovers_total counter\n");
+        out.push_str(&format!("ifa_transport_multipath_failovers_total{} {}\n", base_lbl, s.multipath_total_failovers));
+
+        if !s.multipath_paths.is_empty() {
+            out.push_str("# HELP ifa_transport_multipath_path_bytes_total Total bytes transferred per bonded path.\n");
+            out.push_str("# TYPE ifa_transport_multipath_path_bytes_total counter\n");
+            for p in &s.multipath_paths {
+                let p_id = p.tunnel_id.to_string();
+                let sent_lbl = self.format_labels(&[("path_id", &p_id), ("name", &p.name), ("direction", "sent")]);
+                let recv_lbl = self.format_labels(&[("path_id", &p_id), ("name", &p.name), ("direction", "received")]);
+                out.push_str(&format!("ifa_transport_multipath_path_bytes_total{} {}\n", sent_lbl, p.bytes_sent));
+                out.push_str(&format!("ifa_transport_multipath_path_bytes_total{} {}\n", recv_lbl, p.bytes_received));
+            }
+        }
+
+        // 6. Post-Quantum Security
+        out.push_str("# HELP ifa_transport_pqc_security_events_total Post-quantum cryptographic session events.\n");
+        out.push_str("# TYPE ifa_transport_pqc_security_events_total counter\n");
+        out.push_str(&format!("ifa_transport_pqc_security_events_total{} {}\n", self.format_labels(&[("event", "handshake_completed")]), s.pqc_handshakes_completed));
+        out.push_str(&format!("ifa_transport_pqc_security_events_total{} {}\n", self.format_labels(&[("event", "rekey_completed")]), s.pqc_rekeys_completed));
+        out.push_str(&format!("ifa_transport_pqc_security_events_total{} {}\n", self.format_labels(&[("event", "auth_failure")]), s.pqc_auth_failures));
+        out.push_str(&format!("ifa_transport_pqc_security_events_total{} {}\n", self.format_labels(&[("event", "replay_rejected")]), s.pqc_replay_attacks_rejected));
+
+        out.push_str("# HELP ifa_transport_pqc_capsules_total Total capsules processed under post-quantum encryption.\n");
+        out.push_str("# TYPE ifa_transport_pqc_capsules_total counter\n");
+        out.push_str(&format!("ifa_transport_pqc_capsules_total{} {}\n", self.format_labels(&[("direction", "encrypted")]), s.pqc_capsules_encrypted));
+        out.push_str(&format!("ifa_transport_pqc_capsules_total{} {}\n", self.format_labels(&[("direction", "decrypted")]), s.pqc_capsules_decrypted));
+
+        out
+    }
+}
+
+/// OpenTelemetry Span representation for transport event tracing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OtelSpan {
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: Option<String>,
+    pub name: String,
+    pub kind: OtelSpanKind,
+    pub start_time_unix_nano: u64,
+    pub end_time_unix_nano: u64,
+    pub attributes: std::collections::BTreeMap<String, String>,
+    pub status: OtelSpanStatus,
+    pub status_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtelSpanKind {
+    Internal = 1,
+    Server = 2,
+    Client = 3,
+    Producer = 4,
+    Consumer = 5,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtelSpanStatus {
+    Unset = 0,
+    Ok = 1,
+    Error = 2,
+}
+
+impl OtelSpan {
+    /// Create a new OTel span initialized from a W3C TraceContext.
+    pub fn from_trace_context(
+        ctx: &TraceContext,
+        name: &str,
+        kind: OtelSpanKind,
+        start_nano: u64,
+    ) -> Self {
+        Self {
+            trace_id: crate::crypto::hex_encode(&ctx.trace_id),
+            span_id: crate::crypto::hex_encode(&ctx.span_id),
+            parent_span_id: None,
+            name: name.to_string(),
+            kind,
+            start_time_unix_nano: start_nano,
+            end_time_unix_nano: start_nano,
+            attributes: ctx.baggage.clone(),
+            status: OtelSpanStatus::Ok,
+            status_message: None,
+        }
+    }
+
+    /// Complete the span with an end timestamp and status.
+    pub fn finish(&mut self, end_nano: u64, status: OtelSpanStatus, message: Option<&str>) {
+        self.end_time_unix_nano = end_nano;
+        self.status = status;
+        self.status_message = message.map(|s| s.to_string());
+    }
+
+    /// Set an attribute tag on the span.
+    pub fn set_attribute(&mut self, key: &str, value: &str) {
+        self.attributes.insert(key.to_string(), value.to_string());
+    }
+}
+
+/// OpenTelemetry OTLP JSON Exporter for metrics and distributed traces.
+#[derive(Debug, Clone, Default)]
+pub struct OtelTransportExporter {
+    pub default_attributes: std::collections::BTreeMap<String, String>,
+}
+
+impl OtelTransportExporter {
+    /// Create a new OpenTelemetry transport exporter.
+    pub fn new() -> Self {
+        Self {
+            default_attributes: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Add a resource attribute.
+    pub fn with_attribute(mut self, key: &str, value: &str) -> Self {
+        self.default_attributes.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// Export a CompositeTransportSnapshot into standard OTLP HTTP/JSON format (`v1/metrics`).
+    pub fn export_metrics_json(
+        &self,
+        snapshot: &CompositeTransportSnapshot,
+        service_name: &str,
+        timestamp_unix_nano: u64,
+    ) -> String {
+        use serde_json::json;
+
+        let mut resource_attrs = vec![
+            json!({ "key": "service.name", "value": { "stringValue": service_name } }),
+            json!({ "key": "service.version", "value": { "stringValue": "0.1.0" } }),
+            json!({ "key": "telemetry.sdk.name", "value": { "stringValue": "ifa-stdlib" } }),
+            json!({ "key": "telemetry.sdk.language", "value": { "stringValue": "ifa/rust" } }),
+        ];
+        for (k, v) in &self.default_attributes {
+            resource_attrs.push(json!({ "key": k, "value": { "stringValue": v } }));
+        }
+
+        let nano_str = timestamp_unix_nano.to_string();
+
+        let metrics = vec![
+            json!({
+                "name": "ifa.transport.rtt",
+                "description": "Smoothed round-trip time in seconds",
+                "unit": "s",
+                "gauge": {
+                    "dataPoints": [{
+                        "timeUnixNano": &nano_str,
+                        "asDouble": snapshot.smoothed_rtt_ms / 1000.0,
+                    }]
+                }
+            }),
+            json!({
+                "name": "ifa.transport.jitter",
+                "description": "Transport latency jitter in seconds",
+                "unit": "s",
+                "gauge": {
+                    "dataPoints": [{
+                        "timeUnixNano": &nano_str,
+                        "asDouble": snapshot.jitter_ms / 1000.0,
+                    }]
+                }
+            }),
+            json!({
+                "name": "ifa.transport.codel.sojourn",
+                "description": "AQM CoDel packet sojourn time in seconds",
+                "unit": "s",
+                "gauge": {
+                    "dataPoints": [{
+                        "timeUnixNano": &nano_str,
+                        "asDouble": snapshot.codel_last_sojourn_micros as f64 / 1_000_000.0,
+                    }]
+                }
+            }),
+            json!({
+                "name": "ifa.transport.codel.drops",
+                "description": "Total packets dropped by Active Queue Management",
+                "unit": "1",
+                "sum": {
+                    "isMonotonic": true,
+                    "aggregationTemporality": 2,
+                    "dataPoints": [
+                        {
+                            "timeUnixNano": &nano_str,
+                            "asInt": (snapshot.codel_early_dropped_packets as i64).to_string(),
+                            "attributes": [{ "key": "reason", "value": { "stringValue": "early_drop" } }]
+                        },
+                        {
+                            "timeUnixNano": &nano_str,
+                            "asInt": (snapshot.codel_buffer_overflow_drops as i64).to_string(),
+                            "attributes": [{ "key": "reason", "value": { "stringValue": "overflow" } }]
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "name": "ifa.transport.codel.ecn_marked",
+                "description": "Total packets marked with ECN CE",
+                "unit": "1",
+                "sum": {
+                    "isMonotonic": true,
+                    "aggregationTemporality": 2,
+                    "dataPoints": [{
+                        "timeUnixNano": &nano_str,
+                        "asInt": (snapshot.codel_ecn_marked_packets as i64).to_string(),
+                    }]
+                }
+            }),
+            json!({
+                "name": "ifa.transport.fec.recovered",
+                "description": "Lost datagrams reconstructed via FEC",
+                "unit": "1",
+                "sum": {
+                    "isMonotonic": true,
+                    "aggregationTemporality": 2,
+                    "dataPoints": [{
+                        "timeUnixNano": &nano_str,
+                        "asInt": (snapshot.recovered_via_fec as i64).to_string(),
+                    }]
+                }
+            }),
+            json!({
+                "name": "ifa.transport.loss_rate",
+                "description": "Estimated transport loss rate",
+                "unit": "1",
+                "gauge": {
+                    "dataPoints": [{
+                        "timeUnixNano": &nano_str,
+                        "asDouble": snapshot.estimated_loss_rate,
+                    }]
+                }
+            }),
+            json!({
+                "name": "ifa.transport.reorder.latency",
+                "description": "Average packet reordering latency in seconds",
+                "unit": "s",
+                "gauge": {
+                    "dataPoints": [{
+                        "timeUnixNano": &nano_str,
+                        "asDouble": snapshot.reorder_average_delay_ms / 1000.0,
+                    }]
+                }
+            }),
+            json!({
+                "name": "ifa.transport.reorder.packets",
+                "description": "Total packets processed by reordering buffer",
+                "unit": "1",
+                "sum": {
+                    "isMonotonic": true,
+                    "aggregationTemporality": 2,
+                    "dataPoints": [
+                        {
+                            "timeUnixNano": &nano_str,
+                            "asInt": (snapshot.reorder_total_in_order as i64).to_string(),
+                            "attributes": [{ "key": "status", "value": { "stringValue": "in_order" } }]
+                        },
+                        {
+                            "timeUnixNano": &nano_str,
+                            "asInt": (snapshot.reorder_total_out_of_order as i64).to_string(),
+                            "attributes": [{ "key": "status", "value": { "stringValue": "out_of_order" } }]
+                        },
+                        {
+                            "timeUnixNano": &nano_str,
+                            "asInt": (snapshot.reorder_total_duplicates as i64).to_string(),
+                            "attributes": [{ "key": "status", "value": { "stringValue": "duplicate" } }]
+                        },
+                        {
+                            "timeUnixNano": &nano_str,
+                            "asInt": (snapshot.reorder_gaps_expired as i64).to_string(),
+                            "attributes": [{ "key": "status", "value": { "stringValue": "gap_expired" } }]
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "name": "ifa.transport.multipath.active_paths",
+                "description": "Active operational paths in bonding pool",
+                "unit": "1",
+                "gauge": {
+                    "dataPoints": [{
+                        "timeUnixNano": &nano_str,
+                        "asInt": (snapshot.multipath_active_paths as i64).to_string(),
+                    }]
+                }
+            }),
+            json!({
+                "name": "ifa.transport.pqc.security_events",
+                "description": "Post-quantum cryptographic session events",
+                "unit": "1",
+                "sum": {
+                    "isMonotonic": true,
+                    "aggregationTemporality": 2,
+                    "dataPoints": [
+                        {
+                            "timeUnixNano": &nano_str,
+                            "asInt": (snapshot.pqc_handshakes_completed as i64).to_string(),
+                            "attributes": [{ "key": "event", "value": { "stringValue": "handshake_completed" } }]
+                        },
+                        {
+                            "timeUnixNano": &nano_str,
+                            "asInt": (snapshot.pqc_rekeys_completed as i64).to_string(),
+                            "attributes": [{ "key": "event", "value": { "stringValue": "rekey_completed" } }]
+                        },
+                        {
+                            "timeUnixNano": &nano_str,
+                            "asInt": (snapshot.pqc_auth_failures as i64).to_string(),
+                            "attributes": [{ "key": "event", "value": { "stringValue": "auth_failure" } }]
+                        },
+                        {
+                            "timeUnixNano": &nano_str,
+                            "asInt": (snapshot.pqc_replay_attacks_rejected as i64).to_string(),
+                            "attributes": [{ "key": "event", "value": { "stringValue": "replay_rejected" } }]
+                        }
+                    ]
+                }
+            }),
+        ];
+
+        let payload = json!({
+            "resourceMetrics": [
+                {
+                    "resource": {
+                        "attributes": resource_attrs,
+                    },
+                    "scopeMetrics": [
+                        {
+                            "scope": {
+                                "name": "ifa.transport.telemetry",
+                                "version": "0.1.0",
+                            },
+                            "metrics": metrics,
+                        }
+                    ]
+                }
+            ]
+        });
+
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Export spans into standard OTLP HTTP/JSON format (`v1/traces`).
+    pub fn export_traces_json(&self, spans: &[OtelSpan], service_name: &str) -> String {
+        use serde_json::{json, Value};
+
+        let mut resource_attrs = vec![
+            json!({ "key": "service.name", "value": { "stringValue": service_name } }),
+            json!({ "key": "telemetry.sdk.name", "value": { "stringValue": "ifa-stdlib" } }),
+        ];
+        for (k, v) in &self.default_attributes {
+            resource_attrs.push(json!({ "key": k, "value": { "stringValue": v } }));
+        }
+
+        let span_values: Vec<Value> = spans
+            .iter()
+            .map(|s| {
+                let mut attrs = Vec::new();
+                for (k, v) in &s.attributes {
+                    attrs.push(json!({ "key": k, "value": { "stringValue": v } }));
+                }
+
+                let mut obj = json!({
+                    "traceId": s.trace_id,
+                    "spanId": s.span_id,
+                    "name": s.name,
+                    "kind": s.kind as u32,
+                    "startTimeUnixNano": s.start_time_unix_nano.to_string(),
+                    "endTimeUnixNano": s.end_time_unix_nano.to_string(),
+                    "attributes": attrs,
+                    "status": {
+                        "code": s.status as u32,
+                    }
+                });
+
+                if let Some(parent) = &s.parent_span_id {
+                    obj["parentSpanId"] = json!(parent);
+                }
+                if let Some(msg) = &s.status_message {
+                    obj["status"]["message"] = json!(msg);
+                }
+                obj
+            })
+            .collect();
+
+        let payload = json!({
+            "resourceSpans": [
+                {
+                    "resource": {
+                        "attributes": resource_attrs,
+                    },
+                    "scopeSpans": [
+                        {
+                            "scope": {
+                                "name": "ifa.transport.traces",
+                                "version": "0.1.0",
+                            },
+                            "spans": span_values,
+                        }
+                    ]
+                }
+            ]
+        });
+
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+/// Central distributed transport telemetry registry and metrics dispatcher.
+#[derive(Debug, Clone)]
+pub struct DistributedTransportTelemetry {
+    pub service_name: String,
+    pub labels: std::collections::BTreeMap<String, String>,
+    pub smoothed_rtt_ms: f64,
+    pub min_rtt_ms: f64,
+    pub latest_rtt_ms: f64,
+    pub jitter_ms: f64,
+    pub codel_telemetry: AqmCodelTelemetry,
+    pub fec_telemetry: ReliableDatagramTelemetry,
+    pub reorder_telemetry: CompositeReorderTelemetry,
+    pub multipath_telemetry: Option<MultipathBondingTelemetry>,
+    pub shaper_telemetry: Option<TrafficShaperTelemetry>,
+    pub scheduler_telemetry: Option<SpWdrrTelemetry>,
+    pub pqc_telemetry: PqcCapsuleTelemetry,
+    pub recorded_spans: Vec<OtelSpan>,
+    prometheus_exporter: PrometheusTransportExporter,
+    otel_exporter: OtelTransportExporter,
+}
+
+impl DistributedTransportTelemetry {
+    /// Create a new telemetry registry for the specified service name.
+    pub fn new(service_name: &str) -> Self {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("service".to_string(), service_name.to_string());
+        Self {
+            service_name: service_name.to_string(),
+            labels: labels.clone(),
+            smoothed_rtt_ms: 0.0,
+            min_rtt_ms: 0.0,
+            latest_rtt_ms: 0.0,
+            jitter_ms: 0.0,
+            codel_telemetry: AqmCodelTelemetry::default(),
+            fec_telemetry: ReliableDatagramTelemetry::default(),
+            reorder_telemetry: CompositeReorderTelemetry {
+                active_flows_count: 0,
+                total_received_packets: 0,
+                total_delivered_packets: 0,
+                total_in_order_packets: 0,
+                total_out_of_order_packets: 0,
+                total_duplicate_packets: 0,
+                total_gaps_expired: 0,
+                total_window_overflows: 0,
+                total_buffered_packets: 0,
+                max_reordering_delay_ms: 0.0,
+                flow_telemetry: Vec::new(),
+            },
+            multipath_telemetry: None,
+            shaper_telemetry: None,
+            scheduler_telemetry: None,
+            pqc_telemetry: PqcCapsuleTelemetry::default(),
+            recorded_spans: Vec::new(),
+            prometheus_exporter: PrometheusTransportExporter::new().with_label("service", service_name),
+            otel_exporter: OtelTransportExporter::new().with_attribute("service.name", service_name),
+        }
+    }
+
+    /// Add a label attached to telemetry exports.
+    pub fn with_label(mut self, key: &str, value: &str) -> Self {
+        self.labels.insert(key.to_string(), value.to_string());
+        self.prometheus_exporter = self.prometheus_exporter.with_label(key, value);
+        self.otel_exporter = self.otel_exporter.with_attribute(key, value);
+        self
+    }
+
+    /// Record an RTT sample in milliseconds with RFC 3550 style jitter EWMA smoothing.
+    pub fn record_rtt_sample(&mut self, rtt_ms: f64) {
+        self.latest_rtt_ms = rtt_ms;
+        if self.min_rtt_ms == 0.0 || rtt_ms < self.min_rtt_ms {
+            self.min_rtt_ms = rtt_ms;
+        }
+        if self.smoothed_rtt_ms == 0.0 {
+            self.smoothed_rtt_ms = rtt_ms;
+            self.jitter_ms = rtt_ms / 2.0;
+        } else {
+            let diff = (rtt_ms - self.smoothed_rtt_ms).abs();
+            self.jitter_ms += (diff - self.jitter_ms) * 0.0625; // 1/16 EWMA
+            self.smoothed_rtt_ms += (rtt_ms - self.smoothed_rtt_ms) * 0.125; // 1/8 EWMA
+        }
+    }
+
+    /// Record an updated AQM CoDel telemetry snapshot.
+    pub fn record_codel(&mut self, telem: &AqmCodelTelemetry) {
+        self.codel_telemetry = *telem;
+    }
+
+    /// Record an updated Selective ACK / Hybrid FEC telemetry snapshot.
+    pub fn record_fec(&mut self, telem: &ReliableDatagramTelemetry) {
+        self.fec_telemetry = *telem;
+    }
+
+    /// Record an updated composite reordering telemetry snapshot.
+    pub fn record_reorder(&mut self, telem: &CompositeReorderTelemetry) {
+        self.reorder_telemetry = telem.clone();
+    }
+
+    /// Record an updated multipath bonding telemetry snapshot.
+    pub fn record_multipath(&mut self, telem: &MultipathBondingTelemetry) {
+        self.multipath_telemetry = Some(telem.clone());
+    }
+
+    /// Record an updated token bucket traffic shaper telemetry snapshot.
+    pub fn record_shaper(&mut self, telem: &TrafficShaperTelemetry) {
+        self.shaper_telemetry = Some(*telem);
+    }
+
+    /// Record an updated SP-WDRR scheduler telemetry snapshot.
+    pub fn record_scheduler(&mut self, telem: &SpWdrrTelemetry) {
+        self.scheduler_telemetry = Some(*telem);
+    }
+
+    /// Record an updated Post-Quantum security telemetry snapshot.
+    pub fn record_pqc(&mut self, telem: &PqcCapsuleTelemetry) {
+        self.pqc_telemetry = *telem;
+    }
+
+    /// Record an OpenTelemetry tracing span.
+    pub fn record_span(&mut self, span: OtelSpan) {
+        self.recorded_spans.push(span);
+        if self.recorded_spans.len() > 1000 {
+            self.recorded_spans.drain(0..500);
+        }
+    }
+
+    /// Build a consolidated snapshot across all recorded transport telemetry.
+    pub fn snapshot(&self) -> CompositeTransportSnapshot {
+        let (reorder_avg_delay, reorder_dyn_timeout) = if !self.reorder_telemetry.flow_telemetry.is_empty() {
+            let avg = self.reorder_telemetry.flow_telemetry.iter().map(|f| f.average_reordering_delay_ms).sum::<f64>()
+                / self.reorder_telemetry.flow_telemetry.len() as f64;
+            let timeout = self.reorder_telemetry.flow_telemetry.iter().map(|f| f.dynamic_gap_timeout_ms).sum::<f64>()
+                / self.reorder_telemetry.flow_telemetry.len() as f64;
+            (avg, timeout)
+        } else {
+            (0.0, 0.0)
+        };
+
+        let mp = self.multipath_telemetry.as_ref();
+
+        CompositeTransportSnapshot {
+            smoothed_rtt_ms: self.smoothed_rtt_ms,
+            min_rtt_ms: self.min_rtt_ms,
+            latest_rtt_ms: self.latest_rtt_ms,
+            jitter_ms: self.jitter_ms,
+            codel_last_sojourn_micros: self.codel_telemetry.last_sojourn_micros,
+            codel_min_sojourn_micros: self.codel_telemetry.min_sojourn_micros,
+            codel_early_dropped_packets: self.codel_telemetry.total_early_dropped_packets,
+            codel_buffer_overflow_drops: self.codel_telemetry.total_buffer_overflow_drops,
+            codel_ecn_marked_packets: self.codel_telemetry.total_ecn_marked_packets,
+            codel_queue_packets: self.codel_telemetry.current_queue_packets,
+            codel_queue_bytes: self.codel_telemetry.current_queue_bytes,
+            codel_is_dropping: self.codel_telemetry.is_in_dropping_state,
+            packets_sent: self.fec_telemetry.packets_sent,
+            packets_received: self.fec_telemetry.packets_received,
+            lost_predicted: self.fec_telemetry.lost_predicted,
+            lost_confirmed: self.fec_telemetry.lost_confirmed,
+            recovered_via_fec: self.fec_telemetry.recovered_via_fec,
+            retransmitted_via_sack: self.fec_telemetry.retransmitted_via_sack,
+            retransmissions_dropped_expired: self.fec_telemetry.retransmissions_dropped_expired,
+            fec_packets_sent: self.fec_telemetry.fec_packets_sent,
+            fec_packets_received: self.fec_telemetry.fec_packets_received,
+            duplicate_packets_dropped: self.fec_telemetry.duplicate_packets_dropped,
+            estimated_loss_rate: self.fec_telemetry.estimated_loss_rate,
+            reorder_total_in_order: self.reorder_telemetry.total_in_order_packets,
+            reorder_total_out_of_order: self.reorder_telemetry.total_out_of_order_packets,
+            reorder_total_duplicates: self.reorder_telemetry.total_duplicate_packets,
+            reorder_gaps_expired: self.reorder_telemetry.total_gaps_expired,
+            reorder_window_overflows: self.reorder_telemetry.total_window_overflows,
+            reorder_buffered_packets: self.reorder_telemetry.total_buffered_packets,
+            reorder_average_delay_ms: reorder_avg_delay,
+            reorder_max_delay_ms: self.reorder_telemetry.max_reordering_delay_ms,
+            reorder_dynamic_gap_timeout_ms: reorder_dyn_timeout,
+            multipath_active_paths: mp.map(|m| m.active_paths).unwrap_or(0),
+            multipath_degraded_paths: mp.map(|m| m.degraded_paths).unwrap_or(0),
+            multipath_failed_paths: mp.map(|m| m.failed_paths).unwrap_or(0),
+            multipath_total_packets_sent: mp.map(|m| m.total_packets_sent).unwrap_or(0),
+            multipath_total_bytes_sent: mp.map(|m| m.total_bytes_sent).unwrap_or(0),
+            multipath_total_packets_received: mp.map(|m| m.total_packets_received).unwrap_or(0),
+            multipath_total_bytes_received: mp.map(|m| m.total_bytes_received).unwrap_or(0),
+            multipath_total_failovers: mp.map(|m| m.total_failover_events).unwrap_or(0),
+            multipath_total_replications: mp.map(|m| m.total_replicated_packets).unwrap_or(0),
+            multipath_paths: mp.map(|m| m.paths.clone()).unwrap_or_default(),
+            shaper_tokens_available: self.shaper_telemetry.map(|s| s.current_byte_tokens).unwrap_or(0.0),
+            shaper_conforming_packets: self.shaper_telemetry.map(|s| s.packets_admitted_immediate).unwrap_or(0),
+            shaper_throttled_packets: self.shaper_telemetry.map(|s| s.packets_delayed).unwrap_or(0),
+            scheduler_strict_served: self.scheduler_telemetry.map(|s| s.high_packets_serviced).unwrap_or(0),
+            scheduler_wdrr_served: self.scheduler_telemetry.map(|s| s.data_packets_serviced).unwrap_or(0),
+            scheduler_dropped_overflow: self.scheduler_telemetry.map(|s| s.packets_dropped_queue_full).unwrap_or(0),
+            pqc_handshakes_completed: self.pqc_telemetry.handshakes_completed,
+            pqc_rekeys_completed: self.pqc_telemetry.rekeys_completed,
+            pqc_capsules_encrypted: self.pqc_telemetry.capsules_encrypted,
+            pqc_capsules_decrypted: self.pqc_telemetry.capsules_decrypted,
+            pqc_auth_failures: self.pqc_telemetry.auth_failures,
+            pqc_replay_attacks_rejected: self.pqc_telemetry.replay_attacks_rejected,
+        }
+    }
+
+    /// Export the current composite metrics in Prometheus Exposition format.
+    pub fn export_prometheus(&self) -> String {
+        let snap = self.snapshot();
+        self.prometheus_exporter.export(&snap)
+    }
+
+    /// Export the current composite metrics in OpenTelemetry OTLP JSON format.
+    pub fn export_otlp_metrics_json(&self, timestamp_nanos: u64) -> String {
+        let snap = self.snapshot();
+        self.otel_exporter.export_metrics_json(&snap, &self.service_name, timestamp_nanos)
+    }
+
+    /// Export recorded spans in OpenTelemetry OTLP JSON format.
+    pub fn export_otlp_traces_json(&self) -> String {
+        self.otel_exporter.export_traces_json(&self.recorded_spans, &self.service_name)
+    }
+
+    /// Handle an HTTP metrics endpoint request (e.g. `/metrics`, `/v1/metrics`, `/v1/traces`).
+    /// Returns (HTTP status code, Content-Type, Body).
+    pub fn handle_http_metrics(&self, path: &str, accept_header: &str, timestamp_nanos: u64) -> (u16, &'static str, String) {
+        let clean_path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+        match clean_path {
+            "/metrics" => {
+                if accept_header.contains("application/json") {
+                    (200, "application/json", self.export_otlp_metrics_json(timestamp_nanos))
+                } else {
+                    (200, "text/plain; version=0.0.4; charset=utf-8", self.export_prometheus())
+                }
+            }
+            "/v1/metrics" => {
+                (200, "application/json", self.export_otlp_metrics_json(timestamp_nanos))
+            }
+            "/v1/traces" => {
+                (200, "application/json", self.export_otlp_traces_json())
+            }
+            _ => (404, "text/plain", "Not Found\n".to_string()),
+        }
     }
 }
 
@@ -36851,5 +38150,327 @@ mod tls_alpn_tests {
         let s_telem = server_tunnel.pqc_telemetry().unwrap();
         assert_eq!(c_telem.capsules_encrypted, 1);
         assert_eq!(s_telem.capsules_decrypted, 1);
+    }
+
+    #[test]
+    fn test_w3c_trace_context_codec_and_capsule() {
+        // 1. Generation & parsing of traceparent
+        let mut ctx = TraceContext::new([0xaa; 16], [0xbb; 8], true);
+        ctx.tracestate = "ifa=region:eu-west,prio:1".to_string();
+        ctx.set_baggage("flow_id", "42");
+        ctx.set_baggage("client_id", "gw-paris-01");
+
+        let traceparent = ctx.to_traceparent();
+        assert_eq!(
+            traceparent,
+            "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"
+        );
+
+        let parsed = TraceContext::from_traceparent(&traceparent).expect("parse traceparent");
+        assert_eq!(parsed.version, 0);
+        assert_eq!(parsed.trace_id, [0xaa; 16]);
+        assert_eq!(parsed.span_id, [0xbb; 8]);
+        assert!(parsed.is_sampled());
+
+        // 2. Child span derivation
+        let child = ctx.child_span();
+        assert_eq!(child.trace_id, ctx.trace_id);
+        assert_ne!(child.span_id, ctx.span_id);
+        assert_eq!(child.is_sampled(), ctx.is_sampled());
+        assert_eq!(child.get_baggage("flow_id"), Some("42"));
+
+        // 3. W3C baggage header formatting and parsing
+        let baggage_header = ctx.to_baggage_header();
+        assert!(baggage_header.contains("flow_id=42"));
+        assert!(baggage_header.contains("client_id=gw-paris-01"));
+
+        let mut fresh_ctx = TraceContext::new([0x11; 16], [0x22; 8], false);
+        fresh_ctx.parse_baggage_header(&baggage_header);
+        assert_eq!(fresh_ctx.get_baggage("flow_id"), Some("42"));
+        assert_eq!(fresh_ctx.get_baggage("client_id"), Some("gw-paris-01"));
+
+        // 4. Binary wire codec
+        let wire = ctx.encode_to_wire();
+        let decoded = TraceContext::decode_from_wire(&wire).expect("decode wire");
+        assert_eq!(ctx.trace_id, decoded.trace_id);
+        assert_eq!(ctx.span_id, decoded.span_id);
+        assert_eq!(ctx.trace_flags, decoded.trace_flags);
+        assert_eq!(ctx.tracestate, decoded.tracestate);
+        assert_eq!(ctx.baggage, decoded.baggage);
+
+        // 5. Capsule integration
+        let cap = ctx.to_capsule();
+        assert_eq!(
+            cap.capsule_type,
+            crate::simd_parser::CapsuleType::TelemetryTraceContext
+        );
+        let from_cap = TraceContext::from_capsule(&cap).expect("from capsule");
+        assert_eq!(from_cap, decoded);
+    }
+
+    #[test]
+    fn test_composite_transport_snapshot_wire_codec() {
+        let mut s = CompositeTransportSnapshot::default();
+        s.smoothed_rtt_ms = 24.5;
+        s.jitter_ms = 3.2;
+        s.codel_last_sojourn_micros = 1850;
+        s.codel_early_dropped_packets = 12;
+        s.codel_ecn_marked_packets = 45;
+        s.recovered_via_fec = 18;
+        s.estimated_loss_rate = 0.015;
+        s.reorder_average_delay_ms = 4.1;
+        s.reorder_total_out_of_order = 85;
+        s.multipath_active_paths = 3;
+        s.multipath_total_failovers = 2;
+        s.pqc_handshakes_completed = 1;
+        s.pqc_auth_failures = 0;
+
+        // Wire codec
+        let wire = s.encode_to_wire();
+        assert!(wire.starts_with(b"TELM"));
+        let decoded = CompositeTransportSnapshot::decode_from_wire(&wire).expect("decode wire");
+        assert!((decoded.smoothed_rtt_ms - 24.5).abs() < 1e-4);
+        assert!((decoded.jitter_ms - 3.2).abs() < 1e-4);
+        assert_eq!(decoded.codel_last_sojourn_micros, 1850);
+        assert_eq!(decoded.codel_early_dropped_packets, 12);
+        assert_eq!(decoded.codel_ecn_marked_packets, 45);
+        assert_eq!(decoded.recovered_via_fec, 18);
+        assert!((decoded.estimated_loss_rate - 0.015).abs() < 1e-4);
+        assert_eq!(decoded.multipath_active_paths, 3);
+        assert_eq!(decoded.multipath_total_failovers, 2);
+        assert_eq!(decoded.pqc_handshakes_completed, 1);
+
+        // Capsule
+        let cap = s.to_capsule();
+        assert_eq!(
+            cap.capsule_type,
+            crate::simd_parser::CapsuleType::TelemetryMetricsReport
+        );
+        let from_cap = CompositeTransportSnapshot::from_capsule(&cap).expect("from capsule");
+        assert_eq!(from_cap.codel_last_sojourn_micros, 1850);
+    }
+
+    #[test]
+    fn test_prometheus_exporter_metrics_formatting() {
+        let mut s = CompositeTransportSnapshot::default();
+        s.smoothed_rtt_ms = 35.0;
+        s.min_rtt_ms = 20.0;
+        s.jitter_ms = 4.5;
+        s.codel_last_sojourn_micros = 2100;
+        s.codel_min_sojourn_micros = 1200;
+        s.codel_early_dropped_packets = 5;
+        s.codel_buffer_overflow_drops = 1;
+        s.codel_ecn_marked_packets = 23;
+        s.packets_sent = 10000;
+        s.packets_received = 9980;
+        s.recovered_via_fec = 15;
+        s.retransmitted_via_sack = 5;
+        s.estimated_loss_rate = 0.002;
+        s.reorder_total_in_order = 9900;
+        s.reorder_total_out_of_order = 80;
+        s.reorder_total_duplicates = 2;
+        s.reorder_gaps_expired = 3;
+        s.reorder_average_delay_ms = 2.8;
+        s.multipath_active_paths = 2;
+        s.multipath_total_failovers = 1;
+        s.multipath_paths = vec![
+            PathTelemetrySnapshot {
+                tunnel_id: 101,
+                name: "wan0-5g".to_string(),
+                state: BondedPathState::Active,
+                weight: 10,
+                smoothed_rtt_ms: 22.0,
+                loss_rate: 0.001,
+                quality_score: 95.0,
+                packets_sent: 6000,
+                bytes_sent: 7800000,
+                packets_received: 5990,
+                bytes_received: 7780000,
+            },
+        ];
+        s.pqc_handshakes_completed = 1;
+        s.pqc_rekeys_completed = 2;
+        s.pqc_auth_failures = 0;
+        s.pqc_capsules_encrypted = 500;
+        s.pqc_capsules_decrypted = 500;
+
+        let exporter = PrometheusTransportExporter::new()
+            .with_label("service", "ifa_masque_gateway")
+            .with_label("env", "prod");
+
+        let text = exporter.export(&s);
+
+        // Verification of Prometheus exposition standards
+        assert!(text.contains("# HELP ifa_transport_rtt_seconds"));
+        assert!(text.contains("# TYPE ifa_transport_rtt_seconds gauge"));
+        assert!(text.contains("ifa_transport_rtt_seconds{env=\"prod\",service=\"ifa_masque_gateway\"} 0.035000"));
+
+        assert!(text.contains("# HELP ifa_transport_codel_drops_total"));
+        assert!(text.contains("# TYPE ifa_transport_codel_drops_total counter"));
+        assert!(text.contains("ifa_transport_codel_drops_total{env=\"prod\",reason=\"early_drop\",service=\"ifa_masque_gateway\"} 5"));
+        assert!(text.contains("ifa_transport_codel_drops_total{env=\"prod\",reason=\"overflow\",service=\"ifa_masque_gateway\"} 1"));
+
+        assert!(text.contains("ifa_transport_fec_recovered_total{env=\"prod\",service=\"ifa_masque_gateway\"} 15"));
+        assert!(text.contains("ifa_transport_multipath_path_bytes_total{direction=\"sent\",env=\"prod\",name=\"wan0-5g\",path_id=\"101\",service=\"ifa_masque_gateway\"} 7800000"));
+        assert!(text.contains("ifa_transport_pqc_security_events_total{env=\"prod\",event=\"rekey_completed\",service=\"ifa_masque_gateway\"} 2"));
+    }
+
+    #[test]
+    fn test_opentelemetry_exporter_otlp_json() {
+        let mut s = CompositeTransportSnapshot::default();
+        s.smoothed_rtt_ms = 18.0;
+        s.jitter_ms = 2.0;
+        s.codel_last_sojourn_micros = 850;
+        s.codel_early_dropped_packets = 2;
+        s.codel_ecn_marked_packets = 10;
+        s.recovered_via_fec = 4;
+        s.estimated_loss_rate = 0.001;
+        s.reorder_average_delay_ms = 1.5;
+        s.pqc_handshakes_completed = 1;
+
+        let exporter = OtelTransportExporter::new()
+            .with_attribute("host.name", "edge-router-42");
+
+        let json_str = exporter.export_metrics_json(&s, "masque_gateway", 1700000000000000000);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("parse otlp json");
+
+        assert_eq!(parsed["resourceMetrics"][0]["resource"]["attributes"][0]["key"], "service.name");
+        assert_eq!(parsed["resourceMetrics"][0]["resource"]["attributes"][0]["value"]["stringValue"], "masque_gateway");
+
+        let metrics = &parsed["resourceMetrics"][0]["scopeMetrics"][0]["metrics"];
+        assert!(metrics.as_array().unwrap().iter().any(|m| m["name"] == "ifa.transport.rtt"));
+        assert!(metrics.as_array().unwrap().iter().any(|m| m["name"] == "ifa.transport.codel.sojourn"));
+        assert!(metrics.as_array().unwrap().iter().any(|m| m["name"] == "ifa.transport.fec.recovered"));
+        assert!(metrics.as_array().unwrap().iter().any(|m| m["name"] == "ifa.transport.pqc.security_events"));
+    }
+
+    #[test]
+    fn test_opentelemetry_traces_otlp_json() {
+        let ctx = TraceContext::new([0x55; 16], [0x66; 8], true);
+        let mut span1 = OtelSpan::from_trace_context(
+            &ctx,
+            "transport.pqc_handshake",
+            OtelSpanKind::Internal,
+            1000,
+        );
+        span1.finish(1500, OtelSpanStatus::Ok, None);
+
+        let child_ctx = ctx.child_span();
+        let mut span2 = OtelSpan::from_trace_context(
+            &child_ctx,
+            "transport.fec_recovery",
+            OtelSpanKind::Consumer,
+            1600,
+        );
+        span2.parent_span_id = Some(crate::crypto::hex_encode(&ctx.span_id));
+        span2.set_attribute("recovered_packet_seq", "104");
+        span2.finish(1620, OtelSpanStatus::Ok, None);
+
+        let exporter = OtelTransportExporter::new();
+        let traces_json = exporter.export_traces_json(&[span1, span2], "ifa_service");
+        let parsed: serde_json::Value = serde_json::from_str(&traces_json).expect("parse traces json");
+
+        let spans = &parsed["resourceSpans"][0]["scopeSpans"][0]["spans"];
+        assert_eq!(spans.as_array().unwrap().len(), 2);
+        assert_eq!(spans[0]["name"], "transport.pqc_handshake");
+        assert_eq!(spans[1]["name"], "transport.fec_recovery");
+        assert_eq!(spans[1]["parentSpanId"], crate::crypto::hex_encode(&ctx.span_id));
+    }
+
+    #[test]
+    fn test_distributed_transport_telemetry_registry_and_http_endpoints() {
+        let mut registry = DistributedTransportTelemetry::new("gateway-us-east")
+            .with_label("datacenter", "iad1");
+
+        // Record metrics
+        registry.record_rtt_sample(25.0);
+        registry.record_rtt_sample(27.0);
+        assert!(registry.smoothed_rtt_ms > 0.0);
+        assert!(registry.jitter_ms > 0.0);
+
+        let mut codel = AqmCodelTelemetry::default();
+        codel.last_sojourn_micros = 1400;
+        codel.total_early_dropped_packets = 3;
+        registry.record_codel(&codel);
+
+        let mut fec = ReliableDatagramTelemetry::default();
+        fec.recovered_via_fec = 7;
+        fec.estimated_loss_rate = 0.005;
+        registry.record_fec(&fec);
+
+        let mut pqc = PqcCapsuleTelemetry::default();
+        pqc.handshakes_completed = 1;
+        pqc.capsules_encrypted = 100;
+        registry.record_pqc(&pqc);
+
+        // Snapshot check
+        let snap = registry.snapshot();
+        assert_eq!(snap.codel_last_sojourn_micros, 1400);
+        assert_eq!(snap.recovered_via_fec, 7);
+        assert_eq!(snap.pqc_capsules_encrypted, 100);
+
+        // HTTP handler tests
+        // 1. /metrics with text/plain
+        let (code, ctype, body) = registry.handle_http_metrics("/metrics", "text/plain", 1000);
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "text/plain; version=0.0.4; charset=utf-8");
+        assert!(body.contains("ifa_transport_rtt_seconds"));
+        assert!(body.contains("datacenter=\"iad1\""));
+
+        // 2. /metrics with application/json
+        let (code2, ctype2, body2) = registry.handle_http_metrics("/metrics", "application/json", 1000);
+        assert_eq!(code2, 200);
+        assert_eq!(ctype2, "application/json");
+        assert!(body2.contains("resourceMetrics"));
+
+        // 3. /v1/metrics
+        let (code3, ctype3, body3) = registry.handle_http_metrics("/v1/metrics", "*/*", 1000);
+        assert_eq!(code3, 200);
+        assert_eq!(ctype3, "application/json");
+        assert!(body3.contains("resourceMetrics"));
+
+        // 4. /v1/traces
+        let (code4, ctype4, body4) = registry.handle_http_metrics("/v1/traces", "*/*", 1000);
+        assert_eq!(code4, 200);
+        assert_eq!(ctype4, "application/json");
+        assert!(body4.contains("resourceSpans"));
+
+        // 5. Unknown path
+        let (code5, _, _) = registry.handle_http_metrics("/unknown", "*/*", 1000);
+        assert_eq!(code5, 404);
+    }
+
+    #[test]
+    fn test_extended_connect_tunnel_telemetry_integration() {
+        let registry = DistributedTransportTelemetry::new("tunnel_worker");
+        let mut client_tunnel = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "target.proxy:443")
+            .with_telemetry(registry);
+        client_tunnel.mark_established();
+
+        let mut server_tunnel = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "target.proxy:443");
+        server_tunnel.mark_established();
+
+        // 1. Send and receive W3C TraceContext capsule
+        let mut trace = TraceContext::new([0x33; 16], [0x44; 8], true);
+        trace.set_baggage("session_id", "s-990");
+        client_tunnel.send_trace_context(&trace).expect("send trace context");
+
+        let frames = client_tunnel.drain_egress_data();
+        assert!(!frames.is_empty());
+        for frame in frames {
+            server_tunnel.ingest_network_data(&frame);
+        }
+
+        let recv_trace = server_tunnel.recv_trace_context().expect("recv trace context").expect("trace exists");
+        assert_eq!(recv_trace.trace_id, [0x33; 16]);
+        assert_eq!(recv_trace.span_id, [0x44; 8]);
+        assert_eq!(recv_trace.get_baggage("session_id"), Some("s-990"));
+
+        // 2. Direct Prometheus and OTel export from tunnel
+        let prom = client_tunnel.export_prometheus().expect("export prometheus");
+        assert!(prom.contains("ifa_transport_rtt_seconds"));
+
+        let otel_json = client_tunnel.export_otlp_metrics(1700000000000).expect("export otlp");
+        assert!(otel_json.contains("resourceMetrics"));
     }
 }

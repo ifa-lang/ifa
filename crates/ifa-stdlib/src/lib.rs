@@ -125,6 +125,8 @@ pub use net::{
     AsyncTcpStream, AsyncTimer, AsyncUdpSocket, AsyncWsConnection, AsyncWsPool, BufferedTcpStream,
     ConnectionInfo, Datagram, DatagramLossPattern, DatagramReassemblyError, DropReason, EventHub,
     ExtendedConnectManager, ExtendedConnectTelemetry, ExtendedConnectTunnel,
+    CompositeTransportSnapshot, DistributedTransportTelemetry, OtelSpan, OtelSpanKind,
+    OtelSpanStatus, OtelTransportExporter, PrometheusTransportExporter, TraceContext,
     FecAdaptationRecommendation, HeaderCompressionTelemetry, HeaderStateMigrationReport,
     Http2ClientRequest, Http2MultiplexBenchmarkConfig, Http2MultiplexBenchmarkResult,
     Http2MultiplexComparisonReport, Http2PoolBenchmarkResult, Http2PoolCacheEntry, Http2PoolStats,
