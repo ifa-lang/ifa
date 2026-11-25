@@ -5440,6 +5440,22 @@ pub enum CapsuleType {
     TopologyProbePing,
     /// Distributed MASQUE Topology Active Path Probe Pong / Echo Reply Capsule (type 0x3165).
     TopologyProbePong,
+    /// Distributed Multi-Node Session State Synchronization Announcement (type 0x3170).
+    SessionStateSyncAnnounce,
+    /// Distributed Multi-Node Session State Reconciliation Request (type 0x3171).
+    SessionStateSyncRequest,
+    /// Distributed Multi-Node Session State Synchronization Acknowledgement (type 0x3172).
+    SessionStateSyncAck,
+    /// Distributed Datagram Flow Migration Initiation (type 0x3173).
+    FlowMigrationInitiate,
+    /// Distributed Datagram Flow Migration Preparation Acknowledgement (type 0x3174).
+    FlowMigrationPrepareAck,
+    /// Distributed Datagram Flow Migration Cutover Execution (type 0x3175).
+    FlowMigrationCutover,
+    /// Distributed Datagram Flow Migration Completion & Drain Finalization (type 0x3176).
+    FlowMigrationComplete,
+    /// Distributed Datagram Flow Migration Abort & Rollback (type 0x3177).
+    FlowMigrationAbort,
     /// Unknown or custom capsule type identified by its 62-bit VarInt value.
     Unknown(u64),
 }
@@ -5466,6 +5482,14 @@ impl From<u64> for CapsuleType {
             0x3163 => CapsuleType::TopologySyncResponse,
             0x3164 => CapsuleType::TopologyProbePing,
             0x3165 => CapsuleType::TopologyProbePong,
+            0x3170 => CapsuleType::SessionStateSyncAnnounce,
+            0x3171 => CapsuleType::SessionStateSyncRequest,
+            0x3172 => CapsuleType::SessionStateSyncAck,
+            0x3173 => CapsuleType::FlowMigrationInitiate,
+            0x3174 => CapsuleType::FlowMigrationPrepareAck,
+            0x3175 => CapsuleType::FlowMigrationCutover,
+            0x3176 => CapsuleType::FlowMigrationComplete,
+            0x3177 => CapsuleType::FlowMigrationAbort,
             other => CapsuleType::Unknown(other),
         }
     }
@@ -5493,6 +5517,14 @@ impl From<CapsuleType> for u64 {
             CapsuleType::TopologySyncResponse => 0x3163,
             CapsuleType::TopologyProbePing => 0x3164,
             CapsuleType::TopologyProbePong => 0x3165,
+            CapsuleType::SessionStateSyncAnnounce => 0x3170,
+            CapsuleType::SessionStateSyncRequest => 0x3171,
+            CapsuleType::SessionStateSyncAck => 0x3172,
+            CapsuleType::FlowMigrationInitiate => 0x3173,
+            CapsuleType::FlowMigrationPrepareAck => 0x3174,
+            CapsuleType::FlowMigrationCutover => 0x3175,
+            CapsuleType::FlowMigrationComplete => 0x3176,
+            CapsuleType::FlowMigrationAbort => 0x3177,
             CapsuleType::Unknown(other) => other,
         }
     }
@@ -5601,6 +5633,46 @@ impl HttpCapsule {
     /// Construct a distributed MASQUE topology probe pong / reply capsule.
     pub fn topology_probe_pong(payload: Vec<u8>) -> Self {
         Self::new(CapsuleType::TopologyProbePong, payload)
+    }
+
+    /// Construct a distributed multi-node session state sync announcement capsule.
+    pub fn session_state_sync_announce(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::SessionStateSyncAnnounce, payload)
+    }
+
+    /// Construct a distributed multi-node session state sync request capsule.
+    pub fn session_state_sync_request(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::SessionStateSyncRequest, payload)
+    }
+
+    /// Construct a distributed multi-node session state sync ack capsule.
+    pub fn session_state_sync_ack(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::SessionStateSyncAck, payload)
+    }
+
+    /// Construct a datagram flow migration initiation capsule.
+    pub fn flow_migration_initiate(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::FlowMigrationInitiate, payload)
+    }
+
+    /// Construct a datagram flow migration prepare ack capsule.
+    pub fn flow_migration_prepare_ack(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::FlowMigrationPrepareAck, payload)
+    }
+
+    /// Construct a datagram flow migration cutover capsule.
+    pub fn flow_migration_cutover(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::FlowMigrationCutover, payload)
+    }
+
+    /// Construct a datagram flow migration complete capsule.
+    pub fn flow_migration_complete(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::FlowMigrationComplete, payload)
+    }
+
+    /// Construct a datagram flow migration abort capsule.
+    pub fn flow_migration_abort(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::FlowMigrationAbort, payload)
     }
 
     /// Encode this capsule into QUIC VarInt-framed wire format appended to `out`.
@@ -8427,6 +8499,39 @@ mod http2_tests {
         let (ctx_id, udp_pkt) = decoded[1].decode_udp_datagram().expect("decode udp");
         assert_eq!(ctx_id, 0);
         assert_eq!(udp_pkt, b"raw-udp-dns-packet");
+    }
+
+    #[test]
+    fn test_session_state_and_flow_migration_capsules_roundtrip() {
+        let c_sync_ann = HttpCapsule::session_state_sync_announce(vec![0xAA, 0x01]);
+        let c_sync_req = HttpCapsule::session_state_sync_request(vec![0xBB, 0x02]);
+        let c_sync_ack = HttpCapsule::session_state_sync_ack(vec![0xCC, 0x03]);
+        let c_mig_init = HttpCapsule::flow_migration_initiate(vec![0xDD, 0x04]);
+        let c_mig_ack = HttpCapsule::flow_migration_prepare_ack(vec![0xEE, 0x05]);
+        let c_mig_cut = HttpCapsule::flow_migration_cutover(vec![0xFF, 0x06]);
+        let c_mig_comp = HttpCapsule::flow_migration_complete(vec![0x11, 0x07]);
+        let c_mig_abort = HttpCapsule::flow_migration_abort(vec![0x22, 0x08]);
+
+        let mut wire = Vec::new();
+        c_sync_ann.encode(&mut wire);
+        c_sync_req.encode(&mut wire);
+        c_sync_ack.encode(&mut wire);
+        c_mig_init.encode(&mut wire);
+        c_mig_ack.encode(&mut wire);
+        c_mig_cut.encode(&mut wire);
+        c_mig_comp.encode(&mut wire);
+        c_mig_abort.encode(&mut wire);
+
+        let decoded = HttpCapsule::decode_all(&wire).expect("decode migration capsules");
+        assert_eq!(decoded.len(), 8);
+        assert_eq!(decoded[0], c_sync_ann);
+        assert_eq!(decoded[1], c_sync_req);
+        assert_eq!(decoded[2], c_sync_ack);
+        assert_eq!(decoded[3], c_mig_init);
+        assert_eq!(decoded[4], c_mig_ack);
+        assert_eq!(decoded[5], c_mig_cut);
+        assert_eq!(decoded[6], c_mig_comp);
+        assert_eq!(decoded[7], c_mig_abort);
     }
 
     #[test]

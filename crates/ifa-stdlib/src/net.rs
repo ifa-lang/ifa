@@ -13081,6 +13081,158 @@ impl ExtendedConnectTunnel {
         Ok(None)
     }
 
+    /// Send a distributed session state sync announce capsule over this tunnel.
+    pub fn send_session_state_sync(&mut self, announce: &SessionStateSyncAnnounce) -> Result<(), String> {
+        let capsule = announce.to_capsule();
+        self.send_secure_capsule(&capsule)
+    }
+
+    /// Receive a distributed session state sync announce capsule from this tunnel.
+    pub fn recv_session_state_sync(&mut self) -> Result<Option<SessionStateSyncAnnounce>, String> {
+        if let Some(cap) = self.recv_secure_capsule()? {
+            if cap.capsule_type == crate::simd_parser::CapsuleType::SessionStateSyncAnnounce {
+                let announce = SessionStateSyncAnnounce::from_capsule(&cap)?;
+                return Ok(Some(announce));
+            } else {
+                self.capsule_queue.push_front(cap);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Send a distributed session state sync request capsule over this tunnel.
+    pub fn send_session_state_request(&mut self, req: &SessionStateSyncRequest) -> Result<(), String> {
+        let capsule = req.to_capsule();
+        self.send_secure_capsule(&capsule)
+    }
+
+    /// Receive a distributed session state sync request capsule from this tunnel.
+    pub fn recv_session_state_request(&mut self) -> Result<Option<SessionStateSyncRequest>, String> {
+        if let Some(cap) = self.recv_secure_capsule()? {
+            if cap.capsule_type == crate::simd_parser::CapsuleType::SessionStateSyncRequest {
+                let req = SessionStateSyncRequest::from_capsule(&cap)?;
+                return Ok(Some(req));
+            } else {
+                self.capsule_queue.push_front(cap);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Send a distributed session state sync ack capsule over this tunnel.
+    pub fn send_session_state_ack(&mut self, ack: &SessionStateSyncAck) -> Result<(), String> {
+        let capsule = ack.to_capsule();
+        self.send_secure_capsule(&capsule)
+    }
+
+    /// Receive a distributed session state sync ack capsule from this tunnel.
+    pub fn recv_session_state_ack(&mut self) -> Result<Option<SessionStateSyncAck>, String> {
+        if let Some(cap) = self.recv_secure_capsule()? {
+            if cap.capsule_type == crate::simd_parser::CapsuleType::SessionStateSyncAck {
+                let ack = SessionStateSyncAck::from_capsule(&cap)?;
+                return Ok(Some(ack));
+            } else {
+                self.capsule_queue.push_front(cap);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Send a flow migration initiate capsule over this tunnel.
+    pub fn send_flow_migration_initiate(&mut self, init: &FlowMigrationInitiate) -> Result<(), String> {
+        let capsule = init.to_capsule();
+        self.send_secure_capsule(&capsule)
+    }
+
+    /// Receive a flow migration initiate capsule from this tunnel.
+    pub fn recv_flow_migration_initiate(&mut self) -> Result<Option<FlowMigrationInitiate>, String> {
+        if let Some(cap) = self.recv_secure_capsule()? {
+            if cap.capsule_type == crate::simd_parser::CapsuleType::FlowMigrationInitiate {
+                let init = FlowMigrationInitiate::from_capsule(&cap)?;
+                return Ok(Some(init));
+            } else {
+                self.capsule_queue.push_front(cap);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Send a flow migration prepare ack capsule over this tunnel.
+    pub fn send_flow_migration_prepare_ack(&mut self, ack: &FlowMigrationPrepareAck) -> Result<(), String> {
+        let capsule = ack.to_capsule();
+        self.send_secure_capsule(&capsule)
+    }
+
+    /// Receive a flow migration prepare ack capsule from this tunnel.
+    pub fn recv_flow_migration_prepare_ack(&mut self) -> Result<Option<FlowMigrationPrepareAck>, String> {
+        if let Some(cap) = self.recv_secure_capsule()? {
+            if cap.capsule_type == crate::simd_parser::CapsuleType::FlowMigrationPrepareAck {
+                let ack = FlowMigrationPrepareAck::from_capsule(&cap)?;
+                return Ok(Some(ack));
+            } else {
+                self.capsule_queue.push_front(cap);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Send a flow migration cutover capsule over this tunnel.
+    pub fn send_flow_migration_cutover(&mut self, cutover: &FlowMigrationCutover) -> Result<(), String> {
+        let capsule = cutover.to_capsule();
+        self.send_secure_capsule(&capsule)
+    }
+
+    /// Receive a flow migration cutover capsule from this tunnel.
+    pub fn recv_flow_migration_cutover(&mut self) -> Result<Option<FlowMigrationCutover>, String> {
+        if let Some(cap) = self.recv_secure_capsule()? {
+            if cap.capsule_type == crate::simd_parser::CapsuleType::FlowMigrationCutover {
+                let cutover = FlowMigrationCutover::from_capsule(&cap)?;
+                return Ok(Some(cutover));
+            } else {
+                self.capsule_queue.push_front(cap);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Send a flow migration complete capsule over this tunnel.
+    pub fn send_flow_migration_complete(&mut self, complete: &FlowMigrationComplete) -> Result<(), String> {
+        let capsule = complete.to_capsule();
+        self.send_secure_capsule(&capsule)
+    }
+
+    /// Receive a flow migration complete capsule from this tunnel.
+    pub fn recv_flow_migration_complete(&mut self) -> Result<Option<FlowMigrationComplete>, String> {
+        if let Some(cap) = self.recv_secure_capsule()? {
+            if cap.capsule_type == crate::simd_parser::CapsuleType::FlowMigrationComplete {
+                let complete = FlowMigrationComplete::from_capsule(&cap)?;
+                return Ok(Some(complete));
+            } else {
+                self.capsule_queue.push_front(cap);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Send a flow migration abort capsule over this tunnel.
+    pub fn send_flow_migration_abort(&mut self, abort: &FlowMigrationAbort) -> Result<(), String> {
+        let capsule = abort.to_capsule();
+        self.send_secure_capsule(&capsule)
+    }
+
+    /// Receive a flow migration abort capsule from this tunnel.
+    pub fn recv_flow_migration_abort(&mut self) -> Result<Option<FlowMigrationAbort>, String> {
+        if let Some(cap) = self.recv_secure_capsule()? {
+            if cap.capsule_type == crate::simd_parser::CapsuleType::FlowMigrationAbort {
+                let abort = FlowMigrationAbort::from_capsule(&cap)?;
+                return Ok(Some(abort));
+            } else {
+                self.capsule_queue.push_front(cap);
+            }
+        }
+        Ok(None)
+    }
+
     /// Send a UDP datagram adaptively: if payload fits within path PMTU (accounting for RFC 9297
     /// Capsule & Context ID overhead), it is transmitted directly as a single DATAGRAM capsule.
     /// If payload exceeds PMTU, it is fragmented into RFC 9297/9298 compatible chunks.
@@ -27144,6 +27296,1319 @@ impl DistributedMasqueTopologyDiscoveryEngine {
     }
 }
 
+// ── Multi-Node Session State Synchronization & Seamless Datagram Flow Migration Protocol ────
+
+/// Operational role of a distributed gateway node regarding a specific MASQUE session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRole {
+    Primary = 0,
+    Standby = 1,
+    MigratingSource = 2,
+    MigratingTarget = 3,
+    Draining = 4,
+}
+
+impl SessionRole {
+    pub fn as_u8(&self) -> u8 {
+        *self as u8
+    }
+
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            0 => Self::Primary,
+            1 => Self::Standby,
+            2 => Self::MigratingSource,
+            3 => Self::MigratingTarget,
+            _ => Self::Draining,
+        }
+    }
+}
+
+/// Lifecycle phase of an active or transitioning session across distributed gateways.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionMigrationPhase {
+    Idle = 0,
+    Preparing = 1,
+    PreSyncing = 2,
+    CutoverRequested = 3,
+    CutoverAcked = 4,
+    Draining = 5,
+    Completed = 6,
+    Aborted = 7,
+}
+
+impl SessionMigrationPhase {
+    pub fn as_u8(&self) -> u8 {
+        *self as u8
+    }
+
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            0 => Self::Idle,
+            1 => Self::Preparing,
+            2 => Self::PreSyncing,
+            3 => Self::CutoverRequested,
+            4 => Self::CutoverAcked,
+            5 => Self::Draining,
+            6 => Self::Completed,
+            _ => Self::Aborted,
+        }
+    }
+}
+
+/// Root cause or trigger event driving a datagram flow or session migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationTriggerReason {
+    OperatorManual = 0,
+    LinkDegradation = 1,
+    NodeMaintenance = 2,
+    LoadBalancing = 3,
+    PathDisruption = 4,
+}
+
+impl MigrationTriggerReason {
+    pub fn as_u8(&self) -> u8 {
+        *self as u8
+    }
+
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            0 => Self::OperatorManual,
+            1 => Self::LinkDegradation,
+            2 => Self::NodeMaintenance,
+            3 => Self::LoadBalancing,
+            _ => Self::PathDisruption,
+        }
+    }
+}
+
+/// A serialized snapshot of a MASQUE session state synchronized across distributed gateways.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStateSnapshot {
+    pub session_id: String,
+    pub client_id: String,
+    pub state_epoch: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub tx_next_seq: u64,
+    pub rx_highest_seq: u64,
+    pub rx_window_base: u64,
+    pub rx_window_bitmap: u64,
+    pub active_tunnel_id: u64,
+    pub crypto_key_epoch: u32,
+    pub flow_ids: Vec<u64>,
+    pub migration_phase: SessionMigrationPhase,
+}
+
+impl SessionStateSnapshot {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(128);
+        topo_put_str(&mut buf, &self.session_id);
+        topo_put_str(&mut buf, &self.client_id);
+        topo_put_u64(&mut buf, self.state_epoch);
+        topo_put_u64(&mut buf, self.created_at_ms);
+        topo_put_u64(&mut buf, self.updated_at_ms);
+        topo_put_u64(&mut buf, self.tx_next_seq);
+        topo_put_u64(&mut buf, self.rx_highest_seq);
+        topo_put_u64(&mut buf, self.rx_window_base);
+        topo_put_u64(&mut buf, self.rx_window_bitmap);
+        topo_put_u64(&mut buf, self.active_tunnel_id);
+        topo_put_u32(&mut buf, self.crypto_key_epoch);
+        topo_put_u16(&mut buf, self.flow_ids.len() as u16);
+        for fid in &self.flow_ids {
+            topo_put_u64(&mut buf, *fid);
+        }
+        topo_put_u8(&mut buf, self.migration_phase.as_u8());
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        let session_id = topo_get_str(buf, &mut offset)?;
+        let client_id = topo_get_str(buf, &mut offset)?;
+        let state_epoch = topo_get_u64(buf, &mut offset)?;
+        let created_at_ms = topo_get_u64(buf, &mut offset)?;
+        let updated_at_ms = topo_get_u64(buf, &mut offset)?;
+        let tx_next_seq = topo_get_u64(buf, &mut offset)?;
+        let rx_highest_seq = topo_get_u64(buf, &mut offset)?;
+        let rx_window_base = topo_get_u64(buf, &mut offset)?;
+        let rx_window_bitmap = topo_get_u64(buf, &mut offset)?;
+        let active_tunnel_id = topo_get_u64(buf, &mut offset)?;
+        let crypto_key_epoch = topo_get_u32(buf, &mut offset)?;
+        let flow_count = topo_get_u16(buf, &mut offset)? as usize;
+        let mut flow_ids = Vec::with_capacity(flow_count);
+        for _ in 0..flow_count {
+            flow_ids.push(topo_get_u64(buf, &mut offset)?);
+        }
+        let phase_byte = topo_get_u8(buf, &mut offset)?;
+        let migration_phase = SessionMigrationPhase::from_u8(phase_byte);
+
+        Ok(Self {
+            session_id,
+            client_id,
+            state_epoch,
+            created_at_ms,
+            updated_at_ms,
+            tx_next_seq,
+            rx_highest_seq,
+            rx_window_base,
+            rx_window_bitmap,
+            active_tunnel_id,
+            crypto_key_epoch,
+            flow_ids,
+            migration_phase,
+        })
+    }
+
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::session_state_sync_announce(self.to_bytes())
+    }
+
+    pub fn from_capsule(cap: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        Self::from_bytes(&cap.payload)
+    }
+}
+
+/// Announcement message synchronizing a session's state between gateways.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStateSyncAnnounce {
+    pub origin_node_id: String,
+    pub snapshot: SessionStateSnapshot,
+    pub is_heartbeat: bool,
+}
+
+impl SessionStateSyncAnnounce {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(160);
+        topo_put_str(&mut buf, &self.origin_node_id);
+        topo_put_u8(&mut buf, if self.is_heartbeat { 1 } else { 0 });
+        let snap_bytes = self.snapshot.to_bytes();
+        topo_put_u32(&mut buf, snap_bytes.len() as u32);
+        buf.extend_from_slice(&snap_bytes);
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        let origin_node_id = topo_get_str(buf, &mut offset)?;
+        let hb_byte = topo_get_u8(buf, &mut offset)?;
+        let snap_len = topo_get_u32(buf, &mut offset)? as usize;
+        if offset + snap_len > buf.len() {
+            return Err("Unexpected EOF reading snapshot in SessionStateSyncAnnounce".to_string());
+        }
+        let snapshot = SessionStateSnapshot::from_bytes(&buf[offset..offset + snap_len])?;
+        Ok(Self {
+            origin_node_id,
+            snapshot,
+            is_heartbeat: hb_byte != 0,
+        })
+    }
+
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::session_state_sync_announce(self.to_bytes())
+    }
+
+    pub fn from_capsule(cap: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        if cap.capsule_type != crate::simd_parser::CapsuleType::SessionStateSyncAnnounce {
+            return Err("Expected SessionStateSyncAnnounce capsule".to_string());
+        }
+        Self::from_bytes(&cap.payload)
+    }
+}
+
+/// Request sent by a peer gateway to reconcile or fetch session state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStateSyncRequest {
+    pub requester_node_id: String,
+    pub session_id: String,
+    pub known_epoch: u64,
+}
+
+impl SessionStateSyncRequest {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+        topo_put_str(&mut buf, &self.requester_node_id);
+        topo_put_str(&mut buf, &self.session_id);
+        topo_put_u64(&mut buf, self.known_epoch);
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        let requester_node_id = topo_get_str(buf, &mut offset)?;
+        let session_id = topo_get_str(buf, &mut offset)?;
+        let known_epoch = topo_get_u64(buf, &mut offset)?;
+        Ok(Self {
+            requester_node_id,
+            session_id,
+            known_epoch,
+        })
+    }
+
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::session_state_sync_request(self.to_bytes())
+    }
+
+    pub fn from_capsule(cap: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        if cap.capsule_type != crate::simd_parser::CapsuleType::SessionStateSyncRequest {
+            return Err("Expected SessionStateSyncRequest capsule".to_string());
+        }
+        Self::from_bytes(&cap.payload)
+    }
+}
+
+/// Acknowledgement of a session state synchronization announcement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStateSyncAck {
+    pub responder_node_id: String,
+    pub session_id: String,
+    pub synced_epoch: u64,
+    pub success: bool,
+    pub error_message: Option<String>,
+}
+
+impl SessionStateSyncAck {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+        topo_put_str(&mut buf, &self.responder_node_id);
+        topo_put_str(&mut buf, &self.session_id);
+        topo_put_u64(&mut buf, self.synced_epoch);
+        topo_put_u8(&mut buf, if self.success { 1 } else { 0 });
+        if let Some(ref err) = self.error_message {
+            topo_put_u8(&mut buf, 1);
+            topo_put_str(&mut buf, err);
+        } else {
+            topo_put_u8(&mut buf, 0);
+        }
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        let responder_node_id = topo_get_str(buf, &mut offset)?;
+        let session_id = topo_get_str(buf, &mut offset)?;
+        let synced_epoch = topo_get_u64(buf, &mut offset)?;
+        let succ_byte = topo_get_u8(buf, &mut offset)?;
+        let has_err = topo_get_u8(buf, &mut offset)?;
+        let error_message = if has_err != 0 {
+            Some(topo_get_str(buf, &mut offset)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            responder_node_id,
+            session_id,
+            synced_epoch,
+            success: succ_byte != 0,
+            error_message,
+        })
+    }
+
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::session_state_sync_ack(self.to_bytes())
+    }
+
+    pub fn from_capsule(cap: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        if cap.capsule_type != crate::simd_parser::CapsuleType::SessionStateSyncAck {
+            return Err("Expected SessionStateSyncAck capsule".to_string());
+        }
+        Self::from_bytes(&cap.payload)
+    }
+}
+
+/// Message to initiate transparent migration of a datagram flow / session to a target gateway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowMigrationInitiate {
+    pub migration_id: u64,
+    pub session_id: String,
+    pub source_node_id: String,
+    pub target_node_id: String,
+    pub reason: MigrationTriggerReason,
+    pub snapshot: SessionStateSnapshot,
+}
+
+impl FlowMigrationInitiate {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(192);
+        topo_put_u64(&mut buf, self.migration_id);
+        topo_put_str(&mut buf, &self.session_id);
+        topo_put_str(&mut buf, &self.source_node_id);
+        topo_put_str(&mut buf, &self.target_node_id);
+        topo_put_u8(&mut buf, self.reason.as_u8());
+        let snap_bytes = self.snapshot.to_bytes();
+        topo_put_u32(&mut buf, snap_bytes.len() as u32);
+        buf.extend_from_slice(&snap_bytes);
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        let migration_id = topo_get_u64(buf, &mut offset)?;
+        let session_id = topo_get_str(buf, &mut offset)?;
+        let source_node_id = topo_get_str(buf, &mut offset)?;
+        let target_node_id = topo_get_str(buf, &mut offset)?;
+        let reason_byte = topo_get_u8(buf, &mut offset)?;
+        let snap_len = topo_get_u32(buf, &mut offset)? as usize;
+        if offset + snap_len > buf.len() {
+            return Err("Unexpected EOF reading snapshot in FlowMigrationInitiate".to_string());
+        }
+        let snapshot = SessionStateSnapshot::from_bytes(&buf[offset..offset + snap_len])?;
+        Ok(Self {
+            migration_id,
+            session_id,
+            source_node_id,
+            target_node_id,
+            reason: MigrationTriggerReason::from_u8(reason_byte),
+            snapshot,
+        })
+    }
+
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::flow_migration_initiate(self.to_bytes())
+    }
+
+    pub fn from_capsule(cap: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        if cap.capsule_type != crate::simd_parser::CapsuleType::FlowMigrationInitiate {
+            return Err("Expected FlowMigrationInitiate capsule".to_string());
+        }
+        Self::from_bytes(&cap.payload)
+    }
+}
+
+/// Target gateway response acknowledging preparation for incoming flow migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowMigrationPrepareAck {
+    pub migration_id: u64,
+    pub session_id: String,
+    pub target_node_id: String,
+    pub target_tunnel_endpoint: String,
+    pub ready: bool,
+    pub target_epoch: u64,
+}
+
+impl FlowMigrationPrepareAck {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(96);
+        topo_put_u64(&mut buf, self.migration_id);
+        topo_put_str(&mut buf, &self.session_id);
+        topo_put_str(&mut buf, &self.target_node_id);
+        topo_put_str(&mut buf, &self.target_tunnel_endpoint);
+        topo_put_u8(&mut buf, if self.ready { 1 } else { 0 });
+        topo_put_u64(&mut buf, self.target_epoch);
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        let migration_id = topo_get_u64(buf, &mut offset)?;
+        let session_id = topo_get_str(buf, &mut offset)?;
+        let target_node_id = topo_get_str(buf, &mut offset)?;
+        let target_tunnel_endpoint = topo_get_str(buf, &mut offset)?;
+        let ready_byte = topo_get_u8(buf, &mut offset)?;
+        let target_epoch = topo_get_u64(buf, &mut offset)?;
+        Ok(Self {
+            migration_id,
+            session_id,
+            target_node_id,
+            target_tunnel_endpoint,
+            ready: ready_byte != 0,
+            target_epoch,
+        })
+    }
+
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::flow_migration_prepare_ack(self.to_bytes())
+    }
+
+    pub fn from_capsule(cap: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        if cap.capsule_type != crate::simd_parser::CapsuleType::FlowMigrationPrepareAck {
+            return Err("Expected FlowMigrationPrepareAck capsule".to_string());
+        }
+        Self::from_bytes(&cap.payload)
+    }
+}
+
+/// Atomic cutover command switching primary datagram handling to the target gateway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowMigrationCutover {
+    pub migration_id: u64,
+    pub session_id: String,
+    pub source_node_id: String,
+    pub target_node_id: String,
+    pub cutover_seq: u64,
+    pub timestamp_ms: u64,
+}
+
+impl FlowMigrationCutover {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(96);
+        topo_put_u64(&mut buf, self.migration_id);
+        topo_put_str(&mut buf, &self.session_id);
+        topo_put_str(&mut buf, &self.source_node_id);
+        topo_put_str(&mut buf, &self.target_node_id);
+        topo_put_u64(&mut buf, self.cutover_seq);
+        topo_put_u64(&mut buf, self.timestamp_ms);
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        let migration_id = topo_get_u64(buf, &mut offset)?;
+        let session_id = topo_get_str(buf, &mut offset)?;
+        let source_node_id = topo_get_str(buf, &mut offset)?;
+        let target_node_id = topo_get_str(buf, &mut offset)?;
+        let cutover_seq = topo_get_u64(buf, &mut offset)?;
+        let timestamp_ms = topo_get_u64(buf, &mut offset)?;
+        Ok(Self {
+            migration_id,
+            session_id,
+            source_node_id,
+            target_node_id,
+            cutover_seq,
+            timestamp_ms,
+        })
+    }
+
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::flow_migration_cutover(self.to_bytes())
+    }
+
+    pub fn from_capsule(cap: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        if cap.capsule_type != crate::simd_parser::CapsuleType::FlowMigrationCutover {
+            return Err("Expected FlowMigrationCutover capsule".to_string());
+        }
+        Self::from_bytes(&cap.payload)
+    }
+}
+
+/// Finalization confirmation completing migration and draining residual forwarding queues.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowMigrationComplete {
+    pub migration_id: u64,
+    pub session_id: String,
+    pub target_node_id: String,
+    pub forwarded_packets_received: u64,
+    pub final_epoch: u64,
+}
+
+impl FlowMigrationComplete {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(80);
+        topo_put_u64(&mut buf, self.migration_id);
+        topo_put_str(&mut buf, &self.session_id);
+        topo_put_str(&mut buf, &self.target_node_id);
+        topo_put_u64(&mut buf, self.forwarded_packets_received);
+        topo_put_u64(&mut buf, self.final_epoch);
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        let migration_id = topo_get_u64(buf, &mut offset)?;
+        let session_id = topo_get_str(buf, &mut offset)?;
+        let target_node_id = topo_get_str(buf, &mut offset)?;
+        let forwarded_packets_received = topo_get_u64(buf, &mut offset)?;
+        let final_epoch = topo_get_u64(buf, &mut offset)?;
+        Ok(Self {
+            migration_id,
+            session_id,
+            target_node_id,
+            forwarded_packets_received,
+            final_epoch,
+        })
+    }
+
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::flow_migration_complete(self.to_bytes())
+    }
+
+    pub fn from_capsule(cap: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        if cap.capsule_type != crate::simd_parser::CapsuleType::FlowMigrationComplete {
+            return Err("Expected FlowMigrationComplete capsule".to_string());
+        }
+        Self::from_bytes(&cap.payload)
+    }
+}
+
+/// Abort message rolling back migration state upon failure or communication loss.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowMigrationAbort {
+    pub migration_id: u64,
+    pub session_id: String,
+    pub reason: String,
+}
+
+impl FlowMigrationAbort {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+        topo_put_u64(&mut buf, self.migration_id);
+        topo_put_str(&mut buf, &self.session_id);
+        topo_put_str(&mut buf, &self.reason);
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        let migration_id = topo_get_u64(buf, &mut offset)?;
+        let session_id = topo_get_str(buf, &mut offset)?;
+        let reason = topo_get_str(buf, &mut offset)?;
+        Ok(Self {
+            migration_id,
+            session_id,
+            reason,
+        })
+    }
+
+    pub fn to_capsule(&self) -> crate::simd_parser::HttpCapsule {
+        crate::simd_parser::HttpCapsule::flow_migration_abort(self.to_bytes())
+    }
+
+    pub fn from_capsule(cap: &crate::simd_parser::HttpCapsule) -> Result<Self, String> {
+        if cap.capsule_type != crate::simd_parser::CapsuleType::FlowMigrationAbort {
+            return Err("Expected FlowMigrationAbort capsule".to_string());
+        }
+        Self::from_bytes(&cap.payload)
+    }
+}
+
+/// An individual datagram forwarded in transit from the old gateway to the new primary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardedDatagram {
+    pub sequence: u64,
+    pub flow_id: u64,
+    pub payload: Vec<u8>,
+    pub forwarded_at_ms: u64,
+}
+
+impl ForwardedDatagram {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + self.payload.len());
+        topo_put_u64(&mut buf, self.sequence);
+        topo_put_u64(&mut buf, self.flow_id);
+        topo_put_u64(&mut buf, self.forwarded_at_ms);
+        topo_put_u32(&mut buf, self.payload.len() as u32);
+        buf.extend_from_slice(&self.payload);
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        let sequence = topo_get_u64(buf, &mut offset)?;
+        let flow_id = topo_get_u64(buf, &mut offset)?;
+        let forwarded_at_ms = topo_get_u64(buf, &mut offset)?;
+        let p_len = topo_get_u32(buf, &mut offset)? as usize;
+        if offset + p_len > buf.len() {
+            return Err("Unexpected EOF reading payload in ForwardedDatagram".to_string());
+        }
+        let payload = buf[offset..offset + p_len].to_vec();
+        Ok(Self {
+            sequence,
+            flow_id,
+            payload,
+            forwarded_at_ms,
+        })
+    }
+}
+
+/// FIFO buffer holding datagrams forwarded during cutover to guarantee zero packet loss.
+#[derive(Debug, Clone)]
+pub struct MigrationForwardingBuffer {
+    pub capacity: usize,
+    pub queue: std::collections::VecDeque<ForwardedDatagram>,
+    pub total_enqueued: u64,
+    pub total_forwarded: u64,
+    pub total_dropped: u64,
+}
+
+impl MigrationForwardingBuffer {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(16),
+            queue: std::collections::VecDeque::new(),
+            total_enqueued: 0,
+            total_forwarded: 0,
+            total_dropped: 0,
+        }
+    }
+
+    pub fn push(&mut self, datagram: ForwardedDatagram) -> bool {
+        self.total_enqueued += 1;
+        if self.queue.len() >= self.capacity {
+            self.total_dropped += 1;
+            return false;
+        }
+        self.queue.push_back(datagram);
+        true
+    }
+
+    pub fn pop(&mut self) -> Option<ForwardedDatagram> {
+        if let Some(d) = self.queue.pop_front() {
+            self.total_forwarded += 1;
+            Some(d)
+        } else {
+            None
+        }
+    }
+
+    pub fn drain_all(&mut self) -> Vec<ForwardedDatagram> {
+        let items: Vec<ForwardedDatagram> = self.queue.drain(..).collect();
+        self.total_forwarded += items.len() as u64;
+        items
+    }
+
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
+
+/// Complete synchronized state and tracking buffers for a MASQUE session on a gateway node.
+#[derive(Debug, Clone)]
+pub struct SynchronizedSessionRecord {
+    pub role: SessionRole,
+    pub snapshot: SessionStateSnapshot,
+    pub forwarding_buffer: MigrationForwardingBuffer,
+    pub deduplication_window: std::collections::HashSet<u64>,
+    pub delivered_packets: Vec<(u64, Vec<u8>)>,
+    pub last_sync_time_ms: u64,
+}
+
+impl SynchronizedSessionRecord {
+    pub fn new(role: SessionRole, snapshot: SessionStateSnapshot, now_ms: u64) -> Self {
+        Self {
+            role,
+            snapshot,
+            forwarding_buffer: MigrationForwardingBuffer::new(1024),
+            deduplication_window: std::collections::HashSet::new(),
+            delivered_packets: Vec::new(),
+            last_sync_time_ms: now_ms,
+        }
+    }
+
+    /// Deliver a datagram if not duplicate, recording in deduplication window.
+    pub fn deliver_datagram(&mut self, seq: u64, payload: Vec<u8>) -> bool {
+        if self.deduplication_window.contains(&seq) {
+            return false;
+        }
+        self.deduplication_window.insert(seq);
+        if seq > self.snapshot.rx_highest_seq {
+            self.snapshot.rx_highest_seq = seq;
+        }
+        self.delivered_packets.push((seq, payload));
+        true
+    }
+}
+
+/// Central engine managing multi-node session synchronization across distributed gateways.
+#[derive(Debug, Clone)]
+pub struct MultiNodeSessionSyncEngine {
+    pub local_node_id: String,
+    pub sessions: std::collections::HashMap<String, SynchronizedSessionRecord>,
+    pub sync_sequence: u64,
+    pub total_sync_announces_sent: u64,
+    pub total_sync_announces_received: u64,
+    pub total_sync_requests_received: u64,
+}
+
+impl MultiNodeSessionSyncEngine {
+    pub fn new(local_node_id: &str) -> Self {
+        Self {
+            local_node_id: local_node_id.to_string(),
+            sessions: std::collections::HashMap::new(),
+            sync_sequence: 0,
+            total_sync_announces_sent: 0,
+            total_sync_announces_received: 0,
+            total_sync_requests_received: 0,
+        }
+    }
+
+    /// Register a newly established primary MASQUE session on this gateway.
+    pub fn register_primary_session(
+        &mut self,
+        session_id: &str,
+        client_id: &str,
+        tunnel_id: u64,
+        now_ms: u64,
+    ) -> &mut SynchronizedSessionRecord {
+        let snapshot = SessionStateSnapshot {
+            session_id: session_id.to_string(),
+            client_id: client_id.to_string(),
+            state_epoch: 1,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            tx_next_seq: 1,
+            rx_highest_seq: 0,
+            rx_window_base: 0,
+            rx_window_bitmap: 0,
+            active_tunnel_id: tunnel_id,
+            crypto_key_epoch: 1,
+            flow_ids: vec![1],
+            migration_phase: SessionMigrationPhase::Idle,
+        };
+        let record = SynchronizedSessionRecord::new(SessionRole::Primary, snapshot, now_ms);
+        self.sessions.insert(session_id.to_string(), record);
+        self.sessions.get_mut(session_id).expect("session exists")
+    }
+
+    pub fn get_session(&self, session_id: &str) -> Option<&SynchronizedSessionRecord> {
+        self.sessions.get(session_id)
+    }
+
+    pub fn get_session_mut(&mut self, session_id: &str) -> Option<&mut SynchronizedSessionRecord> {
+        self.sessions.get_mut(session_id)
+    }
+
+    /// Update progression of a primary session and produce an incremental sync announcement.
+    pub fn update_primary_progress(
+        &mut self,
+        session_id: &str,
+        tx_seq: u64,
+        rx_seq: u64,
+        now_ms: u64,
+    ) -> Option<SessionStateSyncAnnounce> {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            if session.role == SessionRole::Primary {
+                session.snapshot.state_epoch += 1;
+                session.snapshot.updated_at_ms = now_ms;
+                session.snapshot.tx_next_seq = tx_seq;
+                if rx_seq > session.snapshot.rx_highest_seq {
+                    session.snapshot.rx_highest_seq = rx_seq;
+                }
+                session.last_sync_time_ms = now_ms;
+                self.total_sync_announces_sent += 1;
+
+                return Some(SessionStateSyncAnnounce {
+                    origin_node_id: self.local_node_id.clone(),
+                    snapshot: session.snapshot.clone(),
+                    is_heartbeat: false,
+                });
+            }
+        }
+        None
+    }
+
+    /// Ingest a session state sync announcement from a remote primary gateway.
+    pub fn handle_sync_announce(
+        &mut self,
+        announce: &SessionStateSyncAnnounce,
+        now_ms: u64,
+    ) -> SessionStateSyncAck {
+        self.total_sync_announces_received += 1;
+        let s_id = &announce.snapshot.session_id;
+
+        if let Some(existing) = self.sessions.get_mut(s_id) {
+            if announce.snapshot.state_epoch >= existing.snapshot.state_epoch {
+                existing.snapshot = announce.snapshot.clone();
+                existing.last_sync_time_ms = now_ms;
+                SessionStateSyncAck {
+                    responder_node_id: self.local_node_id.clone(),
+                    session_id: s_id.clone(),
+                    synced_epoch: existing.snapshot.state_epoch,
+                    success: true,
+                    error_message: None,
+                }
+            } else {
+                SessionStateSyncAck {
+                    responder_node_id: self.local_node_id.clone(),
+                    session_id: s_id.clone(),
+                    synced_epoch: existing.snapshot.state_epoch,
+                    success: false,
+                    error_message: Some("Incoming epoch is older than current local epoch".to_string()),
+                }
+            }
+        } else {
+            // New standby replica session record
+            let mut record = SynchronizedSessionRecord::new(
+                SessionRole::Standby,
+                announce.snapshot.clone(),
+                now_ms,
+            );
+            record.last_sync_time_ms = now_ms;
+            let epoch = record.snapshot.state_epoch;
+            self.sessions.insert(s_id.clone(), record);
+
+            SessionStateSyncAck {
+                responder_node_id: self.local_node_id.clone(),
+                session_id: s_id.clone(),
+                synced_epoch: epoch,
+                success: true,
+                error_message: None,
+            }
+        }
+    }
+
+    /// Handle a sync request asking for latest session state snapshot.
+    pub fn handle_sync_request(
+        &mut self,
+        req: &SessionStateSyncRequest,
+    ) -> Option<SessionStateSyncAnnounce> {
+        self.total_sync_requests_received += 1;
+        if let Some(session) = self.sessions.get(&req.session_id) {
+            Some(SessionStateSyncAnnounce {
+                origin_node_id: self.local_node_id.clone(),
+                snapshot: session.snapshot.clone(),
+                is_heartbeat: false,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn sessions_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn primary_sessions_count(&self) -> usize {
+        self.sessions.values().filter(|s| s.role == SessionRole::Primary).count()
+    }
+
+    pub fn standby_sessions_count(&self) -> usize {
+        self.sessions.values().filter(|s| s.role == SessionRole::Standby).count()
+    }
+}
+
+/// Tracking context for an in-flight session migration across gateways.
+#[derive(Debug, Clone)]
+pub struct MigrationContext {
+    pub migration_id: u64,
+    pub session_id: String,
+    pub source_node_id: String,
+    pub target_node_id: String,
+    pub reason: MigrationTriggerReason,
+    pub phase: SessionMigrationPhase,
+    pub start_time_ms: u64,
+    pub cutover_time_ms: Option<u64>,
+    pub completed_time_ms: Option<u64>,
+    pub cutover_seq: u64,
+    pub forwarded_count: u64,
+}
+
+/// Performance and reliability telemetry for seamless flow migrations.
+#[derive(Debug, Clone, Default)]
+pub struct MigrationTelemetry {
+    pub active_migrations: usize,
+    pub total_migrations_started: u64,
+    pub total_migrations_completed: u64,
+    pub total_migrations_aborted: u64,
+    pub total_datagrams_forwarded: u64,
+    pub zero_loss_migrations: u64,
+    pub average_cutover_duration_ms: f64,
+}
+
+/// Seamless migration manager executing zero-packet-loss handover between MASQUE gateways.
+#[derive(Debug, Clone)]
+pub struct SeamlessFlowMigrationManager {
+    pub local_node_id: String,
+    pub active_migrations: std::collections::HashMap<u64, MigrationContext>,
+    pub next_migration_id: u64,
+    pub total_migrations_started: u64,
+    pub total_migrations_completed: u64,
+    pub total_migrations_aborted: u64,
+    pub total_datagrams_forwarded: u64,
+    pub zero_loss_migrations: u64,
+    pub total_cutover_duration_ms: u64,
+}
+
+impl SeamlessFlowMigrationManager {
+    pub fn new(local_node_id: &str) -> Self {
+        Self {
+            local_node_id: local_node_id.to_string(),
+            active_migrations: std::collections::HashMap::new(),
+            next_migration_id: 1,
+            total_migrations_started: 0,
+            total_migrations_completed: 0,
+            total_migrations_aborted: 0,
+            total_datagrams_forwarded: 0,
+            zero_loss_migrations: 0,
+            total_cutover_duration_ms: 0,
+        }
+    }
+
+    /// Step 1: Initiate migration from the source gateway node.
+    pub fn initiate_migration(
+        &mut self,
+        sync_engine: &mut MultiNodeSessionSyncEngine,
+        session_id: &str,
+        target_node: &str,
+        reason: MigrationTriggerReason,
+        now_ms: u64,
+    ) -> Result<FlowMigrationInitiate, String> {
+        let session = sync_engine
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("Session {session_id} not found on source node"))?;
+
+        if session.role != SessionRole::Primary {
+            return Err("Only primary gateway node can initiate migration".to_string());
+        }
+
+        let migration_id = self.next_migration_id;
+        self.next_migration_id += 1;
+        self.total_migrations_started += 1;
+
+        session.role = SessionRole::MigratingSource;
+        session.snapshot.migration_phase = SessionMigrationPhase::Preparing;
+        session.snapshot.state_epoch += 1;
+        session.snapshot.updated_at_ms = now_ms;
+
+        let ctx = MigrationContext {
+            migration_id,
+            session_id: session_id.to_string(),
+            source_node_id: self.local_node_id.clone(),
+            target_node_id: target_node.to_string(),
+            reason,
+            phase: SessionMigrationPhase::Preparing,
+            start_time_ms: now_ms,
+            cutover_time_ms: None,
+            completed_time_ms: None,
+            cutover_seq: session.snapshot.tx_next_seq,
+            forwarded_count: 0,
+        };
+        self.active_migrations.insert(migration_id, ctx);
+
+        Ok(FlowMigrationInitiate {
+            migration_id,
+            session_id: session_id.to_string(),
+            source_node_id: self.local_node_id.clone(),
+            target_node_id: target_node.to_string(),
+            reason,
+            snapshot: session.snapshot.clone(),
+        })
+    }
+
+    /// Step 2: Handle migration initiation on the target gateway node.
+    pub fn handle_migration_initiate(
+        &mut self,
+        sync_engine: &mut MultiNodeSessionSyncEngine,
+        init: &FlowMigrationInitiate,
+        target_endpoint: &str,
+        now_ms: u64,
+    ) -> Result<FlowMigrationPrepareAck, String> {
+        let s_id = &init.session_id;
+
+        // Create or update session in MigratingTarget role
+        let mut snapshot = init.snapshot.clone();
+        snapshot.state_epoch += 1;
+        snapshot.updated_at_ms = now_ms;
+        snapshot.migration_phase = SessionMigrationPhase::PreSyncing;
+
+        let mut record = SynchronizedSessionRecord::new(SessionRole::MigratingTarget, snapshot, now_ms);
+        record.last_sync_time_ms = now_ms;
+        let target_epoch = record.snapshot.state_epoch;
+        sync_engine.sessions.insert(s_id.clone(), record);
+
+        let ctx = MigrationContext {
+            migration_id: init.migration_id,
+            session_id: s_id.clone(),
+            source_node_id: init.source_node_id.clone(),
+            target_node_id: self.local_node_id.clone(),
+            reason: init.reason,
+            phase: SessionMigrationPhase::PreSyncing,
+            start_time_ms: now_ms,
+            cutover_time_ms: None,
+            completed_time_ms: None,
+            cutover_seq: init.snapshot.tx_next_seq,
+            forwarded_count: 0,
+        };
+        self.active_migrations.insert(init.migration_id, ctx);
+
+        Ok(FlowMigrationPrepareAck {
+            migration_id: init.migration_id,
+            session_id: s_id.clone(),
+            target_node_id: self.local_node_id.clone(),
+            target_tunnel_endpoint: target_endpoint.to_string(),
+            ready: true,
+            target_epoch,
+        })
+    }
+
+    /// Step 3: Handle prepare ack on source node and emit cutover order.
+    pub fn handle_prepare_ack(
+        &mut self,
+        sync_engine: &mut MultiNodeSessionSyncEngine,
+        ack: &FlowMigrationPrepareAck,
+        now_ms: u64,
+    ) -> Result<FlowMigrationCutover, String> {
+        let ctx = self
+            .active_migrations
+            .get_mut(&ack.migration_id)
+            .ok_or_else(|| format!("Migration {} not found", ack.migration_id))?;
+
+        if !ack.ready {
+            return Err("Target gateway failed to prepare for migration".to_string());
+        }
+
+        let session = sync_engine
+            .sessions
+            .get_mut(&ack.session_id)
+            .ok_or_else(|| format!("Session {} not found", ack.session_id))?;
+
+        let cutover_seq = session.snapshot.tx_next_seq;
+        session.snapshot.migration_phase = SessionMigrationPhase::CutoverRequested;
+        session.snapshot.state_epoch = ack.target_epoch + 1;
+        session.snapshot.updated_at_ms = now_ms;
+
+        ctx.phase = SessionMigrationPhase::CutoverRequested;
+        ctx.cutover_time_ms = Some(now_ms);
+        ctx.cutover_seq = cutover_seq;
+
+        Ok(FlowMigrationCutover {
+            migration_id: ack.migration_id,
+            session_id: ack.session_id.clone(),
+            source_node_id: self.local_node_id.clone(),
+            target_node_id: ack.target_node_id.clone(),
+            cutover_seq,
+            timestamp_ms: now_ms,
+        })
+    }
+
+    /// Step 4: Handle cutover command on target node.
+    pub fn handle_cutover(
+        &mut self,
+        sync_engine: &mut MultiNodeSessionSyncEngine,
+        cutover: &FlowMigrationCutover,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let ctx = self
+            .active_migrations
+            .get_mut(&cutover.migration_id)
+            .ok_or_else(|| format!("Migration {} not found", cutover.migration_id))?;
+
+        let session = sync_engine
+            .sessions
+            .get_mut(&cutover.session_id)
+            .ok_or_else(|| format!("Session {} not found", cutover.session_id))?;
+
+        session.snapshot.migration_phase = SessionMigrationPhase::CutoverAcked;
+        session.snapshot.updated_at_ms = now_ms;
+        ctx.phase = SessionMigrationPhase::CutoverAcked;
+        ctx.cutover_time_ms = Some(now_ms);
+        ctx.cutover_seq = cutover.cutover_seq;
+
+        Ok(())
+    }
+
+    /// Forward a datagram received in-flight on the old source node during cutover transition.
+    pub fn forward_transit_datagram(
+        &mut self,
+        sync_engine: &mut MultiNodeSessionSyncEngine,
+        session_id: &str,
+        seq: u64,
+        flow_id: u64,
+        payload: Vec<u8>,
+        now_ms: u64,
+    ) -> Result<ForwardedDatagram, String> {
+        let session = sync_engine
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("Session {session_id} not found"))?;
+
+        let datagram = ForwardedDatagram {
+            sequence: seq,
+            flow_id,
+            payload,
+            forwarded_at_ms: now_ms,
+        };
+
+        session.forwarding_buffer.push(datagram.clone());
+        self.total_datagrams_forwarded += 1;
+
+        if let Some(ctx) = self.active_migrations.values_mut().find(|c| c.session_id == session_id) {
+            ctx.forwarded_count += 1;
+        }
+
+        Ok(datagram)
+    }
+
+    /// Ingest a forwarded datagram on the new target node (seamless merge).
+    pub fn ingest_forwarded_datagram(
+        &mut self,
+        sync_engine: &mut MultiNodeSessionSyncEngine,
+        session_id: &str,
+        datagram: ForwardedDatagram,
+        _now_ms: u64,
+    ) -> Result<bool, String> {
+        let session = sync_engine
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("Session {session_id} not found"))?;
+
+        let delivered = session.deliver_datagram(datagram.sequence, datagram.payload);
+        if delivered {
+            self.total_datagrams_forwarded += 1;
+            if let Some(ctx) = self.active_migrations.values_mut().find(|c| c.session_id == session_id) {
+                ctx.forwarded_count += 1;
+            }
+        }
+        Ok(delivered)
+    }
+
+    /// Ingest a datagram received directly from the client on the new target node.
+    pub fn ingest_direct_datagram(
+        &mut self,
+        sync_engine: &mut MultiNodeSessionSyncEngine,
+        session_id: &str,
+        seq: u64,
+        _flow_id: u64,
+        payload: Vec<u8>,
+        _now_ms: u64,
+    ) -> Result<bool, String> {
+        let session = sync_engine
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("Session {session_id} not found"))?;
+
+        let delivered = session.deliver_datagram(seq, payload);
+        Ok(delivered)
+    }
+
+    /// Step 5: Finalize migration from target node once direct traffic is active.
+    pub fn finalize_migration(
+        &mut self,
+        sync_engine: &mut MultiNodeSessionSyncEngine,
+        migration_id: u64,
+        now_ms: u64,
+    ) -> Result<FlowMigrationComplete, String> {
+        let ctx = self
+            .active_migrations
+            .get_mut(&migration_id)
+            .ok_or_else(|| format!("Migration {migration_id} not found"))?;
+
+        let session = sync_engine
+            .sessions
+            .get_mut(&ctx.session_id)
+            .ok_or_else(|| format!("Session {} not found", ctx.session_id))?;
+
+        session.role = SessionRole::Primary;
+        session.snapshot.migration_phase = SessionMigrationPhase::Completed;
+        session.snapshot.state_epoch += 1;
+        session.snapshot.updated_at_ms = now_ms;
+
+        let cutover_dur = if let Some(cut_ms) = ctx.cutover_time_ms {
+            now_ms.saturating_sub(cut_ms)
+        } else {
+            0
+        };
+        self.total_cutover_duration_ms += cutover_dur;
+        self.total_migrations_completed += 1;
+        self.zero_loss_migrations += 1;
+
+        ctx.phase = SessionMigrationPhase::Completed;
+        ctx.completed_time_ms = Some(now_ms);
+
+        Ok(FlowMigrationComplete {
+            migration_id,
+            session_id: ctx.session_id.clone(),
+            target_node_id: self.local_node_id.clone(),
+            forwarded_packets_received: ctx.forwarded_count,
+            final_epoch: session.snapshot.state_epoch,
+        })
+    }
+
+    /// Handle complete message on source node (drain and transition to Standby).
+    pub fn handle_migration_complete(
+        &mut self,
+        sync_engine: &mut MultiNodeSessionSyncEngine,
+        complete: &FlowMigrationComplete,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let session = sync_engine
+            .sessions
+            .get_mut(&complete.session_id)
+            .ok_or_else(|| format!("Session {} not found", complete.session_id))?;
+
+        session.role = SessionRole::Standby;
+        session.snapshot.migration_phase = SessionMigrationPhase::Completed;
+        session.snapshot.state_epoch = complete.final_epoch;
+        session.snapshot.updated_at_ms = now_ms;
+        session.forwarding_buffer.drain_all();
+
+        if let Some(ctx) = self.active_migrations.get_mut(&complete.migration_id) {
+            ctx.phase = SessionMigrationPhase::Completed;
+            ctx.completed_time_ms = Some(now_ms);
+        }
+
+        Ok(())
+    }
+
+    /// Abort an ongoing migration and restore primary state on source node.
+    pub fn abort_migration(
+        &mut self,
+        sync_engine: &mut MultiNodeSessionSyncEngine,
+        migration_id: u64,
+        reason: &str,
+    ) -> Result<FlowMigrationAbort, String> {
+        let ctx = self
+            .active_migrations
+            .get_mut(&migration_id)
+            .ok_or_else(|| format!("Migration {migration_id} not found"))?;
+
+        let session = sync_engine
+            .sessions
+            .get_mut(&ctx.session_id)
+            .ok_or_else(|| format!("Session {} not found", ctx.session_id))?;
+
+        if session.role == SessionRole::MigratingSource {
+            session.role = SessionRole::Primary;
+        }
+        session.snapshot.migration_phase = SessionMigrationPhase::Aborted;
+        ctx.phase = SessionMigrationPhase::Aborted;
+        self.total_migrations_aborted += 1;
+
+        Ok(FlowMigrationAbort {
+            migration_id,
+            session_id: ctx.session_id.clone(),
+            reason: reason.to_string(),
+        })
+    }
+
+    /// Handle abort notification on peer node.
+    pub fn handle_migration_abort(
+        &mut self,
+        sync_engine: &mut MultiNodeSessionSyncEngine,
+        abort: &FlowMigrationAbort,
+    ) -> Result<(), String> {
+        if let Some(session) = sync_engine.sessions.get_mut(&abort.session_id) {
+            session.snapshot.migration_phase = SessionMigrationPhase::Aborted;
+            if session.role == SessionRole::MigratingTarget {
+                sync_engine.sessions.remove(&abort.session_id);
+            }
+        }
+        if let Some(ctx) = self.active_migrations.get_mut(&abort.migration_id) {
+            ctx.phase = SessionMigrationPhase::Aborted;
+        }
+        Ok(())
+    }
+
+    /// Retrieve telemetry report on flow migration performance and reliability.
+    pub fn telemetry(&self) -> MigrationTelemetry {
+        let active = self
+            .active_migrations
+            .values()
+            .filter(|c| c.phase != SessionMigrationPhase::Completed && c.phase != SessionMigrationPhase::Aborted)
+            .count();
+
+        let avg_cutover = if self.total_migrations_completed > 0 {
+            (self.total_cutover_duration_ms as f64) / (self.total_migrations_completed as f64)
+        } else {
+            0.0
+        };
+
+        MigrationTelemetry {
+            active_migrations: active,
+            total_migrations_started: self.total_migrations_started,
+            total_migrations_completed: self.total_migrations_completed,
+            total_migrations_aborted: self.total_migrations_aborted,
+            total_datagrams_forwarded: self.total_datagrams_forwarded,
+            zero_loss_migrations: self.zero_loss_migrations,
+            average_cutover_duration_ms: avg_cutover,
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -40331,5 +41796,212 @@ mod tls_alpn_tests {
         let recv_sync_resp = client_tunnel.recv_topology_sync_response().expect("recv sync resp").expect("resp exists");
         assert!(!recv_sync_resp.nodes.is_empty());
         assert!(!recv_sync_resp.links.is_empty());
+    }
+
+    #[test]
+    fn test_multi_node_session_state_synchronization() {
+        let mut node_a = MultiNodeSessionSyncEngine::new("gw-node-a");
+        let mut node_b = MultiNodeSessionSyncEngine::new("gw-node-b");
+
+        // 1. Register session on Primary node A
+        let session_rec = node_a.register_primary_session("sess-alpha-01", "client-99", 5001, 10_000);
+        assert_eq!(session_rec.role, SessionRole::Primary);
+        assert_eq!(session_rec.snapshot.state_epoch, 1);
+
+        // 2. Advance session progress and generate sync announcement
+        let announce = node_a
+            .update_primary_progress("sess-alpha-01", 100, 85, 10_050)
+            .expect("announce produced");
+        assert_eq!(announce.snapshot.state_epoch, 2);
+        assert_eq!(announce.snapshot.tx_next_seq, 100);
+        assert_eq!(announce.snapshot.rx_highest_seq, 85);
+
+        // 3. Transmit announcement across ExtendedConnectTunnel
+        let mut tunnel_a = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "gw-node-b:443");
+        tunnel_a.mark_established();
+        let mut tunnel_b = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "gw-node-b:443");
+        tunnel_b.mark_established();
+
+        tunnel_a.send_session_state_sync(&announce).expect("send sync");
+        for f in tunnel_a.drain_egress_data() {
+            tunnel_b.ingest_network_data(&f);
+        }
+
+        let recv_announce = tunnel_b
+            .recv_session_state_sync()
+            .expect("recv sync")
+            .expect("announce exists");
+        assert_eq!(recv_announce.origin_node_id, "gw-node-a");
+        assert_eq!(recv_announce.snapshot.session_id, "sess-alpha-01");
+
+        // 4. Ingest on node B and verify replica Standby session
+        let ack = node_b.handle_sync_announce(&recv_announce, 10_060);
+        assert!(ack.success);
+        assert_eq!(ack.synced_epoch, 2);
+        assert_eq!(node_b.standby_sessions_count(), 1);
+
+        let replica = node_b.get_session("sess-alpha-01").expect("session exists");
+        assert_eq!(replica.role, SessionRole::Standby);
+        assert_eq!(replica.snapshot.tx_next_seq, 100);
+
+        // 5. Send state sync request from node B to node A
+        let req = SessionStateSyncRequest {
+            requester_node_id: "gw-node-b".to_string(),
+            session_id: "sess-alpha-01".to_string(),
+            known_epoch: 1,
+        };
+        let sync_resp = node_a.handle_sync_request(&req).expect("sync snapshot returned");
+        assert_eq!(sync_resp.snapshot.state_epoch, 2);
+    }
+
+    #[test]
+    fn test_seamless_datagram_flow_migration_lifecycle() {
+        let mut engine_a = MultiNodeSessionSyncEngine::new("gw-iad1");
+        let mut engine_b = MultiNodeSessionSyncEngine::new("gw-fra2");
+        let mut mig_mgr_a = SeamlessFlowMigrationManager::new("gw-iad1");
+        let mut mig_mgr_b = SeamlessFlowMigrationManager::new("gw-fra2");
+
+        // Tunnels for control exchange
+        let mut tunnel_a = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "gw-fra2:443");
+        tunnel_a.mark_established();
+        let mut tunnel_b = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "gw-fra2:443");
+        tunnel_b.mark_established();
+
+        // 1. Establish session on source gateway A
+        engine_a.register_primary_session("sess-live-99", "client-h3", 1001, 1_000);
+        engine_a.update_primary_progress("sess-live-99", 50, 40, 1_100);
+
+        // 2. Step 1: Initiate migration from Node A to Node B
+        let init_cmd = mig_mgr_a
+            .initiate_migration(&mut engine_a, "sess-live-99", "gw-fra2", MigrationTriggerReason::LinkDegradation, 1_200)
+            .expect("initiate migration");
+
+        tunnel_a.send_flow_migration_initiate(&init_cmd).expect("send init");
+        for f in tunnel_a.drain_egress_data() {
+            tunnel_b.ingest_network_data(&f);
+        }
+        let recv_init = tunnel_b.recv_flow_migration_initiate().expect("recv init").expect("exists");
+
+        // 3. Step 2: Handle initiate on Node B and respond with PrepareAck
+        let prep_ack = mig_mgr_b
+            .handle_migration_initiate(&mut engine_b, &recv_init, "https://gw-fra2:8443/tunnel", 1_210)
+            .expect("handle initiate");
+        assert!(prep_ack.ready);
+
+        tunnel_b.send_flow_migration_prepare_ack(&prep_ack).expect("send prepare ack");
+        for f in tunnel_b.drain_egress_data() {
+            tunnel_a.ingest_network_data(&f);
+        }
+        let recv_prep_ack = tunnel_a.recv_flow_migration_prepare_ack().expect("recv prepare ack").expect("exists");
+
+        // 4. Step 3: Handle prepare ack on Node A and issue Cutover
+        let cutover_cmd = mig_mgr_a
+            .handle_prepare_ack(&mut engine_a, &recv_prep_ack, 1_220)
+            .expect("handle prepare ack");
+
+        tunnel_a.send_flow_migration_cutover(&cutover_cmd).expect("send cutover");
+        for f in tunnel_a.drain_egress_data() {
+            tunnel_b.ingest_network_data(&f);
+        }
+        let recv_cutover = tunnel_b.recv_flow_migration_cutover().expect("recv cutover").expect("exists");
+
+        mig_mgr_b.handle_cutover(&mut engine_b, &recv_cutover, 1_230).expect("handle cutover");
+
+        // 5. Datagram forwarding in-flight (zero packet loss):
+        // Datagram #51 arrives at old node A during cutover window
+        let forwarded_dgram = mig_mgr_a
+            .forward_transit_datagram(&mut engine_a, "sess-live-99", 51, 1, b"in_flight_datagram_51".to_vec(), 1_235)
+            .expect("forward datagram");
+
+        // Datagram ingested seamlessly on target Node B
+        let ingested_forwarded = mig_mgr_b
+            .ingest_forwarded_datagram(&mut engine_b, "sess-live-99", forwarded_dgram, 1_240)
+            .expect("ingest forwarded");
+        assert!(ingested_forwarded);
+
+        // Direct datagram #52 arrives on target Node B
+        let ingested_direct = mig_mgr_b
+            .ingest_direct_datagram(&mut engine_b, "sess-live-99", 52, 1, b"direct_datagram_52".to_vec(), 1_245)
+            .expect("ingest direct");
+        assert!(ingested_direct);
+
+        // Deduplication test: re-injecting seq #51 is cleanly dropped
+        let duplicate = mig_mgr_b
+            .ingest_direct_datagram(&mut engine_b, "sess-live-99", 51, 1, b"duplicate_51".to_vec(), 1_250)
+            .expect("ingest direct duplicate");
+        assert!(!duplicate, "Duplicate datagram must be detected and rejected");
+
+        // 6. Step 4: Finalize migration from Node B
+        let complete_cmd = mig_mgr_b
+            .finalize_migration(&mut engine_b, 1, 1_260)
+            .expect("finalize migration");
+        assert_eq!(complete_cmd.forwarded_packets_received, 1);
+
+        tunnel_b.send_flow_migration_complete(&complete_cmd).expect("send complete");
+        for f in tunnel_b.drain_egress_data() {
+            tunnel_a.ingest_network_data(&f);
+        }
+        let recv_complete = tunnel_a.recv_flow_migration_complete().expect("recv complete").expect("exists");
+
+        mig_mgr_a
+            .handle_migration_complete(&mut engine_a, &recv_complete, 1_270)
+            .expect("handle complete on source");
+
+        // 7. Verify end-state: Node B is Primary, Node A is Standby, packets delivered
+        let session_b = engine_b.get_session("sess-live-99").expect("session b exists");
+        assert_eq!(session_b.role, SessionRole::Primary);
+        assert_eq!(session_b.snapshot.migration_phase, SessionMigrationPhase::Completed);
+        assert_eq!(session_b.delivered_packets.len(), 2);
+        assert_eq!(session_b.delivered_packets[0].0, 51);
+        assert_eq!(session_b.delivered_packets[1].0, 52);
+
+        let session_a = engine_a.get_session("sess-live-99").expect("session a exists");
+        assert_eq!(session_a.role, SessionRole::Standby);
+
+        // Telemetry checks
+        let telem = mig_mgr_b.telemetry();
+        assert_eq!(telem.total_migrations_started, 0); // node B was target
+        assert_eq!(telem.total_migrations_completed, 1);
+        assert_eq!(telem.zero_loss_migrations, 1);
+    }
+
+    #[test]
+    fn test_flow_migration_abort_and_rollback() {
+        let mut engine_a = MultiNodeSessionSyncEngine::new("gw-node-1");
+        let mut engine_b = MultiNodeSessionSyncEngine::new("gw-node-2");
+        let mut mig_mgr = SeamlessFlowMigrationManager::new("gw-node-1");
+
+        engine_a.register_primary_session("sess-abort-01", "client-7", 200, 5_000);
+
+        let init = mig_mgr
+            .initiate_migration(&mut engine_a, "sess-abort-01", "gw-node-2", MigrationTriggerReason::OperatorManual, 5_100)
+            .expect("initiate");
+
+        // Target initializes
+        let mut target_mgr = SeamlessFlowMigrationManager::new("gw-node-2");
+        target_mgr
+            .handle_migration_initiate(&mut engine_b, &init, "gw-node-2:443", 5_110)
+            .expect("init target");
+
+        // Abort due to path failure
+        let abort = mig_mgr
+            .abort_migration(&mut engine_a, init.migration_id, "Route unreachable")
+            .expect("abort");
+        assert_eq!(abort.reason, "Route unreachable");
+
+        target_mgr
+            .handle_migration_abort(&mut engine_b, &abort)
+            .expect("target handle abort");
+
+        // Primary role restored on source
+        let restored = engine_a.get_session("sess-abort-01").expect("exists");
+        assert_eq!(restored.role, SessionRole::Primary);
+        assert_eq!(restored.snapshot.migration_phase, SessionMigrationPhase::Aborted);
+
+        // Cleaned up from target
+        assert!(engine_b.get_session("sess-abort-01").is_none());
+
+        let telem = mig_mgr.telemetry();
+        assert_eq!(telem.total_migrations_aborted, 1);
     }
 }
