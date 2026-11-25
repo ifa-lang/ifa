@@ -1642,8 +1642,13 @@ impl SimdClassificationBenchmarkReport {
     /// Format benchmark report as a Markdown table.
     pub fn to_markdown_table(&self) -> String {
         let mut s = String::new();
-        s.push_str("### ISSP SIMD Capsule Header Decoding & Telemetry Classification Benchmark\n\n");
-        s.push_str(&format!("**Dataset Size:** {} wire packets per phase\n\n", self.packet_count));
+        s.push_str(
+            "### ISSP SIMD Capsule Header Decoding & Telemetry Classification Benchmark\n\n",
+        );
+        s.push_str(&format!(
+            "**Dataset Size:** {} wire packets per phase\n\n",
+            self.packet_count
+        ));
         s.push_str("| Benchmark Phase | Engine / Mode | Elapsed (ms) | Throughput (Mops/s) | Latency (ns/op) | Speedup |\n");
         s.push_str("|---|---|---|---|---|---|\n");
         s.push_str(&format!(
@@ -1734,7 +1739,8 @@ pub fn run_simd_capsule_and_classification_benchmark(
             1 => {
                 // Telemetry metrics report
                 let mut telem = Vec::new();
-                telem.extend_from_slice(&crate::simd_classifier::ISSP_TELEMETRY_MAGIC.to_be_bytes());
+                telem
+                    .extend_from_slice(&crate::simd_classifier::ISSP_TELEMETRY_MAGIC.to_be_bytes());
                 telem.extend_from_slice(&((i as u32 % 16) + 1).to_le_bytes());
                 telem.extend_from_slice(&1u16.to_le_bytes());
                 telem.extend_from_slice(b"otlp-telemetry-metrics-buffer");
@@ -1873,8 +1879,9 @@ pub fn run_simd_capsule_and_classification_benchmark(
 
     // ── Phase 5: Vectorized Probe Filter ────────────────────────────────────
     let t_start = Instant::now();
-    let probes =
-        crate::simd_classifier::IsspSimdPacketClassifier::filter_heartbeat_probes_simd(&mixed_slices);
+    let probes = crate::simd_classifier::IsspSimdPacketClassifier::filter_heartbeat_probes_simd(
+        &mixed_slices,
+    );
     black_box(&probes);
     let probe_elapsed = t_start.elapsed().as_nanos() as u64;
     let probe_ns = (probe_elapsed as f64) / (count as f64);
@@ -1891,7 +1898,9 @@ pub fn run_simd_capsule_and_classification_benchmark(
     // ── Phase 6: Vectorized Telemetry Filter ────────────────────────────────
     let t_start = Instant::now();
     let telem_indices =
-        crate::simd_classifier::IsspSimdPacketClassifier::filter_telemetry_metrics_simd(&mixed_slices);
+        crate::simd_classifier::IsspSimdPacketClassifier::filter_telemetry_metrics_simd(
+            &mixed_slices,
+        );
     black_box(&telem_indices);
     let telem_elapsed = t_start.elapsed().as_nanos() as u64;
     let telem_ns = (telem_elapsed as f64) / (count as f64);
@@ -2106,7 +2115,9 @@ mod tests {
 
         // Verify Markdown rendering
         let md = report.to_markdown_table();
-        assert!(md.contains("ISSP SIMD Capsule Header Decoding & Telemetry Classification Benchmark"));
+        assert!(
+            md.contains("ISSP SIMD Capsule Header Decoding & Telemetry Classification Benchmark")
+        );
         assert!(md.contains("SIMD / SWAR Vector"));
         assert!(md.contains("SIMD 4-Lane Batch"));
 

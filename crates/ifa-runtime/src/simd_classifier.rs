@@ -211,15 +211,9 @@ pub enum IsspTelemetryPacketClass {
         payload_len: usize,
     },
     /// Raw unencapsulated datagram.
-    RawDatagram {
-        context_id: u64,
-        len: usize,
-    },
+    RawDatagram { context_id: u64, len: usize },
     /// Malformed or unrecognized packet.
-    UnknownOrMalformed {
-        first_dword: u32,
-        len: usize,
-    },
+    UnknownOrMalformed { first_dword: u32, len: usize },
 }
 
 impl IsspTelemetryPacketClass {
@@ -566,10 +560,7 @@ impl IsspSimdPacketClassifier {
     }
 
     /// Classify a batch of packets directly into an existing output buffer.
-    pub fn classify_batch_simd_into(
-        packets: &[&[u8]],
-        out: &mut Vec<IsspTelemetryPacketClass>,
-    ) {
+    pub fn classify_batch_simd_into(packets: &[&[u8]], out: &mut Vec<IsspTelemetryPacketClass>) {
         out.clear();
         out.reserve(packets.len());
         let mut i = 0;

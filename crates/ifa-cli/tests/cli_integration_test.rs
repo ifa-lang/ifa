@@ -1504,7 +1504,9 @@ fn test_net_session_simd_bench_cli() {
 
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("ISSP SIMD Capsule Header Decoding & Telemetry Classification Benchmark"));
+    assert!(
+        stdout.contains("ISSP SIMD Capsule Header Decoding & Telemetry Classification Benchmark")
+    );
     assert!(stdout.contains("SIMD / SWAR Vector"));
     assert!(stdout.contains("SIMD 4-Lane Batch"));
 
