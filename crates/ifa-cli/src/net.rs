@@ -153,6 +153,7 @@ pub enum SessionCommand {
         json: bool,
     },
     /// Expose live multipath balancing telemetry over HTTP (Prometheus `/metrics` and OTLP `/v1/metrics`)
+    /// and streaming WebSocket (`/ws/metrics`)
     TelemetryServe {
         /// TCP address to bind the telemetry HTTP server (e.g. 127.0.0.1:9100)
         #[arg(short, long, default_value = "127.0.0.1:9100")]
@@ -163,6 +164,12 @@ pub enum SessionCommand {
         /// Maximum number of requests to serve before exiting (0 = unlimited)
         #[arg(short, long, default_value = "0")]
         max_requests: usize,
+        /// Interval in milliseconds between streaming WebSocket frames on `/ws/metrics`
+        #[arg(long, default_value = "500")]
+        ws_interval_ms: u64,
+        /// Maximum streaming frames per WebSocket connection before closure (0 = unlimited)
+        #[arg(long, default_value = "0")]
+        ws_max_frames: u64,
         /// Node identifier included in exported metrics labels
         #[arg(long, default_value = "ifa-issp-node")]
         node_id: String,
@@ -1532,6 +1539,8 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
             addr,
             file,
             max_requests,
+            ws_interval_ms,
+            ws_max_frames,
             node_id,
         } => {
             let registry = match resolve_state_file(file.as_ref()) {
@@ -1562,16 +1571,30 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 .unwrap_or_else(|_| addr.clone());
 
             eprintln!(
-                "Telemetry server listening on http://{} — Prometheus: /metrics | OTLP JSON: /v1/metrics",
+                "Telemetry server listening on http://{} — Prometheus: /metrics | OTLP JSON: /v1/metrics | WebSocket: /ws/metrics",
                 local_addr
             );
 
             if max_requests == 0 {
                 // Unlimited: serve until SIGINT / process termination
                 loop {
-                    match server.try_serve_one() {
-                        Ok(Some((status, path))) => {
-                            eprintln!("[{}] {} -> HTTP {}", current_unix_secs(), path, status);
+                    match server.try_serve_one_smart(ws_interval_ms, ws_max_frames) {
+                        Ok(Some((status_or_frames, path))) => {
+                            if path == "/ws/metrics" {
+                                eprintln!(
+                                    "[{}] {} -> WS streamed {} frame(s)",
+                                    current_unix_secs(),
+                                    path,
+                                    status_or_frames
+                                );
+                            } else {
+                                eprintln!(
+                                    "[{}] {} -> HTTP {}",
+                                    current_unix_secs(),
+                                    path,
+                                    status_or_frames
+                                );
+                            }
                         }
                         Ok(None) => {
                             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1590,9 +1613,23 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 let mut served = 0usize;
                 server.set_nonblocking(false).ok();
                 while served < max_requests {
-                    match server.try_serve_one() {
-                        Ok(Some((status, path))) => {
-                            eprintln!("[{}] {} -> HTTP {}", current_unix_secs(), path, status);
+                    match server.try_serve_one_smart(ws_interval_ms, ws_max_frames) {
+                        Ok(Some((status_or_frames, path))) => {
+                            if path == "/ws/metrics" {
+                                eprintln!(
+                                    "[{}] {} -> WS streamed {} frame(s)",
+                                    current_unix_secs(),
+                                    path,
+                                    status_or_frames
+                                );
+                            } else {
+                                eprintln!(
+                                    "[{}] {} -> HTTP {}",
+                                    current_unix_secs(),
+                                    path,
+                                    status_or_frames
+                                );
+                            }
                             served += 1;
                         }
                         Ok(None) => {
@@ -1777,5 +1814,84 @@ mod tests {
         }
         client.join().ok();
         assert_eq!(served, 1, "expected exactly 1 served request");
+    }
+
+    #[test]
+    fn test_telemetry_serve_binds_and_serves_websocket_smart_stream() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let registry = SessionRegistry::new(1);
+        let server = IsspTelemetryServer::bind("127.0.0.1:0", "test-node-ws-cli", registry)
+            .expect("bind failed");
+        server.set_nonblocking(true).unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let req = "GET /ws/metrics HTTP/1.1\r\n\
+                       Host: localhost\r\n\
+                       Upgrade: websocket\r\n\
+                       Connection: Upgrade\r\n\
+                       Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                       Sec-WebSocket-Version: 13\r\n\r\n";
+            stream.write_all(req.as_bytes()).unwrap();
+
+            // Read handshake response
+            let mut resp_bytes: Vec<u8> = Vec::with_capacity(256);
+            let mut one = [0u8; 1];
+            loop {
+                stream.read_exact(&mut one).unwrap();
+                resp_bytes.push(one[0]);
+                if resp_bytes.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let resp_str = String::from_utf8_lossy(&resp_bytes).to_string();
+
+            // Read 1 streamed frame
+            let mut hdr = [0u8; 2];
+            stream.read_exact(&mut hdr).unwrap();
+            assert_eq!(hdr[0], 0x81, "FIN + text opcode");
+            let payload_len: usize = match hdr[1] & 0x7F {
+                126 => {
+                    let mut ext = [0u8; 2];
+                    stream.read_exact(&mut ext).unwrap();
+                    u16::from_be_bytes(ext) as usize
+                }
+                127 => {
+                    let mut ext = [0u8; 8];
+                    stream.read_exact(&mut ext).unwrap();
+                    u64::from_be_bytes(ext) as usize
+                }
+                n => n as usize,
+            };
+            let mut payload = vec![0u8; payload_len];
+            stream.read_exact(&mut payload).unwrap();
+            let frame_payload = String::from_utf8_lossy(&payload).to_string();
+
+            (resp_str, frame_payload)
+        });
+
+        let mut served = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !served && std::time::Instant::now() < deadline {
+            match server.try_serve_one_smart(1, 1) {
+                Ok(Some((frames, path))) => {
+                    assert_eq!(path, "/ws/metrics");
+                    assert_eq!(frames, 1);
+                    served = true;
+                }
+                Ok(None) | Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+        assert!(served, "did not serve the WebSocket /ws/metrics request in time");
+
+        let (resp_str, frame_payload) = handle.join().unwrap();
+        assert!(resp_str.contains("101 Switching Protocols"));
+        assert!(frame_payload.contains("\"active_paths\""));
     }
 }
