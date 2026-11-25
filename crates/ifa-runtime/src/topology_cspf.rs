@@ -130,6 +130,131 @@ impl TopologyGraph {
         });
     }
 
+    /// Return the number of nodes in the graph.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Return the total number of directed edges in the graph.
+    pub fn edge_count(&self) -> usize {
+        self.adj.values().map(|v| v.len()).sum()
+    }
+
+    /// Return an immutable slice of all registered node IDs.
+    pub fn nodes(&self) -> &[NodeId] {
+        &self.nodes
+    }
+
+    /// Check if a directed edge exists from `from` to `to`.
+    pub fn has_edge(&self, from: NodeId, to: NodeId) -> bool {
+        self.adj
+            .get(&from)
+            .map(|edges| edges.iter().any(|e| e.to == to))
+            .unwrap_or(false)
+    }
+
+    /// Remove a directed edge from `from` to `to`.
+    /// Returns `true` if an edge was found and removed.
+    pub fn remove_edge(&mut self, from: NodeId, to: NodeId) -> bool {
+        if let Some(edges) = self.adj.get_mut(&from) {
+            let initial_len = edges.len();
+            edges.retain(|e| e.to != to);
+            edges.len() < initial_len
+        } else {
+            false
+        }
+    }
+
+    /// Remove symmetric directed edges between `a` and `b`.
+    /// Returns `true` if at least one edge was removed.
+    pub fn remove_symmetric_edge(&mut self, a: NodeId, b: NodeId) -> bool {
+        let r1 = self.remove_edge(a, b);
+        let r2 = self.remove_edge(b, a);
+        r1 || r2
+    }
+
+    /// Update QoS metrics on an existing directed edge.
+    /// If the edge does not exist, returns `false`.
+    pub fn update_edge(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        avail_bw_bps: u64,
+        rtt_us: u32,
+        loss_millipct: u32,
+    ) -> bool {
+        if let Some(edges) = self.adj.get_mut(&from) {
+            if let Some(edge) = edges.iter_mut().find(|e| e.to == to) {
+                edge.avail_bw_bps = avail_bw_bps;
+                edge.rtt_us = rtt_us;
+                edge.loss_millipct = loss_millipct;
+                edge.cost = TopoEdge::compute_cost(rtt_us, loss_millipct);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Update symmetric QoS metrics between `a` and `b`.
+    pub fn update_symmetric_edge(
+        &mut self,
+        a: NodeId,
+        b: NodeId,
+        avail_bw_bps: u64,
+        rtt_us: u32,
+        loss_millipct: u32,
+    ) -> bool {
+        let u1 = self.update_edge(a, b, avail_bw_bps, rtt_us, loss_millipct);
+        let u2 = self.update_edge(b, a, avail_bw_bps, rtt_us, loss_millipct);
+        u1 || u2
+    }
+
+    /// Generate a deterministic, high-density mesh topology graph with `num_nodes` nodes.
+    /// Includes a primary ring backbone and multiple chord cross-links per node.
+    pub fn generate_dense_mesh(
+        num_nodes: usize,
+        cross_link_degree: usize,
+        base_bw_bps: u64,
+        base_rtt_us: u32,
+    ) -> Self {
+        let mut graph = Self::new();
+        let n = num_nodes.max(4);
+
+        for i in 0..n {
+            graph.add_node(NodeId(i as u32));
+        }
+
+        // 1. Primary ring backbone: (i <-> (i + 1) % n) with high bandwidth and low RTT.
+        for i in 0..n {
+            let a = NodeId(i as u32);
+            let b = NodeId(((i + 1) % n) as u32);
+            graph.add_symmetric_edge(a, b, base_bw_bps, base_rtt_us, 5);
+        }
+
+        // 2. Chords / cross-links with varying strides for multi-path density.
+        let strides = [2, 3, 5, 7, 11, 13];
+        let max_strides = cross_link_degree.min(strides.len());
+
+        for (k_idx, &stride) in strides.iter().take(max_strides).enumerate() {
+            if stride >= n {
+                continue;
+            }
+            let chord_bw = (base_bw_bps / (k_idx as u64 + 2)).max(10_000_000);
+            let chord_rtt = base_rtt_us + (stride as u32 * 450);
+            let chord_loss = 10 + (k_idx as u32 * 15);
+
+            for i in 0..n {
+                let a = NodeId(i as u32);
+                let b = NodeId(((i + stride) % n) as u32);
+                if !graph.has_edge(a, b) {
+                    graph.add_symmetric_edge(a, b, chord_bw, chord_rtt, chord_loss);
+                }
+            }
+        }
+
+        graph
+    }
+
     /// Outgoing edges from `node`, filtered by constraints.
     fn constrained_neighbors<'a>(
         &'a self,
@@ -547,6 +672,41 @@ impl CspfMultipathGroup {
         self.recompute_weights();
     }
 
+    /// Validate all paths in the group against the live topology graph and constraints.
+    /// Marks paths violating constraints or containing severed links as unhealthy.
+    /// Returns the number of healthy operational paths remaining.
+    pub fn update_health_from_graph(
+        &mut self,
+        graph: &TopologyGraph,
+        constraints: &CspfConstraints,
+    ) -> usize {
+        for (i, p) in self.paths.iter().enumerate() {
+            let mut valid = true;
+            for w in p.nodes.windows(2) {
+                let from = w[0];
+                let to = w[1];
+                let edge_valid = graph
+                    .adj
+                    .get(&from)
+                    .and_then(|edges| edges.iter().find(|e| e.to == to))
+                    .map(|e| constraints.satisfied_by(e))
+                    .unwrap_or(false);
+                if !edge_valid {
+                    valid = false;
+                    break;
+                }
+            }
+            if self.path_healthy[i] != valid {
+                if !valid {
+                    self.total_failovers += 1;
+                }
+                self.path_healthy[i] = valid;
+            }
+        }
+        self.recompute_weights();
+        self.healthy_count()
+    }
+
     /// Set individual path health by index.
     pub fn set_path_health(&mut self, index: usize, healthy: bool) {
         if let Some(h) = self.path_healthy.get_mut(index) {
@@ -831,5 +991,52 @@ mod tests {
         assert_eq!(group.healthy_count(), 0);
         assert!(group.primary_healthy_path().is_none());
         assert!(group.select_path_for_flow(123).is_none());
+    }
+
+    #[test]
+    fn test_dense_mesh_generation_and_edge_mutation() {
+        let mut mesh = TopologyGraph::generate_dense_mesh(16, 3, 1_000_000_000, 3_000);
+        assert_eq!(mesh.node_count(), 16);
+        assert!(mesh.edge_count() >= 16 * 2 * 3);
+        assert!(mesh.has_edge(n(0), n(1)));
+        assert!(mesh.has_edge(n(1), n(0)));
+
+        // Mutate edge
+        assert!(mesh.update_edge(n(0), n(1), 10_000_000, 50_000, 500));
+        assert!(mesh.remove_edge(n(0), n(1)));
+        assert!(!mesh.has_edge(n(0), n(1)));
+        assert!(mesh.has_edge(n(1), n(0)));
+        assert!(mesh.remove_symmetric_edge(n(1), n(2)));
+        assert!(!mesh.has_edge(n(1), n(2)));
+        assert!(!mesh.has_edge(n(2), n(1)));
+    }
+
+    #[test]
+    fn test_multipath_health_update_from_graph() {
+        let mut g = diamond_graph();
+        let constraints = CspfConstraints {
+            min_bw_bps: 10_000_000,
+            max_rtt_us: 15_000,
+            max_loss_millipct: 10_000,
+        };
+        let paths =
+            cspf_k_disjoint_paths(&g, n(0), n(3), &constraints, 2, DisjointMode::EdgeDisjoint);
+        let mut group = CspfMultipathGroup::new(n(0), n(3), paths);
+        assert_eq!(group.healthy_count(), 2);
+
+        // Degrade link 1->3 latency to 50ms (> 15ms constraint)
+        g.update_edge(n(1), n(3), 100_000_000, 50_000, 10);
+        let remaining = group.update_health_from_graph(&g, &constraints);
+        assert_eq!(remaining, 1);
+        assert_eq!(group.healthy_count(), 1);
+        assert_eq!(
+            group.primary_healthy_path().unwrap().nodes,
+            vec![n(0), n(2), n(3)]
+        );
+
+        // Restore link
+        g.update_edge(n(1), n(3), 100_000_000, 5_000, 10);
+        let restored = group.update_health_from_graph(&g, &constraints);
+        assert_eq!(restored, 2);
     }
 }

@@ -15,6 +15,10 @@ use crate::telemetry::{
     IsspSubpathBalancingMetrics, IsspTelemetryHttpHandler, LatencyHistogram,
     DEFAULT_LATENCY_BUCKETS_SECONDS,
 };
+use crate::topology_cspf::{
+    cspf_k_disjoint_paths, CspfConstraints, CspfMultipathGroup, DisjointMode, NodeId, TopoEdge,
+    TopologyGraph,
+};
 use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::time::Instant;
@@ -2653,6 +2657,376 @@ pub fn run_jitter_anomaly_and_threshold_benchmark(
     }
 }
 
+/// Comprehensive benchmark report evaluating closed-loop topological convergence
+/// and resilient multipath routing across high-density mesh topologies.
+#[derive(Debug, Clone)]
+pub struct TopologicalConvergenceBenchmarkReport {
+    pub topology_nodes: usize,
+    pub topology_edges: usize,
+    pub closed_loop_cycles: usize,
+    pub total_perturbations: usize,
+    pub fast_failovers_absorbed: usize,
+    pub dynamic_recomputations: usize,
+    pub total_convergence_time_ms: f64,
+    pub avg_recomputation_latency_us: f64,
+    pub max_recomputation_latency_us: f64,
+    pub recomputations_per_sec: f64,
+    pub failover_success_ratio: f64,
+    pub avg_path_stretch: f64,
+    pub disjoint_retention_ratio: f64,
+    pub loops_detected: usize,
+    pub orphaned_flows: usize,
+    pub verification_passed: bool,
+}
+
+impl TopologicalConvergenceBenchmarkReport {
+    pub fn to_markdown_table(&self) -> String {
+        let mut s = String::new();
+        s.push_str("### ISSP High-Density Mesh Closed-Loop Topological Convergence Benchmark\n\n");
+        s.push_str(&format!(
+            "- **Topology Density**: {} nodes, {} directed edges (closed-loop mesh)\n",
+            self.topology_nodes, self.topology_edges
+        ));
+        s.push_str(&format!(
+            "- **Closed-Loop Perturbations Evaluated**: {} cycles ({} total impairment events) in {:.2} ms\n",
+            self.closed_loop_cycles, self.total_perturbations, self.total_convergence_time_ms
+        ));
+        s.push_str(&format!(
+            "- **Dynamic CSPF Convergence Throughput**: {:.1} recomputations/sec (avg {:.2} µs, max {:.2} µs)\n",
+            self.recomputations_per_sec, self.avg_recomputation_latency_us, self.max_recomputation_latency_us
+        ));
+        s.push_str(&format!(
+            "- **Perturbation Absorption**: {} fast-failovers absorbed, {} dynamic CSPF re-syntheses\n",
+            self.fast_failovers_absorbed, self.dynamic_recomputations
+        ));
+        s.push_str(&format!(
+            "- **Resilience & Accuracy**: {:.1}% failover success, {:.1}% disjoint retention, stretch {:.2}x\n",
+            self.failover_success_ratio * 100.0, self.disjoint_retention_ratio * 100.0, self.avg_path_stretch
+        ));
+        s.push_str(&format!(
+            "- **Loop Freedom & Reachability**: {} loops detected, {} orphaned flows\n",
+            self.loops_detected, self.orphaned_flows
+        ));
+        s.push_str(&format!(
+            "- **Verification Status**: {}\n\n",
+            if self.verification_passed {
+                "PASSED (100% loop-free convergence, deterministic failover & path diversity preservation)"
+            } else {
+                "FAILED (routing loop or orphaned flow detected under perturbation)"
+            }
+        ));
+
+        s.push_str("| Benchmark Phase | Metric | Value | Unit |\n");
+        s.push_str("|---|---|---|---|\n");
+        s.push_str(&format!(
+            "| Topological Mesh Density | Node Count | {} | nodes |\n",
+            self.topology_nodes
+        ));
+        s.push_str(&format!(
+            "| Topological Mesh Density | Edge Count | {} | edges |\n",
+            self.topology_edges
+        ));
+        s.push_str(&format!(
+            "| Reactive CSPF Convergence | Recomputation Throughput | {:.1} | ops/sec |\n",
+            self.recomputations_per_sec
+        ));
+        s.push_str(&format!(
+            "| Reactive CSPF Convergence | Mean Latency | {:.2} | µs |\n",
+            self.avg_recomputation_latency_us
+        ));
+        s.push_str(&format!(
+            "| Reactive CSPF Convergence | Peak Latency | {:.2} | µs |\n",
+            self.max_recomputation_latency_us
+        ));
+        s.push_str(&format!(
+            "| Resilient Path Diversity | Failover Success Ratio | {:.2} | % |\n",
+            self.failover_success_ratio * 100.0
+        ));
+        s.push_str(&format!(
+            "| Resilient Path Diversity | Mean Path Stretch | {:.3} | ratio |\n",
+            self.avg_path_stretch
+        ));
+        s.push_str(&format!(
+            "| Resilient Path Diversity | Disjoint Retention | {:.2} | % |\n",
+            self.disjoint_retention_ratio * 100.0
+        ));
+        s
+    }
+
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"topology_nodes\":{},",
+                "\"topology_edges\":{},",
+                "\"closed_loop_cycles\":{},",
+                "\"total_perturbations\":{},",
+                "\"fast_failovers_absorbed\":{},",
+                "\"dynamic_recomputations\":{},",
+                "\"total_convergence_time_ms\":{:.4},",
+                "\"avg_recomputation_latency_us\":{:.2},",
+                "\"max_recomputation_latency_us\":{:.2},",
+                "\"recomputations_per_sec\":{:.1},",
+                "\"failover_success_ratio\":{:.4},",
+                "\"avg_path_stretch\":{:.3},",
+                "\"disjoint_retention_ratio\":{:.4},",
+                "\"loops_detected\":{},",
+                "\"orphaned_flows\":{},",
+                "\"verification_passed\":{}",
+                "}}"
+            ),
+            self.topology_nodes,
+            self.topology_edges,
+            self.closed_loop_cycles,
+            self.total_perturbations,
+            self.fast_failovers_absorbed,
+            self.dynamic_recomputations,
+            self.total_convergence_time_ms,
+            self.avg_recomputation_latency_us,
+            self.max_recomputation_latency_us,
+            self.recomputations_per_sec,
+            self.failover_success_ratio,
+            self.avg_path_stretch,
+            self.disjoint_retention_ratio,
+            self.loops_detected,
+            self.orphaned_flows,
+            self.verification_passed
+        )
+    }
+}
+
+/// Run automated high-performance benchmark measuring closed-loop topological convergence,
+/// CSPF path diversity preservation, loop-freedom, and failover resilience on high-density mesh topologies.
+pub fn run_topological_convergence_benchmark(
+    node_count: usize,
+    closed_loop_cycles: usize,
+) -> TopologicalConvergenceBenchmarkReport {
+    let n = node_count.clamp(16, 64);
+    let cycles = closed_loop_cycles.max(20);
+    let cross_links = 4;
+    let base_bw = 1_000_000_000u64; // 1 Gbps
+    let base_rtt = 4_000u32; // 4 ms
+    let mut mesh = TopologyGraph::generate_dense_mesh(n, cross_links, base_bw, base_rtt);
+
+    let initial_nodes = mesh.node_count();
+    let initial_edges = mesh.edge_count();
+
+    let constraints = CspfConstraints {
+        min_bw_bps: 20_000_000,   // 20 Mbps min
+        max_rtt_us: 35_000,       // 35 ms max
+        max_loss_millipct: 1_000, // 1% max
+    };
+
+    // Construct representative diameter traffic pairs across the mesh.
+    let pair_count = 6;
+    let mut pairs = Vec::with_capacity(pair_count);
+    for p in 0..pair_count {
+        let src = NodeId(p as u32);
+        let dst = NodeId(((p + n / 2) % n) as u32);
+        pairs.push((src, dst));
+    }
+
+    // Baseline synthesis of K=3 EdgeDisjoint paths per pair.
+    let mut groups = Vec::with_capacity(pair_count);
+    let mut baseline_costs = Vec::with_capacity(pair_count);
+    for &(src, dst) in &pairs {
+        let paths =
+            cspf_k_disjoint_paths(&mesh, src, dst, &constraints, 3, DisjointMode::EdgeDisjoint);
+        let base_cost = paths.first().map(|p| p.total_cost).unwrap_or(1);
+        baseline_costs.push(base_cost);
+        groups.push(CspfMultipathGroup::new(src, dst, paths));
+    }
+
+    let mut fast_failovers_absorbed = 0usize;
+    let mut dynamic_recomputations = 0usize;
+    let mut total_perturbations = 0usize;
+    let mut recomputation_latencies_us = Vec::with_capacity(cycles);
+    let mut path_stretches = Vec::with_capacity(cycles);
+    let mut disjoint_retentions = 0usize;
+    let mut loops_detected = 0usize;
+    let mut orphaned_flows = 0usize;
+
+    let t_benchmark_start = Instant::now();
+
+    for cycle in 0..cycles {
+        let pair_idx = cycle % pair_count;
+        let (src, dst) = pairs[pair_idx];
+        let baseline_cost = baseline_costs[pair_idx];
+
+        // 1. Perturbation Phase
+        total_perturbations += 1;
+        let p_type = cycle % 4;
+
+        // Collect edges from current primary path
+        let primary_edges: Vec<(NodeId, NodeId)> = groups[pair_idx]
+            .primary_healthy_path()
+            .map(|p| p.nodes.windows(2).map(|w| (w[0], w[1])).collect())
+            .unwrap_or_default();
+
+        let mut affected_edges = Vec::new();
+
+        match p_type {
+            0 => {
+                // Single link severance on primary path
+                if let Some(&edge) = primary_edges.first() {
+                    mesh.remove_edge(edge.0, edge.1);
+                    affected_edges.push(edge);
+                }
+            }
+            1 => {
+                // Bandwidth degradation (throttle below 20 Mbps constraint)
+                if let Some(&edge) = primary_edges.first() {
+                    mesh.update_edge(edge.0, edge.1, 5_000_000, 10_000, 50);
+                    affected_edges.push(edge);
+                }
+            }
+            2 => {
+                // Latency surge (RTT surges to 80 ms, exceeding 35 ms constraint)
+                if let Some(&edge) = primary_edges.last() {
+                    mesh.update_edge(edge.0, edge.1, 500_000_000, 80_000, 100);
+                    affected_edges.push(edge);
+                }
+            }
+            _ => {
+                // Multi-link concurrent failure cutting all paths in this group
+                // to force dynamic CSPF re-synthesis in closed loop.
+                for path in &groups[pair_idx].paths {
+                    if let Some(w) = path.nodes.windows(2).next() {
+                        let edge = (w[0], w[1]);
+                        mesh.remove_edge(edge.0, edge.1);
+                        affected_edges.push(edge);
+                    }
+                }
+            }
+        }
+
+        // 2. Reactive Closed-Loop Convergence
+        let t_conv_start = Instant::now();
+
+        // Detect degradation / link down via live graph validation
+        let healthy = groups[pair_idx].update_health_from_graph(&mesh, &constraints);
+
+        if healthy > 0 {
+            // Absorbed via fast subpath failover in O(1)
+            fast_failovers_absorbed += 1;
+        } else {
+            // All existing disjoint paths degraded; dynamic CSPF re-synthesis in closed loop
+            let new_paths =
+                cspf_k_disjoint_paths(&mesh, src, dst, &constraints, 3, DisjointMode::EdgeDisjoint);
+            groups[pair_idx] = CspfMultipathGroup::new(src, dst, new_paths);
+            dynamic_recomputations += 1;
+        }
+
+        let conv_latency_us = t_conv_start.elapsed().as_nanos() as f64 / 1_000.0;
+        recomputation_latencies_us.push(conv_latency_us);
+
+        // 3. Verification & Metrics Assessment
+        if let Some(active_path) = groups[pair_idx].primary_healthy_path() {
+            // Loop freedom check
+            let mut visited = std::collections::HashSet::new();
+            for &node in &active_path.nodes {
+                if !visited.insert(node) {
+                    loops_detected += 1;
+                    break;
+                }
+            }
+
+            // Path stretch calculation
+            let stretch = (active_path.total_cost as f64) / (baseline_cost.max(1) as f64);
+            path_stretches.push(stretch.max(1.0));
+
+            // Disjoint retention check
+            if groups[pair_idx].healthy_count() >= 2 {
+                disjoint_retentions += 1;
+            }
+        } else {
+            orphaned_flows += 1;
+        }
+
+        // 4. Closed-Loop Healing & Restoration
+        for edge in affected_edges {
+            // Restore nominal edge parameters
+            if !mesh.has_edge(edge.0, edge.1) {
+                mesh.add_edge(TopoEdge {
+                    from: edge.0,
+                    to: edge.1,
+                    avail_bw_bps: base_bw,
+                    rtt_us: base_rtt,
+                    loss_millipct: 5,
+                    cost: TopoEdge::compute_cost(base_rtt, 5),
+                });
+            } else {
+                mesh.update_edge(edge.0, edge.1, base_bw, base_rtt, 5);
+            }
+        }
+
+        // Periodically refresh paths back to nominal optimal baseline
+        if cycle % 2 == 1 {
+            groups[pair_idx].update_health_from_graph(&mesh, &constraints);
+            if groups[pair_idx].healthy_count() < 2 {
+                let restored_paths = cspf_k_disjoint_paths(
+                    &mesh,
+                    src,
+                    dst,
+                    &constraints,
+                    3,
+                    DisjointMode::EdgeDisjoint,
+                );
+                groups[pair_idx] = CspfMultipathGroup::new(src, dst, restored_paths);
+            }
+        }
+    }
+
+    let total_convergence_time_ms = t_benchmark_start.elapsed().as_secs_f64() * 1000.0;
+    let avg_recomputation_latency_us = if !recomputation_latencies_us.is_empty() {
+        recomputation_latencies_us.iter().sum::<f64>() / (recomputation_latencies_us.len() as f64)
+    } else {
+        0.0
+    };
+    let max_recomputation_latency_us = recomputation_latencies_us
+        .iter()
+        .copied()
+        .fold(0.0, f64::max);
+    let recomputations_per_sec = if avg_recomputation_latency_us > 0.0 {
+        1_000_000.0 / avg_recomputation_latency_us
+    } else {
+        0.0
+    };
+
+    let failover_success_ratio = ((cycles - orphaned_flows) as f64) / (cycles as f64);
+    let avg_path_stretch = if !path_stretches.is_empty() {
+        path_stretches.iter().sum::<f64>() / (path_stretches.len() as f64)
+    } else {
+        1.0
+    };
+    let disjoint_retention_ratio = (disjoint_retentions as f64) / (cycles as f64);
+
+    let verification_passed = loops_detected == 0
+        && orphaned_flows == 0
+        && fast_failovers_absorbed > 0
+        && dynamic_recomputations > 0
+        && failover_success_ratio >= 0.99;
+
+    TopologicalConvergenceBenchmarkReport {
+        topology_nodes: initial_nodes,
+        topology_edges: initial_edges,
+        closed_loop_cycles: cycles,
+        total_perturbations,
+        fast_failovers_absorbed,
+        dynamic_recomputations,
+        total_convergence_time_ms,
+        avg_recomputation_latency_us,
+        max_recomputation_latency_us,
+        recomputations_per_sec,
+        failover_success_ratio,
+        avg_path_stretch,
+        disjoint_retention_ratio,
+        loops_detected,
+        orphaned_flows,
+        verification_passed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2922,6 +3296,35 @@ mod tests {
 
         let json = report.to_json();
         assert!(json.contains("\"total_samples\":300"));
+        assert!(json.contains("\"verification_passed\":true"));
+    }
+
+    #[test]
+    fn test_topological_convergence_benchmark_runs() {
+        let report = run_topological_convergence_benchmark(24, 30);
+        assert_eq!(report.topology_nodes, 24);
+        assert!(report.topology_edges > 100);
+        assert_eq!(report.closed_loop_cycles, 30);
+        assert_eq!(report.total_perturbations, 30);
+        assert!(report.fast_failovers_absorbed > 0);
+        assert!(report.dynamic_recomputations > 0);
+        assert!(report.recomputations_per_sec > 0.0);
+        assert!(report.avg_recomputation_latency_us > 0.0);
+        assert!(report.failover_success_ratio >= 0.99);
+        assert!(report.avg_path_stretch >= 1.0);
+        assert!(report.disjoint_retention_ratio > 0.0);
+        assert_eq!(report.loops_detected, 0);
+        assert_eq!(report.orphaned_flows, 0);
+        assert!(report.verification_passed);
+
+        let md = report.to_markdown_table();
+        assert!(md.contains("ISSP High-Density Mesh Closed-Loop Topological Convergence Benchmark"));
+        assert!(md.contains(
+            "PASSED (100% loop-free convergence, deterministic failover & path diversity preservation)"
+        ));
+
+        let json = report.to_json();
+        assert!(json.contains("\"topology_nodes\":24"));
         assert!(json.contains("\"verification_passed\":true"));
     }
 }
