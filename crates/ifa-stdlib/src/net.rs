@@ -10114,6 +10114,527 @@ impl StrictPriorityWdrrScheduler {
     }
 }
 
+/// ECN (Explicit Congestion Notification) 2-bit codepoint (RFC 3168 / RFC 9330 / RFC 9331).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum EcnCodemark {
+    /// 00: Not-ECT (Not ECN-Capable Transport). Sender does not support ECN; packet MUST be dropped on congestion.
+    #[default]
+    NotEct,
+    /// 01: ECT(1) (RFC 9330 / RFC 9331 L4S Prague Low-Latency, Low-Loss, Scalable Throughput).
+    Ect1,
+    /// 10: ECT(0) (RFC 3168 Classic ECN-Capable Transport).
+    Ect0,
+    /// 11: CE (Congestion Experienced). Marked by intermediate queue or tunnel to signal congestion without packet loss.
+    Ce,
+}
+
+impl EcnCodemark {
+    /// Return the 2-bit raw integer representation (0b00, 0b01, 0b10, 0b11).
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            Self::NotEct => 0b00,
+            Self::Ect1 => 0b01,
+            Self::Ect0 => 0b10,
+            Self::Ce => 0b11,
+        }
+    }
+
+    /// Parse from 2-bit integer.
+    pub fn from_u8(val: u8) -> Self {
+        match val & 0x03 {
+            0b00 => Self::NotEct,
+            0b01 => Self::Ect1,
+            0b10 => Self::Ect0,
+            0b11 => Self::Ce,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Whether this packet is ECN-capable (ECT(0) or ECT(1) or already CE).
+    pub fn is_ecn_capable(&self) -> bool {
+        matches!(self, Self::Ect1 | Self::Ect0 | Self::Ce)
+    }
+
+    /// Whether this packet belongs to the L4S scalable low-latency transport class (ECT(1)).
+    pub fn is_l4s(&self) -> bool {
+        matches!(self, Self::Ect1)
+    }
+}
+
+/// Configuration for Controlled Delay (CoDel) Active Queue Management (RFC 8289 / RFC 9330).
+#[derive(Debug, Clone)]
+pub struct AqmCodelConfig {
+    /// Target acceptable sojourn delay through the queue (default: 5ms for classic traffic).
+    pub target_duration: Duration,
+    /// Target acceptable sojourn delay for L4S ECT(1) traffic (default: 1ms for ultra-low latency).
+    pub l4s_target_duration: Duration,
+    /// Sliding observation interval for minimum sojourn delay evaluation (default: 100ms).
+    pub interval: Duration,
+    /// Maximum buffer capacity in packets before tail-drop (default: 1024).
+    pub max_buffer_packets: usize,
+    /// Maximum buffer capacity in bytes before tail-drop (default: 2 * 1024 * 1024 = 2MB).
+    pub max_buffer_bytes: usize,
+    /// Minimum queue byte threshold below which dropping/marking is inhibited even if delay exceeds target
+    /// (to avoid penalizing under-utilized queues or short solitary packet bursts; default: 1500 bytes MTU).
+    pub byte_threshold: usize,
+    /// Whether explicit congestion notification (CE marking) is enabled for ECT-capable packets.
+    /// If false, even ECT packets will be dropped early under congestion.
+    pub ecn_enabled: bool,
+    /// Whether L4S dual-target delay differentiation is enabled (ECT(1) uses l4s_target_duration).
+    pub l4s_enabled: bool,
+}
+
+impl Default for AqmCodelConfig {
+    fn default() -> Self {
+        Self {
+            target_duration: Duration::from_millis(5),
+            l4s_target_duration: Duration::from_millis(1),
+            interval: Duration::from_millis(100),
+            max_buffer_packets: 1024,
+            max_buffer_bytes: 2 * 1024 * 1024,
+            byte_threshold: 1500,
+            ecn_enabled: true,
+            l4s_enabled: true,
+        }
+    }
+}
+
+impl AqmCodelConfig {
+    /// Set target acceptable sojourn delay for classic traffic.
+    pub fn with_target(mut self, target: Duration) -> Self {
+        self.target_duration = target;
+        self
+    }
+
+    /// Set target acceptable sojourn delay for L4S ECT(1) traffic.
+    pub fn with_l4s_target(mut self, l4s_target: Duration) -> Self {
+        self.l4s_target_duration = l4s_target;
+        self
+    }
+
+    /// Set observation sliding interval.
+    pub fn with_interval(mut self, interval: Duration) -> Self {
+        self.interval = interval;
+        self
+    }
+
+    /// Set maximum buffer packet capacity.
+    pub fn with_max_buffer_packets(mut self, max_packets: usize) -> Self {
+        self.max_buffer_packets = max_packets.max(1);
+        self
+    }
+
+    /// Set maximum buffer byte capacity.
+    pub fn with_max_buffer_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_buffer_bytes = max_bytes.max(1024);
+        self
+    }
+
+    /// Set minimum queue bytes threshold before AQM drop/mark can engage.
+    pub fn with_byte_threshold(mut self, threshold: usize) -> Self {
+        self.byte_threshold = threshold;
+        self
+    }
+
+    /// Enable or disable ECN CE marking.
+    pub fn with_ecn(mut self, enabled: bool) -> Self {
+        self.ecn_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable L4S dual-target delay evaluation.
+    pub fn with_l4s(mut self, enabled: bool) -> Self {
+        self.l4s_enabled = enabled;
+        self
+    }
+}
+
+/// Packet representation dequeued from the AQM CoDel queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AqmDequeuedPacket {
+    /// Unique sequential packet ID.
+    pub id: u64,
+    /// Raw byte payload of the capsule / datagram.
+    pub payload: Vec<u8>,
+    /// ECN status on departure (e.g. marked Ce if congestion was signaled).
+    pub ecn: EcnCodemark,
+    /// Sojourn duration spent waiting in the queue.
+    pub sojourn_duration: Duration,
+    /// Whether this packet was marked with CE due to CoDel congestion.
+    pub marked_ce: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AqmPacket {
+    id: u64,
+    payload: Vec<u8>,
+    ecn: EcnCodemark,
+    enqueued_at: std::time::Instant,
+    byte_cost: usize,
+}
+
+/// Real-time telemetry snapshot for AQM CoDel queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AqmCodelTelemetry {
+    pub total_enqueued_packets: usize,
+    pub total_enqueued_bytes: usize,
+    pub total_dequeued_packets: usize,
+    pub total_dequeued_bytes: usize,
+    pub total_early_dropped_packets: usize,
+    pub total_early_dropped_bytes: usize,
+    pub total_buffer_overflow_drops: usize,
+    pub total_ecn_marked_packets: usize,
+    pub total_ecn_marked_bytes: usize,
+    pub current_queue_packets: usize,
+    pub current_queue_bytes: usize,
+    pub last_sojourn_micros: u64,
+    pub min_sojourn_micros: u64,
+    pub is_in_dropping_state: bool,
+    pub consecutive_drop_count: usize,
+}
+
+/// Controlled Delay (CoDel) Active Queue Management with DualQ ECN/L4S support (RFC 8289 / RFC 9330).
+#[derive(Debug, Clone)]
+pub struct AqmCodelQueue {
+    pub config: AqmCodelConfig,
+    packets: std::collections::VecDeque<AqmPacket>,
+    next_packet_id: u64,
+    current_queue_bytes: usize,
+    first_above_time: Option<std::time::Instant>,
+    drop_next: std::time::Instant,
+    is_dropping: bool,
+    consecutive_drop_count: usize,
+    interval_end: std::time::Instant,
+    last_sojourn_micros: u64,
+    min_sojourn_micros: u64,
+    total_enqueued_packets: usize,
+    total_enqueued_bytes: usize,
+    total_dequeued_packets: usize,
+    total_dequeued_bytes: usize,
+    total_early_dropped_packets: usize,
+    total_early_dropped_bytes: usize,
+    total_buffer_overflow_drops: usize,
+    total_ecn_marked_packets: usize,
+    total_ecn_marked_bytes: usize,
+}
+
+impl Default for AqmCodelQueue {
+    fn default() -> Self {
+        Self::new(AqmCodelConfig::default())
+    }
+}
+
+impl AqmCodelQueue {
+    /// Create a new AQM CoDel queue with the given configuration.
+    pub fn new(config: AqmCodelConfig) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            config: config.clone(),
+            packets: std::collections::VecDeque::new(),
+            next_packet_id: 1,
+            current_queue_bytes: 0,
+            first_above_time: None,
+            drop_next: now,
+            is_dropping: false,
+            consecutive_drop_count: 0,
+            interval_end: now + config.interval,
+            last_sojourn_micros: 0,
+            min_sojourn_micros: u64::MAX,
+            total_enqueued_packets: 0,
+            total_enqueued_bytes: 0,
+            total_dequeued_packets: 0,
+            total_dequeued_bytes: 0,
+            total_early_dropped_packets: 0,
+            total_early_dropped_bytes: 0,
+            total_buffer_overflow_drops: 0,
+            total_ecn_marked_packets: 0,
+            total_ecn_marked_bytes: 0,
+        }
+    }
+
+    /// Compute control law duration for next drop: interval / sqrt(count).
+    fn control_law(&self, count: usize) -> Duration {
+        let c = (count.max(1) as f64).sqrt();
+        let micros = (self.config.interval.as_micros() as f64 / c) as u64;
+        Duration::from_micros(micros.max(500))
+    }
+
+    /// Enqueue a raw byte payload into the AQM queue with an explicit ECN codemark.
+    pub fn enqueue(
+        &mut self,
+        payload: Vec<u8>,
+        ecn: EcnCodemark,
+        now: std::time::Instant,
+    ) -> Result<u64, DropReason> {
+        let byte_cost = payload.len();
+        if self.packets.len() >= self.config.max_buffer_packets
+            || self.current_queue_bytes + byte_cost > self.config.max_buffer_bytes
+        {
+            self.total_buffer_overflow_drops += 1;
+            return Err(DropReason::QueueFull {
+                current_depth: self.packets.len(),
+                max_depth: self.config.max_buffer_packets,
+            });
+        }
+
+        let id = self.next_packet_id;
+        self.next_packet_id = self.next_packet_id.wrapping_add(1);
+
+        self.total_enqueued_packets += 1;
+        self.total_enqueued_bytes += byte_cost;
+        self.current_queue_bytes += byte_cost;
+
+        self.packets.push_back(AqmPacket {
+            id,
+            payload,
+            ecn,
+            enqueued_at: now,
+            byte_cost,
+        });
+
+        Ok(id)
+    }
+
+    /// Enqueue an HTTP capsule into the AQM queue with explicit ECN codemark.
+    pub fn enqueue_capsule(
+        &mut self,
+        capsule: &crate::simd_parser::HttpCapsule,
+        ecn: EcnCodemark,
+        now: std::time::Instant,
+    ) -> Result<u64, DropReason> {
+        let payload = capsule.encode_to_vec();
+        self.enqueue(payload, ecn, now)
+    }
+
+    /// Dequeue a single packet evaluated under the CoDel control law and ECN/L4S policy.
+    pub fn dequeue_one(&mut self, now: std::time::Instant) -> Option<AqmDequeuedPacket> {
+        loop {
+            let pkt = self.packets.pop_front()?;
+            self.current_queue_bytes = self.current_queue_bytes.saturating_sub(pkt.byte_cost);
+
+            let sojourn = now.saturating_duration_since(pkt.enqueued_at);
+            self.last_sojourn_micros = sojourn.as_micros() as u64;
+
+            // Track minimum sojourn delay across sliding window interval
+            if now >= self.interval_end {
+                self.interval_end = now + self.config.interval;
+                self.min_sojourn_micros = sojourn.as_micros() as u64;
+            } else {
+                self.min_sojourn_micros = self.min_sojourn_micros.min(sojourn.as_micros() as u64);
+            }
+
+            // Determine target delay for this packet (L4S vs Classic)
+            let target = if self.config.l4s_enabled && pkt.ecn.is_l4s() {
+                self.config.l4s_target_duration
+            } else {
+                self.config.target_duration
+            };
+
+            // Evaluate CoDel condition: delay exceeds target AND queue has standing backlog above byte threshold
+            let delay_above_target =
+                sojourn >= target && self.current_queue_bytes >= self.config.byte_threshold;
+
+            if !delay_above_target {
+                // Not congested or queue is draining; clear congestion state
+                self.first_above_time = None;
+                self.is_dropping = false;
+                self.consecutive_drop_count = 0;
+
+                self.total_dequeued_packets += 1;
+                self.total_dequeued_bytes += pkt.byte_cost;
+
+                return Some(AqmDequeuedPacket {
+                    id: pkt.id,
+                    payload: pkt.payload,
+                    ecn: pkt.ecn,
+                    sojourn_duration: sojourn,
+                    marked_ce: false,
+                });
+            }
+
+            // RFC 9330 / RFC 9331 L4S immediate marking:
+            // L4S ECT(1) flows use instantaneous step marking when sojourn exceeds l4s_target_duration
+            // rather than waiting for CoDel's smoothed interval timer.
+            if self.config.l4s_enabled && pkt.ecn.is_l4s() && self.config.ecn_enabled {
+                self.total_ecn_marked_packets += 1;
+                self.total_ecn_marked_bytes += pkt.byte_cost;
+                self.total_dequeued_packets += 1;
+                self.total_dequeued_bytes += pkt.byte_cost;
+
+                return Some(AqmDequeuedPacket {
+                    id: pkt.id,
+                    payload: pkt.payload,
+                    ecn: EcnCodemark::Ce,
+                    sojourn_duration: sojourn,
+                    marked_ce: true,
+                });
+            }
+
+            // Delay is above target and queue has standing backlog!
+            if self.first_above_time.is_none() {
+                // Delay just exceeded target; record deadline when drop state will activate
+                self.first_above_time = Some(now + self.config.interval);
+
+                self.total_dequeued_packets += 1;
+                self.total_dequeued_bytes += pkt.byte_cost;
+
+                return Some(AqmDequeuedPacket {
+                    id: pkt.id,
+                    payload: pkt.payload,
+                    ecn: pkt.ecn,
+                    sojourn_duration: sojourn,
+                    marked_ce: false,
+                });
+            }
+
+            let first_above = self.first_above_time.unwrap();
+            if now < first_above {
+                // Still within the grace interval
+                self.total_dequeued_packets += 1;
+                self.total_dequeued_bytes += pkt.byte_cost;
+
+                return Some(AqmDequeuedPacket {
+                    id: pkt.id,
+                    payload: pkt.payload,
+                    ecn: pkt.ecn,
+                    sojourn_duration: sojourn,
+                    marked_ce: false,
+                });
+            }
+
+            // Delay has stayed above target for longer than interval!
+            if !self.is_dropping {
+                self.is_dropping = true;
+                self.consecutive_drop_count = 1;
+                let next_step = self.control_law(self.consecutive_drop_count);
+                self.drop_next = now + next_step;
+
+                if self.config.ecn_enabled && pkt.ecn.is_ecn_capable() {
+                    // Mark packet with CE (Congestion Experienced) without dropping
+                    self.total_ecn_marked_packets += 1;
+                    self.total_ecn_marked_bytes += pkt.byte_cost;
+                    self.total_dequeued_packets += 1;
+                    self.total_dequeued_bytes += pkt.byte_cost;
+
+                    return Some(AqmDequeuedPacket {
+                        id: pkt.id,
+                        payload: pkt.payload,
+                        ecn: EcnCodemark::Ce,
+                        sojourn_duration: sojourn,
+                        marked_ce: true,
+                    });
+                } else {
+                    // Early Drop non-ECN packet to signal congestion
+                    self.total_early_dropped_packets += 1;
+                    self.total_early_dropped_bytes += pkt.byte_cost;
+                    continue;
+                }
+            } else if now >= self.drop_next {
+                self.consecutive_drop_count += 1;
+                let next_step = self.control_law(self.consecutive_drop_count);
+                self.drop_next = now + next_step;
+
+                if self.config.ecn_enabled && pkt.ecn.is_ecn_capable() {
+                    self.total_ecn_marked_packets += 1;
+                    self.total_ecn_marked_bytes += pkt.byte_cost;
+                    self.total_dequeued_packets += 1;
+                    self.total_dequeued_bytes += pkt.byte_cost;
+
+                    return Some(AqmDequeuedPacket {
+                        id: pkt.id,
+                        payload: pkt.payload,
+                        ecn: EcnCodemark::Ce,
+                        sojourn_duration: sojourn,
+                        marked_ce: true,
+                    });
+                } else {
+                    self.total_early_dropped_packets += 1;
+                    self.total_early_dropped_bytes += pkt.byte_cost;
+                    continue;
+                }
+            } else {
+                // In dropping state, but drop_next interval has not arrived yet. Forward without marking.
+                self.total_dequeued_packets += 1;
+                self.total_dequeued_bytes += pkt.byte_cost;
+
+                return Some(AqmDequeuedPacket {
+                    id: pkt.id,
+                    payload: pkt.payload,
+                    ecn: pkt.ecn,
+                    sojourn_duration: sojourn,
+                    marked_ce: false,
+                });
+            }
+        }
+    }
+
+    /// Dequeue up to `max_packets` eligible packets from the queue.
+    pub fn dequeue_batch(
+        &mut self,
+        now: std::time::Instant,
+        max_packets: usize,
+    ) -> Vec<AqmDequeuedPacket> {
+        let mut batch = Vec::with_capacity(max_packets.min(64));
+        while batch.len() < max_packets {
+            if let Some(pkt) = self.dequeue_one(now) {
+                batch.push(pkt);
+            } else {
+                break;
+            }
+        }
+        batch
+    }
+
+    /// Number of packets currently waiting in the queue.
+    pub fn len(&self) -> usize {
+        self.packets.len()
+    }
+
+    /// Whether the queue is currently empty.
+    pub fn is_empty(&self) -> bool {
+        self.packets.is_empty()
+    }
+
+    /// Total bytes currently waiting in the queue.
+    pub fn queued_bytes(&self) -> usize {
+        self.current_queue_bytes
+    }
+
+    /// Retrieve real-time telemetry metrics.
+    pub fn telemetry(&self) -> AqmCodelTelemetry {
+        AqmCodelTelemetry {
+            total_enqueued_packets: self.total_enqueued_packets,
+            total_enqueued_bytes: self.total_enqueued_bytes,
+            total_dequeued_packets: self.total_dequeued_packets,
+            total_dequeued_bytes: self.total_dequeued_bytes,
+            total_early_dropped_packets: self.total_early_dropped_packets,
+            total_early_dropped_bytes: self.total_early_dropped_bytes,
+            total_buffer_overflow_drops: self.total_buffer_overflow_drops,
+            total_ecn_marked_packets: self.total_ecn_marked_packets,
+            total_ecn_marked_bytes: self.total_ecn_marked_bytes,
+            current_queue_packets: self.packets.len(),
+            current_queue_bytes: self.current_queue_bytes,
+            last_sojourn_micros: self.last_sojourn_micros,
+            min_sojourn_micros: if self.min_sojourn_micros == u64::MAX {
+                0
+            } else {
+                self.min_sojourn_micros
+            },
+            is_in_dropping_state: self.is_dropping,
+            consecutive_drop_count: self.consecutive_drop_count,
+        }
+    }
+
+    /// Clear all queued packets and reset queue bytes.
+    pub fn clear(&mut self) {
+        self.packets.clear();
+        self.current_queue_bytes = 0;
+        self.first_above_time = None;
+        self.is_dropping = false;
+        self.consecutive_drop_count = 0;
+    }
+}
+
 /// Network path associating a local network interface with a remote peer endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPath {
@@ -11313,6 +11834,7 @@ pub struct ExtendedConnectTunnel {
     pub state: TunnelState,
     pub shaper: Option<AdaptiveTokenBucketShaper>,
     pub sp_wdrr_scheduler: Option<StrictPriorityWdrrScheduler>,
+    pub aqm_codel: Option<AqmCodelQueue>,
     ingress_buffer: std::collections::VecDeque<u8>,
     egress_frames: std::collections::VecDeque<Vec<u8>>,
     capsule_queue: std::collections::VecDeque<crate::simd_parser::HttpCapsule>,
@@ -11333,6 +11855,7 @@ impl ExtendedConnectTunnel {
             state: TunnelState::PendingHandshake,
             shaper: None,
             sp_wdrr_scheduler: None,
+            aqm_codel: None,
             ingress_buffer: std::collections::VecDeque::with_capacity(4096),
             egress_frames: std::collections::VecDeque::new(),
             capsule_queue: std::collections::VecDeque::new(),
@@ -11353,6 +11876,12 @@ impl ExtendedConnectTunnel {
     /// Attach a Strict-Priority Weighted Deficit Round-Robin (SP-WDRR) scheduler for control/data isolation.
     pub fn with_sp_wdrr_scheduler(mut self, scheduler: StrictPriorityWdrrScheduler) -> Self {
         self.sp_wdrr_scheduler = Some(scheduler);
+        self
+    }
+
+    /// Attach an Active Queue Management (CoDel) queue with ECN/L4S support.
+    pub fn with_aqm_codel(mut self, aqm: AqmCodelQueue) -> Self {
+        self.aqm_codel = Some(aqm);
         self
     }
 
@@ -11516,6 +12045,58 @@ impl ExtendedConnectTunnel {
     /// Retrieve SP-WDRR telemetry if enabled on this tunnel.
     pub fn sp_wdrr_telemetry(&self) -> Option<SpWdrrTelemetry> {
         self.sp_wdrr_scheduler.as_ref().map(|s| s.telemetry())
+    }
+
+    /// Enqueue an RFC 9297 capsule into the AQM CoDel queue with explicit ECN codemark.
+    pub fn send_capsule_aqm(
+        &mut self,
+        capsule: &crate::simd_parser::HttpCapsule,
+        ecn: EcnCodemark,
+        now: std::time::Instant,
+    ) -> Result<u64, DropReason> {
+        if let Some(ref mut aqm) = self.aqm_codel {
+            aqm.enqueue_capsule(capsule, ecn, now)
+        } else {
+            self.send_capsule(capsule);
+            Ok(0)
+        }
+    }
+
+    /// Enqueue a raw UDP datagram packet into the AQM CoDel queue.
+    pub fn send_udp_packet_aqm(
+        &mut self,
+        packet: &[u8],
+        ecn: EcnCodemark,
+        now: std::time::Instant,
+    ) -> Result<u64, DropReason> {
+        let cap = crate::simd_parser::HttpCapsule::udp_datagram(0, packet);
+        self.send_capsule_aqm(&cap, ecn, now)
+    }
+
+    /// Drain up to `max_packets` scheduled packets from the AQM CoDel queue at the current timestamp `now`.
+    /// Packets whose sojourn delay exceeds CoDel target are marked CE (if ECN capable) or dropped early.
+    /// Admitted packets are transferred into the tunnel's outbound transmission queue (`egress_frames`).
+    /// Returns the vector of admitted dequeued packets.
+    pub fn drain_aqm_capsules(
+        &mut self,
+        now: std::time::Instant,
+        max_packets: usize,
+    ) -> Vec<AqmDequeuedPacket> {
+        if let Some(ref mut aqm) = self.aqm_codel {
+            let packets = aqm.dequeue_batch(now, max_packets);
+            for pkt in &packets {
+                self.total_bytes_sent += pkt.payload.len();
+                self.egress_frames.push_back(pkt.payload.clone());
+            }
+            packets
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Retrieve AQM CoDel telemetry metrics if enabled on this tunnel.
+    pub fn aqm_telemetry(&self) -> Option<AqmCodelTelemetry> {
+        self.aqm_codel.as_ref().map(|a| a.telemetry())
     }
 
     /// Poll and dequeue the next incoming UDP datagram packet payload.
@@ -32562,5 +33143,214 @@ mod tls_alpn_tests {
         let telem = tunnel.sp_wdrr_telemetry().expect("sp wdrr telemetry");
         assert_eq!(telem.control_packets_serviced, 1);
         assert_eq!(telem.data_packets_serviced, 2);
+    }
+
+    #[test]
+    fn test_ecn_codemark_representation() {
+        assert_eq!(EcnCodemark::NotEct.as_u8(), 0b00);
+        assert_eq!(EcnCodemark::Ect1.as_u8(), 0b01);
+        assert_eq!(EcnCodemark::Ect0.as_u8(), 0b10);
+        assert_eq!(EcnCodemark::Ce.as_u8(), 0b11);
+
+        assert_eq!(EcnCodemark::from_u8(0), EcnCodemark::NotEct);
+        assert_eq!(EcnCodemark::from_u8(1), EcnCodemark::Ect1);
+        assert_eq!(EcnCodemark::from_u8(2), EcnCodemark::Ect0);
+        assert_eq!(EcnCodemark::from_u8(3), EcnCodemark::Ce);
+
+        assert!(!EcnCodemark::NotEct.is_ecn_capable());
+        assert!(EcnCodemark::Ect1.is_ecn_capable());
+        assert!(EcnCodemark::Ect0.is_ecn_capable());
+        assert!(EcnCodemark::Ce.is_ecn_capable());
+
+        assert!(EcnCodemark::Ect1.is_l4s());
+        assert!(!EcnCodemark::Ect0.is_l4s());
+        assert!(!EcnCodemark::NotEct.is_l4s());
+    }
+
+    #[test]
+    fn test_aqm_codel_normal_dequeue_below_target() {
+        let now = std::time::Instant::now();
+        let config = AqmCodelConfig::default()
+            .with_target(Duration::from_millis(10))
+            .with_interval(Duration::from_millis(100));
+        let mut aqm = AqmCodelQueue::new(config);
+
+        for i in 0..5 {
+            let payload = format!("DATA_PAYLOAD_{}", i).into_bytes();
+            aqm.enqueue(payload, EcnCodemark::Ect0, now)
+                .expect("enqueue success");
+        }
+
+        assert_eq!(aqm.len(), 5);
+        assert!(!aqm.is_empty());
+
+        // Dequeue at now + 2ms (sojourn 2ms < target 10ms)
+        let later = now + Duration::from_millis(2);
+        let batch = aqm.dequeue_batch(later, 10);
+        assert_eq!(batch.len(), 5);
+
+        for pkt in &batch {
+            assert_eq!(pkt.ecn, EcnCodemark::Ect0);
+            assert!(!pkt.marked_ce);
+            assert_eq!(pkt.sojourn_duration, Duration::from_millis(2));
+        }
+
+        let telem = aqm.telemetry();
+        assert_eq!(telem.total_enqueued_packets, 5);
+        assert_eq!(telem.total_dequeued_packets, 5);
+        assert_eq!(telem.total_early_dropped_packets, 0);
+        assert_eq!(telem.total_ecn_marked_packets, 0);
+        assert!(!telem.is_in_dropping_state);
+    }
+
+    #[test]
+    fn test_aqm_codel_early_drop_non_ect_packets() {
+        let t0 = std::time::Instant::now();
+        let config = AqmCodelConfig::default()
+            .with_target(Duration::from_millis(5))
+            .with_interval(Duration::from_millis(20))
+            .with_byte_threshold(10);
+        let mut aqm = AqmCodelQueue::new(config);
+
+        // Enqueue 5 non-ECN packets
+        for i in 0..5 {
+            let payload = format!("NON_ECT_PACKET_{}", i).into_bytes();
+            aqm.enqueue(payload, EcnCodemark::NotEct, t0)
+                .expect("enqueue");
+        }
+
+        // Dequeue first packet during grace interval (t0 + 5ms)
+        let pkt1 = aqm
+            .dequeue_one(t0 + Duration::from_millis(5))
+            .expect("first pkt");
+        assert_eq!(pkt1.ecn, EcnCodemark::NotEct);
+        assert!(!pkt1.marked_ce);
+
+        // Advance time well past interval: t0 + 30ms (sojourn 30ms > target 5ms, elapsed > interval 20ms)
+        let t_congested = t0 + Duration::from_millis(30);
+        // The next dequeue should detect persistent queue delay above target past interval.
+        // Since packets are NotEct, it will early drop the congested packet(s).
+        let _pkt2 = aqm.dequeue_one(t_congested);
+
+        let telem = aqm.telemetry();
+        assert!(
+            telem.total_early_dropped_packets > 0,
+            "must have early dropped at least one non-ECT packet"
+        );
+        assert!(telem.is_in_dropping_state);
+    }
+
+    #[test]
+    fn test_aqm_codel_ecn_ce_marking() {
+        let t0 = std::time::Instant::now();
+        let config = AqmCodelConfig::default()
+            .with_target(Duration::from_millis(5))
+            .with_interval(Duration::from_millis(20))
+            .with_byte_threshold(10)
+            .with_ecn(true);
+        let mut aqm = AqmCodelQueue::new(config);
+
+        // Enqueue 5 ECT(0) and ECT(1) packets
+        for i in 0..5 {
+            let payload = format!("ECT_PACKET_{}", i).into_bytes();
+            let mark = if i % 2 == 0 {
+                EcnCodemark::Ect0
+            } else {
+                EcnCodemark::Ect1
+            };
+            aqm.enqueue(payload, mark, t0).expect("enqueue");
+        }
+
+        // Dequeue first packet in grace interval
+        let pkt1 = aqm
+            .dequeue_one(t0 + Duration::from_millis(5))
+            .expect("pkt 1");
+        assert_eq!(pkt1.ecn, EcnCodemark::Ect0);
+        assert!(!pkt1.marked_ce);
+
+        // Advance time to persistent congestion: t0 + 30ms (> interval 20ms)
+        let t_congested = t0 + Duration::from_millis(30);
+        let pkt2 = aqm.dequeue_one(t_congested).expect("pkt 2 marked CE");
+        assert_eq!(
+            pkt2.ecn,
+            EcnCodemark::Ce,
+            "ECT packet must be marked CE instead of dropped"
+        );
+        assert!(pkt2.marked_ce);
+
+        let telem = aqm.telemetry();
+        assert!(telem.total_ecn_marked_packets >= 1);
+        assert_eq!(
+            telem.total_early_dropped_packets, 0,
+            "No ECT packets should be dropped"
+        );
+    }
+
+    #[test]
+    fn test_aqm_codel_l4s_low_latency_target() {
+        let t0 = std::time::Instant::now();
+        let config = AqmCodelConfig::default()
+            .with_target(Duration::from_millis(10)) // Classic target: 10ms
+            .with_l4s_target(Duration::from_millis(2)) // L4S target: 2ms
+            .with_interval(Duration::from_millis(15))
+            .with_byte_threshold(10)
+            .with_l4s(true);
+        let mut aqm = AqmCodelQueue::new(config);
+
+        // Enqueue L4S ECT(1) packet and Classic ECT(0) packet
+        aqm.enqueue(b"L4S_STREAM_FRAME".to_vec(), EcnCodemark::Ect1, t0)
+            .expect("l4s pkt");
+        aqm.enqueue(b"CLASSIC_STREAM_FRAME".to_vec(), EcnCodemark::Ect0, t0)
+            .expect("classic pkt");
+
+        // Dequeue at t0 + 20ms (> interval 15ms)
+        // For L4S: target was 2ms, sojourn is 20ms -> marked CE!
+        let l4s_pkt = aqm
+            .dequeue_one(t0 + Duration::from_millis(20))
+            .expect("l4s dequeued");
+        assert_eq!(l4s_pkt.ecn, EcnCodemark::Ce);
+        assert!(l4s_pkt.marked_ce);
+    }
+
+    #[test]
+    fn test_extended_connect_tunnel_aqm_integration() {
+        let now = std::time::Instant::now();
+        let config = AqmCodelConfig::default()
+            .with_target(Duration::from_millis(5))
+            .with_interval(Duration::from_millis(20))
+            .with_byte_threshold(10);
+        let aqm = AqmCodelQueue::new(config);
+
+        let mut tunnel =
+            ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "masque.example.com")
+                .with_aqm_codel(aqm);
+
+        // Send UDP packet via tunnel AQM
+        tunnel
+            .send_udp_packet_aqm(b"FAST_UDP_PAYLOAD", EcnCodemark::Ect1, now)
+            .expect("enqueue udp aqm");
+
+        // Send capsule via tunnel AQM
+        let cap = crate::simd_parser::HttpCapsule::new(
+            crate::simd_parser::CapsuleType::AddressAssign,
+            vec![192, 168, 1, 100],
+        );
+        tunnel
+            .send_capsule_aqm(&cap, EcnCodemark::Ect0, now)
+            .expect("enqueue cap aqm");
+
+        // Drain AQM capsules immediately (below target delay)
+        let dequeued = tunnel.drain_aqm_capsules(now + Duration::from_millis(1), 10);
+        assert_eq!(dequeued.len(), 2);
+        assert_eq!(dequeued[0].ecn, EcnCodemark::Ect1);
+        assert_eq!(dequeued[1].ecn, EcnCodemark::Ect0);
+
+        let egress = tunnel.drain_egress_data();
+        assert_eq!(egress.len(), 2);
+
+        let telem = tunnel.aqm_telemetry().expect("aqm telemetry");
+        assert_eq!(telem.total_enqueued_packets, 2);
+        assert_eq!(telem.total_dequeued_packets, 2);
+        assert_eq!(telem.total_early_dropped_packets, 0);
     }
 }
