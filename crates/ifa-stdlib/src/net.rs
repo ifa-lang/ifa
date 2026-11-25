@@ -34864,6 +34864,7 @@ impl AlpnNegotiator {
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tls_alpn_tests {
+    #![allow(clippy::field_reassign_with_default)]
     use super::*;
 
     // ── AlpnProtocol ─────────────────────────────────────────────────────────
