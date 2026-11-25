@@ -55,9 +55,9 @@ pub use header::{
     FLAG_EPOCH_1, FLAG_FREE, FLAG_PINNED, FLAG_QUARANTINED, FLAG_READONLY,
 };
 pub use jitter_anomaly::{
-    apply_dynamic_thresholds, AnomalySeverity, DynamicCongestionThresholds,
-    JitterAnomalyDetector, JitterAnomalyKind, JitterDetectorConfig, JitterDetectorStats,
-    JitterMitigationAction, JitterMultipathBridge, JitterSampleEvaluation,
+    apply_dynamic_thresholds, AnomalySeverity, DynamicCongestionThresholds, JitterAnomalyDetector,
+    JitterAnomalyKind, JitterDetectorConfig, JitterDetectorStats, JitterMitigationAction,
+    JitterMultipathBridge, JitterSampleEvaluation,
 };
 pub use mtls_attestation::{
     ifa_digest32, ifa_kdf_derive, ifa_mac, MeshAttestationCertificate, MeshNodeRole,

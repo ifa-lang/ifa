@@ -1740,8 +1740,10 @@ fn test_cli_net_session_jitter_anomaly_and_thresholds() {
         .expect("exec jitter bench");
     assert!(bench_out.status.success());
     let bench_str = String::from_utf8_lossy(&bench_out.stdout);
-    assert!(bench_str.contains("ISSP Jitter Anomaly Detection & Dynamic BBR/LEDBAT Threshold Benchmark"));
-    assert!(bench_str.contains("PASSED (100% anomaly pattern classification & dynamic threshold derivation)"));
+    assert!(bench_str
+        .contains("ISSP Jitter Anomaly Detection & Dynamic BBR/LEDBAT Threshold Benchmark"));
+    assert!(bench_str
+        .contains("PASSED (100% anomaly pattern classification & dynamic threshold derivation)"));
 
     // 2. Benchmark JSON output
     let bench_json = Command::new(ifa_bin)

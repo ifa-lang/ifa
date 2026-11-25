@@ -400,10 +400,7 @@ impl JitterAnomalyDetector {
         if effective_rtt < self.min_rtt_us {
             // Check if baseline dropped significantly (downward route shift)
             if self.min_rtt_us != u64::MAX
-                && self
-                    .min_rtt_us
-                    .saturating_sub(effective_rtt)
-                    > self.config.route_shift_step_us
+                && self.min_rtt_us.saturating_sub(effective_rtt) > self.config.route_shift_step_us
             {
                 route_shifted = true;
             }
@@ -512,7 +509,10 @@ impl JitterAnomalyDetector {
         if queuing_delay > self.config.max_ledbat_target_us * 3
             && self.consecutive_bloat_samples >= 5
         {
-            return (JitterAnomalyKind::SevereImpairment, AnomalySeverity::Critical);
+            return (
+                JitterAnomalyKind::SevereImpairment,
+                AnomalySeverity::Critical,
+            );
         }
 
         // Bufferbloat onset: consecutive monotonic queuing increase
@@ -579,8 +579,10 @@ impl JitterAnomalyDetector {
         match anomaly_kind {
             JitterAnomalyKind::Nominal => {
                 let adaptive = (0.2 * self.base_rtt_us() as f64 + 2.0 * std_dev).round() as u64;
-                target_delay = adaptive
-                    .clamp(self.config.min_ledbat_target_us, self.config.max_ledbat_target_us);
+                target_delay = adaptive.clamp(
+                    self.config.min_ledbat_target_us,
+                    self.config.max_ledbat_target_us,
+                );
                 pacing_gain = self.config.bbr_nominal_gain_q8; // 1.0x
                 action = JitterMitigationAction::Maintain;
             }
@@ -644,7 +646,10 @@ impl JitterAnomalyDetector {
     pub fn derive_thresholds(&self) -> DynamicCongestionThresholds {
         let queuing = self.last_rtt_us.saturating_sub(self.base_rtt_us());
         let std_dev = self.std_dev_rtt_us();
-        let last_kind = self.stats.last_anomaly.unwrap_or(JitterAnomalyKind::Nominal);
+        let last_kind = self
+            .stats
+            .last_anomaly
+            .unwrap_or(JitterAnomalyKind::Nominal);
         let sev = match last_kind {
             JitterAnomalyKind::Nominal => AnomalySeverity::Nominal,
             JitterAnomalyKind::TransientSpike => AnomalySeverity::Low,
@@ -661,28 +666,40 @@ impl JitterAnomalyDetector {
         let mut out = String::with_capacity(1024);
         let thresholds = self.derive_thresholds();
 
-        out.push_str("# HELP ifa_jitter_mean_rtt_us Running mean round-trip time in microseconds.\n");
+        out.push_str(
+            "# HELP ifa_jitter_mean_rtt_us Running mean round-trip time in microseconds.\n",
+        );
         out.push_str("# TYPE ifa_jitter_mean_rtt_us gauge\n");
         out.push_str(&format!(
             "ifa_jitter_mean_rtt_us{{path_id=\"{}\",iface=\"{}\"}} {:.1}\n",
             path_id, iface, self.welford_mean
         ));
 
-        out.push_str("# HELP ifa_jitter_std_dev_us Running standard deviation of RTT in microseconds.\n");
+        out.push_str(
+            "# HELP ifa_jitter_std_dev_us Running standard deviation of RTT in microseconds.\n",
+        );
         out.push_str("# TYPE ifa_jitter_std_dev_us gauge\n");
         out.push_str(&format!(
             "ifa_jitter_std_dev_us{{path_id=\"{}\",iface=\"{}\"}} {:.1}\n",
-            path_id, iface, self.std_dev_rtt_us()
+            path_id,
+            iface,
+            self.std_dev_rtt_us()
         ));
 
-        out.push_str("# HELP ifa_jitter_rfc3550_us RFC 3550 interarrival jitter in microseconds.\n");
+        out.push_str(
+            "# HELP ifa_jitter_rfc3550_us RFC 3550 interarrival jitter in microseconds.\n",
+        );
         out.push_str("# TYPE ifa_jitter_rfc3550_us gauge\n");
         out.push_str(&format!(
             "ifa_jitter_rfc3550_us{{path_id=\"{}\",iface=\"{}\"}} {}\n",
-            path_id, iface, self.rfc3550_jitter_us()
+            path_id,
+            iface,
+            self.rfc3550_jitter_us()
         ));
 
-        out.push_str("# HELP ifa_jitter_anomalies_total Total classified jitter anomalies by kind.\n");
+        out.push_str(
+            "# HELP ifa_jitter_anomalies_total Total classified jitter anomalies by kind.\n",
+        );
         out.push_str("# TYPE ifa_jitter_anomalies_total counter\n");
         out.push_str(&format!(
             "ifa_jitter_anomalies_total{{path_id=\"{}\",iface=\"{}\",kind=\"nominal\"}} {}\n",
@@ -720,7 +737,9 @@ impl JitterAnomalyDetector {
         out.push_str("# TYPE ifa_dynamic_bbr_pacing_gain gauge\n");
         out.push_str(&format!(
             "ifa_dynamic_bbr_pacing_gain{{path_id=\"{}\",iface=\"{}\"}} {:.3}\n",
-            path_id, iface, thresholds.dynamic_bbr_pacing_gain_q8 as f64 / 256.0
+            path_id,
+            iface,
+            thresholds.dynamic_bbr_pacing_gain_q8 as f64 / 256.0
         ));
 
         out.push_str("# HELP ifa_jitter_congestion_risk_score Normalized predictive congestion risk score [0.0, 1.0].\n");
@@ -817,11 +836,7 @@ impl JitterMultipathBridge {
     }
 
     /// Register or get the detector for a specific subpath.
-    pub fn get_or_create(
-        &mut self,
-        path_id: u32,
-        iface: &str,
-    ) -> &mut JitterAnomalyDetector {
+    pub fn get_or_create(&mut self, path_id: u32, iface: &str) -> &mut JitterAnomalyDetector {
         if let Some(pos) = self.detectors.iter().position(|(id, _, _)| *id == path_id) {
             return &mut self.detectors[pos].2;
         }
@@ -847,7 +862,8 @@ impl JitterMultipathBridge {
 
         // Update path metrics
         route.metrics.jitter_us = eval.rfc3550_jitter_us;
-        route.metrics.rtt_variance_us = (eval.derived_thresholds.congestion_risk_score * 10_000.0) as u64;
+        route.metrics.rtt_variance_us =
+            (eval.derived_thresholds.congestion_risk_score * 10_000.0) as u64;
 
         eval
     }
@@ -902,7 +918,10 @@ mod tests {
         let last_eval = evaluations.last().unwrap();
         assert_eq!(last_eval.anomaly_kind, JitterAnomalyKind::Nominal);
         assert_eq!(last_eval.severity, AnomalySeverity::Nominal);
-        assert_eq!(last_eval.derived_thresholds.recommended_action, JitterMitigationAction::Maintain);
+        assert_eq!(
+            last_eval.derived_thresholds.recommended_action,
+            JitterMitigationAction::Maintain
+        );
         assert!(last_eval.derived_thresholds.dynamic_bbr_pacing_gain_q8 >= 256);
         assert!(last_eval.derived_thresholds.congestion_risk_score < 0.2);
     }
@@ -944,7 +963,10 @@ mod tests {
 
         let eval = bloat_eval.unwrap();
         assert_eq!(eval.anomaly_kind, JitterAnomalyKind::BufferbloatOnset);
-        assert_eq!(eval.derived_thresholds.recommended_action, JitterMitigationAction::ContractLedbatTarget);
+        assert_eq!(
+            eval.derived_thresholds.recommended_action,
+            JitterMitigationAction::ContractLedbatTarget
+        );
         // LEDBAT target should contract below nominal (25ms) to drain the bottleneck buffer
         assert!(eval.derived_thresholds.dynamic_ledbat_target_us < 25_000);
         // BBR pacing gain should throttle back to 0.85x
@@ -965,12 +987,19 @@ mod tests {
         let new_path_rtt = 55_000;
         let mut last_eval = None;
         for i in 1..=10 {
-            last_eval = Some(detector.record_sample(new_path_rtt + (i % 2) * 40, None, (20 + i) * 10_000_000));
+            last_eval = Some(detector.record_sample(
+                new_path_rtt + (i % 2) * 40,
+                None,
+                (20 + i) * 10_000_000,
+            ));
         }
 
         let eval = last_eval.unwrap();
         assert!(eval.derived_thresholds.probe_rtt_required);
-        assert_eq!(eval.derived_thresholds.recommended_action, JitterMitigationAction::TriggerProbeRtt);
+        assert_eq!(
+            eval.derived_thresholds.recommended_action,
+            JitterMitigationAction::TriggerProbeRtt
+        );
     }
 
     #[test]
@@ -990,7 +1019,10 @@ mod tests {
         }
 
         let eval = last_eval.unwrap();
-        assert_eq!(eval.derived_thresholds.recommended_action, JitterMitigationAction::ScaleBbrPacing);
+        assert_eq!(
+            eval.derived_thresholds.recommended_action,
+            JitterMitigationAction::ScaleBbrPacing
+        );
         assert_eq!(eval.derived_thresholds.dynamic_bbr_pacing_gain_q8, 218);
     }
 
@@ -1020,7 +1052,13 @@ mod tests {
 
         let eval = bridge.process_feedback(&mut route, 25_000, None, 100_000_000);
         assert_eq!(eval.rtt_us, 25_000);
-        assert_eq!(route.congestion.ledbat.target_delay_us, eval.derived_thresholds.dynamic_ledbat_target_us);
-        assert_eq!(route.congestion.bbr.pacing_gain_q8, eval.derived_thresholds.dynamic_bbr_pacing_gain_q8);
+        assert_eq!(
+            route.congestion.ledbat.target_delay_us,
+            eval.derived_thresholds.dynamic_ledbat_target_us
+        );
+        assert_eq!(
+            route.congestion.bbr.pacing_gain_q8,
+            eval.derived_thresholds.dynamic_bbr_pacing_gain_q8
+        );
     }
 }

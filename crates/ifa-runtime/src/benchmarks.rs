@@ -2433,7 +2433,9 @@ pub struct JitterAnomalyBenchmarkReport {
 impl JitterAnomalyBenchmarkReport {
     pub fn to_markdown_table(&self) -> String {
         let mut s = String::new();
-        s.push_str("### ISSP Jitter Anomaly Detection & Dynamic BBR/LEDBAT Threshold Benchmark\n\n");
+        s.push_str(
+            "### ISSP Jitter Anomaly Detection & Dynamic BBR/LEDBAT Threshold Benchmark\n\n",
+        );
         s.push_str(&format!(
             "- **Total Telemetry Samples Evaluated**: {} samples across multi-profile impairment scenarios in {:.2} ms\n",
             self.total_samples, self.eval_time_ms
@@ -2885,8 +2887,12 @@ mod tests {
         assert!(report.verification_passed);
 
         let md = report.to_markdown_table();
-        assert!(md.contains("ISSP Jitter Anomaly Detection & Dynamic BBR/LEDBAT Threshold Benchmark"));
-        assert!(md.contains("PASSED (100% anomaly pattern classification & dynamic threshold derivation)"));
+        assert!(
+            md.contains("ISSP Jitter Anomaly Detection & Dynamic BBR/LEDBAT Threshold Benchmark")
+        );
+        assert!(md.contains(
+            "PASSED (100% anomaly pattern classification & dynamic threshold derivation)"
+        ));
 
         let json = report.to_json();
         assert!(json.contains("\"total_samples\":300"));
