@@ -1293,3 +1293,198 @@ fn test_cli_net_session_list_inspect_migrate() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_cli_net_session_telemetry_serve_e2e() {
+    use ifa_runtime::{IsspMultipathRoute, IsspRoutingPolicy, SessionRegistry};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+    use std::process::{Command, Stdio};
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("ifa_cli_telem_serve_e2e_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let state_file = temp_dir.join("telemetry_cluster_state.issp");
+    let reg = SessionRegistry::new(77);
+    reg.set_multipath_routing_policy(IsspRoutingPolicy::BandwidthAggregation)
+        .unwrap();
+    reg.add_multipath_route(IsspMultipathRoute::new(1, 2, "eth0-wan", 1, 100))
+        .unwrap();
+    reg.add_multipath_route(IsspMultipathRoute::new(2, 2, "wwan0-5g", 2, 50))
+        .unwrap();
+    reg.save_to_file(&state_file).expect("save state dump");
+    assert!(state_file.exists());
+
+    let ifa_bin = get_ifa_binary();
+
+    let mut child = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("telemetry-serve")
+        .arg("--addr")
+        .arg("127.0.0.1:0")
+        .arg("--file")
+        .arg(&state_file)
+        .arg("--max-requests")
+        .arg("3")
+        .arg("--ws-interval-ms")
+        .arg("10")
+        .arg("--ws-max-frames")
+        .arg("2")
+        .arg("--node-id")
+        .arg("test-e2e-telem-node")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn `ifa net session telemetry-serve`");
+
+    let child_stderr = child.stderr.take().expect("capture child stderr");
+    let mut reader = BufReader::new(child_stderr);
+
+    // Read stderr until we find the listening address line:
+    // "Telemetry server listening on http://127.0.0.1:<PORT> ..."
+    let mut server_addr = None;
+    let mut line = String::new();
+    while reader.read_line(&mut line).unwrap() > 0 {
+        if let Some(pos) = line.find("http://") {
+            let after_http = &line[pos + 7..];
+            if let Some(addr_str) = after_http.split_whitespace().next() {
+                server_addr = Some(addr_str.to_string());
+                break;
+            }
+        }
+        line.clear();
+    }
+    let server_addr = server_addr.expect("Failed to parse telemetry server address from stderr");
+
+    // Spawn a background thread to drain remaining stderr logs to prevent pipe deadlock
+    let stderr_drain = std::thread::spawn(move || {
+        let mut rest = String::new();
+        let _ = reader.read_to_string(&mut rest);
+        rest
+    });
+
+    // 1. Test GET /metrics (Prometheus endpoint)
+    {
+        let mut stream =
+            TcpStream::connect(&server_addr).expect("connect to telemetry-serve for /metrics");
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+
+        assert!(
+            resp.contains("HTTP/1.1 200 OK"),
+            "expected HTTP 200, got: {}",
+            &resp[..resp.len().min(120)]
+        );
+        assert!(resp.contains("Content-Type: text/plain; version=0.0.4"));
+        assert!(resp.contains("ifa_issp_multipath_active_paths"));
+        assert!(resp.contains("node_id=\"77\""));
+        assert!(resp.contains("interface=\"eth0-wan\""));
+        assert!(resp.contains("interface=\"wwan0-5g\""));
+    }
+
+    // 2. Test GET /v1/metrics (OTLP JSON endpoint)
+    {
+        let mut stream =
+            TcpStream::connect(&server_addr).expect("connect to telemetry-serve for /v1/metrics");
+        stream
+            .write_all(b"GET /v1/metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+
+        assert!(
+            resp.contains("HTTP/1.1 200 OK"),
+            "expected HTTP 200, got: {}",
+            &resp[..resp.len().min(120)]
+        );
+        assert!(resp.contains("Content-Type: application/json"));
+        let body_pos = resp.find("\r\n\r\n").expect("find end of headers");
+        let body = &resp[body_pos + 4..];
+        assert!(body.contains("test-e2e-telem-node"));
+        let val: serde_json::Value = serde_json::from_str(body).expect("valid JSON OTLP body");
+        assert!(val.get("resourceMetrics").is_some() || val.get("scopeMetrics").is_some());
+    }
+
+    // 3. Test GET /ws/metrics (Streaming WebSocket endpoint)
+    {
+        let mut stream =
+            TcpStream::connect(&server_addr).expect("connect to telemetry-serve for /ws/metrics");
+        let ws_req = "GET /ws/metrics HTTP/1.1\r\n\
+                      Host: 127.0.0.1\r\n\
+                      Upgrade: websocket\r\n\
+                      Connection: Upgrade\r\n\
+                      Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                      Sec-WebSocket-Version: 13\r\n\r\n";
+        stream.write_all(ws_req.as_bytes()).unwrap();
+
+        // Read handshake response
+        let mut resp_bytes: Vec<u8> = Vec::with_capacity(256);
+        let mut one = [0u8; 1];
+        loop {
+            stream.read_exact(&mut one).unwrap();
+            resp_bytes.push(one[0]);
+            if resp_bytes.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let resp_str = String::from_utf8_lossy(&resp_bytes).to_string();
+        assert!(resp_str.contains("101 Switching Protocols"));
+        assert!(resp_str.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+
+        // Read streamed WebSocket frames (ws_max_frames: 2)
+        for i in 0..2 {
+            let mut hdr = [0u8; 2];
+            stream.read_exact(&mut hdr).expect("read frame header");
+            assert_eq!(hdr[0], 0x81, "frame {} opcode must be text (0x81)", i);
+            let payload_len: usize = match hdr[1] & 0x7F {
+                126 => {
+                    let mut ext = [0u8; 2];
+                    stream.read_exact(&mut ext).unwrap();
+                    u16::from_be_bytes(ext) as usize
+                }
+                127 => {
+                    let mut ext = [0u8; 8];
+                    stream.read_exact(&mut ext).unwrap();
+                    u64::from_be_bytes(ext) as usize
+                }
+                n => n as usize,
+            };
+            let mut payload = vec![0u8; payload_len];
+            stream.read_exact(&mut payload).unwrap();
+            let frame_payload = String::from_utf8_lossy(&payload).to_string();
+
+            assert!(
+                frame_payload.contains("\"active_paths\":2"),
+                "frame {} missing active_paths: {}",
+                i,
+                frame_payload
+            );
+            assert!(
+                frame_payload.contains("eth0-wan"),
+                "frame {} missing eth0-wan route",
+                i
+            );
+            assert!(
+                frame_payload.contains("wwan0-5g"),
+                "frame {} missing wwan0-5g route",
+                i
+            );
+        }
+    }
+
+    // 4. Verify process termination and graceful exit after max_requests = 3
+    let status = child.wait().expect("child telemetry-serve process wait");
+    assert!(
+        status.success(),
+        "telemetry-serve exited with failure status"
+    );
+
+    let _stderr_logs = stderr_drain.join().unwrap();
+    let _ = fs::remove_dir_all(&temp_dir);
+}

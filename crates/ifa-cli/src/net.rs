@@ -1557,6 +1557,22 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 _ => SessionRegistry::new(1),
             };
 
+            // Ensure baseline multipath routes are present if none configured
+            if let Ok(routes) = registry.list_multipath_routes() {
+                if !routes.iter().any(|r| r.path_id == 1) {
+                    let mut r1 = IsspMultipathRoute::new(1, 10, "eth0-wan", 1, 100)
+                        .with_state(IsspPathState::Active);
+                    r1.metrics.smoothed_rtt_us = 12_000;
+                    let _ = registry.add_multipath_route(r1);
+                }
+                if !routes.iter().any(|r| r.path_id == 2) {
+                    let mut r2 = IsspMultipathRoute::new(2, 10, "wwan0-5g", 2, 50)
+                        .with_state(IsspPathState::Active);
+                    r2.metrics.smoothed_rtt_us = 28_000;
+                    let _ = registry.add_multipath_route(r2);
+                }
+            }
+
             let server = match IsspTelemetryServer::bind(&addr, &node_id, registry) {
                 Ok(s) => s,
                 Err(e) => {
