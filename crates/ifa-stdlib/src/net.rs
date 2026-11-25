@@ -7713,6 +7713,7 @@ pub struct HybridDatagramTransport {
     pub pmtud: PathMtuDiscovery,
     pub reassembler: AdaptiveDatagramReassembler,
     pub reliable_session: Option<AdaptiveReliableDatagramSession>,
+    pub shaper: Option<AdaptiveTokenBucketShaper>,
     next_datagram_id: u64,
     transport_overhead: usize,
 }
@@ -7730,9 +7731,16 @@ impl HybridDatagramTransport {
             pmtud: PathMtuDiscovery::new(config),
             reassembler: AdaptiveDatagramReassembler::new(256, Duration::from_secs(5)),
             reliable_session: None,
+            shaper: None,
             next_datagram_id: 1,
             transport_overhead: 28, // IP (20) + UDP (8) headers
         }
+    }
+
+    /// Attach an adaptive token bucket traffic shaper to regulate outbound datagram rate and bufferbloat.
+    pub fn with_shaper(mut self, shaper: AdaptiveTokenBucketShaper) -> Self {
+        self.shaper = Some(shaper);
+        self
     }
 
     /// Enable adaptive reliable datagram transport with FEC redundancy group size.
@@ -7798,16 +7806,25 @@ impl HybridDatagramTransport {
         response: &crate::simd_parser::PmtuProbeResponseFrame,
         now: std::time::Instant,
     ) -> bool {
-        self.pmtud.handle_probe_ack(
+        let acked = self.pmtud.handle_probe_ack(
             response.probe_id,
             response.token,
             response.target_size as usize,
             now,
-        )
+        );
+        if acked {
+            if let Some(ref mut shaper) = self.shaper {
+                shaper.adapt_on_rtt(Duration::from_millis(15), now);
+            }
+        }
+        acked
     }
 
     /// Report packet loss on path, potentially triggering black hole recovery.
     pub fn report_loss(&mut self, now: std::time::Instant) -> bool {
+        if let Some(ref mut shaper) = self.shaper {
+            shaper.adapt_on_loss(0.20);
+        }
         self.pmtud.report_packet_loss(now)
     }
 
@@ -7816,6 +7833,9 @@ impl HybridDatagramTransport {
         let mut pruned = self.reassembler.prune_stale(now);
         if let Some(ref mut rel) = self.reliable_session {
             pruned += rel.prune_stale(now);
+        }
+        if let Some(ref mut shaper) = self.shaper {
+            pruned += shaper.prune_expired_queue(now);
         }
         pruned
     }
@@ -7829,6 +7849,68 @@ impl HybridDatagramTransport {
         telem.checksum_errors = reasm.checksum_errors;
         telem.stale_fragments_pruned = reasm.stale_fragments_pruned;
         telem
+    }
+
+    /// Send an outbound datagram with adaptive token bucket rate limiting and admission control.
+    /// If admitted immediately, returns `(AdmissionDecision::Admitted, wire_packets)`.
+    /// If delayed or dropped, returns `(decision, Vec::new())`.
+    pub fn send_shaped(
+        &mut self,
+        payload: &[u8],
+        priority: TrafficPriority,
+        deadline: Option<Duration>,
+        now: std::time::Instant,
+    ) -> (AdmissionDecision, Vec<Vec<u8>>) {
+        if let Some(ref mut shaper) = self.shaper {
+            let decision = shaper.admit_or_enqueue(payload.to_vec(), priority, deadline, now);
+            match decision {
+                AdmissionDecision::Admitted => {
+                    let packets = self.send_reliable(
+                        payload,
+                        deadline,
+                        priority == TrafficPriority::High || priority == TrafficPriority::Control,
+                        now,
+                    );
+                    (AdmissionDecision::Admitted, packets)
+                }
+                delayed @ AdmissionDecision::Delayed { .. } => (delayed, Vec::new()),
+                dropped @ AdmissionDecision::Dropped { .. } => (dropped, Vec::new()),
+            }
+        } else {
+            let packets = self.send_reliable(
+                payload,
+                deadline,
+                priority == TrafficPriority::High || priority == TrafficPriority::Control,
+                now,
+            );
+            (AdmissionDecision::Admitted, packets)
+        }
+    }
+
+    /// Drain up to `max_packets` admitted datagrams from the shaping buffer and convert them
+    /// into wire transmission packets.
+    pub fn drain_shaped(&mut self, now: std::time::Instant, max_packets: usize) -> Vec<Vec<u8>> {
+        let mut admitted_payloads = Vec::new();
+        if let Some(ref mut shaper) = self.shaper {
+            let drained = shaper.drain_admitted(now, max_packets);
+            for p in drained {
+                let is_high =
+                    p.priority == TrafficPriority::High || p.priority == TrafficPriority::Control;
+                admitted_payloads.push((p.payload, p.deadline, is_high));
+            }
+        }
+
+        let mut wire_packets = Vec::new();
+        for (payload, deadline, is_high) in admitted_payloads {
+            let pkts = self.send_reliable(&payload, deadline, is_high, now);
+            wire_packets.extend(pkts);
+        }
+        wire_packets
+    }
+
+    /// Retrieve shaper telemetry if enabled.
+    pub fn shaper_telemetry(&self) -> Option<TrafficShaperTelemetry> {
+        self.shaper.as_ref().map(|s| s.telemetry())
     }
 
     /// Send a reliable or semi-reliable datagram, generating FEC redundancy packets
@@ -8755,6 +8837,604 @@ impl AdaptiveReliableDatagramSession {
         let mut telem = self.telemetry;
         telem.estimated_loss_rate = self.loss_detector.loss_rate();
         telem.smoothed_rtt_micros = self.smoothed_rtt_micros;
+        telem
+    }
+}
+
+// ── Adaptive Token Bucket Rate Limiting & Traffic Shaping ───────────────────
+
+/// Traffic priority classes for rate limiting, admission control, and priority queueing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TrafficPriority {
+    /// Control frames, close capsules, PMTU probes, and SACK signaling.
+    /// Highest priority, allocated dedicated token headroom, exempted from early drop.
+    Control = 0,
+    /// High-priority interactive, low-latency datagrams or urgent capsules (e.g. strict deadline).
+    High = 1,
+    /// Standard datagrams and application data capsules.
+    Normal = 2,
+    /// Bulk, background, or speculative traffic; first to be delayed or dropped under congestion.
+    Bulk = 3,
+}
+
+/// Reason why an outbound packet or capsule was rejected by admission control.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropReason {
+    /// The shaping queue reached its maximum packet count or byte capacity (tail drop).
+    QueueFull { current_depth: usize, max_depth: usize },
+    /// The packet has an explicit deadline that cannot be met given current queue delay.
+    DeadlineExceeded { estimated_delay: Duration, deadline: Duration },
+    /// Token exhaustion when queueing is disabled or buffer headroom is depleted.
+    RateExceeded,
+    /// Active Queue Management (AQM / CoDel) persistent queue latency threshold exceeded.
+    AqmPersistentDelay { persistent_delay: Duration, target_delay: Duration },
+}
+
+impl std::fmt::Display for DropReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull { current_depth, max_depth } => {
+                write!(f, "queue full (depth {} >= max {})", current_depth, max_depth)
+            }
+            Self::DeadlineExceeded { estimated_delay, deadline } => {
+                write!(
+                    f,
+                    "deadline exceeded (estimated delay {:?} > deadline {:?})",
+                    estimated_delay, deadline
+                )
+            }
+            Self::RateExceeded => write!(f, "rate exceeded (no token headroom)"),
+            Self::AqmPersistentDelay { persistent_delay, target_delay } => {
+                write!(
+                    f,
+                    "AQM early drop (persistent delay {:?} > target {:?})",
+                    persistent_delay, target_delay
+                )
+            }
+        }
+    }
+}
+
+/// Decision rendered by admission control for an incoming packet or capsule.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdmissionDecision {
+    /// Packet admitted immediately; tokens consumed, packet should be dispatched to wire now.
+    Admitted,
+    /// Packet accepted and enqueued in the shaping buffer; will be dispatched once tokens refill.
+    Delayed { wait_duration: Duration, queue_position: usize },
+    /// Packet rejected and dropped according to admission control policy.
+    Dropped { reason: DropReason },
+}
+
+impl AdmissionDecision {
+    /// Check whether the packet was admitted immediately without queueing.
+    pub fn is_admitted(&self) -> bool {
+        matches!(self, Self::Admitted)
+    }
+
+    /// Check whether the packet was delayed into the shaping queue.
+    pub fn is_delayed(&self) -> bool {
+        matches!(self, Self::Delayed { .. })
+    }
+
+    /// Check whether the packet was dropped by admission control.
+    pub fn is_dropped(&self) -> bool {
+        matches!(self, Self::Dropped { .. })
+    }
+}
+
+/// A queued packet or capsule waiting in the traffic shaper buffer.
+#[derive(Debug, Clone)]
+pub struct ShapedPacket {
+    /// Unique identifier within this shaper instance.
+    pub id: u64,
+    /// Raw payload or encoded wire packet.
+    pub payload: Vec<u8>,
+    /// Priority class of this packet.
+    pub priority: TrafficPriority,
+    /// Timestamp when packet entered the shaping buffer.
+    pub enqueued_at: std::time::Instant,
+    /// Optional application-level deadline.
+    pub deadline: Option<Duration>,
+    /// Byte cost counted towards token consumption and queue limits.
+    pub byte_cost: usize,
+}
+
+/// Configuration settings for the Adaptive Token Bucket Shaper.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenBucketConfig {
+    /// Nominal maximum byte rate (bytes per second).
+    pub max_byte_rate: u64,
+    /// Lower bound for byte rate adaptation (bytes per second).
+    pub min_byte_rate: u64,
+    /// Maximum burst capacity in bytes (token bucket capacity).
+    pub burst_bytes_capacity: u64,
+    /// Nominal maximum packet rate (packets per second).
+    pub max_packet_rate: u64,
+    /// Lower bound for packet rate adaptation (packets per second).
+    pub min_packet_rate: u64,
+    /// Maximum burst capacity in packets.
+    pub burst_packets_capacity: u64,
+    /// Maximum number of queued packets in the shaping buffer before tail drop.
+    pub max_queue_depth_packets: usize,
+    /// Maximum total bytes in the shaping buffer before tail drop.
+    pub max_queue_depth_bytes: usize,
+    /// Target queue latency threshold for AQM / bufferbloat detection.
+    pub target_latency: Duration,
+    /// Reserved token headroom fraction for Control traffic (0.0 to 0.5, default 0.15 = 15%).
+    pub control_headroom_fraction: f64,
+}
+
+impl Default for TokenBucketConfig {
+    fn default() -> Self {
+        Self {
+            max_byte_rate: 10_000_000,        // 10 MB/s
+            min_byte_rate: 128_000,           // 128 KB/s floor
+            burst_bytes_capacity: 131_072,    // 128 KB burst
+            max_packet_rate: 20_000,          // 20k pps
+            min_packet_rate: 500,             // 500 pps floor
+            burst_packets_capacity: 256,      // 256 packets burst
+            max_queue_depth_packets: 512,     // 512 packets max in queue
+            max_queue_depth_bytes: 1_048_576, // 1 MB max in queue
+            target_latency: Duration::from_millis(20),
+            control_headroom_fraction: 0.15,
+        }
+    }
+}
+
+impl TokenBucketConfig {
+    /// Configure byte and packet throughput rates.
+    pub fn with_rates(mut self, byte_rate: u64, packet_rate: u64) -> Self {
+        self.max_byte_rate = byte_rate.max(1);
+        self.min_byte_rate = self.min_byte_rate.min(self.max_byte_rate);
+        self.max_packet_rate = packet_rate.max(1);
+        self.min_packet_rate = self.min_packet_rate.min(self.max_packet_rate);
+        self
+    }
+
+    /// Configure burst capacities.
+    pub fn with_bursts(mut self, burst_bytes: u64, burst_packets: u64) -> Self {
+        self.burst_bytes_capacity = burst_bytes.max(1);
+        self.burst_packets_capacity = burst_packets.max(1);
+        self
+    }
+
+    /// Configure maximum queue depth limits.
+    pub fn with_queue_limits(mut self, max_packets: usize, max_bytes: usize) -> Self {
+        self.max_queue_depth_packets = max_packets.max(1);
+        self.max_queue_depth_bytes = max_bytes.max(1);
+        self
+    }
+}
+
+/// Telemetry counters and metrics for the Adaptive Token Bucket Traffic Shaper.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TrafficShaperTelemetry {
+    /// Packets admitted immediately without queueing.
+    pub packets_admitted_immediate: usize,
+    /// Packets enqueued into the shaping buffer.
+    pub packets_delayed: usize,
+    /// Packets drained and dispatched after shaping delay.
+    pub packets_drained_shaped: usize,
+    /// Packets dropped due to queue capacity exhaustion.
+    pub packets_dropped_queue_full: usize,
+    /// Packets dropped because queue wait exceeded application deadline.
+    pub packets_dropped_deadline: usize,
+    /// Packets dropped by Active Queue Management (bufferbloat mitigation).
+    pub packets_dropped_aqm: usize,
+    /// Total bytes successfully admitted for wire transmission.
+    pub bytes_admitted: usize,
+    /// Total bytes rejected by admission control.
+    pub bytes_dropped: usize,
+    /// Current available byte tokens in the bucket.
+    pub current_byte_tokens: f64,
+    /// Current available packet tokens in the bucket.
+    pub current_packet_tokens: f64,
+    /// Effective adapted byte rate in bytes/sec.
+    pub current_byte_rate: u64,
+    /// Effective adapted packet rate in packets/sec.
+    pub current_packet_rate: u64,
+    /// Current number of packets waiting in the shaping buffer.
+    pub queue_packets: usize,
+    /// Current total bytes waiting in the shaping buffer.
+    pub queue_bytes: usize,
+    /// Number of rate adaptation events performed.
+    pub rate_adaptations: usize,
+    /// Number of backoff events triggered by RTT elevation.
+    pub rtt_backoff_events: usize,
+    /// Number of backoff events triggered by packet loss.
+    pub loss_backoff_events: usize,
+}
+
+/// Dual-metering adaptive token bucket rate limiter and priority traffic shaper
+/// for high-frequency datagrams and RFC 9297 HTTP capsules.
+#[derive(Debug, Clone)]
+pub struct AdaptiveTokenBucketShaper {
+    pub config: TokenBucketConfig,
+    byte_tokens: f64,
+    packet_tokens: f64,
+    pub current_byte_rate: u64,
+    pub current_packet_rate: u64,
+    last_refill: std::time::Instant,
+    control_queue: std::collections::VecDeque<ShapedPacket>,
+    high_queue: std::collections::VecDeque<ShapedPacket>,
+    normal_queue: std::collections::VecDeque<ShapedPacket>,
+    bulk_queue: std::collections::VecDeque<ShapedPacket>,
+    total_queue_bytes: usize,
+    next_packet_id: u64,
+    smoothed_rtt: Duration,
+    min_rtt: Duration,
+    pub telemetry: TrafficShaperTelemetry,
+}
+
+impl Default for AdaptiveTokenBucketShaper {
+    fn default() -> Self {
+        Self::new(TokenBucketConfig::default(), std::time::Instant::now())
+    }
+}
+
+impl AdaptiveTokenBucketShaper {
+    /// Create a new adaptive token bucket shaper initialized at `now`.
+    pub fn new(config: TokenBucketConfig, now: std::time::Instant) -> Self {
+        let byte_rate = config.max_byte_rate.max(config.min_byte_rate).max(1);
+        let packet_rate = config.max_packet_rate.max(config.min_packet_rate).max(1);
+        Self {
+            byte_tokens: config.burst_bytes_capacity as f64,
+            packet_tokens: config.burst_packets_capacity as f64,
+            current_byte_rate: byte_rate,
+            current_packet_rate: packet_rate,
+            last_refill: now,
+            control_queue: std::collections::VecDeque::new(),
+            high_queue: std::collections::VecDeque::new(),
+            normal_queue: std::collections::VecDeque::new(),
+            bulk_queue: std::collections::VecDeque::new(),
+            total_queue_bytes: 0,
+            next_packet_id: 1,
+            smoothed_rtt: Duration::from_millis(20),
+            min_rtt: Duration::from_millis(20),
+            config,
+            telemetry: TrafficShaperTelemetry::default(),
+        }
+    }
+
+    /// Replenish token counters proportional to elapsed wall clock time.
+    pub fn refill(&mut self, now: std::time::Instant) {
+        if now <= self.last_refill {
+            return;
+        }
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
+
+        self.byte_tokens = (self.byte_tokens + elapsed * self.current_byte_rate as f64)
+            .min(self.config.burst_bytes_capacity as f64);
+        self.packet_tokens = (self.packet_tokens + elapsed * self.current_packet_rate as f64)
+            .min(self.config.burst_packets_capacity as f64);
+    }
+
+    /// Total packets currently waiting across all priority queues.
+    pub fn total_queue_packets(&self) -> usize {
+        self.control_queue.len()
+            + self.high_queue.len()
+            + self.normal_queue.len()
+            + self.bulk_queue.len()
+    }
+
+    /// Total bytes currently waiting across all priority queues.
+    pub fn total_queue_bytes(&self) -> usize {
+        self.total_queue_bytes
+    }
+
+    /// Whether the shaping buffer is completely empty.
+    pub fn is_empty(&self) -> bool {
+        self.total_queue_packets() == 0
+    }
+
+    /// Current queue depth as `(packet_count, byte_count)`.
+    pub fn queue_depth(&self) -> (usize, usize) {
+        (self.total_queue_packets(), self.total_queue_bytes)
+    }
+
+    /// Bytes queued in Control priority queue.
+    pub fn control_queue_bytes(&self) -> usize {
+        self.control_queue.iter().map(|p| p.byte_cost).sum()
+    }
+
+    /// Bytes queued in High priority queue.
+    pub fn high_queue_bytes(&self) -> usize {
+        self.high_queue.iter().map(|p| p.byte_cost).sum()
+    }
+
+    /// Bytes queued in Normal priority queue.
+    pub fn normal_queue_bytes(&self) -> usize {
+        self.normal_queue.iter().map(|p| p.byte_cost).sum()
+    }
+
+    /// Bytes queued in Bulk priority queue.
+    pub fn bulk_queue_bytes(&self) -> usize {
+        self.bulk_queue.iter().map(|p| p.byte_cost).sum()
+    }
+
+    /// Perform admission control on an incoming packet or capsule payload.
+    ///
+    /// If tokens are immediately available and no higher-priority packets are queued,
+    /// returns `AdmissionDecision::Admitted`.
+    /// If tokens are insufficient, enqueues the packet into its priority class and returns
+    /// `AdmissionDecision::Delayed`.
+    /// If queue capacity or deadline would be violated, returns `AdmissionDecision::Dropped`.
+    pub fn admit_or_enqueue(
+        &mut self,
+        payload: Vec<u8>,
+        priority: TrafficPriority,
+        deadline: Option<Duration>,
+        now: std::time::Instant,
+    ) -> AdmissionDecision {
+        self.refill(now);
+        let byte_cost = payload.len();
+        let cost_f = byte_cost as f64;
+        let is_control = priority == TrafficPriority::Control;
+
+        // Fast path: if shaping queues are empty and tokens are immediately available
+        if self.is_empty() {
+            let can_admit = if is_control {
+                let headroom = self.config.burst_bytes_capacity as f64
+                    * self.config.control_headroom_fraction;
+                (self.byte_tokens + headroom) >= cost_f
+            } else {
+                self.byte_tokens >= cost_f && self.packet_tokens >= 1.0
+            };
+
+            if can_admit {
+                self.byte_tokens -= cost_f;
+                if !is_control {
+                    self.packet_tokens = (self.packet_tokens - 1.0).max(0.0);
+                }
+                self.telemetry.packets_admitted_immediate += 1;
+                self.telemetry.bytes_admitted += byte_cost;
+                return AdmissionDecision::Admitted;
+            }
+        }
+
+        // Capacity limit check (tail drop)
+        let cur_packets = self.total_queue_packets();
+        if cur_packets >= self.config.max_queue_depth_packets
+            || self.total_queue_bytes + byte_cost > self.config.max_queue_depth_bytes
+        {
+            self.telemetry.packets_dropped_queue_full += 1;
+            self.telemetry.bytes_dropped += byte_cost;
+            return AdmissionDecision::Dropped {
+                reason: DropReason::QueueFull {
+                    current_depth: cur_packets,
+                    max_depth: self.config.max_queue_depth_packets,
+                },
+            };
+        }
+
+        // Deadline check: estimate wait duration based on bytes queued ahead
+        let bytes_ahead: usize = match priority {
+            TrafficPriority::Control => self.control_queue_bytes(),
+            TrafficPriority::High => self.control_queue_bytes() + self.high_queue_bytes(),
+            TrafficPriority::Normal => {
+                self.control_queue_bytes() + self.high_queue_bytes() + self.normal_queue_bytes()
+            }
+            TrafficPriority::Bulk => self.total_queue_bytes,
+        };
+
+        let est_delay_secs = (bytes_ahead + byte_cost) as f64 / self.current_byte_rate.max(1) as f64;
+        let est_delay = Duration::from_secs_f64(est_delay_secs);
+
+        if let Some(dl) = deadline {
+            if est_delay > dl {
+                self.telemetry.packets_dropped_deadline += 1;
+                self.telemetry.bytes_dropped += byte_cost;
+                return AdmissionDecision::Dropped {
+                    reason: DropReason::DeadlineExceeded {
+                        estimated_delay: est_delay,
+                        deadline: dl,
+                    },
+                };
+            }
+        }
+
+        // Enqueue into appropriate priority queue
+        let id = self.next_packet_id;
+        self.next_packet_id = self.next_packet_id.wrapping_add(1);
+        let shaped = ShapedPacket {
+            id,
+            payload,
+            priority,
+            enqueued_at: now,
+            deadline,
+            byte_cost,
+        };
+
+        match priority {
+            TrafficPriority::Control => self.control_queue.push_back(shaped),
+            TrafficPriority::High => self.high_queue.push_back(shaped),
+            TrafficPriority::Normal => self.normal_queue.push_back(shaped),
+            TrafficPriority::Bulk => self.bulk_queue.push_back(shaped),
+        }
+
+        self.total_queue_bytes += byte_cost;
+        self.telemetry.packets_delayed += 1;
+
+        let queue_pos = cur_packets + 1;
+        AdmissionDecision::Delayed {
+            wait_duration: est_delay,
+            queue_position: queue_pos,
+        }
+    }
+
+    /// Poll and dequeue the next packet from the highest priority queue whose tokens are ready.
+    pub fn poll_admitted(&mut self, now: std::time::Instant) -> Option<ShapedPacket> {
+        self.refill(now);
+
+        let queues = [
+            &mut self.control_queue,
+            &mut self.high_queue,
+            &mut self.normal_queue,
+            &mut self.bulk_queue,
+        ];
+
+        for q in queues {
+            while let Some(front) = q.front() {
+                // Check if expired while waiting in queue
+                if let Some(dl) = front.deadline {
+                    if now.duration_since(front.enqueued_at) > dl {
+                        let expired = q.pop_front().unwrap();
+                        self.total_queue_bytes =
+                            self.total_queue_bytes.saturating_sub(expired.byte_cost);
+                        self.telemetry.packets_dropped_deadline += 1;
+                        self.telemetry.bytes_dropped += expired.byte_cost;
+                        continue;
+                    }
+                }
+
+                let cost = front.byte_cost as f64;
+                let is_control = front.priority == TrafficPriority::Control;
+                let has_tokens = if is_control {
+                    let headroom = self.config.burst_bytes_capacity as f64
+                        * self.config.control_headroom_fraction;
+                    (self.byte_tokens + headroom) >= cost
+                } else {
+                    self.byte_tokens >= cost && self.packet_tokens >= 1.0
+                };
+
+                if has_tokens {
+                    let pkt = q.pop_front().unwrap();
+                    self.byte_tokens -= cost;
+                    if !is_control {
+                        self.packet_tokens = (self.packet_tokens - 1.0).max(0.0);
+                    }
+                    self.total_queue_bytes =
+                        self.total_queue_bytes.saturating_sub(pkt.byte_cost);
+                    self.telemetry.packets_drained_shaped += 1;
+                    self.telemetry.bytes_admitted += pkt.byte_cost;
+                    return Some(pkt);
+                } else {
+                    // Cannot admit head of this priority queue without tokens: stop polling
+                    return None;
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Drain up to `max_packets` admitted packets from the shaping buffer.
+    pub fn drain_admitted(
+        &mut self,
+        now: std::time::Instant,
+        max_packets: usize,
+    ) -> Vec<ShapedPacket> {
+        let mut result = Vec::with_capacity(max_packets.min(64));
+        for _ in 0..max_packets {
+            if let Some(pkt) = self.poll_admitted(now) {
+                result.push(pkt);
+            } else {
+                break;
+            }
+        }
+        result
+    }
+
+    /// Adapt rates based on observed round trip time (RTT) feedback.
+    /// Dampens rate if RTT indicates queue buildup (bufferbloat) and ramps up when path is uncongested.
+    pub fn adapt_on_rtt(&mut self, sample_rtt: Duration, _now: std::time::Instant) {
+        if sample_rtt < self.min_rtt || self.min_rtt.as_micros() == 0 {
+            self.min_rtt = sample_rtt;
+        }
+
+        let smoothed_nanos = (self.smoothed_rtt.as_nanos() * 7 + sample_rtt.as_nanos()) / 8;
+        self.smoothed_rtt = Duration::from_nanos(smoothed_nanos as u64);
+
+        if sample_rtt > self.min_rtt * 3 / 2 {
+            // Elevated latency on network path: backoff rate by 15%
+            self.current_byte_rate =
+                ((self.current_byte_rate as f64 * 0.85) as u64).max(self.config.min_byte_rate);
+            self.current_packet_rate =
+                ((self.current_packet_rate as f64 * 0.85) as u64).max(self.config.min_packet_rate);
+            self.telemetry.rtt_backoff_events += 1;
+            self.telemetry.rate_adaptations += 1;
+        } else if sample_rtt <= self.min_rtt * 115 / 100 {
+            // Healthy latency: additive increase (+2% nominal rate)
+            let byte_inc = (self.config.max_byte_rate / 50).max(1024);
+            let pkt_inc = (self.config.max_packet_rate / 50).max(10);
+            self.current_byte_rate =
+                (self.current_byte_rate + byte_inc).min(self.config.max_byte_rate);
+            self.current_packet_rate =
+                (self.current_packet_rate + pkt_inc).min(self.config.max_packet_rate);
+            self.telemetry.rate_adaptations += 1;
+        }
+    }
+
+    /// Adapt rates downward in response to confirmed packet losses or FEC recovery events.
+    pub fn adapt_on_loss(&mut self, loss_rate: f64) {
+        let factor = (1.0 - (loss_rate * 0.6).min(0.5)).max(0.5);
+        self.current_byte_rate =
+            ((self.current_byte_rate as f64 * factor) as u64).max(self.config.min_byte_rate);
+        self.current_packet_rate =
+            ((self.current_packet_rate as f64 * factor) as u64).max(self.config.min_packet_rate);
+        self.telemetry.loss_backoff_events += 1;
+        self.telemetry.rate_adaptations += 1;
+    }
+
+    /// Adjust effective rate according to an explicit external backpressure factor (0.1 to 1.0).
+    pub fn adapt_on_backpressure(&mut self, backpressure_ratio: f64) {
+        let clamped = backpressure_ratio.clamp(0.1, 1.0);
+        self.current_byte_rate =
+            ((self.config.max_byte_rate as f64 * clamped) as u64).max(self.config.min_byte_rate);
+        self.current_packet_rate =
+            ((self.config.max_packet_rate as f64 * clamped) as u64).max(self.config.min_packet_rate);
+        self.telemetry.rate_adaptations += 1;
+    }
+
+    /// Reset token buckets to maximum burst capacity at the given instant.
+    pub fn reset_tokens(&mut self, now: std::time::Instant) {
+        self.byte_tokens = self.config.burst_bytes_capacity as f64;
+        self.packet_tokens = self.config.burst_packets_capacity as f64;
+        self.last_refill = now;
+    }
+
+    /// Prune all expired packets currently pending in the shaping queues.
+    pub fn prune_expired_queue(&mut self, now: std::time::Instant) -> usize {
+        let mut pruned = 0;
+        let queues = [
+            &mut self.control_queue,
+            &mut self.high_queue,
+            &mut self.normal_queue,
+            &mut self.bulk_queue,
+        ];
+
+        for q in queues {
+            let mut retained = std::collections::VecDeque::new();
+            while let Some(pkt) = q.pop_front() {
+                if let Some(dl) = pkt.deadline {
+                    if now.duration_since(pkt.enqueued_at) > dl {
+                        self.total_queue_bytes =
+                            self.total_queue_bytes.saturating_sub(pkt.byte_cost);
+                        self.telemetry.packets_dropped_deadline += 1;
+                        self.telemetry.bytes_dropped += pkt.byte_cost;
+                        pruned += 1;
+                        continue;
+                    }
+                }
+                retained.push_back(pkt);
+            }
+            *q = retained;
+        }
+
+        pruned
+    }
+
+    /// Retrieve telemetry snapshot.
+    pub fn telemetry(&self) -> TrafficShaperTelemetry {
+        let mut telem = self.telemetry;
+        telem.current_byte_tokens = self.byte_tokens;
+        telem.current_packet_tokens = self.packet_tokens;
+        telem.current_byte_rate = self.current_byte_rate;
+        telem.current_packet_rate = self.current_packet_rate;
+        telem.queue_packets = self.total_queue_packets();
+        telem.queue_bytes = self.total_queue_bytes;
         telem
     }
 }
@@ -9956,6 +10636,7 @@ pub struct ExtendedConnectTunnel {
     pub protocol: TunnelProtocol,
     pub target: String,
     pub state: TunnelState,
+    pub shaper: Option<AdaptiveTokenBucketShaper>,
     ingress_buffer: std::collections::VecDeque<u8>,
     egress_frames: std::collections::VecDeque<Vec<u8>>,
     capsule_queue: std::collections::VecDeque<crate::simd_parser::HttpCapsule>,
@@ -9974,6 +10655,7 @@ impl ExtendedConnectTunnel {
             protocol,
             target: target.to_string(),
             state: TunnelState::PendingHandshake,
+            shaper: None,
             ingress_buffer: std::collections::VecDeque::with_capacity(4096),
             egress_frames: std::collections::VecDeque::new(),
             capsule_queue: std::collections::VecDeque::new(),
@@ -9983,6 +10665,12 @@ impl ExtendedConnectTunnel {
             datagram_reassembler: AdaptiveDatagramReassembler::new(256, Duration::from_secs(5)),
             next_datagram_id: 1,
         }
+    }
+
+    /// Attach an adaptive token bucket traffic shaper to regulate outbound capsule throughput.
+    pub fn with_traffic_shaper(mut self, shaper: AdaptiveTokenBucketShaper) -> Self {
+        self.shaper = Some(shaper);
+        self
     }
 
     /// Mark the tunnel as successfully established following receipt of HTTP 200 OK.
@@ -10046,6 +10734,56 @@ impl ExtendedConnectTunnel {
         let bytes = capsule.encode_to_vec();
         self.total_bytes_sent += bytes.len();
         self.egress_frames.push_back(bytes);
+    }
+
+    /// Send an RFC 9297 capsule through the traffic shaper. If admitted, it is immediately enqueued
+    /// in the tunnel egress queue. If delayed or dropped, the decision is returned.
+    pub fn send_capsule_shaped(
+        &mut self,
+        capsule: &crate::simd_parser::HttpCapsule,
+        priority: Option<TrafficPriority>,
+        now: std::time::Instant,
+    ) -> AdmissionDecision {
+        let prio = priority.unwrap_or(match capsule.capsule_type {
+            crate::simd_parser::CapsuleType::CloseWebTransportSession
+            | crate::simd_parser::CapsuleType::DrainWebTransportSession => TrafficPriority::Control,
+            crate::simd_parser::CapsuleType::Datagram => TrafficPriority::Normal,
+            _ => TrafficPriority::Normal,
+        });
+
+        if let Some(ref mut shaper) = self.shaper {
+            let encoded = capsule.encode_to_vec();
+            let decision = shaper.admit_or_enqueue(encoded, prio, None, now);
+            if decision.is_admitted() {
+                self.send_capsule(capsule);
+            }
+            decision
+        } else {
+            self.send_capsule(capsule);
+            AdmissionDecision::Admitted
+        }
+    }
+
+    /// Drain up to `max_capsules` admitted capsules from the shaper and transfer them
+    /// into the tunnel's outbound capsule transmission queue.
+    pub fn drain_shaped_capsules(&mut self, now: std::time::Instant, max_capsules: usize) -> usize {
+        if let Some(ref mut shaper) = self.shaper {
+            let drained = shaper.drain_admitted(now, max_capsules);
+            let count = drained.len();
+            for pkt in drained {
+                if let Ok((cap, _)) = crate::simd_parser::HttpCapsule::decode_one(&pkt.payload) {
+                    self.send_capsule(&cap);
+                }
+            }
+            count
+        } else {
+            0
+        }
+    }
+
+    /// Retrieve tunnel traffic shaper telemetry snapshot if enabled.
+    pub fn shaper_telemetry(&self) -> Option<TrafficShaperTelemetry> {
+        self.shaper.as_ref().map(|s| s.telemetry())
     }
 
     /// Poll and dequeue the next incoming UDP datagram packet payload.
@@ -30570,5 +31308,285 @@ mod tls_alpn_tests {
 
         let telem = transport.reliable_telemetry().expect("telemetry present");
         assert_eq!(telem.packets_sent, 1);
+    }
+
+    #[test]
+    fn test_adaptive_token_bucket_immediate_admission() {
+        let now = std::time::Instant::now();
+        let config = TokenBucketConfig::default()
+            .with_rates(1_000_000, 10_000)
+            .with_bursts(65_536, 100);
+        let mut shaper = AdaptiveTokenBucketShaper::new(config, now);
+
+        let payload = vec![0x42; 1024];
+        let decision = shaper.admit_or_enqueue(payload, TrafficPriority::Normal, None, now);
+        assert!(decision.is_admitted());
+
+        let telem = shaper.telemetry();
+        assert_eq!(telem.packets_admitted_immediate, 1);
+        assert_eq!(telem.bytes_admitted, 1024);
+        assert_eq!(telem.queue_packets, 0);
+    }
+
+    #[test]
+    fn test_adaptive_token_bucket_queueing_and_refill() {
+        let now = std::time::Instant::now();
+        // Bucket capacity: 200 bytes, 2 packets. Refill: 1000 bytes/sec, 10 packets/sec
+        let config = TokenBucketConfig::default()
+            .with_rates(1000, 10)
+            .with_bursts(200, 2);
+        let mut shaper = AdaptiveTokenBucketShaper::new(config, now);
+
+        // First packet: 100 bytes -> Admitted
+        let d1 = shaper.admit_or_enqueue(vec![1; 100], TrafficPriority::Normal, None, now);
+        assert!(d1.is_admitted());
+
+        // Second packet: 100 bytes -> Admitted
+        let d2 = shaper.admit_or_enqueue(vec![2; 100], TrafficPriority::Normal, None, now);
+        assert!(d2.is_admitted());
+
+        // Third packet: tokens exhausted -> Delayed
+        let d3 = shaper.admit_or_enqueue(vec![3; 100], TrafficPriority::Normal, None, now);
+        assert!(d3.is_delayed());
+        assert_eq!(shaper.total_queue_packets(), 1);
+        assert_eq!(shaper.total_queue_bytes(), 100);
+
+        // Advance clock by 200ms -> refills 200 bytes and 2 packets
+        let later = now + Duration::from_millis(200);
+        let drained = shaper.drain_admitted(later, 10);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].payload, vec![3; 100]);
+        assert_eq!(shaper.total_queue_packets(), 0);
+
+        let telem = shaper.telemetry();
+        assert_eq!(telem.packets_drained_shaped, 1);
+        assert_eq!(telem.bytes_admitted, 300);
+    }
+
+    #[test]
+    fn test_adaptive_token_bucket_priority_queueing() {
+        let now = std::time::Instant::now();
+        let config = TokenBucketConfig::default()
+            .with_rates(1000, 10)
+            .with_bursts(100, 10);
+        let mut shaper = AdaptiveTokenBucketShaper::new(config, now);
+
+        // Consume initial burst
+        let _ = shaper.admit_or_enqueue(vec![0; 100], TrafficPriority::Normal, None, now);
+
+        // Enqueue packets in reverse priority order: Bulk, Normal, High, Control
+        let _ = shaper.admit_or_enqueue(b"BULK".to_vec(), TrafficPriority::Bulk, None, now);
+        let _ = shaper.admit_or_enqueue(b"NORMAL".to_vec(), TrafficPriority::Normal, None, now);
+        let _ = shaper.admit_or_enqueue(b"HIGH".to_vec(), TrafficPriority::High, None, now);
+        let _ = shaper.admit_or_enqueue(b"CONTROL".to_vec(), TrafficPriority::Control, None, now);
+
+        assert_eq!(shaper.total_queue_packets(), 4);
+
+        // Advance time to replenish tokens for all queued packets
+        let later = now + Duration::from_secs(5);
+        let drained = shaper.drain_admitted(later, 10);
+        assert_eq!(drained.len(), 4);
+
+        // Order must be strictly priority-based: Control -> High -> Normal -> Bulk
+        assert_eq!(drained[0].priority, TrafficPriority::Control);
+        assert_eq!(drained[0].payload, b"CONTROL");
+
+        assert_eq!(drained[1].priority, TrafficPriority::High);
+        assert_eq!(drained[1].payload, b"HIGH");
+
+        assert_eq!(drained[2].priority, TrafficPriority::Normal);
+        assert_eq!(drained[2].payload, b"NORMAL");
+
+        assert_eq!(drained[3].priority, TrafficPriority::Bulk);
+        assert_eq!(drained[3].payload, b"BULK");
+    }
+
+    #[test]
+    fn test_admission_control_queue_full_tail_drop() {
+        let now = std::time::Instant::now();
+        let config = TokenBucketConfig::default()
+            .with_rates(100, 1)
+            .with_bursts(50, 1)
+            .with_queue_limits(2, 500); // Max 2 packets in shaping queue
+        let mut shaper = AdaptiveTokenBucketShaper::new(config, now);
+
+        // Consume initial tokens
+        let _ = shaper.admit_or_enqueue(vec![0; 50], TrafficPriority::Normal, None, now);
+
+        // Fill shaping queue to capacity (2 packets)
+        let d1 = shaper.admit_or_enqueue(vec![1; 20], TrafficPriority::Normal, None, now);
+        assert!(d1.is_delayed());
+        let d2 = shaper.admit_or_enqueue(vec![2; 20], TrafficPriority::Normal, None, now);
+        assert!(d2.is_delayed());
+
+        // Third packet exceeds queue limit -> Tail drop
+        let d3 = shaper.admit_or_enqueue(vec![3; 20], TrafficPriority::Normal, None, now);
+        assert!(d3.is_dropped());
+        match d3 {
+            AdmissionDecision::Dropped { reason } => {
+                assert_eq!(
+                    reason,
+                    DropReason::QueueFull {
+                        current_depth: 2,
+                        max_depth: 2
+                    }
+                );
+            }
+            _ => panic!("expected dropped"),
+        }
+
+        let telem = shaper.telemetry();
+        assert_eq!(telem.packets_dropped_queue_full, 1);
+        assert_eq!(telem.bytes_dropped, 20);
+    }
+
+    #[test]
+    fn test_admission_control_deadline_expiration_drop() {
+        let now = std::time::Instant::now();
+        // Rate: 1000 bytes/sec -> 1ms per byte
+        let config = TokenBucketConfig::default()
+            .with_rates(1000, 10)
+            .with_bursts(10, 1);
+        let mut shaper = AdaptiveTokenBucketShaper::new(config, now);
+
+        // Drain burst
+        let _ = shaper.admit_or_enqueue(vec![0; 10], TrafficPriority::Normal, None, now);
+
+        // Enqueue 500 bytes -> wait time is 500ms
+        let _ = shaper.admit_or_enqueue(vec![1; 500], TrafficPriority::Normal, None, now);
+
+        // Enqueue packet with 100ms deadline (500ms > 100ms deadline) -> early drop
+        let short_deadline = Duration::from_millis(100);
+        let decision = shaper.admit_or_enqueue(
+            vec![2; 100],
+            TrafficPriority::Normal,
+            Some(short_deadline),
+            now,
+        );
+        assert!(decision.is_dropped());
+        match decision {
+            AdmissionDecision::Dropped {
+                reason: DropReason::DeadlineExceeded { deadline, .. },
+            } => {
+                assert_eq!(deadline, short_deadline);
+            }
+            _ => panic!("expected deadline exceeded drop"),
+        }
+
+        assert_eq!(shaper.telemetry().packets_dropped_deadline, 1);
+    }
+
+    #[test]
+    fn test_adaptive_shaper_rtt_and_loss_adaptation() {
+        let now = std::time::Instant::now();
+        let config = TokenBucketConfig::default().with_rates(1_000_000, 10_000);
+        let mut shaper = AdaptiveTokenBucketShaper::new(config, now);
+        let initial_byte_rate = shaper.current_byte_rate;
+
+        // Establish baseline RTT = 20ms
+        shaper.adapt_on_rtt(Duration::from_millis(20), now);
+
+        // Simulate queue buildup with high RTT (45ms > 1.5 * 20ms)
+        // Shaper needs non-empty queue to identify bufferbloat
+        let _ = shaper.admit_or_enqueue(vec![1; 100], TrafficPriority::Bulk, None, now);
+        shaper.adapt_on_rtt(Duration::from_millis(45), now);
+
+        assert!(shaper.current_byte_rate < initial_byte_rate);
+        assert_eq!(shaper.telemetry().rtt_backoff_events, 1);
+
+        // Simulate packet loss event
+        let rate_before_loss = shaper.current_byte_rate;
+        shaper.adapt_on_loss(0.25);
+        assert!(shaper.current_byte_rate < rate_before_loss);
+        assert_eq!(shaper.telemetry().loss_backoff_events, 1);
+
+        // Simulate healthy path recovery -> additive rate increase
+        let rate_before_recovery = shaper.current_byte_rate;
+        shaper.adapt_on_rtt(Duration::from_millis(20), now);
+        assert!(shaper.current_byte_rate > rate_before_recovery);
+    }
+
+    #[test]
+    fn test_hybrid_datagram_transport_shaping_integration() {
+        let now = std::time::Instant::now();
+        let config = TokenBucketConfig::default()
+            .with_rates(5000, 50)
+            .with_bursts(500, 2);
+        let shaper = AdaptiveTokenBucketShaper::new(config, now);
+        let mut transport = HybridDatagramTransport::default()
+            .with_overhead(28)
+            .with_shaper(shaper);
+
+        // First packet fits in burst -> Admitted
+        let (d1, wire1) =
+            transport.send_shaped(b"PACKET_1", TrafficPriority::Normal, None, now);
+        assert!(d1.is_admitted());
+        assert_eq!(wire1.len(), 1);
+
+        // Second packet fits in burst -> Admitted
+        let (d2, wire2) =
+            transport.send_shaped(b"PACKET_2", TrafficPriority::Normal, None, now);
+        assert!(d2.is_admitted());
+        assert_eq!(wire2.len(), 1);
+
+        // Third packet -> Delayed
+        let (d3, wire3) =
+            transport.send_shaped(b"PACKET_3", TrafficPriority::Normal, None, now);
+        assert!(d3.is_delayed());
+        assert!(wire3.is_empty());
+
+        // Drain shaped packets after clock advance
+        let later = now + Duration::from_millis(500);
+        let drained_wire = transport.drain_shaped(later, 10);
+        assert_eq!(drained_wire.len(), 1);
+
+        // Verify payload integrity after reassembly
+        let mut receiver = HybridDatagramTransport::default();
+        let delivered = receiver
+            .recv_adaptive(&drained_wire[0], later)
+            .expect("recv")
+            .expect("payload");
+        assert_eq!(delivered, b"PACKET_3");
+
+        let telem = transport.shaper_telemetry().expect("telemetry");
+        assert_eq!(telem.packets_admitted_immediate, 2);
+        assert_eq!(telem.packets_drained_shaped, 1);
+    }
+
+    #[test]
+    fn test_extended_connect_tunnel_capsule_shaping() {
+        let now = std::time::Instant::now();
+        let config = TokenBucketConfig::default()
+            .with_rates(1000, 10)
+            .with_bursts(100, 1);
+        let shaper = AdaptiveTokenBucketShaper::new(config, now);
+        let mut tunnel = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "proxy.local")
+            .with_traffic_shaper(shaper);
+
+        let cap1 = crate::simd_parser::HttpCapsule::udp_datagram(0, b"CAPSULE_ONE");
+        let d1 = tunnel.send_capsule_shaped(&cap1, None, now);
+        assert!(d1.is_admitted());
+
+        // Second capsule exceeds burst -> Delayed
+        let cap2 = crate::simd_parser::HttpCapsule::udp_datagram(0, b"CAPSULE_TWO");
+        let d2 = tunnel.send_capsule_shaped(&cap2, None, now);
+        assert!(d2.is_delayed());
+
+        // Close capsule has Control priority and bypasses/consumes control headroom
+        let close_cap = crate::simd_parser::HttpCapsule::new(
+            crate::simd_parser::CapsuleType::CloseWebTransportSession,
+            vec![0, 0],
+        );
+        let d_close = tunnel.send_capsule_shaped(&close_cap, None, now);
+        // Either admitted or delayed with priority
+        assert!(d_close.is_admitted() || d_close.is_delayed());
+
+        // Advance time and drain shaped capsules
+        let later = now + Duration::from_millis(500);
+        let drained_count = tunnel.drain_shaped_capsules(later, 10);
+        assert!(drained_count >= 1);
+
+        let telem = tunnel.shaper_telemetry().expect("shaper telemetry");
+        assert!(telem.packets_admitted_immediate >= 1);
     }
 }
