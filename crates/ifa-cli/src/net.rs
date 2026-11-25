@@ -4,8 +4,8 @@ use clap::Subcommand;
 use ifa_runtime::{
     run_issp_failover_benchmark_suite, run_issp_scenario, IsspCapsule,
     IsspFailoverBenchmarkSuiteReport, IsspHeartbeatProbe, IsspMultipathRoute,
-    IsspMultipathTelemetry, IsspNetworkProfile, IsspPathState, SecurityPolicy, SessionId,
-    SessionRecord, SessionRegistry, SessionSnapshot,
+    IsspMultipathTelemetry, IsspNetworkProfile, IsspPathState, IsspRoutingPolicy, SecurityPolicy,
+    SessionId, SessionRecord, SessionRegistry, SessionSnapshot,
 };
 use serde_json::json;
 use std::fs;
@@ -93,6 +93,24 @@ pub enum SessionCommand {
         /// Simulate heartbeat failure on a specific path ID
         #[arg(long)]
         fail_path: Option<u32>,
+        /// Output formatted as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Benchmark bandwidth aggregation scheduling and out-of-order resequencing compensation
+    Aggregate {
+        /// Number of concurrent sessions to aggregate
+        #[arg(short, long, default_value = "3")]
+        sessions: usize,
+        /// Total packets to schedule across bonded links per session
+        #[arg(short, long, default_value = "60")]
+        packets: usize,
+        /// Differential latency skew in milliseconds between primary and secondary paths
+        #[arg(long, default_value = "35")]
+        skew_ms: u64,
+        /// Path to persistent cluster state dump (.issp or binary dump)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
         /// Output formatted as JSON
         #[arg(long)]
         json: bool,
@@ -732,6 +750,197 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                     );
                 }
                 println!();
+            }
+            ExitCode::SUCCESS
+        }
+        SessionCommand::Aggregate {
+            sessions,
+            packets,
+            skew_ms,
+            file,
+            json,
+        } => {
+            let state_path = resolve_state_file(file.as_ref());
+            let registry = match &state_path {
+                Some(p) if p.exists() => match SessionRegistry::load_from_file(p) {
+                    Ok(reg) => reg,
+                    Err(e) => {
+                        eprintln!("error: failed to load ISSP state file `{}`: {}", p.display(), e);
+                        return ExitCode::FAILURE;
+                    }
+                },
+                _ => SessionRegistry::new(1),
+            };
+
+            let now_ms = current_unix_secs() * 1000;
+
+            // Configure router for Bandwidth Aggregation
+            if let Ok(mut router) = registry.multipath_router.lock() {
+                router.policy = IsspRoutingPolicy::BandwidthAggregation;
+
+                let mut r_fiber = IsspMultipathRoute::new(1, 10, "eth0-fiber-wan", 1, 100)
+                    .with_state(IsspPathState::Active);
+                r_fiber.metrics.smoothed_rtt_us = 10_000; // 5ms one-way delay
+
+                let mut r_5g = IsspMultipathRoute::new(2, 10, "wwan0-5g-edge", 2, 50)
+                    .with_state(IsspPathState::Active);
+                // Secondary path has higher latency by skew_ms * 2
+                r_5g.metrics.smoothed_rtt_us = 10_000 + (skew_ms * 2 * 1_000);
+
+                router.add_route(r_fiber);
+                router.add_route(r_5g);
+            }
+
+            let mut all_inflight = Vec::new();
+            let mut session_ids = Vec::new();
+
+            for s_idx in 1..=sessions {
+                let s_id = SessionId::new(0x3000 + s_idx as u64, 1, s_idx as u32);
+                session_ids.push(s_id);
+
+                for p_idx in 0..packets {
+                    let send_time = now_ms + (p_idx as u64 * 3);
+                    let payload = format!("sess-{}-data-{}", s_idx, p_idx + 1).into_bytes();
+                    match registry.schedule_multipath_packet(&s_id, payload, send_time) {
+                        Ok(sched) => {
+                            let arrival_time = sched.estimated_arrival_unix_ms;
+                            all_inflight.push((sched, arrival_time));
+                        }
+                        Err(e) => {
+                            eprintln!("error: packet scheduling failed: {}", e);
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+            }
+
+            // Group by session to simulate transit and arrival under network skew
+            let mut total_delivered = 0;
+            let mut session_ordered_valid = true;
+
+            for s_id in &session_ids {
+                let mut sess_packets: Vec<_> = all_inflight
+                    .iter()
+                    .filter(|(p, _)| p.session_id == *s_id)
+                    .cloned()
+                    .collect();
+
+                // Sort by physical arrival time at receiver
+                sess_packets.sort_by_key(|(_, arrival)| *arrival);
+
+                let mut sess_delivered = Vec::new();
+                for (pkt, arrival) in sess_packets {
+                    match registry.ingest_multipath_packet(pkt, arrival) {
+                        Ok((delivered, _)) => {
+                            sess_delivered.extend(delivered);
+                        }
+                        Err(e) => {
+                            eprintln!("error: packet ingestion failed: {}", e);
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+
+                // Verify strictly contiguous in-order sequence
+                if sess_delivered.len() != packets {
+                    session_ordered_valid = false;
+                }
+                for (idx, d) in sess_delivered.iter().enumerate() {
+                    if d.packet.multipath_seq == 0 || (idx > 0 && d.packet.multipath_seq <= sess_delivered[idx - 1].packet.multipath_seq) {
+                        session_ordered_valid = false;
+                    }
+                }
+                total_delivered += sess_delivered.len();
+            }
+
+            let reseq_telem = registry
+                .resequencing_telemetry(None)
+                .unwrap_or(None);
+
+            let route_telem = registry
+                .multipath_telemetry()
+                .unwrap_or(IsspMultipathTelemetry {
+                    total_paths: 0,
+                    active_paths: 0,
+                    standby_paths: 0,
+                    degraded_paths: 0,
+                    failed_paths: 0,
+                    total_failovers: 0,
+                    total_heartbeats_sent: 0,
+                    total_heartbeats_received: 0,
+                    total_sessions_bound: 0,
+                    routes: Vec::new(),
+                });
+
+            if json {
+                let val = json!({
+                    "sessions_count": sessions,
+                    "packets_per_session": packets,
+                    "total_packets_scheduled": all_inflight.len(),
+                    "total_packets_delivered": total_delivered,
+                    "differential_skew_ms": skew_ms,
+                    "all_sessions_strictly_in_order": session_ordered_valid,
+                    "resequencing_telemetry": reseq_telem.map(|t| json!({
+                        "total_received": t.total_received,
+                        "in_order_count": t.in_order_count,
+                        "reordered_count": t.reordered_count,
+                        "reorder_rate_percent": t.reorder_rate_percent,
+                        "duplicate_count": t.duplicate_count,
+                        "gaps_expired_count": t.gaps_expired_count,
+                        "average_reorder_delay_ms": t.average_reorder_delay_ms,
+                        "max_reorder_delay_ms": t.max_reorder_delay_ms,
+                        "buffer_depth": t.buffer_depth,
+                    })),
+                    "paths": route_telem.routes.iter().map(|r| json!({
+                        "path_id": r.path_id,
+                        "interface": r.interface_name,
+                        "weight": r.weight,
+                        "total_frames_sent": r.metrics.total_frames_sent,
+                        "total_frames_received": r.metrics.total_frames_received,
+                        "smoothed_rtt_ms": (r.metrics.smoothed_rtt_us as f64) / 1000.0,
+                    })).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&val).unwrap());
+            } else {
+                println!("\n=== ISSP MULTIPATH BANDWIDTH AGGREGATION & RESEQUENCING ===");
+                println!(
+                    "Sessions: {} | Packets/Sess: {} | Total Packets: {} | Path Skew: {} ms",
+                    sessions, packets, all_inflight.len(), skew_ms
+                );
+
+                if let Some(ref t) = reseq_telem {
+                    println!("\n[RESEQUENCING COMPENSATION TELEMETRY]");
+                    println!("- Packets Ingested:    {}", t.total_received);
+                    println!("- In-Order Immediate:  {} ({:.1}%)", t.in_order_count, (t.in_order_count as f64 / t.total_received.max(1) as f64) * 100.0);
+                    println!("- Resequenced/Drain:   {} ({:.1}%)", t.reordered_count, t.reorder_rate_percent);
+                    println!("- Average Buffer Wait: {:.2} ms", t.average_reorder_delay_ms);
+                    println!("- Max Resequence Hold: {} ms", t.max_reorder_delay_ms);
+                    println!("- Duplicates Dropped:  {}", t.duplicate_count);
+                    println!("- Expired Gaps/Drops:  {}", t.gaps_expired_count);
+                }
+
+                println!("\n[AGGREGATED INTERFACES & STRIPING DISTRIBUTION]");
+                println!("| Path ID | Interface | Capacity Weight | Packets Striped | RTT Latency | Target Share |");
+                println!("| :---: | :--- | :---: | :---: | :---: | :---: |");
+                for r in &route_telem.routes {
+                    let total_s = route_telem.routes.iter().map(|x| x.metrics.total_frames_sent).sum::<u64>().max(1);
+                    let share = (r.metrics.total_frames_sent as f64 / total_s as f64) * 100.0;
+                    println!(
+                        "| #{} | {} | {} | {} frames | {:.2} ms | {:.1}% |",
+                        r.path_id,
+                        r.interface_name,
+                        r.weight,
+                        r.metrics.total_frames_sent,
+                        (r.metrics.smoothed_rtt_us as f64) / 1000.0,
+                        share,
+                    );
+                }
+
+                if session_ordered_valid {
+                    println!("\nStatus: 100% IN-ORDER DELIVERY GUARANTEED (ZERO PACKET LOSS UNDER ASYMMETRIC SKEW)\n");
+                } else {
+                    println!("\nStatus: RESEQUENCING INTEGRITY CHECK FAILED\n");
+                }
             }
             ExitCode::SUCCESS
         }

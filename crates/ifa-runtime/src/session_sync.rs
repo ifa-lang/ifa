@@ -1094,6 +1094,348 @@ pub enum IsspRoutingPolicy {
     BestQuality,
     /// Consistent flow hashing across usable paths.
     FlowHashing,
+    /// Capacity-weighted packet striping and bandwidth aggregation across all usable paths.
+    BandwidthAggregation,
+}
+
+/// Scheduled packet for multipath transmission across aggregated interfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsspScheduledPacket {
+    /// Monotonically increasing multipath sequence number assigned by the aggregation scheduler.
+    pub multipath_seq: u64,
+    /// Identifier of the path selected for transmission.
+    pub path_id: u32,
+    /// Identifier of the session originating this packet.
+    pub session_id: SessionId,
+    /// Packet payload.
+    pub payload: Vec<u8>,
+    /// Transmission timestamp (unix ms).
+    pub scheduled_timestamp_unix_ms: u64,
+    /// Estimated arrival timestamp (unix ms) based on path RTT.
+    pub estimated_arrival_unix_ms: u64,
+}
+
+/// In-order or resequenced packet delivered to application/session consumer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsspDeliveredPacket {
+    pub packet: IsspScheduledPacket,
+    /// Delay in milliseconds spent inside the resequencing buffer (0 if received in order).
+    pub reorder_delay_ms: u64,
+    /// Whether the packet arrived out of sequence and was resequenced.
+    pub was_reordered: bool,
+}
+
+/// Result of ingesting a packet into the resequencing buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IsspResequenceStatus {
+    /// Packet arrived in sequence and was delivered immediately.
+    InOrderDelivered,
+    /// Packet arrived out of order and was buffered waiting for missing preceding packets.
+    Buffered {
+        buffered_seq: u64,
+        expected_seq: u64,
+        buffer_depth: usize,
+    },
+    /// Duplicate or obsolete sequence number discarded.
+    DuplicateOrStale {
+        seq: u64,
+        expected_seq: u64,
+    },
+    /// Arrival of missing packet triggered in-order drain of one or more buffered packets.
+    ResequencedDelivered {
+        delivered_count: usize,
+    },
+    /// Gap timeout expired waiting for missing packet; window advanced to prevent HoL blocking.
+    GapExpired {
+        skipped_seq: u64,
+        new_expected_seq: u64,
+        flushed_count: usize,
+    },
+}
+
+/// Telemetry metrics for multipath packet resequencing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspResequencingTelemetry {
+    pub expected_seq: u64,
+    pub buffer_depth: usize,
+    pub buffer_capacity: usize,
+    pub gap_timeout_ms: u64,
+    pub total_received: u64,
+    pub in_order_count: u64,
+    pub reordered_count: u64,
+    pub duplicate_count: u64,
+    pub gaps_expired_count: u64,
+    pub average_reorder_delay_ms: f64,
+    pub max_reorder_delay_ms: u64,
+    pub reorder_rate_percent: f64,
+}
+
+/// Sliding window resequencing buffer providing out-of-order packet compensation
+/// with adaptive gap timeout to eliminate Head-of-Line blocking over asymmetric multipath links.
+#[derive(Debug, Clone)]
+pub struct IsspResequencingBuffer {
+    pub expected_seq: u64,
+    pub capacity: usize,
+    pub gap_timeout_ms: u64,
+    pub gap_wait_start_unix_ms: u64,
+    pub buffer: BTreeMap<u64, (IsspScheduledPacket, u64)>,
+    pub total_received: u64,
+    pub in_order_count: u64,
+    pub reordered_count: u64,
+    pub duplicate_count: u64,
+    pub gaps_expired_count: u64,
+    pub total_reorder_delay_ms: u64,
+    pub max_reorder_delay_ms: u64,
+}
+
+impl IsspResequencingBuffer {
+    /// Create a new resequencing buffer with specified capacity and gap timeout.
+    pub fn new(initial_seq: u64, capacity: usize, gap_timeout_ms: u64) -> Self {
+        Self {
+            expected_seq: initial_seq,
+            capacity: capacity.max(16),
+            gap_timeout_ms: gap_timeout_ms.max(10),
+            gap_wait_start_unix_ms: 0,
+            buffer: BTreeMap::new(),
+            total_received: 0,
+            in_order_count: 0,
+            reordered_count: 0,
+            duplicate_count: 0,
+            gaps_expired_count: 0,
+            total_reorder_delay_ms: 0,
+            max_reorder_delay_ms: 0,
+        }
+    }
+
+    /// Ingest a packet, returning delivered in-order packets and resequencing status.
+    pub fn ingest(
+        &mut self,
+        packet: IsspScheduledPacket,
+        now_ms: u64,
+    ) -> (Vec<IsspDeliveredPacket>, IsspResequenceStatus) {
+        self.total_received += 1;
+        let seq = packet.multipath_seq;
+
+        // Auto-initialize base expected sequence on first packet if initial was 0
+        if self.expected_seq == 0 {
+            self.expected_seq = seq;
+        }
+
+        if seq < self.expected_seq {
+            self.duplicate_count += 1;
+            return (
+                Vec::new(),
+                IsspResequenceStatus::DuplicateOrStale {
+                    seq,
+                    expected_seq: self.expected_seq,
+                },
+            );
+        }
+
+        if seq == self.expected_seq {
+            let mut delivered = Vec::new();
+            self.in_order_count += 1;
+            delivered.push(IsspDeliveredPacket {
+                packet,
+                reorder_delay_ms: 0,
+                was_reordered: false,
+            });
+            self.expected_seq += 1;
+
+            // Drain contiguous buffered packets
+            while let Some(&first_buffered_seq) = self.buffer.keys().next() {
+                if first_buffered_seq == self.expected_seq {
+                    let (buffered_pkt, arrival_ms) = self.buffer.remove(&first_buffered_seq).unwrap();
+                    let delay = now_ms.saturating_sub(arrival_ms);
+                    self.total_reorder_delay_ms += delay;
+                    self.max_reorder_delay_ms = self.max_reorder_delay_ms.max(delay);
+                    self.reordered_count += 1;
+                    delivered.push(IsspDeliveredPacket {
+                        packet: buffered_pkt,
+                        reorder_delay_ms: delay,
+                        was_reordered: true,
+                    });
+                    self.expected_seq += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if self.buffer.is_empty() {
+                self.gap_wait_start_unix_ms = 0;
+            } else {
+                self.gap_wait_start_unix_ms = now_ms;
+            }
+
+            let status = if delivered.len() > 1 {
+                IsspResequenceStatus::ResequencedDelivered {
+                    delivered_count: delivered.len(),
+                }
+            } else {
+                IsspResequenceStatus::InOrderDelivered
+            };
+
+            return (delivered, status);
+        }
+
+        // Out-of-order packet: seq > expected_seq
+        if self.buffer.contains_key(&seq) {
+            self.duplicate_count += 1;
+            return (
+                Vec::new(),
+                IsspResequenceStatus::DuplicateOrStale {
+                    seq,
+                    expected_seq: self.expected_seq,
+                },
+            );
+        }
+
+        // Buffer full / gap overflow protection: force advance to prevent Head-of-Line deadlock
+        if (seq - self.expected_seq) as usize >= self.capacity || self.buffer.len() >= self.capacity {
+            let skipped = self.expected_seq;
+            let mut delivered = Vec::new();
+
+            let next_target = if let Some(&lowest) = self.buffer.keys().next() {
+                lowest
+            } else {
+                seq
+            };
+            self.gaps_expired_count += next_target.saturating_sub(self.expected_seq);
+            self.expected_seq = next_target;
+
+            // Drain contiguous from new expected
+            while let Some(&cand_seq) = self.buffer.keys().next() {
+                if cand_seq == self.expected_seq {
+                    let (buffered_pkt, arrival_ms) = self.buffer.remove(&cand_seq).unwrap();
+                    let delay = now_ms.saturating_sub(arrival_ms);
+                    self.total_reorder_delay_ms += delay;
+                    self.max_reorder_delay_ms = self.max_reorder_delay_ms.max(delay);
+                    self.reordered_count += 1;
+                    delivered.push(IsspDeliveredPacket {
+                        packet: buffered_pkt,
+                        reorder_delay_ms: delay,
+                        was_reordered: true,
+                    });
+                    self.expected_seq += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if seq == self.expected_seq {
+                delivered.push(IsspDeliveredPacket {
+                    packet,
+                    reorder_delay_ms: 0,
+                    was_reordered: false,
+                });
+                self.expected_seq += 1;
+            } else if seq > self.expected_seq {
+                self.buffer.insert(seq, (packet, now_ms));
+            }
+
+            self.gap_wait_start_unix_ms = if self.buffer.is_empty() { 0 } else { now_ms };
+
+            let flushed_count = delivered.len();
+            return (
+                delivered,
+                IsspResequenceStatus::GapExpired {
+                    skipped_seq: skipped,
+                    new_expected_seq: self.expected_seq,
+                    flushed_count,
+                },
+            );
+        }
+
+        // Buffer out-of-order packet
+        if self.gap_wait_start_unix_ms == 0 {
+            self.gap_wait_start_unix_ms = now_ms;
+        }
+        self.buffer.insert(seq, (packet, now_ms));
+
+        (
+            Vec::new(),
+            IsspResequenceStatus::Buffered {
+                buffered_seq: seq,
+                expected_seq: self.expected_seq,
+                buffer_depth: self.buffer.len(),
+            },
+        )
+    }
+
+    /// Check if gap timeout expired and force window forward to drain buffered packets.
+    pub fn check_gap_timeout(&mut self, now_ms: u64) -> (Vec<IsspDeliveredPacket>, Option<IsspResequenceStatus>) {
+        if self.buffer.is_empty() || self.gap_wait_start_unix_ms == 0 {
+            return (Vec::new(), None);
+        }
+
+        let elapsed = now_ms.saturating_sub(self.gap_wait_start_unix_ms);
+        if elapsed < self.gap_timeout_ms {
+            return (Vec::new(), None);
+        }
+
+        let skipped = self.expected_seq;
+        let next_seq = *self.buffer.keys().next().unwrap();
+        self.gaps_expired_count += next_seq.saturating_sub(self.expected_seq);
+        self.expected_seq = next_seq;
+
+        let mut delivered = Vec::new();
+        while let Some(&cand_seq) = self.buffer.keys().next() {
+            if cand_seq == self.expected_seq {
+                let (buffered_pkt, arrival_ms) = self.buffer.remove(&cand_seq).unwrap();
+                let delay = now_ms.saturating_sub(arrival_ms);
+                self.total_reorder_delay_ms += delay;
+                self.max_reorder_delay_ms = self.max_reorder_delay_ms.max(delay);
+                self.reordered_count += 1;
+                delivered.push(IsspDeliveredPacket {
+                    packet: buffered_pkt,
+                    reorder_delay_ms: delay,
+                    was_reordered: true,
+                });
+                self.expected_seq += 1;
+            } else {
+                break;
+            }
+        }
+
+        self.gap_wait_start_unix_ms = if self.buffer.is_empty() { 0 } else { now_ms };
+
+        let status = IsspResequenceStatus::GapExpired {
+            skipped_seq: skipped,
+            new_expected_seq: self.expected_seq,
+            flushed_count: delivered.len(),
+        };
+
+        (delivered, Some(status))
+    }
+
+    /// Resequencing telemetry summary.
+    pub fn telemetry(&self) -> IsspResequencingTelemetry {
+        let avg_delay = if self.reordered_count > 0 {
+            self.total_reorder_delay_ms as f64 / self.reordered_count as f64
+        } else {
+            0.0
+        };
+        let reorder_rate = if self.total_received > 0 {
+            (self.reordered_count as f64 / self.total_received as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        IsspResequencingTelemetry {
+            expected_seq: self.expected_seq,
+            buffer_depth: self.buffer.len(),
+            buffer_capacity: self.capacity,
+            gap_timeout_ms: self.gap_timeout_ms,
+            total_received: self.total_received,
+            in_order_count: self.in_order_count,
+            reordered_count: self.reordered_count,
+            duplicate_count: self.duplicate_count,
+            gaps_expired_count: self.gaps_expired_count,
+            average_reorder_delay_ms: avg_delay,
+            max_reorder_delay_ms: self.max_reorder_delay_ms,
+            reorder_rate_percent: reorder_rate,
+        }
+    }
 }
 
 /// Aggregated telemetry across all multipath links in the router.
@@ -1118,6 +1460,9 @@ pub struct IsspDynamicMultipathRouter {
     session_bindings: HashMap<SessionId, u32>,
     pub policy: IsspRoutingPolicy,
     next_probe_seq: u64,
+    next_multipath_seq: u64,
+    path_deficits: HashMap<u32, i64>,
+    resequencers: HashMap<SessionId, IsspResequencingBuffer>,
     pub total_failovers: u64,
     failover_history: Vec<IsspFailoverEvent>,
 }
@@ -1130,6 +1475,9 @@ impl IsspDynamicMultipathRouter {
             session_bindings: HashMap::new(),
             policy,
             next_probe_seq: 1,
+            next_multipath_seq: 1,
+            path_deficits: HashMap::new(),
+            resequencers: HashMap::new(),
             total_failovers: 0,
             failover_history: Vec::new(),
         }
@@ -1233,6 +1581,11 @@ impl IsspDynamicMultipathRouter {
                 IsspRoutingPolicy::FlowHashing => usable
                     .iter()
                     .min_by_key(|r| r.priority)
+                    .map(|r| r.path_id)
+                    .unwrap(),
+                IsspRoutingPolicy::BandwidthAggregation => usable
+                    .iter()
+                    .max_by_key(|r| r.weight)
                     .map(|r| r.path_id)
                     .unwrap(),
             };
@@ -1426,6 +1779,184 @@ impl IsspDynamicMultipathRouter {
             total_heartbeats_received: hb_recv,
             total_sessions_bound: self.session_bindings.len(),
             routes: self.paths.values().cloned().collect(),
+        }
+    }
+
+    /// Schedule a packet for multipath transmission according to current routing and aggregation policy.
+    pub fn schedule_packet(
+        &mut self,
+        session_id: &SessionId,
+        payload: Vec<u8>,
+        now_ms: u64,
+    ) -> Result<IsspScheduledPacket, SyncError> {
+        let payload_len = payload.len();
+        let selected_path_id = match self.policy {
+            IsspRoutingPolicy::BandwidthAggregation => {
+                let usable_ids: Vec<u32> = self
+                    .paths
+                    .values()
+                    .filter(|r| r.state.is_usable())
+                    .map(|r| r.path_id)
+                    .collect();
+
+                if usable_ids.is_empty() {
+                    if let Ok(cand) = self.select_best_candidate_path(None) {
+                        if let Some(r) = self.paths.get_mut(&cand) {
+                            r.state = IsspPathState::Active;
+                        }
+                        cand
+                    } else {
+                        return Err(SyncError::NoUsablePaths);
+                    }
+                } else if usable_ids.len() == 1 {
+                    usable_ids[0]
+                } else {
+                    // Smooth Weighted Round-Robin (SWRR) packet scheduling
+                    let total_weight: i64 = usable_ids
+                        .iter()
+                        .map(|&pid| self.paths.get(&pid).map(|r| r.weight as i64).unwrap_or(1))
+                        .sum();
+
+                    let mut best_pid = usable_ids[0];
+                    let mut max_current = i64::MIN;
+
+                    for &pid in &usable_ids {
+                        let eff_w = self.paths.get(&pid).map(|r| r.weight as i64).unwrap_or(1);
+                        let cur = self.path_deficits.entry(pid).or_insert(0);
+                        *cur += eff_w;
+                        if *cur > max_current {
+                            max_current = *cur;
+                            best_pid = pid;
+                        }
+                    }
+
+                    if let Some(best_cur) = self.path_deficits.get_mut(&best_pid) {
+                        *best_cur -= total_weight;
+                    }
+
+                    best_pid
+                }
+            }
+            _ => self.resolve_path_for_session(session_id, now_ms)?,
+        };
+
+        let seq = self.next_multipath_seq;
+        self.next_multipath_seq += 1;
+
+        self.resequencers
+            .entry(*session_id)
+            .or_insert_with(|| IsspResequencingBuffer::new(seq, 256, 150));
+
+        let route = self
+            .paths
+            .get_mut(&selected_path_id)
+            .ok_or(SyncError::PathNotFound(selected_path_id))?;
+        route.metrics.total_frames_sent += 1;
+        route.metrics.total_bytes_sent += payload_len as u64;
+
+        let one_way_delay_ms = (route.metrics.smoothed_rtt_us / 2_000).max(1);
+        let estimated_arrival = now_ms + one_way_delay_ms;
+
+        Ok(IsspScheduledPacket {
+            multipath_seq: seq,
+            path_id: selected_path_id,
+            session_id: *session_id,
+            payload,
+            scheduled_timestamp_unix_ms: now_ms,
+            estimated_arrival_unix_ms: estimated_arrival,
+        })
+    }
+
+    /// Ingest a received packet into the per-session resequencing buffer.
+    pub fn ingest_multipath_packet(
+        &mut self,
+        packet: IsspScheduledPacket,
+        now_ms: u64,
+    ) -> (Vec<IsspDeliveredPacket>, IsspResequenceStatus) {
+        if let Some(route) = self.paths.get_mut(&packet.path_id) {
+            route.metrics.total_frames_received += 1;
+            route.metrics.total_bytes_received += packet.payload.len() as u64;
+        }
+        let s_id = packet.session_id;
+        let seq = packet.multipath_seq;
+        let resequencer = self
+            .resequencers
+            .entry(s_id)
+            .or_insert_with(|| IsspResequencingBuffer::new(seq, 256, 150));
+        resequencer.ingest(packet, now_ms)
+    }
+
+    /// Evaluate resequencing gap timeouts across all active session buffers and drain unblocked packets.
+    pub fn check_resequencing_timeouts(
+        &mut self,
+        now_ms: u64,
+    ) -> Vec<(SessionId, Vec<IsspDeliveredPacket>, IsspResequenceStatus)> {
+        let mut results = Vec::new();
+        for (s_id, reseq) in &mut self.resequencers {
+            let (del, status_opt) = reseq.check_gap_timeout(now_ms);
+            if let Some(status) = status_opt {
+                results.push((*s_id, del, status));
+            }
+        }
+        results
+    }
+
+    /// Retrieve resequencing telemetry report for a specific session or aggregated across all sessions.
+    pub fn resequencing_telemetry(
+        &self,
+        session_id: Option<&SessionId>,
+    ) -> Option<IsspResequencingTelemetry> {
+        if let Some(s_id) = session_id {
+            self.resequencers.get(s_id).map(|r| r.telemetry())
+        } else {
+            if self.resequencers.is_empty() {
+                return None;
+            }
+            let mut total_recv = 0;
+            let mut in_order = 0;
+            let mut reordered = 0;
+            let mut duplicates = 0;
+            let mut gaps = 0;
+            let mut total_delay = 0;
+            let mut max_delay = 0;
+            let mut total_depth = 0;
+
+            for r in self.resequencers.values() {
+                total_recv += r.total_received;
+                in_order += r.in_order_count;
+                reordered += r.reordered_count;
+                duplicates += r.duplicate_count;
+                gaps += r.gaps_expired_count;
+                total_delay += r.total_reorder_delay_ms;
+                max_delay = max_delay.max(r.max_reorder_delay_ms);
+                total_depth += r.buffer.len();
+            }
+
+            let avg_delay = if reordered > 0 {
+                total_delay as f64 / reordered as f64
+            } else {
+                0.0
+            };
+            let reorder_rate = if total_recv > 0 {
+                (reordered as f64 / total_recv as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            Some(IsspResequencingTelemetry {
+                expected_seq: 0,
+                buffer_depth: total_depth,
+                buffer_capacity: 256,
+                gap_timeout_ms: 150,
+                total_received: total_recv,
+                in_order_count: in_order,
+                reordered_count: reordered,
+                duplicate_count: duplicates,
+                gaps_expired_count: gaps,
+                average_reorder_delay_ms: avg_delay,
+                max_reorder_delay_ms: max_delay,
+                reorder_rate_percent: reorder_rate,
+            })
         }
     }
 }
@@ -2215,6 +2746,57 @@ impl SessionRegistry {
             .lock()
             .map_err(|_| SyncError::LockPoisoned)?;
         Ok(router.telemetry())
+    }
+
+    /// Schedule a packet for multipath transmission according to current routing and aggregation policy.
+    pub fn schedule_multipath_packet(
+        &self,
+        session_id: &SessionId,
+        payload: Vec<u8>,
+        now_ms: u64,
+    ) -> Result<IsspScheduledPacket, SyncError> {
+        let mut router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        router.schedule_packet(session_id, payload, now_ms)
+    }
+
+    /// Ingest an incoming multipath packet into the per-session resequencing buffer.
+    pub fn ingest_multipath_packet(
+        &self,
+        packet: IsspScheduledPacket,
+        now_ms: u64,
+    ) -> Result<(Vec<IsspDeliveredPacket>, IsspResequenceStatus), SyncError> {
+        let mut router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        Ok(router.ingest_multipath_packet(packet, now_ms))
+    }
+
+    /// Check resequencing gap timeouts and return flushed packets.
+    pub fn check_resequencing_timeouts(
+        &self,
+        now_ms: u64,
+    ) -> Result<Vec<(SessionId, Vec<IsspDeliveredPacket>, IsspResequenceStatus)>, SyncError> {
+        let mut router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        Ok(router.check_resequencing_timeouts(now_ms))
+    }
+
+    /// Retrieve resequencing telemetry metrics for a specific session or cluster aggregated.
+    pub fn resequencing_telemetry(
+        &self,
+        session_id: Option<&SessionId>,
+    ) -> Result<Option<IsspResequencingTelemetry>, SyncError> {
+        let router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        Ok(router.resequencing_telemetry(session_id))
     }
 }
 
@@ -3415,5 +3997,268 @@ mod tests {
 
         // Session is now dynamically served by path 20
         assert_eq!(reg.resolve_session_path(&sid, 1_003_000).unwrap(), 20);
+    }
+
+    #[test]
+    fn test_resequencing_buffer_in_order_and_out_of_order_drain() {
+        let mut reseq = IsspResequencingBuffer::new(1, 64, 200);
+        let s_id = SessionId::new(0x1234, 1, 1);
+
+        let p1 = IsspScheduledPacket {
+            multipath_seq: 1,
+            path_id: 10,
+            session_id: s_id,
+            payload: b"pkt1".to_vec(),
+            scheduled_timestamp_unix_ms: 1000,
+            estimated_arrival_unix_ms: 1010,
+        };
+        let p2 = IsspScheduledPacket {
+            multipath_seq: 2,
+            path_id: 10,
+            session_id: s_id,
+            payload: b"pkt2".to_vec(),
+            scheduled_timestamp_unix_ms: 1002,
+            estimated_arrival_unix_ms: 1012,
+        };
+        let p3 = IsspScheduledPacket {
+            multipath_seq: 3,
+            path_id: 20,
+            session_id: s_id,
+            payload: b"pkt3".to_vec(),
+            scheduled_timestamp_unix_ms: 1004,
+            estimated_arrival_unix_ms: 1060,
+        };
+        let p4 = IsspScheduledPacket {
+            multipath_seq: 4,
+            path_id: 10,
+            session_id: s_id,
+            payload: b"pkt4".to_vec(),
+            scheduled_timestamp_unix_ms: 1006,
+            estimated_arrival_unix_ms: 1016,
+        };
+
+        // Ingest p1 at t = 1010
+        let (del1, st1) = reseq.ingest(p1, 1010);
+        assert_eq!(del1.len(), 1);
+        assert_eq!(del1[0].packet.multipath_seq, 1);
+        assert!(!del1[0].was_reordered);
+        assert_eq!(st1, IsspResequenceStatus::InOrderDelivered);
+
+        // Ingest p2 at t = 1012
+        let (del2, st2) = reseq.ingest(p2, 1012);
+        assert_eq!(del2.len(), 1);
+        assert_eq!(del2[0].packet.multipath_seq, 2);
+        assert!(!del2[0].was_reordered);
+        assert_eq!(st2, IsspResequenceStatus::InOrderDelivered);
+
+        // Ingest p4 at t = 1016 (Out of order: p3 has not arrived yet!)
+        let (del4, st4) = reseq.ingest(p4, 1016);
+        assert_eq!(del4.len(), 0);
+        assert_eq!(
+            st4,
+            IsspResequenceStatus::Buffered {
+                buffered_seq: 4,
+                expected_seq: 3,
+                buffer_depth: 1,
+            }
+        );
+
+        // Now p3 arrives at t = 1060 (arriving on slower path 20)
+        let (del3, st3) = reseq.ingest(p3, 1060);
+        // It must deliver both p3 and p4 in strictly contiguous order!
+        assert_eq!(del3.len(), 2);
+        assert_eq!(del3[0].packet.multipath_seq, 3);
+        assert!(!del3[0].was_reordered);
+        assert_eq!(del3[1].packet.multipath_seq, 4);
+        assert!(del3[1].was_reordered);
+        assert_eq!(del3[1].reorder_delay_ms, 1060 - 1016); // 44ms in buffer
+        assert_eq!(
+            st3,
+            IsspResequenceStatus::ResequencedDelivered {
+                delivered_count: 2
+            }
+        );
+
+        let telem = reseq.telemetry();
+        assert_eq!(telem.total_received, 4);
+        assert_eq!(telem.in_order_count, 3); // 1, 2, 3
+        assert_eq!(telem.reordered_count, 1); // 4 was buffered and resequenced
+        assert_eq!(telem.buffer_depth, 0);
+        assert_eq!(telem.max_reorder_delay_ms, 44);
+    }
+
+    #[test]
+    fn test_resequencing_buffer_duplicate_and_gap_timeout() {
+        let mut reseq = IsspResequencingBuffer::new(10, 32, 100);
+        let s_id = SessionId::new(0x4444, 2, 2);
+
+        let make_pkt = |seq: u64| IsspScheduledPacket {
+            multipath_seq: seq,
+            path_id: 1,
+            session_id: s_id,
+            payload: format!("data-{}", seq).into_bytes(),
+            scheduled_timestamp_unix_ms: 1000,
+            estimated_arrival_unix_ms: 1010,
+        };
+
+        // Ingest duplicate / stale seq 9
+        let (del_stale, st_stale) = reseq.ingest(make_pkt(9), 1010);
+        assert!(del_stale.is_empty());
+        assert_eq!(
+            st_stale,
+            IsspResequenceStatus::DuplicateOrStale {
+                seq: 9,
+                expected_seq: 10
+            }
+        );
+
+        // Ingest seq 10 (in-order)
+        let (del10, _) = reseq.ingest(make_pkt(10), 1010);
+        assert_eq!(del10.len(), 1);
+
+        // Ingest seq 12 and 13 (seq 11 is lost!)
+        let (del12, st12) = reseq.ingest(make_pkt(12), 1015);
+        assert!(del12.is_empty());
+        assert!(matches!(st12, IsspResequenceStatus::Buffered { .. }));
+
+        let (del13, _) = reseq.ingest(make_pkt(13), 1020);
+        assert!(del13.is_empty());
+
+        // Ingest duplicate seq 12
+        let (del12_dup, st12_dup) = reseq.ingest(make_pkt(12), 1025);
+        assert!(del12_dup.is_empty());
+        assert!(matches!(st12_dup, IsspResequenceStatus::DuplicateOrStale { .. }));
+
+        // Check timeout at t = 1050 (elapsed 35ms < 100ms) -> no timeout yet
+        let (tout_early, st_early) = reseq.check_gap_timeout(1050);
+        assert!(tout_early.is_empty());
+        assert!(st_early.is_none());
+
+        // Check timeout at t = 1120 (elapsed 105ms >= 100ms) -> gap 11 expired!
+        let (tout_drain, st_drain) = reseq.check_gap_timeout(1120);
+        assert_eq!(tout_drain.len(), 2); // delivers 12 and 13
+        assert_eq!(tout_drain[0].packet.multipath_seq, 12);
+        assert_eq!(tout_drain[1].packet.multipath_seq, 13);
+        assert_eq!(
+            st_drain,
+            Some(IsspResequenceStatus::GapExpired {
+                skipped_seq: 11,
+                new_expected_seq: 14,
+                flushed_count: 2,
+            })
+        );
+        assert_eq!(reseq.expected_seq, 14);
+    }
+
+    #[test]
+    fn test_dynamic_multipath_bandwidth_aggregation_scheduling() {
+        let mut router = IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::BandwidthAggregation);
+
+        // Path 1: 1Gbps Fiber (Weight 100, RTT 10ms)
+        let mut r1 = IsspMultipathRoute::new(1, 10, "eth0-fiber", 1, 100)
+            .with_state(IsspPathState::Active);
+        r1.metrics.smoothed_rtt_us = 10_000;
+
+        // Path 2: 500Mbps 5G (Weight 50, RTT 40ms)
+        let mut r2 = IsspMultipathRoute::new(2, 10, "wwan0-5g", 2, 50)
+            .with_state(IsspPathState::Active);
+        r2.metrics.smoothed_rtt_us = 40_000;
+
+        router.add_route(r1);
+        router.add_route(r2);
+
+        let s_id = SessionId::new(0x7777, 1, 1);
+        let mut count_p1 = 0;
+        let mut count_p2 = 0;
+
+        for i in 1..=30 {
+            let pkt = router
+                .schedule_packet(&s_id, vec![0u8; 128], 1_000 + i)
+                .unwrap();
+            assert_eq!(pkt.multipath_seq, i);
+            if pkt.path_id == 1 {
+                count_p1 += 1;
+            } else if pkt.path_id == 2 {
+                count_p2 += 1;
+            }
+        }
+
+        // With weights 100 vs 50, Path 1 should schedule approximately double Path 2
+        assert_eq!(count_p1 + count_p2, 30);
+        assert!(count_p1 >= 18 && count_p1 <= 22, "count_p1 was {}", count_p1);
+        assert!(count_p2 >= 8 && count_p2 <= 12, "count_p2 was {}", count_p2);
+
+        let r1_m = router.get_route(1).unwrap();
+        let r2_m = router.get_route(2).unwrap();
+        assert_eq!(r1_m.metrics.total_frames_sent, count_p1);
+        assert_eq!(r2_m.metrics.total_frames_sent, count_p2);
+    }
+
+    #[test]
+    fn test_end_to_end_bandwidth_aggregation_and_resequencing_under_skew() {
+        let reg = SessionRegistry::new(1);
+        {
+            let mut router = reg.multipath_router.lock().unwrap();
+            router.policy = IsspRoutingPolicy::BandwidthAggregation;
+
+            // Fast path (RTT 10ms, weight 100)
+            let mut r_fast = IsspMultipathRoute::new(1, 10, "fiber-fast", 1, 100)
+                .with_state(IsspPathState::Active);
+            r_fast.metrics.smoothed_rtt_us = 10_000; // 5ms one-way
+
+            // Slow path (RTT 80ms, weight 50)
+            let mut r_slow = IsspMultipathRoute::new(2, 10, "wwan-slow", 2, 50)
+                .with_state(IsspPathState::Active);
+            r_slow.metrics.smoothed_rtt_us = 80_000; // 40ms one-way
+
+            router.add_route(r_fast);
+            router.add_route(r_slow);
+        }
+
+        let s_id = SessionId::new(0x8888, 1, 1);
+        let t_start = 10_000;
+
+        // Schedule 15 packets
+        let mut inflight = Vec::new();
+        for i in 0..15 {
+            let pkt = reg
+                .schedule_multipath_packet(&s_id, format!("msg-{}", i + 1).into_bytes(), t_start + i * 2)
+                .unwrap();
+            let arrival_time = pkt.estimated_arrival_unix_ms;
+            inflight.push((pkt, arrival_time));
+        }
+
+        // Sort by simulated physical arrival time (simulating faster path arriving earlier)
+        inflight.sort_by_key(|(_, arr)| *arr);
+
+        // Verify that packets are out-of-order in transit due to latency skew
+        let arrival_seqs: Vec<u64> = inflight.iter().map(|(p, _)| p.multipath_seq).collect();
+        let is_strictly_ordered = arrival_seqs.windows(2).all(|w| w[0] < w[1]);
+        assert!(
+            !is_strictly_ordered,
+            "Latency skew must cause out-of-order packet arrivals: {:?}",
+            arrival_seqs
+        );
+
+        // Ingest into resequencing buffer in arrival order
+        let mut final_delivered = Vec::new();
+        for (pkt, arrival_time) in inflight {
+            let (delivered, _) = reg.ingest_multipath_packet(pkt, arrival_time).unwrap();
+            final_delivered.extend(delivered);
+        }
+
+        // All 15 packets must be delivered in strictly contiguous in-order sequence 1..=15
+        assert_eq!(final_delivered.len(), 15);
+        for (idx, d) in final_delivered.iter().enumerate() {
+            assert_eq!(d.packet.multipath_seq, (idx + 1) as u64);
+        }
+
+        // Telemetry check
+        let telem = reg.resequencing_telemetry(Some(&s_id)).unwrap().unwrap();
+        assert_eq!(telem.total_received, 15);
+        assert!(telem.reordered_count > 0);
+        assert!(telem.reorder_rate_percent > 0.0);
+        assert_eq!(telem.duplicate_count, 0);
+        assert_eq!(telem.gaps_expired_count, 0);
     }
 }

@@ -1147,5 +1147,53 @@ fn test_cli_net_session_list_inspect_migrate() {
     assert_eq!(fail_val["failed_paths"], 1);
     assert_eq!(fail_val["active_paths"], 1);
 
+    // 14. Test `ifa net session aggregate` table output
+    let agg_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("aggregate")
+        .arg("--sessions")
+        .arg("2")
+        .arg("--packets")
+        .arg("15")
+        .arg("--skew-ms")
+        .arg("30")
+        .output()
+        .expect("execute aggregate");
+    assert!(
+        agg_out.status.success(),
+        "aggregate failed: {}",
+        String::from_utf8_lossy(&agg_out.stderr)
+    );
+    let agg_str = String::from_utf8_lossy(&agg_out.stdout);
+    assert!(agg_str.contains("ISSP MULTIPATH BANDWIDTH AGGREGATION & RESEQUENCING"));
+    assert!(agg_str.contains("eth0-fiber-wan"));
+    assert!(agg_str.contains("wwan0-5g-edge"));
+    assert!(agg_str.contains("100% IN-ORDER DELIVERY GUARANTEED"));
+
+    // 15. Test `ifa net session aggregate --json`
+    let agg_json_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("aggregate")
+        .arg("--sessions")
+        .arg("2")
+        .arg("--packets")
+        .arg("20")
+        .arg("--skew-ms")
+        .arg("25")
+        .arg("--json")
+        .output()
+        .expect("execute aggregate json");
+    assert!(agg_json_out.status.success());
+    let agg_val: serde_json::Value =
+        serde_json::from_slice(&agg_json_out.stdout).expect("valid JSON aggregate output");
+    assert_eq!(agg_val["sessions_count"], 2);
+    assert_eq!(agg_val["packets_per_session"], 20);
+    assert_eq!(agg_val["total_packets_scheduled"], 40);
+    assert_eq!(agg_val["total_packets_delivered"], 40);
+    assert_eq!(agg_val["all_sessions_strictly_in_order"], true);
+    assert_eq!(agg_val["paths"].as_array().unwrap().len(), 2);
+
     let _ = fs::remove_dir_all(&temp_dir);
 }
