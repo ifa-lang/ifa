@@ -13372,6 +13372,804 @@ impl MultipathTunnelBondingEngine {
     }
 }
 
+// ============================================================================
+// Adaptive Out-of-Order Packet & Datagram Reordering Engine
+// ============================================================================
+
+/// Sequence number initialization policy for an incoming datagram flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InitialSeqMode {
+    /// Strictly expect first packet sequence to be 0.
+    StrictZero,
+    /// Strictly expect first packet sequence to be 1.
+    StrictOne,
+    /// Latch next expected sequence to the sequence number of the very first datagram received.
+    #[default]
+    LatchFirst,
+}
+
+/// Configuration parameters for the adaptive out-of-order reordering buffer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReorderBufferConfig {
+    /// Maximum capacity of buffered out-of-order packets per flow (default: 512).
+    pub max_window_size: usize,
+    /// Minimum dynamic gap timeout duration floor (default: 4ms).
+    pub min_gap_timeout: Duration,
+    /// Maximum dynamic gap timeout duration ceiling (default: 150ms).
+    pub max_gap_timeout: Duration,
+    /// Multiplier weighting smoothed RTT in dynamic gap timeout computation (default: 0.5).
+    pub rtt_factor: f64,
+    /// Multiplier weighting RTT variance / jitter in dynamic gap timeout computation (default: 3.5).
+    pub jitter_factor: f64,
+    /// Multiplier weighting path delay skew in dynamic gap timeout computation (default: 1.0).
+    pub skew_factor: f64,
+    /// Idle duration before an inactive flow buffer is pruned (default: 60s).
+    pub flow_idle_timeout: Duration,
+    /// Initial sequence expectation behavior.
+    pub initial_seq_mode: InitialSeqMode,
+}
+
+impl Default for ReorderBufferConfig {
+    fn default() -> Self {
+        Self {
+            max_window_size: 512,
+            min_gap_timeout: Duration::from_millis(4),
+            max_gap_timeout: Duration::from_millis(150),
+            rtt_factor: 0.5,
+            jitter_factor: 3.5,
+            skew_factor: 1.0,
+            flow_idle_timeout: Duration::from_secs(60),
+            initial_seq_mode: InitialSeqMode::LatchFirst,
+        }
+    }
+}
+
+/// Internal queued datagram held in the sliding window waiting for missing gaps to be resolved.
+#[derive(Debug, Clone)]
+pub struct BufferedDatagram {
+    pub seq_num: u64,
+    pub payload: Vec<u8>,
+    pub tunnel_id: u64,
+    pub flags: u16,
+    pub arrival_time: std::time::Instant,
+    pub wire_timestamp_micros: u64,
+    pub is_replicated: bool,
+}
+
+/// In-order or reordered datagram released to application layer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeliveredDatagram {
+    /// Sequence number of the datagram.
+    pub seq_num: u64,
+    /// Unpacked payload bytes.
+    pub payload: Vec<u8>,
+    /// Tunnel ID over which the datagram arrived.
+    pub tunnel_id: u64,
+    /// Wire flags associated with this datagram.
+    pub flags: u16,
+    /// Initial arrival timestamp into the reorder buffer.
+    pub arrival_time: std::time::Instant,
+    /// Final release timestamp when handed to application.
+    pub delivery_time: std::time::Instant,
+    /// Time spent waiting in the reorder buffer (Duration::ZERO if received in order).
+    pub reordering_delay: Duration,
+    /// Whether this datagram arrived out-of-order and had to be resequenced.
+    pub was_reordered: bool,
+    /// Whether an unrecoverable packet gap was skipped immediately before delivering this datagram.
+    pub gap_skipped_before: bool,
+}
+
+/// Result of ingesting a datagram into the reorder buffer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReorderIngestStatus {
+    /// Ingested packet matched next expected sequence and was delivered immediately,
+    /// along with any consecutive datagrams that were buffered.
+    Delivered(Vec<DeliveredDatagram>),
+    /// Packet arrived out-of-order (seq > next_expected) and has been queued in sliding window.
+    Buffered {
+        buffered_seq: u64,
+        expected_seq: u64,
+        current_buffer_len: usize,
+    },
+    /// Duplicate datagram detected (seq < expected_seq or seq already buffered) and discarded.
+    Duplicate {
+        seq_num: u64,
+        expected_seq: u64,
+    },
+    /// Datagram discarded because its sequence is older than the sliding window floor.
+    StaleDropped {
+        seq_num: u64,
+        window_floor: u64,
+    },
+    /// Buffer reached capacity limit; window was forcibly advanced, skipping missing gaps
+    /// and delivering queued forward packets to prevent deadlock.
+    ForcedEvictionDeliver {
+        evicted_gaps: u64,
+        delivered: Vec<DeliveredDatagram>,
+    },
+}
+
+/// Telemetry metrics for an individual flow reorder buffer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlowReorderTelemetry {
+    pub flow_id: u64,
+    pub next_expected_seq: u64,
+    pub highest_seq_seen: u64,
+    pub buffered_packets_count: usize,
+    pub total_received: u64,
+    pub total_delivered: u64,
+    pub total_in_order: u64,
+    pub total_out_of_order: u64,
+    pub total_duplicates: u64,
+    pub total_gaps_expired: u64,
+    pub total_window_overflows: u64,
+    pub dynamic_gap_timeout_ms: f64,
+    pub average_reordering_delay_ms: f64,
+    pub max_reordering_delay_ms: f64,
+    pub smoothed_rtt_ms: f64,
+    pub jitter_ms: f64,
+    pub multipath_skew_ms: f64,
+}
+
+/// Global aggregated telemetry across all active flow reordering buffers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompositeReorderTelemetry {
+    pub active_flows_count: usize,
+    pub total_received_packets: u64,
+    pub total_delivered_packets: u64,
+    pub total_in_order_packets: u64,
+    pub total_out_of_order_packets: u64,
+    pub total_duplicate_packets: u64,
+    pub total_gaps_expired: u64,
+    pub total_window_overflows: u64,
+    pub total_buffered_packets: usize,
+    pub max_reordering_delay_ms: f64,
+    pub flow_telemetry: Vec<FlowReorderTelemetry>,
+}
+
+/// Per-flow adaptive sliding window reordering buffer with dynamic jitter-aware gap timeout.
+#[derive(Debug, Clone)]
+pub struct AdaptiveFlowReorderBuffer {
+    /// Identifier for this flow.
+    pub flow_id: u64,
+    /// Operating configuration.
+    pub config: ReorderBufferConfig,
+    /// Next in-order sequence number expected by the receiver.
+    pub next_expected_seq: u64,
+    /// Highest sequence number observed so far.
+    pub highest_seq_seen: u64,
+    /// Whether the initial sequence number has been anchored.
+    pub has_latched_first: bool,
+    /// Out-of-order packets indexed by sequence number.
+    pub buffer: std::collections::BTreeMap<u64, BufferedDatagram>,
+    /// Active deadline for the current sequence gap.
+    pub gap_deadline: Option<std::time::Instant>,
+    /// Starting sequence number of the current gap under timeout watch.
+    pub gap_start_seq: Option<u64>,
+    /// Marker indicating that a gap was recently skipped due to timeout or eviction.
+    pub gap_skipped_flag: bool,
+    /// Smoothed RTT for this flow/path.
+    pub smoothed_rtt: Duration,
+    /// Jitter (RTT variance) for this flow/path.
+    pub jitter: Duration,
+    /// Differential path latency skew across bonded tunnels.
+    pub multipath_skew: Duration,
+    /// Flow creation time.
+    pub created_at: std::time::Instant,
+    /// Last packet ingestion or timeout activity timestamp.
+    pub last_activity: std::time::Instant,
+    /// Cumulative counters.
+    pub total_received: u64,
+    pub total_delivered: u64,
+    pub total_in_order: u64,
+    pub total_out_of_order: u64,
+    pub total_duplicates: u64,
+    pub total_gaps_expired: u64,
+    pub total_window_overflows: u64,
+    pub total_reordering_delay: Duration,
+    pub max_reordering_delay: Duration,
+}
+
+impl AdaptiveFlowReorderBuffer {
+    /// Create a new adaptive reordering buffer for a specific flow ID.
+    pub fn new(flow_id: u64, config: ReorderBufferConfig, now: std::time::Instant) -> Self {
+        let (next_seq, latched) = match config.initial_seq_mode {
+            InitialSeqMode::StrictZero => (0, true),
+            InitialSeqMode::StrictOne => (1, true),
+            InitialSeqMode::LatchFirst => (0, false),
+        };
+        Self {
+            flow_id,
+            config,
+            next_expected_seq: next_seq,
+            highest_seq_seen: 0,
+            has_latched_first: latched,
+            buffer: std::collections::BTreeMap::new(),
+            gap_deadline: None,
+            gap_start_seq: None,
+            gap_skipped_flag: false,
+            smoothed_rtt: Duration::from_millis(20),
+            jitter: Duration::from_millis(5),
+            multipath_skew: Duration::from_millis(10),
+            created_at: now,
+            last_activity: now,
+            total_received: 0,
+            total_delivered: 0,
+            total_in_order: 0,
+            total_out_of_order: 0,
+            total_duplicates: 0,
+            total_gaps_expired: 0,
+            total_window_overflows: 0,
+            total_reordering_delay: Duration::ZERO,
+            max_reordering_delay: Duration::ZERO,
+        }
+    }
+
+    /// Update network dynamics (SRTT, jitter, and multipath skew) to dynamically tune gap timeout.
+    pub fn update_network_metrics(&mut self, srtt: Duration, jitter: Duration, skew: Duration) {
+        self.smoothed_rtt = srtt;
+        self.jitter = jitter;
+        self.multipath_skew = skew;
+    }
+
+    /// Compute dynamic gap timeout based on SRTT, jitter, and multipath differential skew.
+    pub fn compute_dynamic_gap_timeout(&self) -> Duration {
+        let timeout_secs = self.config.min_gap_timeout.as_secs_f64()
+            + (self.smoothed_rtt.as_secs_f64() * self.config.rtt_factor)
+            + (self.jitter.as_secs_f64() * self.config.jitter_factor)
+            + (self.multipath_skew.as_secs_f64() * self.config.skew_factor);
+
+        let clamped = timeout_secs.clamp(
+            self.config.min_gap_timeout.as_secs_f64(),
+            self.config.max_gap_timeout.as_secs_f64(),
+        );
+        Duration::from_secs_f64(clamped)
+    }
+
+    /// Ingest an incoming datagram and process ordering.
+    pub fn ingest(
+        &mut self,
+        seq_num: u64,
+        payload: Vec<u8>,
+        tunnel_id: u64,
+        flags: u16,
+        timestamp_micros: u64,
+        now: std::time::Instant,
+    ) -> ReorderIngestStatus {
+        self.last_activity = now;
+        self.total_received += 1;
+
+        // Latch sequence on first datagram if configured
+        if !self.has_latched_first {
+            self.next_expected_seq = seq_num;
+            self.highest_seq_seen = seq_num;
+            self.has_latched_first = true;
+        }
+
+        // Duplicate check: older than expected sequence
+        if seq_num < self.next_expected_seq {
+            self.total_duplicates += 1;
+            return ReorderIngestStatus::Duplicate {
+                seq_num,
+                expected_seq: self.next_expected_seq,
+            };
+        }
+
+        // Duplicate check: already buffered
+        if self.buffer.contains_key(&seq_num) {
+            self.total_duplicates += 1;
+            return ReorderIngestStatus::Duplicate {
+                seq_num,
+                expected_seq: self.next_expected_seq,
+            };
+        }
+
+        // In-order arrival matching expected sequence
+        if seq_num == self.next_expected_seq {
+            self.total_in_order += 1;
+            if seq_num > self.highest_seq_seen {
+                self.highest_seq_seen = seq_num;
+            }
+
+            let mut delivered = Vec::new();
+            delivered.push(DeliveredDatagram {
+                seq_num,
+                payload,
+                tunnel_id,
+                flags,
+                arrival_time: now,
+                delivery_time: now,
+                reordering_delay: Duration::ZERO,
+                was_reordered: false,
+                gap_skipped_before: self.gap_skipped_flag,
+            });
+            self.gap_skipped_flag = false;
+            self.next_expected_seq = self.next_expected_seq.wrapping_add(1);
+            self.total_delivered += 1;
+
+            // Drain any consecutive packets queued in buffer
+            while let Some(buffered) = self.buffer.remove(&self.next_expected_seq) {
+                let delay = now.saturating_duration_since(buffered.arrival_time);
+                self.total_reordering_delay += delay;
+                if delay > self.max_reordering_delay {
+                    self.max_reordering_delay = delay;
+                }
+
+                delivered.push(DeliveredDatagram {
+                    seq_num: buffered.seq_num,
+                    payload: buffered.payload,
+                    tunnel_id: buffered.tunnel_id,
+                    flags: buffered.flags,
+                    arrival_time: buffered.arrival_time,
+                    delivery_time: now,
+                    reordering_delay: delay,
+                    was_reordered: true,
+                    gap_skipped_before: false,
+                });
+                self.next_expected_seq = self.next_expected_seq.wrapping_add(1);
+                self.total_delivered += 1;
+            }
+
+            // Update gap timer state
+            if self.buffer.is_empty() {
+                self.gap_deadline = None;
+                self.gap_start_seq = None;
+            } else {
+                self.gap_start_seq = Some(self.next_expected_seq);
+                self.gap_deadline = Some(now + self.compute_dynamic_gap_timeout());
+            }
+
+            return ReorderIngestStatus::Delivered(delivered);
+        }
+
+        // Out-of-order arrival (seq_num > self.next_expected_seq)
+        self.total_out_of_order += 1;
+        if seq_num > self.highest_seq_seen {
+            self.highest_seq_seen = seq_num;
+        }
+
+        // Start dynamic gap timer if not already active
+        if self.gap_deadline.is_none() {
+            self.gap_start_seq = Some(self.next_expected_seq);
+            self.gap_deadline = Some(now + self.compute_dynamic_gap_timeout());
+        }
+
+        // Check for buffer overflow or extreme sequence jump
+        let window_distance = seq_num.saturating_sub(self.next_expected_seq) as usize;
+        let is_overflow = self.buffer.len() >= self.config.max_window_size
+            || window_distance > (self.config.max_window_size * 2);
+
+        if is_overflow {
+            self.total_window_overflows += 1;
+            // Store current packet
+            let is_replicated = (flags & BONDING_FLAG_REPLICATED) != 0;
+            self.buffer.insert(
+                seq_num,
+                BufferedDatagram {
+                    seq_num,
+                    payload,
+                    tunnel_id,
+                    flags,
+                    arrival_time: now,
+                    wire_timestamp_micros: timestamp_micros,
+                    is_replicated,
+                },
+            );
+
+            // Force advance window to the lowest buffered sequence
+            let mut delivered = Vec::new();
+            let mut evicted_gaps = 0;
+            if let Some(&first_buffered_seq) = self.buffer.keys().next() {
+                evicted_gaps = first_buffered_seq.saturating_sub(self.next_expected_seq);
+                self.total_gaps_expired += evicted_gaps;
+                self.next_expected_seq = first_buffered_seq;
+                self.gap_skipped_flag = true;
+
+                while let Some(buffered) = self.buffer.remove(&self.next_expected_seq) {
+                    let delay = now.saturating_duration_since(buffered.arrival_time);
+                    self.total_reordering_delay += delay;
+                    if delay > self.max_reordering_delay {
+                        self.max_reordering_delay = delay;
+                    }
+
+                    delivered.push(DeliveredDatagram {
+                        seq_num: buffered.seq_num,
+                        payload: buffered.payload,
+                        tunnel_id: buffered.tunnel_id,
+                        flags: buffered.flags,
+                        arrival_time: buffered.arrival_time,
+                        delivery_time: now,
+                        reordering_delay: delay,
+                        was_reordered: true,
+                        gap_skipped_before: self.gap_skipped_flag,
+                    });
+                    self.gap_skipped_flag = false;
+                    self.next_expected_seq = self.next_expected_seq.wrapping_add(1);
+                    self.total_delivered += 1;
+                }
+            }
+
+            if self.buffer.is_empty() {
+                self.gap_deadline = None;
+                self.gap_start_seq = None;
+            } else {
+                self.gap_start_seq = Some(self.next_expected_seq);
+                self.gap_deadline = Some(now + self.compute_dynamic_gap_timeout());
+            }
+
+            ReorderIngestStatus::ForcedEvictionDeliver {
+                evicted_gaps,
+                delivered,
+            }
+        } else {
+            // Buffer packet normally
+            let is_replicated = (flags & BONDING_FLAG_REPLICATED) != 0;
+            self.buffer.insert(
+                seq_num,
+                BufferedDatagram {
+                    seq_num,
+                    payload,
+                    tunnel_id,
+                    flags,
+                    arrival_time: now,
+                    wire_timestamp_micros: timestamp_micros,
+                    is_replicated,
+                },
+            );
+
+            ReorderIngestStatus::Buffered {
+                buffered_seq: seq_num,
+                expected_seq: self.next_expected_seq,
+                current_buffer_len: self.buffer.len(),
+            }
+        }
+    }
+
+    /// Check if the active gap deadline has expired; if so, skip the gap and deliver ready packets.
+    pub fn check_gap_timeout(&mut self, now: std::time::Instant) -> Option<Vec<DeliveredDatagram>> {
+        let deadline = self.gap_deadline?;
+        if now < deadline {
+            return None;
+        }
+
+        // Gap expired: skip missing packets up to lowest buffered sequence
+        if let Some(&first_buffered_seq) = self.buffer.keys().next() {
+            let skipped = first_buffered_seq.saturating_sub(self.next_expected_seq);
+            self.total_gaps_expired += skipped;
+            self.next_expected_seq = first_buffered_seq;
+            self.gap_skipped_flag = true;
+
+            let mut delivered = Vec::new();
+            while let Some(buffered) = self.buffer.remove(&self.next_expected_seq) {
+                let delay = now.saturating_duration_since(buffered.arrival_time);
+                self.total_reordering_delay += delay;
+                if delay > self.max_reordering_delay {
+                    self.max_reordering_delay = delay;
+                }
+
+                delivered.push(DeliveredDatagram {
+                    seq_num: buffered.seq_num,
+                    payload: buffered.payload,
+                    tunnel_id: buffered.tunnel_id,
+                    flags: buffered.flags,
+                    arrival_time: buffered.arrival_time,
+                    delivery_time: now,
+                    reordering_delay: delay,
+                    was_reordered: true,
+                    gap_skipped_before: self.gap_skipped_flag,
+                });
+                self.gap_skipped_flag = false;
+                self.next_expected_seq = self.next_expected_seq.wrapping_add(1);
+                self.total_delivered += 1;
+            }
+
+            if self.buffer.is_empty() {
+                self.gap_deadline = None;
+                self.gap_start_seq = None;
+            } else {
+                self.gap_start_seq = Some(self.next_expected_seq);
+                self.gap_deadline = Some(now + self.compute_dynamic_gap_timeout());
+            }
+
+            Some(delivered)
+        } else {
+            self.gap_deadline = None;
+            self.gap_start_seq = None;
+            None
+        }
+    }
+
+    /// Forcibly drain all buffered packets regardless of sequence gaps.
+    pub fn force_drain_all(&mut self, now: std::time::Instant) -> Vec<DeliveredDatagram> {
+        let mut delivered = Vec::with_capacity(self.buffer.len());
+        let entries: Vec<(u64, BufferedDatagram)> = std::mem::take(&mut self.buffer).into_iter().collect();
+        for (seq, buffered) in entries {
+            let delay = now.saturating_duration_since(buffered.arrival_time);
+            self.total_reordering_delay += delay;
+            if delay > self.max_reordering_delay {
+                self.max_reordering_delay = delay;
+            }
+            delivered.push(DeliveredDatagram {
+                seq_num: seq,
+                payload: buffered.payload,
+                tunnel_id: buffered.tunnel_id,
+                flags: buffered.flags,
+                arrival_time: buffered.arrival_time,
+                delivery_time: now,
+                reordering_delay: delay,
+                was_reordered: true,
+                gap_skipped_before: self.gap_skipped_flag,
+            });
+            self.gap_skipped_flag = false;
+            self.total_delivered += 1;
+        }
+        if let Some(last) = delivered.last() {
+            self.next_expected_seq = last.seq_num.wrapping_add(1);
+        }
+        self.gap_deadline = None;
+        self.gap_start_seq = None;
+        delivered
+    }
+
+    /// Produce telemetry snapshot for this flow buffer.
+    pub fn telemetry(&self) -> FlowReorderTelemetry {
+        let avg_delay_ms = if self.total_delivered > 0 {
+            (self.total_reordering_delay.as_secs_f64() * 1000.0) / (self.total_delivered as f64)
+        } else {
+            0.0
+        };
+
+        FlowReorderTelemetry {
+            flow_id: self.flow_id,
+            next_expected_seq: self.next_expected_seq,
+            highest_seq_seen: self.highest_seq_seen,
+            buffered_packets_count: self.buffer.len(),
+            total_received: self.total_received,
+            total_delivered: self.total_delivered,
+            total_in_order: self.total_in_order,
+            total_out_of_order: self.total_out_of_order,
+            total_duplicates: self.total_duplicates,
+            total_gaps_expired: self.total_gaps_expired,
+            total_window_overflows: self.total_window_overflows,
+            dynamic_gap_timeout_ms: self.compute_dynamic_gap_timeout().as_secs_f64() * 1000.0,
+            average_reordering_delay_ms: avg_delay_ms,
+            max_reordering_delay_ms: self.max_reordering_delay.as_secs_f64() * 1000.0,
+            smoothed_rtt_ms: self.smoothed_rtt.as_secs_f64() * 1000.0,
+            jitter_ms: self.jitter.as_secs_f64() * 1000.0,
+            multipath_skew_ms: self.multipath_skew.as_secs_f64() * 1000.0,
+        }
+    }
+}
+
+/// Composite multi-flow reordering manager coordinating resequencing buffers across bonded tunnels.
+#[derive(Debug, Clone)]
+pub struct CompositeDatagramReorderEngine {
+    /// Active flow reorder buffers indexed by flow ID.
+    flows: std::collections::HashMap<u64, AdaptiveFlowReorderBuffer>,
+    /// Mapping from 5-tuple FlowKey to flow ID.
+    flow_key_map: std::collections::HashMap<FlowKey, u64>,
+    /// Next available internal flow ID.
+    next_flow_id: u64,
+    /// Default buffer configuration for newly initialized flows.
+    config: ReorderBufferConfig,
+}
+
+impl CompositeDatagramReorderEngine {
+    /// Create a new composite reordering engine with the specified configuration.
+    pub fn new(config: ReorderBufferConfig) -> Self {
+        Self {
+            flows: std::collections::HashMap::new(),
+            flow_key_map: std::collections::HashMap::new(),
+            next_flow_id: 1,
+            config,
+        }
+    }
+
+    /// Create a new composite reordering engine with default production settings.
+    pub fn with_default_config() -> Self {
+        Self::new(ReorderBufferConfig::default())
+    }
+
+    /// Access or create the reorder buffer for a specific numeric flow ID.
+    pub fn get_or_create_flow(
+        &mut self,
+        flow_id: u64,
+        now: std::time::Instant,
+    ) -> &mut AdaptiveFlowReorderBuffer {
+        let config = self.config.clone();
+        self.flows
+            .entry(flow_id)
+            .or_insert_with(|| AdaptiveFlowReorderBuffer::new(flow_id, config, now))
+    }
+
+    /// Resolve or allocate a numeric flow ID for a 5-tuple flow key.
+    pub fn resolve_flow_id(&mut self, key: &FlowKey) -> u64 {
+        if let Some(&id) = self.flow_key_map.get(key) {
+            id
+        } else {
+            let id = self.next_flow_id;
+            self.next_flow_id = self.next_flow_id.wrapping_add(1);
+            self.flow_key_map.insert(key.clone(), id);
+            id
+        }
+    }
+
+    /// Ingest a datagram for a given flow ID into the reordering pipeline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_datagram(
+        &mut self,
+        flow_id: u64,
+        seq_num: u64,
+        payload: Vec<u8>,
+        tunnel_id: u64,
+        flags: u16,
+        timestamp_micros: u64,
+        now: std::time::Instant,
+    ) -> ReorderIngestStatus {
+        let flow = self.get_or_create_flow(flow_id, now);
+        flow.ingest(seq_num, payload, tunnel_id, flags, timestamp_micros, now)
+    }
+
+    /// Ingest a datagram for a 5-tuple flow key into the reordering pipeline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_flow_key_datagram(
+        &mut self,
+        flow_key: &FlowKey,
+        seq_num: u64,
+        payload: Vec<u8>,
+        tunnel_id: u64,
+        flags: u16,
+        timestamp_micros: u64,
+        now: std::time::Instant,
+    ) -> ReorderIngestStatus {
+        let flow_id = self.resolve_flow_id(flow_key);
+        self.ingest_datagram(
+            flow_id,
+            seq_num,
+            payload,
+            tunnel_id,
+            flags,
+            timestamp_micros,
+            now,
+        )
+    }
+
+    /// Ingest a datagram received directly from a bonded tunnel (`ReceivedBondedDatagram`).
+    ///
+    /// When `use_flow_seq` is true, resequencing uses `header.flow_seq_num` under flow ID derived from tunnel/flow.
+    /// When `use_flow_seq` is false, resequencing uses `header.bonding_seq_num` across aggregate tunnel flow ID 0.
+    pub fn ingest_bonded_datagram(
+        &mut self,
+        packet: &ReceivedBondedDatagram,
+        use_flow_seq: bool,
+        now: std::time::Instant,
+    ) -> ReorderIngestStatus {
+        if use_flow_seq {
+            let flow_id = (packet.tunnel_id << 32) | 1;
+            self.ingest_datagram(
+                flow_id,
+                packet.header.flow_seq_num as u64,
+                packet.payload.clone(),
+                packet.tunnel_id,
+                packet.header.flags,
+                packet.header.timestamp_micros,
+                now,
+            )
+        } else {
+            // Aggregate bonding sequence reordering on flow 0
+            self.ingest_datagram(
+                0,
+                packet.header.bonding_seq_num,
+                packet.payload.clone(),
+                packet.tunnel_id,
+                packet.header.flags,
+                packet.header.timestamp_micros,
+                now,
+            )
+        }
+    }
+
+    /// Update network dynamics (SRTT, jitter, and skew) for a specific flow.
+    pub fn update_flow_metrics(
+        &mut self,
+        flow_id: u64,
+        srtt: Duration,
+        jitter: Duration,
+        skew: Duration,
+    ) {
+        if let Some(flow) = self.flows.get_mut(&flow_id) {
+            flow.update_network_metrics(srtt, jitter, skew);
+        }
+    }
+
+    /// Poll all active flow buffers for expired gap timeouts and deliver available datagrams.
+    pub fn poll_timeouts(
+        &mut self,
+        now: std::time::Instant,
+    ) -> std::collections::BTreeMap<u64, Vec<DeliveredDatagram>> {
+        let mut results = std::collections::BTreeMap::new();
+        for (&flow_id, flow) in &mut self.flows {
+            if let Some(delivered) = flow.check_gap_timeout(now) {
+                if !delivered.is_empty() {
+                    results.insert(flow_id, delivered);
+                }
+            }
+        }
+        results
+    }
+
+    /// Remove idle flow buffers that have seen no traffic for longer than flow_idle_timeout.
+    pub fn cleanup_idle_flows(&mut self, now: std::time::Instant) -> usize {
+        let timeout = self.config.flow_idle_timeout;
+        let mut pruned = 0;
+        self.flows.retain(|_, flow| {
+            if now.saturating_duration_since(flow.last_activity) > timeout && flow.buffer.is_empty()
+            {
+                pruned += 1;
+                false
+            } else {
+                true
+            }
+        });
+        pruned
+    }
+
+    /// Count of active flow reordering buffers.
+    pub fn active_flows_count(&self) -> usize {
+        self.flows.len()
+    }
+
+    /// Total count of buffered packets across all active flow buffers.
+    pub fn total_buffered_packets(&self) -> usize {
+        self.flows.values().map(|f| f.buffer.len()).sum()
+    }
+
+    /// Produce comprehensive telemetry metrics across all managed flows.
+    pub fn telemetry(&self) -> CompositeReorderTelemetry {
+        let mut total_rx = 0;
+        let mut total_del = 0;
+        let mut total_in = 0;
+        let mut total_ooo = 0;
+        let mut total_dup = 0;
+        let mut total_gaps = 0;
+        let mut total_overflows = 0;
+        let mut total_buf = 0;
+        let mut max_delay = Duration::ZERO;
+        let mut flow_telemetry = Vec::with_capacity(self.flows.len());
+
+        for flow in self.flows.values() {
+            let ft = flow.telemetry();
+            total_rx += ft.total_received;
+            total_del += ft.total_delivered;
+            total_in += ft.total_in_order;
+            total_ooo += ft.total_out_of_order;
+            total_dup += ft.total_duplicates;
+            total_gaps += ft.total_gaps_expired;
+            total_overflows += ft.total_window_overflows;
+            total_buf += ft.buffered_packets_count;
+            if flow.max_reordering_delay > max_delay {
+                max_delay = flow.max_reordering_delay;
+            }
+            flow_telemetry.push(ft);
+        }
+
+        CompositeReorderTelemetry {
+            active_flows_count: self.flows.len(),
+            total_received_packets: total_rx,
+            total_delivered_packets: total_del,
+            total_in_order_packets: total_in,
+            total_out_of_order_packets: total_ooo,
+            total_duplicate_packets: total_dup,
+            total_gaps_expired: total_gaps,
+            total_window_overflows: total_overflows,
+            total_buffered_packets: total_buf,
+            max_reordering_delay_ms: max_delay.as_secs_f64() * 1000.0,
+            flow_telemetry,
+        }
+    }
+}
+
+
 /// Hierarchical Deficit Round Robin (DRR) arbitrator for multi-session HTTP/2 & HTTP/3 connection pools.
 ///
 /// Features:
@@ -34726,5 +35524,264 @@ mod tls_alpn_tests {
             .expect("receive packet");
         assert_eq!(rx.tunnel_id, 1);
         assert!(!rx.payload.is_empty());
+    }
+
+    #[test]
+    fn test_reorder_buffer_nominal_in_order_delivery() {
+        let now = std::time::Instant::now();
+        let config = ReorderBufferConfig {
+            initial_seq_mode: InitialSeqMode::StrictOne,
+            ..Default::default()
+        };
+        let mut buf = AdaptiveFlowReorderBuffer::new(1, config, now);
+
+        for seq in 1..=5 {
+            let payload = format!("PACKET_{}", seq).into_bytes();
+            let res = buf.ingest(seq, payload, 10, 0, 1000 * seq, now);
+            match res {
+                ReorderIngestStatus::Delivered(del) => {
+                    assert_eq!(del.len(), 1);
+                    assert_eq!(del[0].seq_num, seq);
+                    assert_eq!(del[0].reordering_delay, Duration::ZERO);
+                    assert!(!del[0].was_reordered);
+                    assert!(!del[0].gap_skipped_before);
+                }
+                other => panic!("Expected Delivered for in-order packet {}, got {:?}", seq, other),
+            }
+        }
+
+        assert_eq!(buf.next_expected_seq, 6);
+        assert_eq!(buf.buffer.len(), 0);
+        let telem = buf.telemetry();
+        assert_eq!(telem.total_in_order, 5);
+        assert_eq!(telem.total_out_of_order, 0);
+        assert_eq!(telem.total_duplicates, 0);
+    }
+
+    #[test]
+    fn test_reorder_buffer_out_of_order_arrival_and_cascade_drain() {
+        let now = std::time::Instant::now();
+        let config = ReorderBufferConfig {
+            initial_seq_mode: InitialSeqMode::StrictOne,
+            ..Default::default()
+        };
+        let mut buf = AdaptiveFlowReorderBuffer::new(100, config, now);
+
+        // Packet 1 arrives in-order
+        let res1 = buf.ingest(1, b"P1".to_vec(), 1, 0, 100, now);
+        match res1 {
+            ReorderIngestStatus::Delivered(del) => {
+                assert_eq!(del.len(), 1);
+                assert_eq!(del[0].seq_num, 1);
+            }
+            _ => panic!("Expected Delivered for 1"),
+        }
+
+        // Packet 3 arrives out-of-order (gap at 2)
+        let t3 = now + Duration::from_millis(5);
+        let res3 = buf.ingest(3, b"P3".to_vec(), 2, 0, 300, t3);
+        assert!(matches!(res3, ReorderIngestStatus::Buffered { buffered_seq: 3, expected_seq: 2, current_buffer_len: 1 }));
+        assert!(buf.gap_deadline.is_some());
+
+        // Packet 4 arrives out-of-order
+        let t4 = now + Duration::from_millis(7);
+        let res4 = buf.ingest(4, b"P4".to_vec(), 2, 0, 400, t4);
+        assert!(matches!(res4, ReorderIngestStatus::Buffered { buffered_seq: 4, expected_seq: 2, current_buffer_len: 2 }));
+
+        // Packet 2 arrives now! Must release 2, 3, 4 in strict order
+        let t2 = now + Duration::from_millis(15);
+        let res2 = buf.ingest(2, b"P2".to_vec(), 1, 0, 200, t2);
+        match res2 {
+            ReorderIngestStatus::Delivered(del) => {
+                assert_eq!(del.len(), 3);
+                assert_eq!(del[0].seq_num, 2);
+                assert!(!del[0].was_reordered);
+                assert_eq!(del[1].seq_num, 3);
+                assert!(del[1].was_reordered);
+                assert_eq!(del[2].seq_num, 4);
+                assert!(del[2].was_reordered);
+            }
+            _ => panic!("Expected cascade Delivered on resolving gap with packet 2"),
+        }
+
+        assert_eq!(buf.next_expected_seq, 5);
+        assert_eq!(buf.buffer.len(), 0);
+        assert!(buf.gap_deadline.is_none());
+
+        let telem = buf.telemetry();
+        assert_eq!(telem.total_delivered, 4);
+        assert_eq!(telem.total_in_order, 2);
+        assert_eq!(telem.total_out_of_order, 2);
+        assert!(telem.max_reordering_delay_ms > 0.0);
+    }
+
+    #[test]
+    fn test_reorder_buffer_duplicate_and_stale_detection() {
+        let now = std::time::Instant::now();
+        let config = ReorderBufferConfig {
+            initial_seq_mode: InitialSeqMode::StrictOne,
+            ..Default::default()
+        };
+        let mut buf = AdaptiveFlowReorderBuffer::new(200, config, now);
+
+        // Receive 1 in-order
+        buf.ingest(1, b"P1".to_vec(), 1, 0, 100, now);
+
+        // Duplicate of 1 (seq < next_expected_seq = 2)
+        let dup1 = buf.ingest(1, b"P1_DUP".to_vec(), 1, 0, 100, now);
+        assert_eq!(dup1, ReorderIngestStatus::Duplicate { seq_num: 1, expected_seq: 2 });
+
+        // Packet 4 arrives (buffered)
+        buf.ingest(4, b"P4".to_vec(), 2, 0, 400, now);
+
+        // Duplicate of 4 (already buffered)
+        let dup4 = buf.ingest(4, b"P4_DUP".to_vec(), 2, 0, 400, now);
+        assert_eq!(dup4, ReorderIngestStatus::Duplicate { seq_num: 4, expected_seq: 2 });
+
+        let telem = buf.telemetry();
+        assert_eq!(telem.total_duplicates, 2);
+    }
+
+    #[test]
+    fn test_reorder_buffer_dynamic_gap_timeout_expiry() {
+        let now = std::time::Instant::now();
+        let mut config = ReorderBufferConfig::default();
+        config.min_gap_timeout = Duration::from_millis(10);
+        config.max_gap_timeout = Duration::from_millis(50);
+        config.initial_seq_mode = InitialSeqMode::StrictOne;
+
+        let mut buf = AdaptiveFlowReorderBuffer::new(300, config, now);
+        buf.update_network_metrics(
+            Duration::from_millis(10), // SRTT
+            Duration::from_millis(2),  // Jitter
+            Duration::from_millis(4),  // Skew
+        );
+
+        // Packet 1 in order
+        buf.ingest(1, b"P1".to_vec(), 1, 0, 100, now);
+
+        // Packet 4 arrives: gap at 2, 3
+        buf.ingest(4, b"P4".to_vec(), 1, 0, 400, now);
+        assert_eq!(buf.next_expected_seq, 2);
+        assert!(buf.gap_deadline.is_some());
+
+        // Check before deadline expires -> no delivery
+        let early_check = buf.check_gap_timeout(now + Duration::from_millis(2));
+        assert!(early_check.is_none());
+        assert_eq!(buf.next_expected_seq, 2);
+
+        // Check after gap timeout expiration (e.g. at +100ms)
+        let expired_check = buf.check_gap_timeout(now + Duration::from_millis(100));
+        assert!(expired_check.is_some());
+        let delivered = expired_check.unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].seq_num, 4);
+        assert!(delivered[0].gap_skipped_before, "Must notify that gap 2..3 was skipped");
+
+        assert_eq!(buf.next_expected_seq, 5);
+        assert_eq!(buf.buffer.len(), 0);
+
+        let telem = buf.telemetry();
+        assert_eq!(telem.total_gaps_expired, 2); // skipped 2 and 3
+    }
+
+    #[test]
+    fn test_reorder_buffer_window_overflow_forced_eviction() {
+        let now = std::time::Instant::now();
+        let config = ReorderBufferConfig {
+            max_window_size: 3, // tiny window
+            initial_seq_mode: InitialSeqMode::StrictOne,
+            ..Default::default()
+        };
+        let mut buf = AdaptiveFlowReorderBuffer::new(400, config, now);
+
+        // Gap at 1: ingest 2, 3, 4 (fill up max_window_size = 3)
+        buf.ingest(2, b"P2".to_vec(), 1, 0, 200, now);
+        buf.ingest(3, b"P3".to_vec(), 1, 0, 300, now);
+        buf.ingest(4, b"P4".to_vec(), 1, 0, 400, now);
+        assert_eq!(buf.buffer.len(), 3);
+        assert_eq!(buf.next_expected_seq, 1);
+
+        // Ingest 5 -> triggers window overflow and forced eviction
+        let res5 = buf.ingest(5, b"P5".to_vec(), 1, 0, 500, now);
+        match res5 {
+            ReorderIngestStatus::ForcedEvictionDeliver { evicted_gaps, delivered } => {
+                assert_eq!(evicted_gaps, 1, "Must evict gap at seq 1");
+                assert_eq!(delivered.len(), 4, "Must deliver 2, 3, 4, 5");
+                assert_eq!(delivered[0].seq_num, 2);
+                assert!(delivered[0].gap_skipped_before);
+                assert_eq!(delivered[3].seq_num, 5);
+            }
+            other => panic!("Expected ForcedEvictionDeliver, got {:?}", other),
+        }
+
+        assert_eq!(buf.next_expected_seq, 6);
+        assert_eq!(buf.buffer.len(), 0);
+
+        let telem = buf.telemetry();
+        assert_eq!(telem.total_window_overflows, 1);
+        assert_eq!(telem.total_gaps_expired, 1);
+    }
+
+    #[test]
+    fn test_composite_reorder_engine_with_bonded_datagrams() {
+        let now = std::time::Instant::now();
+        let mut engine = CompositeDatagramReorderEngine::with_default_config();
+
+        // Simulate 2 paths delivering packets for a bonded tunnel
+        let hdr1 = BondingDatagramHeader::new(1, 101, 1, 0, 1000);
+        let pkt1 = ReceivedBondedDatagram {
+            header: hdr1,
+            tunnel_id: 1,
+            payload: b"DATA_SEQ_1".to_vec(),
+            received_at: now,
+        };
+
+        // Out-of-order packet 3 arrives first over path 2
+        let hdr3 = BondingDatagramHeader::new(3, 103, 2, 0, 3000);
+        let pkt3 = ReceivedBondedDatagram {
+            header: hdr3,
+            tunnel_id: 2,
+            payload: b"DATA_SEQ_3".to_vec(),
+            received_at: now + Duration::from_millis(2),
+        };
+
+        let res_first = engine.ingest_bonded_datagram(&pkt1, false, now);
+        assert!(matches!(res_first, ReorderIngestStatus::Delivered(_)));
+
+        let res_ooo = engine.ingest_bonded_datagram(&pkt3, false, now + Duration::from_millis(2));
+        assert!(matches!(res_ooo, ReorderIngestStatus::Buffered { .. }));
+
+        // Now packet 2 arrives over path 1
+        let hdr2 = BondingDatagramHeader::new(2, 102, 1, 0, 2000);
+        let pkt2 = ReceivedBondedDatagram {
+            header: hdr2,
+            tunnel_id: 1,
+            payload: b"DATA_SEQ_2".to_vec(),
+            received_at: now + Duration::from_millis(6),
+        };
+        let res_gap = engine.ingest_bonded_datagram(&pkt2, false, now + Duration::from_millis(6));
+        match res_gap {
+            ReorderIngestStatus::Delivered(del) => {
+                assert_eq!(del.len(), 2);
+                assert_eq!(del[0].seq_num, 2);
+                assert_eq!(del[1].seq_num, 3);
+            }
+            other => panic!("Expected Delivered(2, 3), got {:?}", other),
+        }
+
+        // Test telemetry
+        let telem = engine.telemetry();
+        assert_eq!(telem.active_flows_count, 1);
+        assert_eq!(telem.total_delivered_packets, 3);
+        assert_eq!(telem.total_buffered_packets, 0);
+
+        // Test timeout polling and idle flow cleanup
+        let timeouts = engine.poll_timeouts(now + Duration::from_secs(1));
+        assert!(timeouts.is_empty());
+
+        let pruned = engine.cleanup_idle_flows(now + Duration::from_secs(120));
+        assert_eq!(pruned, 1);
+        assert_eq!(engine.active_flows_count(), 0);
     }
 }
