@@ -8861,22 +8861,41 @@ pub enum TrafficPriority {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DropReason {
     /// The shaping queue reached its maximum packet count or byte capacity (tail drop).
-    QueueFull { current_depth: usize, max_depth: usize },
+    QueueFull {
+        current_depth: usize,
+        max_depth: usize,
+    },
     /// The packet has an explicit deadline that cannot be met given current queue delay.
-    DeadlineExceeded { estimated_delay: Duration, deadline: Duration },
+    DeadlineExceeded {
+        estimated_delay: Duration,
+        deadline: Duration,
+    },
     /// Token exhaustion when queueing is disabled or buffer headroom is depleted.
     RateExceeded,
     /// Active Queue Management (AQM / CoDel) persistent queue latency threshold exceeded.
-    AqmPersistentDelay { persistent_delay: Duration, target_delay: Duration },
+    AqmPersistentDelay {
+        persistent_delay: Duration,
+        target_delay: Duration,
+    },
 }
 
 impl std::fmt::Display for DropReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::QueueFull { current_depth, max_depth } => {
-                write!(f, "queue full (depth {} >= max {})", current_depth, max_depth)
+            Self::QueueFull {
+                current_depth,
+                max_depth,
+            } => {
+                write!(
+                    f,
+                    "queue full (depth {} >= max {})",
+                    current_depth, max_depth
+                )
             }
-            Self::DeadlineExceeded { estimated_delay, deadline } => {
+            Self::DeadlineExceeded {
+                estimated_delay,
+                deadline,
+            } => {
                 write!(
                     f,
                     "deadline exceeded (estimated delay {:?} > deadline {:?})",
@@ -8884,7 +8903,10 @@ impl std::fmt::Display for DropReason {
                 )
             }
             Self::RateExceeded => write!(f, "rate exceeded (no token headroom)"),
-            Self::AqmPersistentDelay { persistent_delay, target_delay } => {
+            Self::AqmPersistentDelay {
+                persistent_delay,
+                target_delay,
+            } => {
                 write!(
                     f,
                     "AQM early drop (persistent delay {:?} > target {:?})",
@@ -8901,7 +8923,10 @@ pub enum AdmissionDecision {
     /// Packet admitted immediately; tokens consumed, packet should be dispatched to wire now.
     Admitted,
     /// Packet accepted and enqueued in the shaping buffer; will be dispatched once tokens refill.
-    Delayed { wait_duration: Duration, queue_position: usize },
+    Delayed {
+        wait_duration: Duration,
+        queue_position: usize,
+    },
     /// Packet rejected and dropped according to admission control policy.
     Dropped { reason: DropReason },
 }
@@ -9176,8 +9201,8 @@ impl AdaptiveTokenBucketShaper {
         // Fast path: if shaping queues are empty and tokens are immediately available
         if self.is_empty() {
             let can_admit = if is_control {
-                let headroom = self.config.burst_bytes_capacity as f64
-                    * self.config.control_headroom_fraction;
+                let headroom =
+                    self.config.burst_bytes_capacity as f64 * self.config.control_headroom_fraction;
                 (self.byte_tokens + headroom) >= cost_f
             } else {
                 self.byte_tokens >= cost_f && self.packet_tokens >= 1.0
@@ -9219,7 +9244,8 @@ impl AdaptiveTokenBucketShaper {
             TrafficPriority::Bulk => self.total_queue_bytes,
         };
 
-        let est_delay_secs = (bytes_ahead + byte_cost) as f64 / self.current_byte_rate.max(1) as f64;
+        let est_delay_secs =
+            (bytes_ahead + byte_cost) as f64 / self.current_byte_rate.max(1) as f64;
         let est_delay = Duration::from_secs_f64(est_delay_secs);
 
         if let Some(dl) = deadline {
@@ -9305,8 +9331,7 @@ impl AdaptiveTokenBucketShaper {
                     if !is_control {
                         self.packet_tokens = (self.packet_tokens - 1.0).max(0.0);
                     }
-                    self.total_queue_bytes =
-                        self.total_queue_bytes.saturating_sub(pkt.byte_cost);
+                    self.total_queue_bytes = self.total_queue_bytes.saturating_sub(pkt.byte_cost);
                     self.telemetry.packets_drained_shaped += 1;
                     self.telemetry.bytes_admitted += pkt.byte_cost;
                     return Some(pkt);
@@ -9383,8 +9408,8 @@ impl AdaptiveTokenBucketShaper {
         let clamped = backpressure_ratio.clamp(0.1, 1.0);
         self.current_byte_rate =
             ((self.config.max_byte_rate as f64 * clamped) as u64).max(self.config.min_byte_rate);
-        self.current_packet_rate =
-            ((self.config.max_packet_rate as f64 * clamped) as u64).max(self.config.min_packet_rate);
+        self.current_packet_rate = ((self.config.max_packet_rate as f64 * clamped) as u64)
+            .max(self.config.min_packet_rate);
         self.telemetry.rate_adaptations += 1;
     }
 
@@ -31518,20 +31543,17 @@ mod tls_alpn_tests {
             .with_shaper(shaper);
 
         // First packet fits in burst -> Admitted
-        let (d1, wire1) =
-            transport.send_shaped(b"PACKET_1", TrafficPriority::Normal, None, now);
+        let (d1, wire1) = transport.send_shaped(b"PACKET_1", TrafficPriority::Normal, None, now);
         assert!(d1.is_admitted());
         assert_eq!(wire1.len(), 1);
 
         // Second packet fits in burst -> Admitted
-        let (d2, wire2) =
-            transport.send_shaped(b"PACKET_2", TrafficPriority::Normal, None, now);
+        let (d2, wire2) = transport.send_shaped(b"PACKET_2", TrafficPriority::Normal, None, now);
         assert!(d2.is_admitted());
         assert_eq!(wire2.len(), 1);
 
         // Third packet -> Delayed
-        let (d3, wire3) =
-            transport.send_shaped(b"PACKET_3", TrafficPriority::Normal, None, now);
+        let (d3, wire3) = transport.send_shaped(b"PACKET_3", TrafficPriority::Normal, None, now);
         assert!(d3.is_delayed());
         assert!(wire3.is_empty());
 
