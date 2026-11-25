@@ -1061,8 +1061,14 @@ impl TelemetryComparativeReport {
             self.concurrent_sessions
         ));
         table.push_str("| Transport Protocol | Samples | Time (ms) | Throughput (snap/s) | Bandwidth (MB/s) | Avg Latency (µs) | P95 Latency (µs) | P99 Latency (µs) | Framing Overhead | Wire Savings |\n");
-        table.push_str("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n");
-        for r in [&self.websocket_result, &self.http_prometheus_result, &self.http_otel_result] {
+        table.push_str(
+            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n",
+        );
+        for r in [
+            &self.websocket_result,
+            &self.http_prometheus_result,
+            &self.http_otel_result,
+        ] {
             table.push_str(&format!(
                 "| {} | {} | {:.2} | **{:.1}** | {:.2} | {:.2} | {:.2} | {:.2} | {:.2}% | {:.1}% |\n",
                 r.transport_name,
@@ -1126,7 +1132,9 @@ impl TelemetryComparativeReport {
 
 /// Construct a saturated `IsspMultipathBalancingSnapshot` representing realistic production multipath traffic
 /// with `concurrent_sessions` concurrent active sessions distributed across 4 heterogeneous network subpaths.
-pub fn create_saturated_multipath_snapshot(concurrent_sessions: usize) -> IsspMultipathBalancingSnapshot {
+pub fn create_saturated_multipath_snapshot(
+    concurrent_sessions: usize,
+) -> IsspMultipathBalancingSnapshot {
     let ts = 1_700_000_000_000_000_000u64;
     let total_sessions = concurrent_sessions.max(1);
     let primary_sessions = (total_sessions * 7) / 10;
@@ -1455,12 +1463,8 @@ pub fn run_telemetry_streaming_vs_polling_benchmark(
     let prom_start = Instant::now();
     for _ in 0..iters {
         let sample_start = Instant::now();
-        let (code, ctype, body) = handler.handle_snapshot_with_quorum(
-            "/metrics",
-            "text/plain; version=0.0.4",
-            &snap,
-            3,
-        );
+        let (code, ctype, body) =
+            handler.handle_snapshot_with_quorum("/metrics", "text/plain; version=0.0.4", &snap, 3);
         let resp_headers = format!(
             "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             code,
@@ -1506,12 +1510,8 @@ pub fn run_telemetry_streaming_vs_polling_benchmark(
     let otel_start = Instant::now();
     for _ in 0..iters {
         let sample_start = Instant::now();
-        let (code, ctype, body) = handler.handle_snapshot_with_quorum(
-            "/v1/metrics",
-            "application/json",
-            &snap,
-            3,
-        );
+        let (code, ctype, body) =
+            handler.handle_snapshot_with_quorum("/v1/metrics", "application/json", &snap, 3);
         let resp_headers = format!(
             "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             code,
@@ -1560,14 +1560,18 @@ pub fn run_telemetry_streaming_vs_polling_benchmark(
     };
 
     let savings_prom = if prom_result.total_wire_bytes > 0 {
-        ((prom_result.total_wire_bytes.saturating_sub(ws_result.total_wire_bytes) as f64)
+        ((prom_result
+            .total_wire_bytes
+            .saturating_sub(ws_result.total_wire_bytes) as f64)
             / (prom_result.total_wire_bytes as f64))
             * 100.0
     } else {
         0.0
     };
     let savings_otel = if otel_result.total_wire_bytes > 0 {
-        ((otel_result.total_wire_bytes.saturating_sub(ws_result.total_wire_bytes) as f64)
+        ((otel_result
+            .total_wire_bytes
+            .saturating_sub(ws_result.total_wire_bytes) as f64)
             / (otel_result.total_wire_bytes as f64))
             * 100.0
     } else {
