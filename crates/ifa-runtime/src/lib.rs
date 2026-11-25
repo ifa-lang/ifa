@@ -84,7 +84,8 @@ pub use session_sync::{
 pub use string::IfaString;
 pub use telemetry::{
     supervise_command, IsspMultipathBalancingSnapshot, IsspSubpathBalancingMetrics,
-    IsspTelemetryHttpHandler, IsspTelemetryServer, OtelMultipathBalancingExporter,
-    PrometheusMultipathBalancingExporter, ResourceAuditScope, ResourceUsage,
+    IsspTelemetryHttpHandler, IsspTelemetryServer, LatencyHistogram,
+    OtelMultipathBalancingExporter, PrometheusMultipathBalancingExporter, ResourceAuditScope,
+    ResourceUsage, DEFAULT_LATENCY_BUCKETS_SECONDS,
 };
 pub use wasi::*;

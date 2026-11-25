@@ -880,6 +880,12 @@ pub struct IsspPathMetrics {
     pub total_bytes_sent: u64,
     /// Cumulative bytes received over this path.
     pub total_bytes_received: u64,
+    /// Cumulative count of TCP segment retransmissions detected on this path.
+    pub tcp_retrans_count: u64,
+    /// Cumulative count of ISSP datagram capsule retransmissions on this path.
+    pub issp_retrans_count: u64,
+    /// Latency histogram distribution recorded from heartbeat probes and frame acks.
+    pub latency_histogram: crate::telemetry::LatencyHistogram,
 }
 
 impl Default for IsspPathMetrics {
@@ -898,6 +904,9 @@ impl Default for IsspPathMetrics {
             total_frames_received: 0,
             total_bytes_sent: 0,
             total_bytes_received: 0,
+            tcp_retrans_count: 0,
+            issp_retrans_count: 0,
+            latency_histogram: crate::telemetry::LatencyHistogram::default(),
         }
     }
 }
@@ -924,7 +933,7 @@ impl IsspPathMetrics {
         (weight.max(1) as f64) * latency_factor * loss_factor * state_mult
     }
 
-    /// Record a round-trip time measurement from a heartbeat pong response.
+    /// Record a round-trip time measurement from a heartbeat pong response, updating EWMA and histogram.
     pub fn update_rtt(&mut self, sample_rtt_us: u64) {
         if self.smoothed_rtt_us == 0 {
             self.smoothed_rtt_us = sample_rtt_us;
@@ -933,6 +942,54 @@ impl IsspPathMetrics {
             let diff = (sample_rtt_us as i64 - self.smoothed_rtt_us as i64).unsigned_abs();
             self.rtt_variance_us = (3 * self.rtt_variance_us + diff) / 4;
             self.smoothed_rtt_us = (7 * self.smoothed_rtt_us + sample_rtt_us) / 8;
+        }
+        self.latency_histogram.observe_us(sample_rtt_us);
+    }
+
+    /// Record an RTT sample in microseconds.
+    pub fn record_latency_sample(&mut self, sample_rtt_us: u64) {
+        self.update_rtt(sample_rtt_us);
+    }
+
+    /// Record TCP segment retransmission event.
+    pub fn record_tcp_retransmit(&mut self, count: u64) {
+        self.tcp_retrans_count = self.tcp_retrans_count.saturating_add(count);
+    }
+
+    /// Record ISSP capsule retransmission event.
+    pub fn record_issp_retransmit(&mut self, count: u64) {
+        self.issp_retrans_count = self.issp_retrans_count.saturating_add(count);
+    }
+
+    /// Total retransmissions (TCP + ISSP).
+    pub fn total_retrans_count(&self) -> u64 {
+        self.tcp_retrans_count.saturating_add(self.issp_retrans_count)
+    }
+
+    /// TCP retransmission ratio (0.0 to 1.0).
+    pub fn tcp_retransmission_ratio(&self) -> f64 {
+        if self.total_frames_sent == 0 {
+            0.0
+        } else {
+            ((self.tcp_retrans_count as f64) / (self.total_frames_sent as f64)).clamp(0.0, 1.0)
+        }
+    }
+
+    /// ISSP retransmission ratio (0.0 to 1.0).
+    pub fn issp_retransmission_ratio(&self) -> f64 {
+        if self.total_frames_sent == 0 {
+            0.0
+        } else {
+            ((self.issp_retrans_count as f64) / (self.total_frames_sent as f64)).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Total retransmission ratio (0.0 to 1.0).
+    pub fn total_retransmission_ratio(&self) -> f64 {
+        if self.total_frames_sent == 0 {
+            0.0
+        } else {
+            ((self.total_retrans_count() as f64) / (self.total_frames_sent as f64)).clamp(0.0, 1.0)
         }
     }
 }
@@ -1543,6 +1600,21 @@ impl IsspMultipathRoute {
         self.heartbeat_timeout_ms = timeout_ms;
         self.max_missed_heartbeats = max_missed;
         self
+    }
+
+    /// Record an RTT sample on this route, updating latency histogram and smoothed RTT.
+    pub fn record_latency_sample(&mut self, sample_rtt_us: u64) {
+        self.metrics.record_latency_sample(sample_rtt_us);
+    }
+
+    /// Record TCP segment retransmission event on this route.
+    pub fn record_tcp_retransmit(&mut self, count: u64) {
+        self.metrics.record_tcp_retransmit(count);
+    }
+
+    /// Record ISSP capsule retransmission event on this route.
+    pub fn record_issp_retransmit(&mut self, count: u64) {
+        self.metrics.record_issp_retransmit(count);
     }
 }
 
@@ -2472,6 +2544,36 @@ impl IsspDynamicMultipathRouter {
     /// Return the active routing policy.
     pub fn policy(&self) -> IsspRoutingPolicy {
         self.policy
+    }
+
+    /// Record a round-trip latency observation on a specific path.
+    pub fn record_latency_sample(&mut self, path_id: u32, rtt_us: u64) -> Result<(), SyncError> {
+        let route = self
+            .paths
+            .get_mut(&path_id)
+            .ok_or(SyncError::PathNotFound(path_id))?;
+        route.record_latency_sample(rtt_us);
+        Ok(())
+    }
+
+    /// Record TCP segment retransmission event on a specific path.
+    pub fn record_tcp_retransmit(&mut self, path_id: u32, count: u64) -> Result<(), SyncError> {
+        let route = self
+            .paths
+            .get_mut(&path_id)
+            .ok_or(SyncError::PathNotFound(path_id))?;
+        route.record_tcp_retransmit(count);
+        Ok(())
+    }
+
+    /// Record ISSP capsule retransmission event on a specific path.
+    pub fn record_issp_retransmit(&mut self, path_id: u32, count: u64) -> Result<(), SyncError> {
+        let route = self
+            .paths
+            .get_mut(&path_id)
+            .ok_or(SyncError::PathNotFound(path_id))?;
+        route.record_issp_retransmit(count);
+        Ok(())
     }
 
     /// Capture a real-time telemetry snapshot of dynamic multipath bandwidth balancing,
@@ -3794,16 +3896,54 @@ impl SessionRegistry {
         router.path_bandwidth_estimate(path_id)
     }
 
+    /// Return `(total_sessions, primary_sessions, standby_sessions)` tracked in registry.
+    pub fn session_counts(&self) -> Result<(usize, usize, usize), SyncError> {
+        let guard = self.sessions.lock().map_err(|_| SyncError::LockPoisoned)?;
+        let mut primary = 0;
+        let mut standby = 0;
+        for record in guard.values() {
+            if record.is_primary {
+                primary += 1;
+            } else {
+                standby += 1;
+            }
+        }
+        Ok((guard.len(), primary, standby))
+    }
+
+    /// Record a round-trip latency observation on a specific path.
+    pub fn record_latency_sample(&self, path_id: u32, rtt_us: u64) -> Result<(), SyncError> {
+        let mut router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        router.record_latency_sample(path_id, rtt_us)
+    }
+
+    /// Record TCP segment retransmission event on a specific path.
+    pub fn record_tcp_retransmit(&self, path_id: u32, count: u64) -> Result<(), SyncError> {
+        let mut router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        router.record_tcp_retransmit(path_id, count)
+    }
+
+    /// Record ISSP capsule retransmission event on a specific path.
+    pub fn record_issp_retransmit(&self, path_id: u32, count: u64) -> Result<(), SyncError> {
+        let mut router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        router.record_issp_retransmit(path_id, count)
+    }
+
     /// Retrieve real-time dynamic multipath balancing telemetry snapshot.
     pub fn multipath_balancing_snapshot(
         &self,
         timestamp_unix_ns: u64,
     ) -> Result<crate::telemetry::IsspMultipathBalancingSnapshot, SyncError> {
-        let router = self
-            .multipath_router
-            .lock()
-            .map_err(|_| SyncError::LockPoisoned)?;
-        Ok(router.balancing_snapshot(timestamp_unix_ns))
+        crate::telemetry::IsspMultipathBalancingSnapshot::from_registry(self, timestamp_unix_ns)
     }
 
     /// Handle an HTTP metrics endpoint request (`/metrics`, `/v1/metrics`, `/healthz`) for dynamic multipath balancing telemetry.

@@ -128,6 +128,119 @@ pub fn supervise_command(cmd: &mut Command) -> std::io::Result<(ExitStatus, Reso
 
 // ─── Dynamic Multipath ISSP Balancing Telemetry & Exporters ─────────────────
 
+/// Standard latency bucket thresholds in seconds for network interfaces and sessions:
+/// 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s.
+pub const DEFAULT_LATENCY_BUCKETS_SECONDS: [f64; 10] = [
+    0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500,
+];
+
+/// Cumulative latency histogram tracking round-trip and transmission latencies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LatencyHistogram {
+    /// Upper bounds for each cumulative bucket in seconds.
+    pub buckets: Vec<f64>,
+    /// Cumulative counts for each bucket.
+    pub cumulative_counts: Vec<u64>,
+    /// Total count of all observed samples.
+    pub count: u64,
+    /// Sum of all observed sample durations in seconds.
+    pub sum_seconds: f64,
+    /// Minimum observed sample in seconds.
+    pub min_seconds: f64,
+    /// Maximum observed sample in seconds.
+    pub max_seconds: f64,
+}
+
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl LatencyHistogram {
+    /// Create a new latency histogram with custom bucket thresholds or defaults.
+    pub fn new(buckets: Option<&[f64]>) -> Self {
+        let b = match buckets {
+            Some(custom) => custom.to_vec(),
+            None => DEFAULT_LATENCY_BUCKETS_SECONDS.to_vec(),
+        };
+        let len = b.len();
+        Self {
+            buckets: b,
+            cumulative_counts: vec![0; len],
+            count: 0,
+            sum_seconds: 0.0,
+            min_seconds: f64::INFINITY,
+            max_seconds: 0.0,
+        }
+    }
+
+    /// Record a single latency observation in seconds.
+    pub fn observe(&mut self, sample_seconds: f64) {
+        if sample_seconds.is_nan() || sample_seconds < 0.0 {
+            return;
+        }
+        self.count = self.count.saturating_add(1);
+        self.sum_seconds += sample_seconds;
+        if sample_seconds < self.min_seconds {
+            self.min_seconds = sample_seconds;
+        }
+        if sample_seconds > self.max_seconds {
+            self.max_seconds = sample_seconds;
+        }
+        for (idx, &bound) in self.buckets.iter().enumerate() {
+            if sample_seconds <= bound {
+                self.cumulative_counts[idx] = self.cumulative_counts[idx].saturating_add(1);
+            }
+        }
+    }
+
+    /// Record a single latency observation in microseconds.
+    pub fn observe_us(&mut self, sample_us: u64) {
+        self.observe((sample_us as f64) / 1_000_000.0);
+    }
+
+    /// Merge another latency histogram into this one.
+    pub fn merge(&mut self, other: &LatencyHistogram) {
+        if other.count == 0 {
+            return;
+        }
+        self.count = self.count.saturating_add(other.count);
+        self.sum_seconds += other.sum_seconds;
+        if other.min_seconds < self.min_seconds {
+            self.min_seconds = other.min_seconds;
+        }
+        if other.max_seconds > self.max_seconds {
+            self.max_seconds = other.max_seconds;
+        }
+        if self.buckets == other.buckets {
+            for (idx, val) in other.cumulative_counts.iter().enumerate() {
+                if idx < self.cumulative_counts.len() {
+                    self.cumulative_counts[idx] = self.cumulative_counts[idx].saturating_add(*val);
+                }
+            }
+        }
+    }
+
+    /// Calculate mean latency in seconds. Returns 0.0 if count is 0.
+    pub fn mean_seconds(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum_seconds / (self.count as f64)
+        }
+    }
+
+    /// Safe minimum in seconds (0.0 if no observations recorded).
+    pub fn safe_min_seconds(&self) -> f64 {
+        if self.min_seconds.is_infinite() {
+            0.0
+        } else {
+            self.min_seconds
+        }
+    }
+}
+
 /// Telemetry metrics snapshot for dynamic multipath ISSP bandwidth balancing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IsspMultipathBalancingSnapshot {
@@ -145,6 +258,26 @@ pub struct IsspMultipathBalancingSnapshot {
     pub total_effective_weight: u32,
     /// Detailed balancing metrics per subpath.
     pub subpaths: Vec<IsspSubpathBalancingMetrics>,
+    /// Aggregated latency histograms indexed by network interface name (e.g. "eth0-wan", "wwan0-5g").
+    pub interface_latency_histograms: BTreeMap<String, LatencyHistogram>,
+    /// TCP retransmission ratio indexed by network interface name.
+    pub interface_tcp_retrans_ratios: BTreeMap<String, f64>,
+    /// ISSP retransmission ratio indexed by network interface name.
+    pub interface_issp_retrans_ratios: BTreeMap<String, f64>,
+    /// Total cluster sessions tracked.
+    pub total_sessions: usize,
+    /// Primary active sessions owned by local node.
+    pub primary_sessions: usize,
+    /// Standby shadow-replicated sessions.
+    pub standby_sessions: usize,
+    /// Total TCP retransmissions across all operational subpaths.
+    pub total_tcp_retransmissions: u64,
+    /// Total ISSP retransmissions across all operational subpaths.
+    pub total_issp_retransmissions: u64,
+    /// Aggregate TCP retransmission ratio across all operational subpaths.
+    pub aggregate_tcp_retrans_ratio: f64,
+    /// Aggregate ISSP retransmission ratio across all operational subpaths.
+    pub aggregate_issp_retrans_ratio: f64,
 }
 
 impl IsspMultipathBalancingSnapshot {
@@ -174,6 +307,70 @@ impl IsspMultipathBalancingSnapshot {
             }
         }
 
+        let mut iface_histograms: BTreeMap<String, LatencyHistogram> = BTreeMap::new();
+        let mut iface_tx_frames: BTreeMap<String, u64> = BTreeMap::new();
+        let mut iface_tcp_retrans: BTreeMap<String, u64> = BTreeMap::new();
+        let mut iface_issp_retrans: BTreeMap<String, u64> = BTreeMap::new();
+
+        let mut total_tcp_retrans: u64 = 0;
+        let mut total_issp_retrans: u64 = 0;
+        let mut total_tx_frames: u64 = 0;
+
+        for route in router.routes() {
+            let iface = route.interface_name.clone();
+            let tcp_ret = route.metrics.tcp_retrans_count;
+            let issp_ret = route.metrics.issp_retrans_count;
+            let frames_sent = route.metrics.total_frames_sent;
+
+            total_tcp_retrans = total_tcp_retrans.saturating_add(tcp_ret);
+            total_issp_retrans = total_issp_retrans.saturating_add(issp_ret);
+            total_tx_frames = total_tx_frames.saturating_add(frames_sent);
+
+            let cur_tx = iface_tx_frames.entry(iface.clone()).or_insert(0);
+            *cur_tx = cur_tx.saturating_add(frames_sent);
+
+            let cur_tcp = iface_tcp_retrans.entry(iface.clone()).or_insert(0);
+            *cur_tcp = cur_tcp.saturating_add(tcp_ret);
+
+            let cur_issp = iface_issp_retrans.entry(iface.clone()).or_insert(0);
+            *cur_issp = cur_issp.saturating_add(issp_ret);
+
+            iface_histograms
+                .entry(iface)
+                .or_default()
+                .merge(&route.metrics.latency_histogram);
+        }
+
+        let mut iface_tcp_ratios = BTreeMap::new();
+        let mut iface_issp_ratios = BTreeMap::new();
+        for (iface, frames) in &iface_tx_frames {
+            let tcp_ret = *iface_tcp_retrans.get(iface).unwrap_or(&0);
+            let issp_ret = *iface_issp_retrans.get(iface).unwrap_or(&0);
+            let tcp_r = if *frames == 0 {
+                0.0
+            } else {
+                (tcp_ret as f64) / (*frames as f64)
+            };
+            let issp_r = if *frames == 0 {
+                0.0
+            } else {
+                (issp_ret as f64) / (*frames as f64)
+            };
+            iface_tcp_ratios.insert(iface.clone(), tcp_r.clamp(0.0, 1.0));
+            iface_issp_ratios.insert(iface.clone(), issp_r.clamp(0.0, 1.0));
+        }
+
+        let agg_tcp_ratio = if total_tx_frames == 0 {
+            0.0
+        } else {
+            ((total_tcp_retrans as f64) / (total_tx_frames as f64)).clamp(0.0, 1.0)
+        };
+        let agg_issp_ratio = if total_tx_frames == 0 {
+            0.0
+        } else {
+            ((total_issp_retrans as f64) / (total_tx_frames as f64)).clamp(0.0, 1.0)
+        };
+
         let mut subpaths = Vec::with_capacity(router.routes().count());
         for route in router.routes() {
             let eff_w = route.effective_weight();
@@ -190,6 +387,13 @@ impl IsspMultipathBalancingSnapshot {
             } else {
                 route.congestion.bbr.rt_prop_us
             };
+
+            let tcp_ret = route.metrics.tcp_retrans_count;
+            let issp_ret = route.metrics.issp_retrans_count;
+            let tcp_ratio = route.metrics.tcp_retransmission_ratio();
+            let issp_ratio = route.metrics.issp_retransmission_ratio();
+            let total_ratio = route.metrics.total_retransmission_ratio();
+            let lat_hist = route.metrics.latency_histogram.clone();
 
             subpaths.push(IsspSubpathBalancingMetrics {
                 path_id: route.path_id,
@@ -214,6 +418,12 @@ impl IsspMultipathBalancingSnapshot {
                 bytes_in_flight: route.congestion.bytes_in_flight,
                 total_frames_sent: route.metrics.total_frames_sent,
                 total_frames_received: route.metrics.total_frames_received,
+                tcp_retrans_count: tcp_ret,
+                issp_retrans_count: issp_ret,
+                tcp_retrans_ratio: tcp_ratio,
+                issp_retrans_ratio: issp_ratio,
+                total_retrans_ratio: total_ratio,
+                latency_histogram: lat_hist,
             });
         }
 
@@ -225,7 +435,34 @@ impl IsspMultipathBalancingSnapshot {
             active_paths: usable_paths.len(),
             total_effective_weight: total_eff_w,
             subpaths,
+            interface_latency_histograms: iface_histograms,
+            interface_tcp_retrans_ratios: iface_tcp_ratios,
+            interface_issp_retrans_ratios: iface_issp_ratios,
+            total_sessions: 0,
+            primary_sessions: 0,
+            standby_sessions: 0,
+            total_tcp_retransmissions: total_tcp_retrans,
+            total_issp_retransmissions: total_issp_retrans,
+            aggregate_tcp_retrans_ratio: agg_tcp_ratio,
+            aggregate_issp_retrans_ratio: agg_issp_ratio,
         }
+    }
+
+    /// Capture a balancing snapshot from a `SessionRegistry`, enriching metrics with live session counts.
+    pub fn from_registry(
+        registry: &crate::session_sync::SessionRegistry,
+        timestamp_unix_ns: u64,
+    ) -> Result<Self, crate::session_sync::SyncError> {
+        let (total_s, primary_s, standby_s) = registry.session_counts()?;
+        let router = registry
+            .multipath_router
+            .lock()
+            .map_err(|_| crate::session_sync::SyncError::LockPoisoned)?;
+        let mut snap = Self::from_router(&router, timestamp_unix_ns);
+        snap.total_sessions = total_s;
+        snap.primary_sessions = primary_s;
+        snap.standby_sessions = standby_s;
+        Ok(snap)
     }
 
     /// Retrieve balancing metrics for a specific subpath ID if present.
@@ -291,6 +528,18 @@ pub struct IsspSubpathBalancingMetrics {
     pub total_frames_sent: u64,
     /// Total frames received across this subpath.
     pub total_frames_received: u64,
+    /// Cumulative count of TCP segment retransmissions detected on this subpath.
+    pub tcp_retrans_count: u64,
+    /// Cumulative count of ISSP datagram capsule retransmissions on this subpath.
+    pub issp_retrans_count: u64,
+    /// TCP retransmission ratio [0.0 - 1.0].
+    pub tcp_retrans_ratio: f64,
+    /// ISSP retransmission ratio [0.0 - 1.0].
+    pub issp_retrans_ratio: f64,
+    /// Total combined retransmission ratio [0.0 - 1.0].
+    pub total_retrans_ratio: f64,
+    /// Latency histogram distribution for this specific subpath.
+    pub latency_histogram: LatencyHistogram,
 }
 
 // ─── Prometheus Exposition Format 0.0.4 Exporter ────────────────────────────
@@ -360,6 +609,28 @@ impl PrometheusMultipathBalancingExporter {
         out.push_str(&format!(
             "ifa_issp_multipath_total_effective_weight{} {}\n",
             base_lbl, s.total_effective_weight
+        ));
+
+        // Cluster session metrics
+        out.push_str("# HELP ifa_session_total_sessions Total active sessions tracked in registry.\n");
+        out.push_str("# TYPE ifa_session_total_sessions gauge\n");
+        out.push_str(&format!(
+            "ifa_session_total_sessions{} {}\n",
+            base_lbl, s.total_sessions
+        ));
+
+        out.push_str("# HELP ifa_session_primary_sessions Primary active sessions owned by local node.\n");
+        out.push_str("# TYPE ifa_session_primary_sessions gauge\n");
+        out.push_str(&format!(
+            "ifa_session_primary_sessions{} {}\n",
+            base_lbl, s.primary_sessions
+        ));
+
+        out.push_str("# HELP ifa_session_standby_sessions Standby shadow-replicated sessions.\n");
+        out.push_str("# TYPE ifa_session_standby_sessions gauge\n");
+        out.push_str(&format!(
+            "ifa_session_standby_sessions{} {}\n",
+            base_lbl, s.standby_sessions
         ));
 
         // 2. Per-subpath metrics
@@ -620,6 +891,147 @@ impl PrometheusMultipathBalancingExporter {
                 out.push_str(&format!(
                     "ifa_issp_subpath_frames_received_total{} {}\n",
                     lbl, sp.total_frames_received
+                ));
+            }
+
+            // Subpath TCP Retransmissions Total
+            out.push_str("# HELP ifa_issp_subpath_tcp_retransmissions_total Total TCP segment retransmissions detected on subpath.\n");
+            out.push_str("# TYPE ifa_issp_subpath_tcp_retransmissions_total counter\n");
+            for sp in &s.subpaths {
+                let p_id = sp.path_id.to_string();
+                let lbl = self.format_labels(&[
+                    ("node_id", &node_str),
+                    ("path_id", &p_id),
+                    ("interface", &sp.interface_name),
+                    ("state", &sp.state),
+                    ("phase", &sp.congestion_phase),
+                ]);
+                out.push_str(&format!(
+                    "ifa_issp_subpath_tcp_retransmissions_total{} {}\n",
+                    lbl, sp.tcp_retrans_count
+                ));
+            }
+
+            // Subpath ISSP Retransmissions Total
+            out.push_str("# HELP ifa_issp_subpath_issp_retransmissions_total Total ISSP capsule retransmissions on subpath.\n");
+            out.push_str("# TYPE ifa_issp_subpath_issp_retransmissions_total counter\n");
+            for sp in &s.subpaths {
+                let p_id = sp.path_id.to_string();
+                let lbl = self.format_labels(&[
+                    ("node_id", &node_str),
+                    ("path_id", &p_id),
+                    ("interface", &sp.interface_name),
+                    ("state", &sp.state),
+                    ("phase", &sp.congestion_phase),
+                ]);
+                out.push_str(&format!(
+                    "ifa_issp_subpath_issp_retransmissions_total{} {}\n",
+                    lbl, sp.issp_retrans_count
+                ));
+            }
+
+            // Subpath TCP Retransmission Ratio
+            out.push_str("# HELP ifa_issp_subpath_tcp_retransmission_ratio Retransmission ratio for TCP traffic on subpath [0.0 - 1.0].\n");
+            out.push_str("# TYPE ifa_issp_subpath_tcp_retransmission_ratio gauge\n");
+            for sp in &s.subpaths {
+                let p_id = sp.path_id.to_string();
+                let lbl = self.format_labels(&[
+                    ("node_id", &node_str),
+                    ("path_id", &p_id),
+                    ("interface", &sp.interface_name),
+                    ("state", &sp.state),
+                    ("phase", &sp.congestion_phase),
+                ]);
+                out.push_str(&format!(
+                    "ifa_issp_subpath_tcp_retransmission_ratio{} {:.6}\n",
+                    lbl, sp.tcp_retrans_ratio
+                ));
+            }
+
+            // Subpath ISSP Retransmission Ratio
+            out.push_str("# HELP ifa_issp_subpath_issp_retransmission_ratio Retransmission ratio for ISSP traffic on subpath [0.0 - 1.0].\n");
+            out.push_str("# TYPE ifa_issp_subpath_issp_retransmission_ratio gauge\n");
+            for sp in &s.subpaths {
+                let p_id = sp.path_id.to_string();
+                let lbl = self.format_labels(&[
+                    ("node_id", &node_str),
+                    ("path_id", &p_id),
+                    ("interface", &sp.interface_name),
+                    ("state", &sp.state),
+                    ("phase", &sp.congestion_phase),
+                ]);
+                out.push_str(&format!(
+                    "ifa_issp_subpath_issp_retransmission_ratio{} {:.6}\n",
+                    lbl, sp.issp_retrans_ratio
+                ));
+            }
+        }
+
+        // 3. Interface Latency Histograms
+        if !s.interface_latency_histograms.is_empty() {
+            out.push_str("# HELP ifa_issp_interface_latency_seconds Latency histogram distribution per physical/virtual network interface.\n");
+            out.push_str("# TYPE ifa_issp_interface_latency_seconds histogram\n");
+            for (iface, hist) in &s.interface_latency_histograms {
+                for (idx, &bound) in hist.buckets.iter().enumerate() {
+                    let le_str = format!("{:.3}", bound);
+                    let lbl = self.format_labels(&[
+                        ("node_id", &node_str),
+                        ("interface", iface),
+                        ("le", &le_str),
+                    ]);
+                    out.push_str(&format!(
+                        "ifa_issp_interface_latency_seconds_bucket{} {}\n",
+                        lbl, hist.cumulative_counts[idx]
+                    ));
+                }
+                let inf_lbl = self.format_labels(&[
+                    ("node_id", &node_str),
+                    ("interface", iface),
+                    ("le", "+Inf"),
+                ]);
+                out.push_str(&format!(
+                    "ifa_issp_interface_latency_seconds_bucket{} {}\n",
+                    inf_lbl, hist.count
+                ));
+                let sum_lbl = self.format_labels(&[
+                    ("node_id", &node_str),
+                    ("interface", iface),
+                ]);
+                out.push_str(&format!(
+                    "ifa_issp_interface_latency_seconds_sum{} {:.6}\n",
+                    sum_lbl, hist.sum_seconds
+                ));
+                out.push_str(&format!(
+                    "ifa_issp_interface_latency_seconds_count{} {}\n",
+                    sum_lbl, hist.count
+                ));
+            }
+        }
+
+        // 4. Interface Retransmission Ratios
+        if !s.interface_tcp_retrans_ratios.is_empty() || !s.interface_issp_retrans_ratios.is_empty() {
+            out.push_str("# HELP ifa_session_interface_retransmission_ratio Retransmission ratio per network interface categorized by protocol (tcp or issp).\n");
+            out.push_str("# TYPE ifa_session_interface_retransmission_ratio gauge\n");
+            for (iface, ratio) in &s.interface_tcp_retrans_ratios {
+                let lbl = self.format_labels(&[
+                    ("node_id", &node_str),
+                    ("interface", iface),
+                    ("protocol", "tcp"),
+                ]);
+                out.push_str(&format!(
+                    "ifa_session_interface_retransmission_ratio{} {:.6}\n",
+                    lbl, ratio
+                ));
+            }
+            for (iface, ratio) in &s.interface_issp_retrans_ratios {
+                let lbl = self.format_labels(&[
+                    ("node_id", &node_str),
+                    ("interface", iface),
+                    ("protocol", "issp"),
+                ]);
+                out.push_str(&format!(
+                    "ifa_session_interface_retransmission_ratio{} {:.6}\n",
+                    lbl, ratio
                 ));
             }
         }
@@ -1020,6 +1432,162 @@ impl OtelMultipathBalancingExporter {
             ),
             ce_dps.join(",\n")
         ));
+
+        // 10. Sessions count gauge
+        metric_entries.push(format!(
+            concat!(
+                "            {{\n",
+                "              \"name\": \"ifa.session.total_sessions\",\n",
+                "              \"description\": \"Total active sessions tracked in registry\",\n",
+                "              \"unit\": \"1\",\n",
+                "              \"gauge\": {{\n",
+                "                \"dataPoints\": [\n",
+                "                  {{\n",
+                "                    \"timeUnixNano\": \"{}\",\n",
+                "                    \"asInt\": \"{}\",\n",
+                "                    \"attributes\": [\n",
+                "                      {{\"key\": \"node_id\", \"value\": {{\"stringValue\": \"{}\"}}}},\n",
+                "                      {{\"key\": \"policy\", \"value\": {{\"stringValue\": \"{}\"}}}}\n",
+                "                    ]\n",
+                "                  }}\n",
+                "                ]\n",
+                "              }}\n",
+                "            }}"
+            ),
+            ts_str, s.total_sessions, node_str, escape_json_str(&s.routing_policy)
+        ));
+
+        // 11. Subpath TCP retransmission ratio
+        let tcp_ratio_dps: Vec<String> = s
+            .subpaths
+            .iter()
+            .map(|sp| {
+                format!(
+                    concat!(
+                        "                  {{\n",
+                        "                    \"timeUnixNano\": \"{}\",\n",
+                        "                    \"asDouble\": {:.6},\n",
+                        "                    \"attributes\": [\n{}\n",
+                        "                    ]\n",
+                        "                  }}"
+                    ),
+                    ts_str,
+                    sp.tcp_retrans_ratio,
+                    subpath_attrs(sp)
+                )
+            })
+            .collect();
+        metric_entries.push(format!(
+            concat!(
+                "            {{\n",
+                "              \"name\": \"ifa.issp.subpath.tcp_retransmission_ratio\",\n",
+                "              \"description\": \"TCP retransmission ratio on subpath\",\n",
+                "              \"unit\": \"1\",\n",
+                "              \"gauge\": {{\n",
+                "                \"dataPoints\": [\n{}\n",
+                "                ]\n",
+                "              }}\n",
+                "            }}"
+            ),
+            tcp_ratio_dps.join(",\n")
+        ));
+
+        // 12. Subpath ISSP retransmission ratio
+        let issp_ratio_dps: Vec<String> = s
+            .subpaths
+            .iter()
+            .map(|sp| {
+                format!(
+                    concat!(
+                        "                  {{\n",
+                        "                    \"timeUnixNano\": \"{}\",\n",
+                        "                    \"asDouble\": {:.6},\n",
+                        "                    \"attributes\": [\n{}\n",
+                        "                    ]\n",
+                        "                  }}"
+                    ),
+                    ts_str,
+                    sp.issp_retrans_ratio,
+                    subpath_attrs(sp)
+                )
+            })
+            .collect();
+        metric_entries.push(format!(
+            concat!(
+                "            {{\n",
+                "              \"name\": \"ifa.issp.subpath.issp_retransmission_ratio\",\n",
+                "              \"description\": \"ISSP capsule retransmission ratio on subpath\",\n",
+                "              \"unit\": \"1\",\n",
+                "              \"gauge\": {{\n",
+                "                \"dataPoints\": [\n{}\n",
+                "                ]\n",
+                "              }}\n",
+                "            }}"
+            ),
+            issp_ratio_dps.join(",\n")
+        ));
+
+        // 13. Interface Latency Histograms
+        if !s.interface_latency_histograms.is_empty() {
+            let mut hist_dps = Vec::new();
+            for (iface, hist) in &s.interface_latency_histograms {
+                let bounds_str = hist
+                    .buckets
+                    .iter()
+                    .map(|b| format!("{:.6}", b))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let counts_str = hist
+                    .cumulative_counts
+                    .iter()
+                    .map(|c| format!("\"{}\"", c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                hist_dps.push(format!(
+                    concat!(
+                        "                  {{\n",
+                        "                    \"timeUnixNano\": \"{}\",\n",
+                        "                    \"count\": \"{}\",\n",
+                        "                    \"sum\": {:.6},\n",
+                        "                    \"bucketCounts\": [{}],\n",
+                        "                    \"explicitBounds\": [{}],\n",
+                        "                    \"min\": {:.6},\n",
+                        "                    \"max\": {:.6},\n",
+                        "                    \"attributes\": [\n",
+                        "                      {{\"key\": \"node_id\", \"value\": {{\"stringValue\": \"{}\"}}}},\n",
+                        "                      {{\"key\": \"interface\", \"value\": {{\"stringValue\": \"{}\"}}}}\n",
+                        "                    ]\n",
+                        "                  }}"
+                    ),
+                    ts_str,
+                    hist.count,
+                    hist.sum_seconds,
+                    counts_str,
+                    bounds_str,
+                    hist.safe_min_seconds(),
+                    hist.max_seconds,
+                    node_str,
+                    escape_json_str(iface)
+                ));
+            }
+
+            metric_entries.push(format!(
+                concat!(
+                    "            {{\n",
+                    "              \"name\": \"ifa.issp.interface.latency\",\n",
+                    "              \"description\": \"Round-trip latency distribution per network interface\",\n",
+                    "              \"unit\": \"s\",\n",
+                    "              \"histogram\": {{\n",
+                    "                \"aggregationTemporality\": 2,\n",
+                    "                \"dataPoints\": [\n{}\n",
+                    "                ]\n",
+                    "              }}\n",
+                    "            }}"
+                ),
+                hist_dps.join(",\n")
+            ));
+        }
 
         out.push_str(&metric_entries.join(",\n"));
         out.push_str("\n          ]\n");
@@ -1566,6 +2134,8 @@ fn snapshot_to_compact_json(s: &IsspMultipathBalancingSnapshot) -> String {
     out.push_str(&s.active_paths.to_string());
     out.push_str(",\"total_eff_w\":");
     out.push_str(&s.total_effective_weight.to_string());
+    out.push_str(",\"sessions\":");
+    out.push_str(&s.total_sessions.to_string());
     out.push_str(",\"subpaths\":[");
     for (i, sp) in s.subpaths.iter().enumerate() {
         if i > 0 {
@@ -1585,6 +2155,10 @@ fn snapshot_to_compact_json(s: &IsspMultipathBalancingSnapshot) -> String {
         out.push_str(&sp.rtt_us.to_string());
         out.push_str(",\"bbr_bps\":");
         out.push_str(&sp.bbr_bw_bps.to_string());
+        out.push_str(",\"tcp_ratio\":");
+        out.push_str(&format!("{:.4}", sp.tcp_retrans_ratio));
+        out.push_str(",\"issp_ratio\":");
+        out.push_str(&format!("{:.4}", sp.issp_retrans_ratio));
         out.push_str(",\"phase\":\"");
         out.push_str(&escape_json_str(&sp.congestion_phase));
         out.push_str("\"}");
@@ -1598,6 +2172,7 @@ mod tests {
     use super::*;
     use crate::session_sync::{
         IsspDynamicMultipathRouter, IsspMultipathRoute, IsspRoutingPolicy, SessionRegistry,
+        SessionSnapshot,
     };
 
     #[test]
@@ -2111,5 +2686,133 @@ mod tests {
         let (frames, path) = res2.expect("expected WS connection served");
         assert_eq!(frames, 1);
         assert_eq!(path, "/ws/metrics");
+    }
+
+    #[test]
+    fn test_latency_histogram_observe_and_merge() {
+        let mut h1 = LatencyHistogram::default();
+        assert_eq!(h1.count, 0);
+        assert_eq!(h1.mean_seconds(), 0.0);
+        assert_eq!(h1.safe_min_seconds(), 0.0);
+
+        // Observe 2ms (0.002s), 15ms (0.015s), 60ms (0.060s)
+        h1.observe(0.002);
+        h1.observe(0.015);
+        h1.observe_us(60_000); // 60ms
+
+        assert_eq!(h1.count, 3);
+        assert!((h1.safe_min_seconds() - 0.002).abs() < 1e-6);
+        assert!((h1.max_seconds - 0.060).abs() < 1e-6);
+        assert!((h1.mean_seconds() - (0.077 / 3.0)).abs() < 1e-6);
+
+        // Bucket checks:
+        // 0.001 (1ms) -> 0
+        assert_eq!(h1.cumulative_counts[0], 0);
+        // 0.005 (5ms) -> 1 (0.002s)
+        assert_eq!(h1.cumulative_counts[1], 1);
+        // 0.025 (25ms) -> 2 (0.002s, 0.015s)
+        assert_eq!(h1.cumulative_counts[3], 2);
+        // 0.100 (100ms) -> 3 (all three)
+        assert_eq!(h1.cumulative_counts[5], 3);
+
+        // Merge another histogram
+        let mut h2 = LatencyHistogram::default();
+        h2.observe(0.0005); // 0.5ms
+        h2.observe(0.300); // 300ms
+
+        h1.merge(&h2);
+        assert_eq!(h1.count, 5);
+        assert!((h1.safe_min_seconds() - 0.0005).abs() < 1e-6);
+        assert!((h1.max_seconds - 0.300).abs() < 1e-6);
+        // 0.001 bucket now has 1
+        assert_eq!(h1.cumulative_counts[0], 1);
+    }
+
+    #[test]
+    fn test_interface_latency_histograms_and_retransmissions() {
+        let reg = SessionRegistry::new(10);
+        reg.set_multipath_routing_policy(IsspRoutingPolicy::BandwidthAggregation)
+            .unwrap();
+
+        let mut r1 = IsspMultipathRoute::new(1, 2, "eth0-wan", 1, 100);
+        r1.metrics.total_frames_sent = 1000;
+        r1.metrics.record_tcp_retransmit(25);
+        r1.metrics.record_issp_retransmit(5);
+        r1.record_latency_sample(12_000); // 12ms
+        r1.record_latency_sample(18_000); // 18ms
+
+        let mut r2 = IsspMultipathRoute::new(2, 2, "wwan0-5g", 2, 50);
+        r2.metrics.total_frames_sent = 500;
+        r2.metrics.record_tcp_retransmit(40);
+        r2.metrics.record_issp_retransmit(10);
+        r2.record_latency_sample(45_000); // 45ms
+
+        reg.add_multipath_route(r1).unwrap();
+        reg.add_multipath_route(r2).unwrap();
+
+        // Register dummy sessions to test session counting
+        let s1 = SessionSnapshot::new(
+            crate::session_sync::SessionId::new(1, 10, 1),
+            1,
+            1000,
+        );
+        let s2 = SessionSnapshot::new(
+            crate::session_sync::SessionId::new(2, 10, 2),
+            1,
+            1000,
+        );
+        reg.upsert_primary(s1).unwrap();
+        reg.upsert_primary(s2).unwrap();
+
+        let snap = reg.multipath_balancing_snapshot(0).unwrap();
+        assert_eq!(snap.total_sessions, 2);
+        assert_eq!(snap.primary_sessions, 2);
+        assert_eq!(snap.standby_sessions, 0);
+
+        // Subpath retransmission checks
+        let sp1 = snap.subpath(1).unwrap();
+        assert_eq!(sp1.tcp_retrans_count, 25);
+        assert_eq!(sp1.issp_retrans_count, 5);
+        assert!((sp1.tcp_retrans_ratio - 0.025).abs() < 1e-4);
+        assert!((sp1.issp_retrans_ratio - 0.005).abs() < 1e-4);
+        assert!((sp1.total_retrans_ratio - 0.030).abs() < 1e-4);
+
+        let sp2 = snap.subpath(2).unwrap();
+        assert_eq!(sp2.tcp_retrans_count, 40);
+        assert_eq!(sp2.issp_retrans_count, 10);
+        assert!((sp2.tcp_retrans_ratio - 0.080).abs() < 1e-4);
+        assert!((sp2.issp_retrans_ratio - 0.020).abs() < 1e-4);
+
+        // Interface latency histograms
+        let eth0_hist = snap
+            .interface_latency_histograms
+            .get("eth0-wan")
+            .expect("eth0-wan histogram");
+        assert_eq!(eth0_hist.count, 2);
+        let wwan_hist = snap
+            .interface_latency_histograms
+            .get("wwan0-5g")
+            .expect("wwan0-5g histogram");
+        assert_eq!(wwan_hist.count, 1);
+
+        // Test Prometheus export
+        let prom = snap.export_prometheus();
+        assert!(prom.contains("# HELP ifa_session_total_sessions"));
+        assert!(prom.contains("ifa_session_total_sessions"));
+        assert!(prom.contains("# HELP ifa_issp_interface_latency_seconds"));
+        assert!(prom.contains("ifa_issp_interface_latency_seconds_bucket{"));
+        assert!(prom.contains("interface=\"eth0-wan\""));
+        assert!(prom.contains("ifa_issp_interface_latency_seconds_count{"));
+        assert!(prom.contains("# HELP ifa_issp_subpath_tcp_retransmission_ratio"));
+        assert!(prom.contains("ifa_issp_subpath_tcp_retransmission_ratio{"));
+        assert!(prom.contains("# HELP ifa_session_interface_retransmission_ratio"));
+        assert!(prom.contains("ifa_session_interface_retransmission_ratio{"));
+        assert!(prom.contains("protocol=\"tcp\""));
+
+        // Test OTLP export
+        let otlp = snap.export_otlp_json("test-service");
+        assert!(otlp.contains("\"ifa.session.total_sessions\""));
+        assert!(otlp.contains("\"ifa.issp.subpath.tcp_retransmission_ratio\""));
+        assert!(otlp.contains("\"ifa.issp.interface.latency\""));
     }
 }

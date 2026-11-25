@@ -67,8 +67,11 @@ All metrics emitted by IFA ISSP multipath conform to Prometheus 0.0.4 text expos
 | `ifa_issp_multipath_total_paths` | `gauge` | `node_id`, `policy` | Total configured subpaths in the registry, including dormant routes. |
 | `ifa_issp_multipath_active_paths` | `gauge` | `node_id`, `policy` | Number of operational subpaths currently eligible for packet distribution. |
 | `ifa_issp_multipath_total_effective_weight` | `gauge` | `node_id`, `policy` | Aggregate scheduling weight across all usable subpaths. |
+| `ifa_session_total_sessions` | `gauge` | `node_id`, `policy` | Total active sessions tracked in cluster registry. |
+| `ifa_session_primary_sessions` | `gauge` | `node_id`, `policy` | Primary active sessions owned by local node. |
+| `ifa_session_standby_sessions` | `gauge` | `node_id`, `policy` | Standby shadow-replicated sessions awaiting failover. |
 
-### 2.2 Per-Subpath Gauges & Counters
+### 2.2 Per-Subpath Gauges, Counters & Retransmissions
 
 All per-subpath metrics share the label set: `node_id`, `path_id`, `interface`, `state`, `phase`.
 
@@ -88,6 +91,19 @@ All per-subpath metrics share the label set: `node_id`, `path_id`, `interface`, 
 | `ifa_issp_subpath_bytes_in_flight` | `gauge` | `bytes` | Current unacknowledged bytes in flight across the subpath. |
 | `ifa_issp_subpath_frames_sent_total` | `counter` | `frames` | Total datagram frames transmitted across the interface. |
 | `ifa_issp_subpath_frames_received_total` | `counter` | `frames` | Total datagram frames acknowledged and received. |
+| `ifa_issp_subpath_tcp_retransmissions_total` | `counter` | `segments` | Total TCP segment retransmissions detected on subpath. |
+| `ifa_issp_subpath_issp_retransmissions_total` | `counter` | `capsules` | Total ISSP datagram capsule retransmissions on subpath. |
+| `ifa_issp_subpath_tcp_retransmission_ratio` | `gauge` | `[0.0 - 1.0]` | Ratio of TCP retransmissions to total frames on subpath. |
+| `ifa_issp_subpath_issp_retransmission_ratio` | `gauge` | `[0.0 - 1.0]` | Ratio of ISSP retransmissions to total frames on subpath. |
+
+### 2.3 Interface Latency Histograms & Protocol Retransmission Ratios
+
+| Metric Name | Type | Labels | Description |
+|---|---|---|---|
+| `ifa_issp_interface_latency_seconds_bucket` | `histogram` | `node_id`, `interface`, `le` | Cumulative latency bucket counts (1ms to 2.5s +Inf) per network interface. |
+| `ifa_issp_interface_latency_seconds_sum` | `histogram` | `node_id`, `interface` | Sum of observed latency durations in seconds. |
+| `ifa_issp_interface_latency_seconds_count` | `histogram` | `node_id`, `interface` | Total count of latency observations recorded on interface. |
+| `ifa_session_interface_retransmission_ratio` | `gauge` | `node_id`, `interface`, `protocol` | Retransmission ratio per interface categorized by protocol (`tcp` or `issp`). |
 
 ---
 
