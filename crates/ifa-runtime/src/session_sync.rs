@@ -2311,6 +2311,7 @@ pub struct IsspDynamicMultipathRouter {
     pub cspf_group: Option<crate::topology_cspf::CspfMultipathGroup>,
     pub constraint_config: SubpathConstraintConfig,
     pub constraint_metrics: SubpathConstraintMetrics,
+    pub flow_slicing: crate::traffic_slicing::FlowSliceNegotiator,
 }
 
 impl IsspDynamicMultipathRouter {
@@ -2339,6 +2340,7 @@ impl IsspDynamicMultipathRouter {
             cspf_group: None,
             constraint_config: SubpathConstraintConfig::default(),
             constraint_metrics: SubpathConstraintMetrics::default(),
+            flow_slicing: crate::traffic_slicing::FlowSliceNegotiator::new(),
         }
     }
 
@@ -2522,6 +2524,31 @@ impl IsspDynamicMultipathRouter {
         session_id: &SessionId,
         _now_ms: u64,
     ) -> Result<u32, SyncError> {
+        // If a flow QoS slice assignment exists and path is usable, steer to sliced subpath
+        if let Some(assignment) = self.flow_slicing.get_assignment(session_id) {
+            let pid = assignment.assigned_path_id;
+            if let Some(route) = self.paths.get(&pid) {
+                if route.state.is_usable() {
+                    return Ok(pid);
+                }
+            }
+        } else if self.flow_slicing.get_profile(session_id).is_some() {
+            let caps = self.snapshot_subpath_qos_capabilities(None);
+            if let Ok(assignment) = self
+                .flow_slicing
+                .negotiate_slice(session_id, &caps, _now_ms)
+            {
+                let pid = assignment.assigned_path_id;
+                if let Some(r) = self.paths.get_mut(&pid) {
+                    if r.state == IsspPathState::Standby {
+                        r.state = IsspPathState::Active;
+                    }
+                    self.session_bindings.insert(*session_id, pid);
+                    return Ok(pid);
+                }
+            }
+        }
+
         // If already bound to a usable path, maintain affinity
         if let Some(&pid) = self.session_bindings.get(session_id) {
             if let Some(route) = self.paths.get(&pid) {
@@ -3238,7 +3265,82 @@ impl IsspDynamicMultipathRouter {
             }
         }
 
+        // Renegotiate flow slices after any subpath state alterations
+        let _ = self.evaluate_flow_slices(now_ms, measured_throughput_bps);
+
         failovers
+    }
+
+    /// Register a Flow QoS profile for dynamic subpath slicing.
+    pub fn register_flow_qos_profile(
+        &mut self,
+        session_id: SessionId,
+        profile: crate::traffic_slicing::FlowQoSProfile,
+    ) {
+        self.flow_slicing.register_profile(session_id, profile);
+    }
+
+    /// Unregister a Flow QoS profile.
+    pub fn unregister_flow_qos_profile(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Option<crate::traffic_slicing::FlowQoSProfile> {
+        self.flow_slicing.unregister_flow(session_id)
+    }
+
+    /// Access active flow slice assignment for a session.
+    pub fn flow_slice_assignment(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<&crate::traffic_slicing::FlowSliceAssignment> {
+        self.flow_slicing.get_assignment(session_id)
+    }
+
+    /// Snapshot live subpath QoS capabilities from active routes.
+    pub fn snapshot_subpath_qos_capabilities(
+        &self,
+        measured_throughput_bps: Option<&HashMap<u32, u64>>,
+    ) -> Vec<crate::traffic_slicing::SubpathQoSCapability> {
+        self.paths
+            .values()
+            .map(|route| {
+                let measured = measured_throughput_bps.and_then(|m| m.get(&route.path_id).copied());
+                let cap_bytes = self.subpath_capacity_bps(route.path_id);
+                let cap_bps = cap_bytes.saturating_mul(8);
+                crate::traffic_slicing::SubpathQoSCapability::from_route(route, cap_bps, measured)
+            })
+            .collect()
+    }
+
+    /// Negotiate subpath assignment for a flow QoS profile.
+    pub fn negotiate_flow_slice(
+        &mut self,
+        session_id: &SessionId,
+        now_ms: u64,
+        measured_throughput_bps: Option<&HashMap<u32, u64>>,
+    ) -> Result<crate::traffic_slicing::FlowSliceAssignment, crate::traffic_slicing::FlowSlicingError>
+    {
+        let caps = self.snapshot_subpath_qos_capabilities(measured_throughput_bps);
+        let assignment = self
+            .flow_slicing
+            .negotiate_slice(session_id, &caps, now_ms)?;
+        self.session_bindings
+            .insert(*session_id, assignment.assigned_path_id);
+        Ok(assignment)
+    }
+
+    /// Re-evaluate live telemetry against active flow QoS slices and migrate flows whose SLA is breached.
+    pub fn evaluate_flow_slices(
+        &mut self,
+        now_ms: u64,
+        measured_throughput_bps: Option<&HashMap<u32, u64>>,
+    ) -> Vec<crate::traffic_slicing::FlowSliceMigrationEvent> {
+        let caps = self.snapshot_subpath_qos_capabilities(measured_throughput_bps);
+        let migrations = self.flow_slicing.evaluate_and_renegotiate(&caps, now_ms);
+        for m in &migrations {
+            self.session_bindings.insert(m.session_id, m.to_path_id);
+        }
+        migrations
     }
 
     /// Return an iterator over all registered routes.

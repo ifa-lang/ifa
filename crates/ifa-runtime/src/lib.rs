@@ -19,6 +19,7 @@ pub mod string;
 pub mod telemetry;
 pub mod telemetry_queue;
 pub mod topology_cspf;
+pub mod traffic_slicing;
 pub mod wasi;
 pub mod zstd_archive;
 
@@ -146,6 +147,11 @@ pub use telemetry_queue::{
 pub use topology_cspf::{
     cspf_k_disjoint_paths, cspf_k_shortest_paths, topology_graph_from_snapshot, CspfConstraints,
     CspfMultipathGroup, CspfPath, DisjointMode, NodeId, TopoEdge, TopologyGraph,
+};
+pub use traffic_slicing::{
+    FlowQoSProfile, FlowSliceAssignment, FlowSliceClass, FlowSliceMigrationEvent,
+    FlowSliceNegotiator, FlowSlicingError, FlowSlicingMetrics, SliceMigrationReason,
+    SubpathQoSCapability,
 };
 pub use wasi::*;
 pub use zstd_archive::{

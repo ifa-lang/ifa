@@ -351,6 +351,12 @@ pub struct IsspMultipathBalancingSnapshot {
     pub last_cutover_latency_us: f64,
     /// Optional CSPF topological resilience snapshot.
     pub cspf_resilience: Option<CspfResilienceSnapshot>,
+    /// Total dynamic flow slice migrations across subpaths.
+    pub total_slice_migrations: u64,
+    /// Active flows partitioned by slice class name.
+    pub active_flows_by_slice: BTreeMap<String, usize>,
+    /// Accumulated SLA violations partitioned by slice class name.
+    pub sla_violations_by_slice: BTreeMap<String, u64>,
 }
 
 impl IsspMultipathBalancingSnapshot {
@@ -554,6 +560,43 @@ impl IsspMultipathBalancingSnapshot {
             max_observed_jitter_us: router.subpath_constraint_metrics().max_observed_jitter_us,
             last_cutover_latency_us: router.subpath_constraint_metrics().last_cutover_latency_us,
             cspf_resilience: router.cspf_group().map(CspfResilienceSnapshot::from_group),
+            total_slice_migrations: router.flow_slicing.metrics().total_slice_migrations,
+            active_flows_by_slice: {
+                let mut m = BTreeMap::new();
+                for class in &[
+                    crate::traffic_slicing::FlowSliceClass::UltraLowLatency,
+                    crate::traffic_slicing::FlowSliceClass::HighThroughput,
+                    crate::traffic_slicing::FlowSliceClass::MissionCritical,
+                    crate::traffic_slicing::FlowSliceClass::BestEffort,
+                ] {
+                    m.insert(
+                        class.as_str().to_string(),
+                        router.flow_slicing.active_flows_in_slice(*class),
+                    );
+                }
+                m
+            },
+            sla_violations_by_slice: {
+                let mut m = BTreeMap::new();
+                for class in &[
+                    crate::traffic_slicing::FlowSliceClass::UltraLowLatency,
+                    crate::traffic_slicing::FlowSliceClass::HighThroughput,
+                    crate::traffic_slicing::FlowSliceClass::MissionCritical,
+                    crate::traffic_slicing::FlowSliceClass::BestEffort,
+                ] {
+                    m.insert(
+                        class.as_str().to_string(),
+                        router
+                            .flow_slicing
+                            .metrics()
+                            .sla_violations
+                            .get(class)
+                            .copied()
+                            .unwrap_or(0),
+                    );
+                }
+                m
+            },
         }
     }
 
@@ -1379,6 +1422,36 @@ impl PrometheusMultipathBalancingExporter {
             "ifa_mesh_subpath_last_cutover_latency_microseconds{} {:.6}\n",
             base_lbl, s.last_cutover_latency_us
         ));
+
+        // Flow Slicing Metrics
+        out.push_str(
+            "# HELP ifa_traffic_slice_migrations_total Dynamic subpath slice migrations.\n",
+        );
+        out.push_str("# TYPE ifa_traffic_slice_migrations_total counter\n");
+        out.push_str(&format!(
+            "ifa_traffic_slice_migrations_total{} {}\n",
+            base_lbl, s.total_slice_migrations
+        ));
+
+        out.push_str("# HELP ifa_traffic_slice_active_flows Current active flows partitioned by slice class.\n");
+        out.push_str("# TYPE ifa_traffic_slice_active_flows gauge\n");
+        for (slice_name, count) in &s.active_flows_by_slice {
+            let slice_lbl = self.format_labels(&[("node_id", &node_str), ("slice", slice_name)]);
+            out.push_str(&format!(
+                "ifa_traffic_slice_active_flows{} {}\n",
+                slice_lbl, count
+            ));
+        }
+
+        out.push_str("# HELP ifa_traffic_slice_sla_violations_total SLA violations accumulated per slice class.\n");
+        out.push_str("# TYPE ifa_traffic_slice_sla_violations_total counter\n");
+        for (slice_name, count) in &s.sla_violations_by_slice {
+            let slice_lbl = self.format_labels(&[("node_id", &node_str), ("slice", slice_name)]);
+            out.push_str(&format!(
+                "ifa_traffic_slice_sla_violations_total{} {}\n",
+                slice_lbl, count
+            ));
+        }
 
         out
     }
