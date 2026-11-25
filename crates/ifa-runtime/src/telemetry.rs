@@ -3121,6 +3121,1158 @@ impl AlertFailoverPolicy {
     }
 }
 
+// ─── Multi-Node Mesh Topology Synthesis & Grafana Supervisor ─────────────
+
+/// Node operational information within a synthesized multi-node mesh topology.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspMeshNodeInfo {
+    /// Unique cluster node identifier.
+    pub node_id: u32,
+    /// Human-readable node name or hostname (e.g. "ifa-gateway-eu1").
+    pub node_name: String,
+    /// Operational role in the mesh ("gateway", "relay", "worker", "edge", "ingress", "egress").
+    pub role: String,
+    /// Network endpoint or advertised address (e.g. "10.0.1.10:9090").
+    pub endpoint: String,
+    /// Operational status string ("healthy", "degraded", "offline").
+    pub status: String,
+    /// Number of active transport subpaths configured on this node.
+    pub active_paths: usize,
+    /// Total active multipath sessions currently tracked by this node.
+    pub total_sessions: usize,
+    /// Instantaneous outbound throughput in bytes per second.
+    pub tx_bytes_per_sec: f64,
+    /// Instantaneous inbound throughput in bytes per second.
+    pub rx_bytes_per_sec: f64,
+    /// Average round-trip time latency across all active subpaths in milliseconds.
+    pub avg_latency_ms: f64,
+    /// TCP retransmission ratio observed on this node [0.0 - 1.0].
+    pub tcp_retrans_ratio: f64,
+    /// ISSP retransmission ratio observed on this node [0.0 - 1.0].
+    pub issp_retrans_ratio: f64,
+    /// Unix timestamp in nanoseconds of the most recent heartbeat/snapshot received from this node.
+    pub last_heartbeat_unix_ns: u64,
+    /// Whether this node is currently considered operational and healthy.
+    pub is_healthy: bool,
+}
+
+impl IsspMeshNodeInfo {
+    /// Create a new node representation in the mesh topology.
+    pub fn new(node_id: u32, node_name: &str, role: &str, endpoint: &str) -> Self {
+        Self {
+            node_id,
+            node_name: node_name.to_string(),
+            role: role.to_string(),
+            endpoint: endpoint.to_string(),
+            status: "healthy".to_string(),
+            active_paths: 0,
+            total_sessions: 0,
+            tx_bytes_per_sec: 0.0,
+            rx_bytes_per_sec: 0.0,
+            avg_latency_ms: 0.0,
+            tcp_retrans_ratio: 0.0,
+            issp_retrans_ratio: 0.0,
+            last_heartbeat_unix_ns: 0,
+            is_healthy: true,
+        }
+    }
+
+    /// Set session metrics for this node.
+    pub fn with_sessions(mut self, sessions: usize, active_paths: usize) -> Self {
+        self.total_sessions = sessions;
+        self.active_paths = active_paths;
+        self
+    }
+
+    /// Set network throughput in bytes per second.
+    pub fn with_throughput(mut self, tx_bps: f64, rx_bps: f64) -> Self {
+        self.tx_bytes_per_sec = tx_bps;
+        self.rx_bytes_per_sec = rx_bps;
+        self
+    }
+
+    /// Set average latency and retransmission ratios.
+    pub fn with_quality(
+        mut self,
+        avg_latency_ms: f64,
+        tcp_retrans: f64,
+        issp_retrans: f64,
+    ) -> Self {
+        self.avg_latency_ms = avg_latency_ms;
+        self.tcp_retrans_ratio = tcp_retrans;
+        self.issp_retrans_ratio = issp_retrans;
+        self
+    }
+
+    /// Set health state and status string.
+    pub fn with_health(mut self, is_healthy: bool, status: &str) -> Self {
+        self.is_healthy = is_healthy;
+        self.status = status.to_string();
+        self
+    }
+
+    /// Format node details as compact JSON.
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "    {{\n",
+                "      \"node_id\": {},\n",
+                "      \"node_name\": \"{}\",\n",
+                "      \"role\": \"{}\",\n",
+                "      \"endpoint\": \"{}\",\n",
+                "      \"status\": \"{}\",\n",
+                "      \"active_paths\": {},\n",
+                "      \"total_sessions\": {},\n",
+                "      \"tx_bytes_per_sec\": {:.2},\n",
+                "      \"rx_bytes_per_sec\": {:.2},\n",
+                "      \"avg_latency_ms\": {:.3},\n",
+                "      \"tcp_retrans_ratio\": {:.6},\n",
+                "      \"issp_retrans_ratio\": {:.6},\n",
+                "      \"last_heartbeat_unix_ns\": {},\n",
+                "      \"is_healthy\": {}\n",
+                "    }}"
+            ),
+            self.node_id,
+            escape_json_str(&self.node_name),
+            escape_json_str(&self.role),
+            escape_json_str(&self.endpoint),
+            escape_json_str(&self.status),
+            self.active_paths,
+            self.total_sessions,
+            self.tx_bytes_per_sec,
+            self.rx_bytes_per_sec,
+            self.avg_latency_ms,
+            self.tcp_retrans_ratio,
+            self.issp_retrans_ratio,
+            self.last_heartbeat_unix_ns,
+            self.is_healthy
+        )
+    }
+}
+
+/// Link operational metrics between two nodes in a synthesized multi-node mesh topology.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspMeshLinkInfo {
+    /// Unique identifier for this link (e.g. "node-1->node-2:eth0").
+    pub link_id: String,
+    /// Source node identifier originating this transport link.
+    pub source_node_id: u32,
+    /// Target destination node identifier.
+    pub target_node_id: u32,
+    /// Interface name carrying traffic (e.g. "eth0-wan", "wwan0-5g").
+    pub interface_name: String,
+    /// Measured round-trip latency in milliseconds.
+    pub latency_ms: f64,
+    /// Measured jitter in milliseconds.
+    pub jitter_ms: f64,
+    /// Packet loss ratio [0.0 - 1.0].
+    pub loss_ratio: f64,
+    /// Retransmission rate [0.0 - 1.0].
+    pub retransmit_rate: f64,
+    /// Outbound link throughput in bytes per second.
+    pub tx_bytes_per_sec: f64,
+    /// Inbound link throughput in bytes per second.
+    pub rx_bytes_per_sec: f64,
+    /// Effective scheduling weight configured on this link.
+    pub weight: u32,
+    /// Operational status ("optimal", "active", "degraded", "congested", "offline").
+    pub status: String,
+    /// Whether this link has been identified as a cluster-wide latency or congestion bottleneck.
+    pub is_bottleneck: bool,
+}
+
+impl IsspMeshLinkInfo {
+    /// Create a new link between two mesh nodes.
+    pub fn new(source: u32, target: u32, interface: &str) -> Self {
+        Self {
+            link_id: format!("node-{}->node-{}:{}", source, target, interface),
+            source_node_id: source,
+            target_node_id: target,
+            interface_name: interface.to_string(),
+            latency_ms: 0.0,
+            jitter_ms: 0.0,
+            loss_ratio: 0.0,
+            retransmit_rate: 0.0,
+            tx_bytes_per_sec: 0.0,
+            rx_bytes_per_sec: 0.0,
+            weight: 100,
+            status: "optimal".to_string(),
+            is_bottleneck: false,
+        }
+    }
+
+    /// Set latency and jitter measurements in milliseconds.
+    pub fn with_latency(mut self, latency_ms: f64, jitter_ms: f64) -> Self {
+        self.latency_ms = latency_ms;
+        self.jitter_ms = jitter_ms;
+        self
+    }
+
+    /// Set loss ratio and retransmit rate.
+    pub fn with_loss(mut self, loss_ratio: f64, retransmit_rate: f64) -> Self {
+        self.loss_ratio = loss_ratio;
+        self.retransmit_rate = retransmit_rate;
+        self
+    }
+
+    /// Set throughput in bytes per second.
+    pub fn with_throughput(mut self, tx_bps: f64, rx_bps: f64) -> Self {
+        self.tx_bytes_per_sec = tx_bps;
+        self.rx_bytes_per_sec = rx_bps;
+        self
+    }
+
+    /// Set scheduling weight.
+    pub fn with_weight(mut self, weight: u32) -> Self {
+        self.weight = weight;
+        self
+    }
+
+    /// Set status and bottleneck flag.
+    pub fn with_status(mut self, status: &str, is_bottleneck: bool) -> Self {
+        self.status = status.to_string();
+        self.is_bottleneck = is_bottleneck;
+        self
+    }
+
+    /// Format link details as compact JSON.
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "    {{\n",
+                "      \"link_id\": \"{}\",\n",
+                "      \"source_node_id\": {},\n",
+                "      \"target_node_id\": {},\n",
+                "      \"interface_name\": \"{}\",\n",
+                "      \"latency_ms\": {:.3},\n",
+                "      \"jitter_ms\": {:.3},\n",
+                "      \"loss_ratio\": {:.6},\n",
+                "      \"retransmit_rate\": {:.6},\n",
+                "      \"tx_bytes_per_sec\": {:.2},\n",
+                "      \"rx_bytes_per_sec\": {:.2},\n",
+                "      \"weight\": {},\n",
+                "      \"status\": \"{}\",\n",
+                "      \"is_bottleneck\": {}\n",
+                "    }}"
+            ),
+            escape_json_str(&self.link_id),
+            self.source_node_id,
+            self.target_node_id,
+            escape_json_str(&self.interface_name),
+            self.latency_ms,
+            self.jitter_ms,
+            self.loss_ratio,
+            self.retransmit_rate,
+            self.tx_bytes_per_sec,
+            self.rx_bytes_per_sec,
+            self.weight,
+            escape_json_str(&self.status),
+            self.is_bottleneck
+        )
+    }
+}
+
+/// Unified snapshot of multi-node mesh topology synthesized for Grafana supervisor panels and Prometheus.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspMeshTopologySnapshot {
+    /// Cluster name or identifier.
+    pub cluster_id: String,
+    /// Timestamp when this mesh snapshot was synthesized, in nanoseconds since Unix epoch.
+    pub timestamp_unix_ns: u64,
+    /// List of registered and discovered nodes in the mesh.
+    pub nodes: Vec<IsspMeshNodeInfo>,
+    /// List of directed links and metrics between mesh nodes.
+    pub links: Vec<IsspMeshLinkInfo>,
+    /// Total count of registered nodes.
+    pub total_nodes: usize,
+    /// Count of currently healthy, operational nodes.
+    pub healthy_nodes: usize,
+    /// Total count of observed mesh links.
+    pub total_links: usize,
+    /// Count of active operational links.
+    pub active_links: usize,
+    /// Mesh graph density ratio `active_links / (total_nodes * (total_nodes - 1))` in [0.0, 1.0].
+    pub mesh_density_ratio: f64,
+    /// Total active sessions aggregated across all cluster nodes.
+    pub cluster_total_sessions: usize,
+    /// Total cluster outbound bandwidth in bytes per second.
+    pub cluster_tx_bytes_per_sec: f64,
+    /// Total cluster inbound bandwidth in bytes per second.
+    pub cluster_rx_bytes_per_sec: f64,
+    /// Cluster-wide mean round-trip latency across all links in milliseconds.
+    pub cluster_avg_latency_ms: f64,
+    /// Minimum link latency observed across the cluster in milliseconds.
+    pub cluster_min_latency_ms: f64,
+    /// Maximum link latency observed across the cluster in milliseconds.
+    pub cluster_max_latency_ms: f64,
+    /// Overall cluster health score in [0.0, 1.0].
+    pub cluster_health_score: f64,
+    /// List of link IDs identified as performance bottlenecks.
+    pub bottlenecks: Vec<String>,
+}
+
+impl Default for IsspMeshTopologySnapshot {
+    fn default() -> Self {
+        Self {
+            cluster_id: "ifa-mesh".to_string(),
+            timestamp_unix_ns: 0,
+            nodes: Vec::new(),
+            links: Vec::new(),
+            total_nodes: 0,
+            healthy_nodes: 0,
+            total_links: 0,
+            active_links: 0,
+            mesh_density_ratio: 0.0,
+            cluster_total_sessions: 0,
+            cluster_tx_bytes_per_sec: 0.0,
+            cluster_rx_bytes_per_sec: 0.0,
+            cluster_avg_latency_ms: 0.0,
+            cluster_min_latency_ms: 0.0,
+            cluster_max_latency_ms: 0.0,
+            cluster_health_score: 1.0,
+            bottlenecks: Vec::new(),
+        }
+    }
+}
+
+impl IsspMeshTopologySnapshot {
+    /// Find node information by numeric identifier.
+    pub fn find_node(&self, node_id: u32) -> Option<&IsspMeshNodeInfo> {
+        self.nodes.iter().find(|n| n.node_id == node_id)
+    }
+
+    /// Find link information by source, target, and interface.
+    pub fn find_link(
+        &self,
+        source: u32,
+        target: u32,
+        interface: &str,
+    ) -> Option<&IsspMeshLinkInfo> {
+        self.links.iter().find(|l| {
+            l.source_node_id == source
+                && l.target_node_id == target
+                && l.interface_name == interface
+        })
+    }
+
+    /// Format snapshot into standard Grafana Node Graph panel format (`{ "nodes": [...], "edges": [...] }`).
+    pub fn to_grafana_node_graph_json(&self) -> String {
+        let mut nodes_json = Vec::with_capacity(self.nodes.len());
+        for n in &self.nodes {
+            let (color, arc_healthy, arc_unhealthy) = if n.is_healthy {
+                ("green", 1.0, 0.0)
+            } else {
+                ("red", 0.0, 1.0)
+            };
+            let main_stat = format!(
+                "{:.1} MB/s",
+                (n.tx_bytes_per_sec + n.rx_bytes_per_sec) / 1_000_000.0
+            );
+            let sec_stat = format!("{:.2} ms", n.avg_latency_ms);
+            let title = format!("node-{}", n.node_id);
+            nodes_json.push(format!(
+                concat!(
+                    "    {{\n",
+                    "      \"id\": \"node-{}\",\n",
+                    "      \"title\": \"{}\",\n",
+                    "      \"subTitle\": \"{}\",\n",
+                    "      \"mainStat\": \"{}\",\n",
+                    "      \"secondaryStat\": \"{}\",\n",
+                    "      \"arc__healthy\": {},\n",
+                    "      \"arc__unhealthy\": {},\n",
+                    "      \"color\": \"{}\",\n",
+                    "      \"detail__name\": \"{}\",\n",
+                    "      \"detail__role\": \"{}\",\n",
+                    "      \"detail__endpoint\": \"{}\",\n",
+                    "      \"detail__sessions\": \"{}\",\n",
+                    "      \"detail__active_paths\": \"{}\",\n",
+                    "      \"detail__status\": \"{}\"\n",
+                    "    }}"
+                ),
+                n.node_id,
+                escape_json_str(&title),
+                escape_json_str(&n.role),
+                escape_json_str(&main_stat),
+                escape_json_str(&sec_stat),
+                arc_healthy,
+                arc_unhealthy,
+                color,
+                escape_json_str(&n.node_name),
+                escape_json_str(&n.role),
+                escape_json_str(&n.endpoint),
+                n.total_sessions,
+                n.active_paths,
+                escape_json_str(&n.status)
+            ));
+        }
+
+        let mut edges_json = Vec::with_capacity(self.links.len());
+        for l in &self.links {
+            let color = if l.is_bottleneck || l.status == "congested" || l.status == "degraded" {
+                "orange"
+            } else if l.status == "offline" {
+                "red"
+            } else {
+                "green"
+            };
+            let edge_id = format!(
+                "node-{}->node-{}:{}",
+                l.source_node_id, l.target_node_id, l.interface_name
+            );
+            let main_stat = format!("{:.2} ms", l.latency_ms);
+            let sec_stat = format!("{:.2}% loss", l.loss_ratio * 100.0);
+            let throughput = format!(
+                "{:.1} MB/s",
+                (l.tx_bytes_per_sec + l.rx_bytes_per_sec) / 1_000_000.0
+            );
+            let jitter = format!("{:.2} ms", l.jitter_ms);
+            edges_json.push(format!(
+                concat!(
+                    "    {{\n",
+                    "      \"id\": \"{}\",\n",
+                    "      \"source\": \"node-{}\",\n",
+                    "      \"target\": \"node-{}\",\n",
+                    "      \"mainStat\": \"{}\",\n",
+                    "      \"secondaryStat\": \"{}\",\n",
+                    "      \"weight\": {},\n",
+                    "      \"color\": \"{}\",\n",
+                    "      \"detail__interface\": \"{}\",\n",
+                    "      \"detail__throughput\": \"{}\",\n",
+                    "      \"detail__jitter\": \"{}\",\n",
+                    "      \"detail__status\": \"{}\"\n",
+                    "    }}"
+                ),
+                escape_json_str(&edge_id),
+                l.source_node_id,
+                l.target_node_id,
+                escape_json_str(&main_stat),
+                escape_json_str(&sec_stat),
+                l.weight,
+                color,
+                escape_json_str(&l.interface_name),
+                escape_json_str(&throughput),
+                escape_json_str(&jitter),
+                escape_json_str(&l.status)
+            ));
+        }
+
+        format!(
+            "{{\n  \"nodes\": [\n{}\n  ],\n  \"edges\": [\n{}\n  ]\n}}",
+            nodes_json.join(",\n"),
+            edges_json.join(",\n")
+        )
+    }
+
+    /// Format snapshot into comprehensive Grafana supervisor topology summary JSON.
+    pub fn to_grafana_topology_summary_json(&self) -> String {
+        let nodes_summary: Vec<String> = self.nodes.iter().map(|n| n.to_json()).collect();
+        let links_summary: Vec<String> = self.links.iter().map(|l| l.to_json()).collect();
+        let bottlenecks_json: Vec<String> = self
+            .bottlenecks
+            .iter()
+            .map(|b| format!("\"{}\"", escape_json_str(b)))
+            .collect();
+
+        format!(
+            concat!(
+                "{{\n",
+                "  \"cluster_id\": \"{}\",\n",
+                "  \"timestamp_unix_ns\": {},\n",
+                "  \"total_nodes\": {},\n",
+                "  \"healthy_nodes\": {},\n",
+                "  \"total_links\": {},\n",
+                "  \"active_links\": {},\n",
+                "  \"mesh_density_ratio\": {:.4},\n",
+                "  \"cluster_health_score\": {:.4},\n",
+                "  \"cluster_total_sessions\": {},\n",
+                "  \"cluster_tx_bytes_per_sec\": {:.2},\n",
+                "  \"cluster_rx_bytes_per_sec\": {:.2},\n",
+                "  \"cluster_avg_latency_ms\": {:.3},\n",
+                "  \"cluster_min_latency_ms\": {:.3},\n",
+                "  \"cluster_max_latency_ms\": {:.3},\n",
+                "  \"bottlenecks\": [{}],\n",
+                "  \"nodes\": [\n{}\n  ],\n",
+                "  \"links\": [\n{}\n  ]\n",
+                "}}"
+            ),
+            escape_json_str(&self.cluster_id),
+            self.timestamp_unix_ns,
+            self.total_nodes,
+            self.healthy_nodes,
+            self.total_links,
+            self.active_links,
+            self.mesh_density_ratio,
+            self.cluster_health_score,
+            self.cluster_total_sessions,
+            self.cluster_tx_bytes_per_sec,
+            self.cluster_rx_bytes_per_sec,
+            self.cluster_avg_latency_ms,
+            self.cluster_min_latency_ms,
+            self.cluster_max_latency_ms,
+            bottlenecks_json.join(", "),
+            nodes_summary.join(",\n"),
+            links_summary.join(",\n")
+        )
+    }
+
+    /// Format snapshot into standard Prometheus 0.0.4 exposition metrics for Grafana dashboards.
+    pub fn to_prometheus_mesh_exposition(&self) -> String {
+        let mut out = String::with_capacity(4096);
+        let c = escape_json_str(&self.cluster_id);
+
+        out.push_str("# HELP ifa_mesh_cluster_nodes_total Total number of registered nodes in the mesh topology\n");
+        out.push_str("# TYPE ifa_mesh_cluster_nodes_total gauge\n");
+        out.push_str(&format!(
+            "ifa_mesh_cluster_nodes_total{{cluster=\"{}\"}} {}\n",
+            c, self.total_nodes
+        ));
+
+        out.push_str("# HELP ifa_mesh_cluster_healthy_nodes Total number of healthy nodes in the mesh topology\n");
+        out.push_str("# TYPE ifa_mesh_cluster_healthy_nodes gauge\n");
+        out.push_str(&format!(
+            "ifa_mesh_cluster_healthy_nodes{{cluster=\"{}\"}} {}\n",
+            c, self.healthy_nodes
+        ));
+
+        out.push_str("# HELP ifa_mesh_cluster_links_total Total number of observed links between mesh nodes\n");
+        out.push_str("# TYPE ifa_mesh_cluster_links_total gauge\n");
+        out.push_str(&format!(
+            "ifa_mesh_cluster_links_total{{cluster=\"{}\"}} {}\n",
+            c, self.total_links
+        ));
+
+        out.push_str("# HELP ifa_mesh_cluster_active_links Number of active operational links in the mesh topology\n");
+        out.push_str("# TYPE ifa_mesh_cluster_active_links gauge\n");
+        out.push_str(&format!(
+            "ifa_mesh_cluster_active_links{{cluster=\"{}\"}} {}\n",
+            c, self.active_links
+        ));
+
+        out.push_str(
+            "# HELP ifa_mesh_cluster_density_ratio Mesh connectivity density ratio in [0.0, 1.0]\n",
+        );
+        out.push_str("# TYPE ifa_mesh_cluster_density_ratio gauge\n");
+        out.push_str(&format!(
+            "ifa_mesh_cluster_density_ratio{{cluster=\"{}\"}} {:.6}\n",
+            c, self.mesh_density_ratio
+        ));
+
+        out.push_str("# HELP ifa_mesh_cluster_sessions_total Total active multipath sessions across all cluster nodes\n");
+        out.push_str("# TYPE ifa_mesh_cluster_sessions_total gauge\n");
+        out.push_str(&format!(
+            "ifa_mesh_cluster_sessions_total{{cluster=\"{}\"}} {}\n",
+            c, self.cluster_total_sessions
+        ));
+
+        out.push_str("# HELP ifa_mesh_cluster_health_score Overall synthesized cluster health score in [0.0, 1.0]\n");
+        out.push_str("# TYPE ifa_mesh_cluster_health_score gauge\n");
+        out.push_str(&format!(
+            "ifa_mesh_cluster_health_score{{cluster=\"{}\"}} {:.6}\n",
+            c, self.cluster_health_score
+        ));
+
+        out.push_str("# HELP ifa_mesh_cluster_tx_bytes_per_sec Aggregate cluster transmission throughput in bytes per second\n");
+        out.push_str("# TYPE ifa_mesh_cluster_tx_bytes_per_sec gauge\n");
+        out.push_str(&format!(
+            "ifa_mesh_cluster_tx_bytes_per_sec{{cluster=\"{}\"}} {:.6}\n",
+            c, self.cluster_tx_bytes_per_sec
+        ));
+
+        out.push_str("# HELP ifa_mesh_cluster_rx_bytes_per_sec Aggregate cluster receive throughput in bytes per second\n");
+        out.push_str("# TYPE ifa_mesh_cluster_rx_bytes_per_sec gauge\n");
+        out.push_str(&format!(
+            "ifa_mesh_cluster_rx_bytes_per_sec{{cluster=\"{}\"}} {:.6}\n",
+            c, self.cluster_rx_bytes_per_sec
+        ));
+
+        out.push_str("# HELP ifa_mesh_cluster_latency_ms Mesh latency summary in milliseconds\n");
+        out.push_str("# TYPE ifa_mesh_cluster_latency_ms gauge\n");
+        out.push_str(&format!(
+            "ifa_mesh_cluster_latency_ms{{cluster=\"{}\",quantile=\"avg\"}} {:.6}\n",
+            c, self.cluster_avg_latency_ms
+        ));
+        out.push_str(&format!(
+            "ifa_mesh_cluster_latency_ms{{cluster=\"{}\",quantile=\"min\"}} {:.6}\n",
+            c, self.cluster_min_latency_ms
+        ));
+        out.push_str(&format!(
+            "ifa_mesh_cluster_latency_ms{{cluster=\"{}\",quantile=\"max\"}} {:.6}\n",
+            c, self.cluster_max_latency_ms
+        ));
+
+        if !self.nodes.is_empty() {
+            out.push_str("# HELP ifa_mesh_node_status Health status of individual mesh nodes (1 = healthy, 0 = degraded/offline)\n");
+            out.push_str("# TYPE ifa_mesh_node_status gauge\n");
+            for n in &self.nodes {
+                let val = if n.is_healthy { 1 } else { 0 };
+                out.push_str(&format!(
+                    "ifa_mesh_node_status{{cluster=\"{}\",node_id=\"{}\",node_name=\"{}\",role=\"{}\"}} {}\n",
+                    c,
+                    n.node_id,
+                    escape_json_str(&n.node_name),
+                    escape_json_str(&n.role),
+                    val
+                ));
+            }
+
+            out.push_str("# HELP ifa_mesh_node_sessions Active sessions on node\n");
+            out.push_str("# TYPE ifa_mesh_node_sessions gauge\n");
+            for n in &self.nodes {
+                out.push_str(&format!(
+                    "ifa_mesh_node_sessions{{cluster=\"{}\",node_id=\"{}\",node_name=\"{}\"}} {}\n",
+                    c,
+                    n.node_id,
+                    escape_json_str(&n.node_name),
+                    n.total_sessions
+                ));
+            }
+
+            out.push_str("# HELP ifa_mesh_node_tx_bytes_per_sec Transmit rate per node\n");
+            out.push_str("# TYPE ifa_mesh_node_tx_bytes_per_sec gauge\n");
+            for n in &self.nodes {
+                out.push_str(&format!(
+                    "ifa_mesh_node_tx_bytes_per_sec{{cluster=\"{}\",node_id=\"{}\"}} {:.6}\n",
+                    c, n.node_id, n.tx_bytes_per_sec
+                ));
+            }
+
+            out.push_str("# HELP ifa_mesh_node_rx_bytes_per_sec Receive rate per node\n");
+            out.push_str("# TYPE ifa_mesh_node_rx_bytes_per_sec gauge\n");
+            for n in &self.nodes {
+                out.push_str(&format!(
+                    "ifa_mesh_node_rx_bytes_per_sec{{cluster=\"{}\",node_id=\"{}\"}} {:.6}\n",
+                    c, n.node_id, n.rx_bytes_per_sec
+                ));
+            }
+
+            out.push_str("# HELP ifa_mesh_node_avg_latency_ms Average latency per node in ms\n");
+            out.push_str("# TYPE ifa_mesh_node_avg_latency_ms gauge\n");
+            for n in &self.nodes {
+                out.push_str(&format!(
+                    "ifa_mesh_node_avg_latency_ms{{cluster=\"{}\",node_id=\"{}\"}} {:.6}\n",
+                    c, n.node_id, n.avg_latency_ms
+                ));
+            }
+        }
+
+        if !self.links.is_empty() {
+            out.push_str("# HELP ifa_mesh_link_latency_ms Measured round-trip latency on mesh links in milliseconds\n");
+            out.push_str("# TYPE ifa_mesh_link_latency_ms gauge\n");
+            for l in &self.links {
+                out.push_str(&format!(
+                    "ifa_mesh_link_latency_ms{{cluster=\"{}\",source=\"{}\",target=\"{}\",interface=\"{}\"}} {:.6}\n",
+                    c,
+                    l.source_node_id,
+                    l.target_node_id,
+                    escape_json_str(&l.interface_name),
+                    l.latency_ms
+                ));
+            }
+
+            out.push_str(
+                "# HELP ifa_mesh_link_loss_ratio Packet loss ratio observed on mesh links\n",
+            );
+            out.push_str("# TYPE ifa_mesh_link_loss_ratio gauge\n");
+            for l in &self.links {
+                out.push_str(&format!(
+                    "ifa_mesh_link_loss_ratio{{cluster=\"{}\",source=\"{}\",target=\"{}\",interface=\"{}\"}} {:.6}\n",
+                    c,
+                    l.source_node_id,
+                    l.target_node_id,
+                    escape_json_str(&l.interface_name),
+                    l.loss_ratio
+                ));
+            }
+
+            out.push_str(
+                "# HELP ifa_mesh_link_jitter_ms Jitter observed on mesh links in milliseconds\n",
+            );
+            out.push_str("# TYPE ifa_mesh_link_jitter_ms gauge\n");
+            for l in &self.links {
+                out.push_str(&format!(
+                    "ifa_mesh_link_jitter_ms{{cluster=\"{}\",source=\"{}\",target=\"{}\",interface=\"{}\"}} {:.6}\n",
+                    c,
+                    l.source_node_id,
+                    l.target_node_id,
+                    escape_json_str(&l.interface_name),
+                    l.jitter_ms
+                ));
+            }
+
+            out.push_str("# HELP ifa_mesh_link_status Operational status of mesh links (1 = active/optimal, 0 = degraded/offline)\n");
+            out.push_str("# TYPE ifa_mesh_link_status gauge\n");
+            for l in &self.links {
+                let val = if l.status == "optimal" || l.status == "active" {
+                    1
+                } else {
+                    0
+                };
+                out.push_str(&format!(
+                    "ifa_mesh_link_status{{cluster=\"{}\",source=\"{}\",target=\"{}\",interface=\"{}\"}} {}\n",
+                    c,
+                    l.source_node_id,
+                    l.target_node_id,
+                    escape_json_str(&l.interface_name),
+                    val
+                ));
+            }
+        }
+
+        out
+    }
+}
+
+/// Multi-node mesh topology synthesizer that aggregates telemetry metrics across cluster nodes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspMultiNodeMeshSynthesizer {
+    /// Cluster name or identifier.
+    pub cluster_id: String,
+    /// Heartbeat expiration timeout in nanoseconds. Nodes unseen longer than this are marked offline.
+    pub heartbeat_timeout_ns: u64,
+    /// Registered mesh nodes indexed by node ID.
+    pub nodes: BTreeMap<u32, IsspMeshNodeInfo>,
+    /// Mesh transport links indexed by `(source_node_id, target_node_id, interface_name)`.
+    pub links: BTreeMap<(u32, u32, String), IsspMeshLinkInfo>,
+}
+
+impl Default for IsspMultiNodeMeshSynthesizer {
+    fn default() -> Self {
+        Self::new("ifa-cluster")
+    }
+}
+
+impl IsspMultiNodeMeshSynthesizer {
+    /// Create a new multi-node mesh topology synthesizer.
+    pub fn new(cluster_id: &str) -> Self {
+        Self {
+            cluster_id: cluster_id.to_string(),
+            heartbeat_timeout_ns: 15_000_000_000, // 15 seconds default
+            nodes: BTreeMap::new(),
+            links: BTreeMap::new(),
+        }
+    }
+
+    /// Set heartbeat timeout in seconds for automatic node degradation.
+    pub fn with_heartbeat_timeout_seconds(mut self, timeout_secs: u64) -> Self {
+        self.heartbeat_timeout_ns = timeout_secs.saturating_mul(1_000_000_000);
+        self
+    }
+
+    /// Register or update a mesh node in the synthesizer.
+    pub fn register_or_update_node(&mut self, node: IsspMeshNodeInfo) {
+        self.nodes.insert(node.node_id, node);
+    }
+
+    /// Register or update a mesh transport link in the synthesizer.
+    pub fn register_or_update_link(&mut self, link: IsspMeshLinkInfo) {
+        let key = (
+            link.source_node_id,
+            link.target_node_id,
+            link.interface_name.clone(),
+        );
+        self.links.insert(key, link);
+    }
+
+    /// Remove a node and its attached links from the synthesizer.
+    pub fn remove_node(&mut self, node_id: u32) {
+        self.nodes.remove(&node_id);
+        self.links
+            .retain(|(src, tgt, _), _| *src != node_id && *tgt != node_id);
+    }
+
+    /// Remove an explicit link from the synthesizer.
+    pub fn remove_link(&mut self, source: u32, target: u32, interface: &str) {
+        self.links.remove(&(source, target, interface.to_string()));
+    }
+
+    /// Ingest a local or remote node balancing snapshot, projecting subpaths onto target peer nodes.
+    pub fn ingest_node_snapshot(
+        &mut self,
+        snapshot: &IsspMultipathBalancingSnapshot,
+        node_name: &str,
+        role: &str,
+        endpoint: &str,
+        peer_targets: &[(u32, &str)],
+    ) {
+        let mut total_rtt_us = 0u64;
+        let mut rtt_count = 0usize;
+        let mut tx_frames = 0u64;
+        let mut rx_frames = 0u64;
+
+        for sp in &snapshot.subpaths {
+            if sp.rtt_us > 0 {
+                total_rtt_us += sp.rtt_us;
+                rtt_count += 1;
+            }
+            tx_frames = tx_frames.saturating_add(sp.total_frames_sent);
+            rx_frames = rx_frames.saturating_add(sp.total_frames_received);
+        }
+
+        let avg_latency_ms = if rtt_count > 0 {
+            (total_rtt_us as f64) / (rtt_count as f64 * 1000.0)
+        } else {
+            0.0
+        };
+
+        let tx_bytes_sec = (tx_frames as f64) * 1420.0;
+        let rx_bytes_sec = (rx_frames as f64) * 1420.0;
+        let is_healthy = snapshot.active_paths > 0;
+        let status = if is_healthy { "healthy" } else { "degraded" };
+
+        let node_info = IsspMeshNodeInfo {
+            node_id: snapshot.node_id,
+            node_name: node_name.to_string(),
+            role: role.to_string(),
+            endpoint: endpoint.to_string(),
+            status: status.to_string(),
+            active_paths: snapshot.active_paths,
+            total_sessions: snapshot.total_sessions,
+            tx_bytes_per_sec: tx_bytes_sec,
+            rx_bytes_per_sec: rx_bytes_sec,
+            avg_latency_ms,
+            tcp_retrans_ratio: snapshot.aggregate_tcp_retrans_ratio,
+            issp_retrans_ratio: snapshot.aggregate_issp_retrans_ratio,
+            last_heartbeat_unix_ns: snapshot.timestamp_unix_ns,
+            is_healthy,
+        };
+        self.nodes.insert(snapshot.node_id, node_info);
+
+        // Project subpaths as mesh links to known peer targets
+        for sp in &snapshot.subpaths {
+            for &(peer_id, iface_hint) in peer_targets {
+                if peer_id != snapshot.node_id
+                    && (iface_hint.is_empty() || sp.interface_name.contains(iface_hint))
+                {
+                    let lat_ms = (sp.rtt_us as f64) / 1000.0;
+                    let jitter_ms = (sp.rtt_gradient_us as f64) / 1000.0;
+                    let loss_ratio = sp.tcp_retrans_ratio.max(sp.issp_retrans_ratio);
+                    let link_status = if !sp.is_usable {
+                        "offline"
+                    } else if loss_ratio > 0.05 || sp.congestion_phase == "Recovery" {
+                        "congested"
+                    } else if sp.state == "Degraded" {
+                        "degraded"
+                    } else {
+                        "optimal"
+                    };
+
+                    let link = IsspMeshLinkInfo {
+                        link_id: format!(
+                            "node-{}->node-{}:{}",
+                            snapshot.node_id, peer_id, sp.interface_name
+                        ),
+                        source_node_id: snapshot.node_id,
+                        target_node_id: peer_id,
+                        interface_name: sp.interface_name.clone(),
+                        latency_ms: lat_ms,
+                        jitter_ms,
+                        loss_ratio,
+                        retransmit_rate: loss_ratio,
+                        tx_bytes_per_sec: (sp.total_frames_sent as f64) * 1420.0,
+                        rx_bytes_per_sec: (sp.total_frames_received as f64) * 1420.0,
+                        weight: sp.effective_weight,
+                        status: link_status.to_string(),
+                        is_bottleneck: false,
+                    };
+                    let key = (snapshot.node_id, peer_id, sp.interface_name.clone());
+                    self.links.insert(key, link);
+                }
+            }
+        }
+    }
+
+    /// Ingest a JSON report payload received from a remote node.
+    pub fn ingest_mesh_report_json(&mut self, json_str: &str, now_ns: u64) -> Result<(), String> {
+        let val = MiniJsonValue::parse(json_str)?;
+        let obj = val
+            .as_object()
+            .ok_or_else(|| "Expected JSON object for mesh report".to_string())?;
+
+        if let Some(cid) = obj.get("cluster_id").and_then(|v| v.as_str()) {
+            if !cid.is_empty() {
+                self.cluster_id = cid.to_string();
+            }
+        }
+
+        let node_val = obj.get("node").or(Some(&val));
+        let mut current_node_id = 0u32;
+        if let Some(nv) = node_val {
+            if let Some(n_obj) = nv.as_object() {
+                if let Some(nid_f) = n_obj.get("node_id").and_then(|v| v.as_f64()) {
+                    let nid = nid_f as u32;
+                    current_node_id = nid;
+                    let node_name = n_obj
+                        .get("node_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("ifa-node");
+                    let role = n_obj
+                        .get("role")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("worker");
+                    let endpoint = n_obj.get("endpoint").and_then(|v| v.as_str()).unwrap_or("");
+                    let active_paths = n_obj
+                        .get("active_paths")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1.0) as usize;
+                    let total_sessions = n_obj
+                        .get("total_sessions")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0) as usize;
+                    let tx_bps = n_obj
+                        .get("tx_bytes_per_sec")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let rx_bps = n_obj
+                        .get("rx_bytes_per_sec")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let avg_lat = n_obj
+                        .get("avg_latency_ms")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let tcp_ret = n_obj
+                        .get("tcp_retrans_ratio")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let issp_ret = n_obj
+                        .get("issp_retrans_ratio")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let is_healthy = n_obj
+                        .get("is_healthy")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let status = n_obj
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(if is_healthy { "healthy" } else { "degraded" });
+
+                    let node_info = IsspMeshNodeInfo {
+                        node_id: nid,
+                        node_name: node_name.to_string(),
+                        role: role.to_string(),
+                        endpoint: endpoint.to_string(),
+                        status: status.to_string(),
+                        active_paths,
+                        total_sessions,
+                        tx_bytes_per_sec: tx_bps,
+                        rx_bytes_per_sec: rx_bps,
+                        avg_latency_ms: avg_lat,
+                        tcp_retrans_ratio: tcp_ret,
+                        issp_retrans_ratio: issp_ret,
+                        last_heartbeat_unix_ns: now_ns,
+                        is_healthy,
+                    };
+                    self.nodes.insert(nid, node_info);
+                }
+            }
+        }
+
+        if let Some(links_arr) = obj.get("links").and_then(|v| v.as_array()) {
+            for item in links_arr {
+                if let Some(l_obj) = item.as_object() {
+                    let src = l_obj
+                        .get("source_node_id")
+                        .and_then(|v| v.as_f64())
+                        .map(|f| f as u32)
+                        .unwrap_or(current_node_id);
+                    let tgt = l_obj
+                        .get("target_node_id")
+                        .and_then(|v| v.as_f64())
+                        .map(|f| f as u32)
+                        .unwrap_or(0);
+                    let iface = l_obj
+                        .get("interface_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("eth0");
+                    let lat = l_obj
+                        .get("latency_ms")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let jitter = l_obj
+                        .get("jitter_ms")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let loss = l_obj
+                        .get("loss_ratio")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let ret = l_obj
+                        .get("retransmit_rate")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let tx_bps = l_obj
+                        .get("tx_bytes_per_sec")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let rx_bps = l_obj
+                        .get("rx_bytes_per_sec")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let weight = l_obj
+                        .get("weight")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(100.0) as u32;
+                    let status = l_obj
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("optimal");
+
+                    let link_id = format!("node-{}->node-{}:{}", src, tgt, iface);
+                    let link = IsspMeshLinkInfo {
+                        link_id,
+                        source_node_id: src,
+                        target_node_id: tgt,
+                        interface_name: iface.to_string(),
+                        latency_ms: lat,
+                        jitter_ms: jitter,
+                        loss_ratio: loss,
+                        retransmit_rate: ret,
+                        tx_bytes_per_sec: tx_bps,
+                        rx_bytes_per_sec: rx_bps,
+                        weight,
+                        status: status.to_string(),
+                        is_bottleneck: false,
+                    };
+                    self.links.insert((src, tgt, iface.to_string()), link);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Synthesize current multi-node mesh topology evaluating heartbeats, bottlenecks, and density.
+    pub fn synthesize(&self, now_ns: u64) -> IsspMeshTopologySnapshot {
+        let mut nodes: Vec<IsspMeshNodeInfo> = Vec::with_capacity(self.nodes.len());
+        let mut healthy_nodes = 0;
+        let mut cluster_sessions = 0;
+        let mut cluster_tx = 0.0;
+        let mut cluster_rx = 0.0;
+
+        for n in self.nodes.values() {
+            let mut node_copy = n.clone();
+            let elapsed_ns = now_ns.saturating_sub(node_copy.last_heartbeat_unix_ns);
+            if self.heartbeat_timeout_ns > 0
+                && node_copy.last_heartbeat_unix_ns > 0
+                && elapsed_ns > self.heartbeat_timeout_ns
+            {
+                node_copy.is_healthy = false;
+                node_copy.status = "offline".to_string();
+            }
+            if node_copy.is_healthy {
+                healthy_nodes += 1;
+            }
+            cluster_sessions += node_copy.total_sessions;
+            cluster_tx += node_copy.tx_bytes_per_sec;
+            cluster_rx += node_copy.rx_bytes_per_sec;
+            nodes.push(node_copy);
+        }
+
+        let mut links: Vec<IsspMeshLinkInfo> = Vec::with_capacity(self.links.len());
+        let mut active_links = 0;
+        let mut sum_latency = 0.0;
+        let mut min_latency = f64::INFINITY;
+        let mut max_latency = 0.0;
+        let mut sum_loss = 0.0;
+
+        for l in self.links.values() {
+            let mut link_copy = l.clone();
+            let src_node = self.nodes.get(&link_copy.source_node_id);
+            let tgt_node = self.nodes.get(&link_copy.target_node_id);
+            let src_ok = src_node.map(|n| n.is_healthy).unwrap_or(true);
+            let tgt_ok = tgt_node.map(|n| n.is_healthy).unwrap_or(true);
+
+            if !src_ok || !tgt_ok {
+                link_copy.status = "offline".to_string();
+            }
+
+            if link_copy.status == "optimal" || link_copy.status == "active" {
+                active_links += 1;
+            }
+
+            if link_copy.latency_ms > 0.0 {
+                sum_latency += link_copy.latency_ms;
+                if link_copy.latency_ms < min_latency {
+                    min_latency = link_copy.latency_ms;
+                }
+                if link_copy.latency_ms > max_latency {
+                    max_latency = link_copy.latency_ms;
+                }
+            }
+            sum_loss += link_copy.loss_ratio;
+            links.push(link_copy);
+        }
+
+        let total_nodes = nodes.len();
+        let total_links = links.len();
+        let avg_latency = if !links.is_empty() {
+            sum_latency / (links.len() as f64)
+        } else {
+            0.0
+        };
+        let min_lat = if min_latency.is_infinite() {
+            0.0
+        } else {
+            min_latency
+        };
+
+        let mut bottlenecks = Vec::new();
+        for l in &mut links {
+            if l.loss_ratio > 0.05 || (avg_latency > 0.0 && l.latency_ms > 2.0 * avg_latency) {
+                l.is_bottleneck = true;
+                bottlenecks.push(l.link_id.clone());
+            }
+        }
+
+        let density_ratio = if total_nodes <= 1 {
+            1.0
+        } else {
+            let max_possible = (total_nodes * (total_nodes - 1)) as f64;
+            ((active_links as f64) / max_possible).min(1.0)
+        };
+
+        let node_health_ratio = if total_nodes > 0 {
+            healthy_nodes as f64 / total_nodes as f64
+        } else {
+            1.0
+        };
+        let link_health_ratio = if total_links > 0 {
+            active_links as f64 / total_links as f64
+        } else {
+            1.0
+        };
+        let avg_loss = if total_links > 0 {
+            sum_loss / total_links as f64
+        } else {
+            0.0
+        };
+        let health_score =
+            (0.5 * node_health_ratio + 0.3 * link_health_ratio + 0.2 * (1.0 - avg_loss.min(1.0)))
+                .clamp(0.0, 1.0);
+
+        IsspMeshTopologySnapshot {
+            cluster_id: self.cluster_id.clone(),
+            timestamp_unix_ns: now_ns,
+            nodes,
+            links,
+            total_nodes,
+            healthy_nodes,
+            total_links,
+            active_links,
+            mesh_density_ratio: density_ratio,
+            cluster_total_sessions: cluster_sessions,
+            cluster_tx_bytes_per_sec: cluster_tx,
+            cluster_rx_bytes_per_sec: cluster_rx,
+            cluster_avg_latency_ms: avg_latency,
+            cluster_min_latency_ms: min_lat,
+            cluster_max_latency_ms: max_latency,
+            cluster_health_score: health_score,
+            bottlenecks,
+        }
+    }
+}
+
 // ─── HTTP Telemetry Handlers & Exposition Server ──────────────────────────
 
 /// HTTP request dispatcher for dynamic ISSP multipath balancing telemetry.
@@ -3130,10 +4282,14 @@ impl AlertFailoverPolicy {
 /// - `/v1/metrics`: OpenTelemetry OTLP JSON payload conforming to OTLP v1/metrics specification
 /// - `/healthz` or `/livez`: Liveness probe returning HTTP 200 OK
 /// - `/readyz`: Readiness probe evaluating cluster quorum degradation threshold (HTTP 200 if quorum healthy, HTTP 503 if degraded)
+/// - `/api/mesh/topology`: Grafana Node Graph visualization panel format JSON
+/// - `/api/mesh/summary`: Grafana supervisor mesh topology summary JSON
+/// - `/api/mesh/metrics`: Multi-node mesh metrics in Prometheus exposition format
 #[derive(Debug, Clone)]
 pub struct IsspTelemetryHttpHandler {
     service_name: String,
     quorum_config: IsspClusterQuorumConfig,
+    mesh_synthesizer: Option<IsspMultiNodeMeshSynthesizer>,
 }
 
 impl IsspTelemetryHttpHandler {
@@ -3142,6 +4298,7 @@ impl IsspTelemetryHttpHandler {
         Self {
             service_name: service_name.to_string(),
             quorum_config: IsspClusterQuorumConfig::default(),
+            mesh_synthesizer: None,
         }
     }
 
@@ -3161,6 +4318,46 @@ impl IsspTelemetryHttpHandler {
         &self.quorum_config
     }
 
+    /// Attach a multi-node mesh synthesizer to this HTTP handler.
+    pub fn with_mesh_synthesizer(mut self, synth: IsspMultiNodeMeshSynthesizer) -> Self {
+        self.mesh_synthesizer = Some(synth);
+        self
+    }
+
+    /// Retrieve a reference to the optional attached mesh synthesizer.
+    pub fn mesh_synthesizer(&self) -> Option<&IsspMultiNodeMeshSynthesizer> {
+        self.mesh_synthesizer.as_ref()
+    }
+
+    /// Helper to project or synthesize a multi-node mesh topology snapshot.
+    fn synthesize_mesh_snapshot(
+        &self,
+        snapshot: &IsspMultipathBalancingSnapshot,
+        cluster_nodes: usize,
+    ) -> IsspMeshTopologySnapshot {
+        let mut synth = if let Some(ref s) = self.mesh_synthesizer {
+            s.clone()
+        } else {
+            let cluster_id = format!("{}-mesh", self.service_name);
+            IsspMultiNodeMeshSynthesizer::new(&cluster_id)
+        };
+
+        let peer_targets: Vec<(u32, &str)> = (1..=cluster_nodes as u32)
+            .filter(|&id| id != snapshot.node_id)
+            .map(|id| (id, ""))
+            .collect();
+
+        synth.ingest_node_snapshot(
+            snapshot,
+            &self.service_name,
+            "gateway",
+            "127.0.0.1:9090",
+            &peer_targets,
+        );
+
+        synth.synthesize(snapshot.timestamp_unix_ns)
+    }
+
     /// Dispatch an HTTP request against a provided snapshot and explicit cluster node count.
     ///
     /// Returns `(http_status_code, content_type_header, response_body_string)`.
@@ -3174,7 +4371,14 @@ impl IsspTelemetryHttpHandler {
         let clean_path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
         match clean_path {
             "/metrics" => {
-                if accept_header.contains("application/json") {
+                if path.contains("format=mesh") {
+                    let mesh_snap = self.synthesize_mesh_snapshot(snapshot, cluster_nodes);
+                    (
+                        200,
+                        "text/plain; version=0.0.4; charset=utf-8",
+                        mesh_snap.to_prometheus_mesh_exposition(),
+                    )
+                } else if accept_header.contains("application/json") {
                     (
                         200,
                         "application/json",
@@ -3194,6 +4398,30 @@ impl IsspTelemetryHttpHandler {
                 snapshot.export_otlp_json(&self.service_name),
             ),
             p if p.contains("MetricsService/Export") => (200, "application/grpc", String::new()),
+            "/api/mesh/topology" | "/api/v1/mesh/topology" => {
+                let mesh_snap = self.synthesize_mesh_snapshot(snapshot, cluster_nodes);
+                (
+                    200,
+                    "application/json",
+                    mesh_snap.to_grafana_node_graph_json(),
+                )
+            }
+            "/api/mesh/summary" | "/api/v1/mesh/summary" => {
+                let mesh_snap = self.synthesize_mesh_snapshot(snapshot, cluster_nodes);
+                (
+                    200,
+                    "application/json",
+                    mesh_snap.to_grafana_topology_summary_json(),
+                )
+            }
+            "/api/mesh/metrics" | "/metrics/mesh" => {
+                let mesh_snap = self.synthesize_mesh_snapshot(snapshot, cluster_nodes);
+                (
+                    200,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                    mesh_snap.to_prometheus_mesh_exposition(),
+                )
+            }
             "/healthz" | "/livez" => {
                 if accept_header.contains("application/json") {
                     let json = format!(
@@ -3339,6 +4567,7 @@ pub struct IsspTelemetryServer {
     registry: Arc<crate::session_sync::SessionRegistry>,
     quorum_config: RwLock<IsspClusterQuorumConfig>,
     failover_policy: RwLock<AlertFailoverPolicy>,
+    mesh_synthesizer: Arc<RwLock<IsspMultiNodeMeshSynthesizer>>,
 }
 
 impl IsspTelemetryServer {
@@ -3349,13 +4578,91 @@ impl IsspTelemetryServer {
         registry: Arc<crate::session_sync::SessionRegistry>,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
+        let cluster_id = format!("{}-cluster", service_name);
         Ok(Self {
             listener,
             service_name: service_name.to_string(),
             registry,
             quorum_config: RwLock::new(IsspClusterQuorumConfig::default()),
             failover_policy: RwLock::new(AlertFailoverPolicy::default()),
+            mesh_synthesizer: Arc::new(RwLock::new(IsspMultiNodeMeshSynthesizer::new(&cluster_id))),
         })
+    }
+
+    /// Retrieve the shared multi-node mesh synthesizer handle.
+    pub fn mesh_synthesizer(&self) -> Arc<RwLock<IsspMultiNodeMeshSynthesizer>> {
+        Arc::clone(&self.mesh_synthesizer)
+    }
+
+    /// Configure a custom multi-node mesh synthesizer.
+    pub fn with_mesh_synthesizer(self, synth: Arc<RwLock<IsspMultiNodeMeshSynthesizer>>) -> Self {
+        Self {
+            mesh_synthesizer: synth,
+            ..self
+        }
+    }
+
+    /// Ingest a remote node's telemetry report into the multi-node mesh synthesizer.
+    pub fn handle_mesh_report(&self, raw_body: &str) -> (u16, &'static str, String) {
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        let mut synth = match self.mesh_synthesizer.write() {
+            Ok(w) => w,
+            Err(_) => {
+                return (
+                    500,
+                    "application/json",
+                    "{\n  \"status\": \"error\",\n  \"message\": \"Mesh synthesizer lock poisoned\"\n}\n".to_string(),
+                );
+            }
+        };
+
+        match synth.ingest_mesh_report_json(raw_body, now_ns) {
+            Ok(()) => {
+                let resp_json = format!(
+                    concat!(
+                        "{{\n",
+                        "  \"status\": \"acknowledged\",\n",
+                        "  \"cluster_id\": \"{}\",\n",
+                        "  \"nodes_tracked\": {},\n",
+                        "  \"links_tracked\": {}\n",
+                        "}}"
+                    ),
+                    escape_json_str(&synth.cluster_id),
+                    synth.nodes.len(),
+                    synth.links.len()
+                );
+                (200, "application/json", resp_json)
+            }
+            Err(e) => {
+                let err_json = format!(
+                    "{{\n  \"status\": \"error\",\n  \"message\": \"Invalid JSON: {}\"\n}}",
+                    escape_json_str(&e)
+                );
+                (400, "application/json", err_json)
+            }
+        }
+    }
+
+    /// Refresh local node metrics in the mesh synthesizer from current registry state.
+    pub fn refresh_local_mesh_node(&self, now_ns: u64) {
+        if let Ok(snap) = self.registry.multipath_balancing_snapshot(now_ns) {
+            let peer_ids = self.registry.peer_node_ids().unwrap_or_default();
+            let peer_targets: Vec<(u32, &str)> = peer_ids.iter().map(|&pid| (pid, "")).collect();
+            let endpoint = self.local_addr().map(|a| a.to_string()).unwrap_or_default();
+            if let Ok(mut w) = self.mesh_synthesizer.write() {
+                w.ingest_node_snapshot(
+                    &snap,
+                    &self.service_name,
+                    "gateway",
+                    &endpoint,
+                    &peer_targets,
+                );
+            }
+        }
     }
 
     /// Configure quorum evaluation parameters.
@@ -3705,11 +5012,62 @@ impl IsspTelemetryServer {
                 let body_str =
                     extract_http_body(&buf[..n], req_str.as_ref(), reader, content_length)?;
                 self.handle_alert_webhook(&body_str)
+            } else if clean_path == "/v1/mesh/report"
+                || clean_path == "/api/mesh/report"
+                || clean_path == "/api/v1/mesh/report"
+            {
+                let body_str =
+                    extract_http_body(&buf[..n], req_str.as_ref(), reader, content_length)?;
+                self.handle_mesh_report(&body_str)
             } else {
                 (404, "text/plain; charset=utf-8", "Not Found\n".to_string())
             }
         } else if clean_path == "/api/v1/failovers" || clean_path == "/failovers" {
             self.handle_failover_history_json()
+        } else if clean_path == "/api/mesh/topology" || clean_path == "/api/v1/mesh/topology" {
+            let timestamp_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            self.refresh_local_mesh_node(timestamp_ns);
+            let snap = self
+                .mesh_synthesizer
+                .read()
+                .map(|r| r.synthesize(timestamp_ns))
+                .unwrap_or_default();
+            (200, "application/json", snap.to_grafana_node_graph_json())
+        } else if clean_path == "/api/mesh/summary" || clean_path == "/api/v1/mesh/summary" {
+            let timestamp_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            self.refresh_local_mesh_node(timestamp_ns);
+            let snap = self
+                .mesh_synthesizer
+                .read()
+                .map(|r| r.synthesize(timestamp_ns))
+                .unwrap_or_default();
+            (
+                200,
+                "application/json",
+                snap.to_grafana_topology_summary_json(),
+            )
+        } else if clean_path == "/api/mesh/metrics" || clean_path == "/metrics/mesh" {
+            let timestamp_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            self.refresh_local_mesh_node(timestamp_ns);
+            let snap = self
+                .mesh_synthesizer
+                .read()
+                .map(|r| r.synthesize(timestamp_ns))
+                .unwrap_or_default();
+            (
+                200,
+                "text/plain; version=0.0.4; charset=utf-8",
+                snap.to_prometheus_mesh_exposition(),
+            )
         } else {
             let timestamp_ns = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -3719,8 +5077,11 @@ impl IsspTelemetryServer {
             let snap_res = self.registry.multipath_balancing_snapshot(timestamp_ns);
             let cluster_nodes = self.registry.cluster_nodes_count().unwrap_or(1);
             let q_cfg = self.quorum_config();
-            let handler =
+            let mut handler =
                 IsspTelemetryHttpHandler::new(&self.service_name).with_quorum_config(q_cfg);
+            if let Ok(r) = self.mesh_synthesizer.read() {
+                handler = handler.with_mesh_synthesizer(r.clone());
+            }
 
             match snap_res {
                 Ok(ref snap) => {
@@ -5537,5 +6898,364 @@ mod tests {
         let (stream2, _) = server.listener.accept().unwrap();
         server.serve_one_connection(stream2).unwrap();
         client2.join().unwrap();
+    }
+
+    #[test]
+    fn test_issp_mesh_node_and_link_models() {
+        let node = IsspMeshNodeInfo::new(1, "ifa-gw-1", "gateway", "10.0.1.1:9090")
+            .with_sessions(120, 3)
+            .with_throughput(50_000_000.0, 48_000_000.0)
+            .with_quality(0.85, 0.001, 0.0)
+            .with_health(true, "healthy");
+
+        assert_eq!(node.node_id, 1);
+        assert_eq!(node.total_sessions, 120);
+        assert_eq!(node.active_paths, 3);
+        assert!(node.is_healthy);
+
+        let node_json = node.to_json();
+        let parsed_node = MiniJsonValue::parse(&node_json).unwrap();
+        assert_eq!(parsed_node.get("node_id").unwrap().as_f64(), Some(1.0));
+        assert_eq!(
+            parsed_node.get("node_name").unwrap().as_str(),
+            Some("ifa-gw-1")
+        );
+
+        let link = IsspMeshLinkInfo::new(1, 2, "eth0")
+            .with_latency(0.45, 0.05)
+            .with_loss(0.0001, 0.0001)
+            .with_throughput(25_000_000.0, 24_000_000.0)
+            .with_weight(100)
+            .with_status("optimal", false);
+
+        assert_eq!(link.source_node_id, 1);
+        assert_eq!(link.target_node_id, 2);
+        assert_eq!(link.interface_name, "eth0");
+        assert!(!link.is_bottleneck);
+
+        let link_json = link.to_json();
+        let parsed_link = MiniJsonValue::parse(&link_json).unwrap();
+        assert_eq!(
+            parsed_link.get("source_node_id").unwrap().as_f64(),
+            Some(1.0)
+        );
+        assert_eq!(
+            parsed_link.get("target_node_id").unwrap().as_f64(),
+            Some(2.0)
+        );
+    }
+
+    #[test]
+    fn test_issp_mesh_synthesizer_multi_node_aggregation_and_density() {
+        let mut synth =
+            IsspMultiNodeMeshSynthesizer::new("ifa-test-mesh").with_heartbeat_timeout_seconds(10);
+
+        let now_ns = 1_700_000_000_000_000_000;
+
+        let mut n1 = IsspMeshNodeInfo::new(1, "node-1", "gateway", "10.0.0.1:9090")
+            .with_sessions(500, 2)
+            .with_throughput(10_000_000.0, 8_000_000.0)
+            .with_quality(1.2, 0.0, 0.0);
+        n1.last_heartbeat_unix_ns = now_ns;
+
+        let mut n2 = IsspMeshNodeInfo::new(2, "node-2", "relay", "10.0.0.2:9090")
+            .with_sessions(300, 2)
+            .with_throughput(8_000_000.0, 7_000_000.0)
+            .with_quality(1.4, 0.0, 0.0);
+        n2.last_heartbeat_unix_ns = now_ns;
+
+        let mut n3 = IsspMeshNodeInfo::new(3, "node-3", "worker", "10.0.0.3:9090")
+            .with_sessions(200, 2)
+            .with_throughput(5_000_000.0, 4_000_000.0)
+            .with_quality(1.5, 0.0, 0.0);
+        n3.last_heartbeat_unix_ns = now_ns;
+
+        synth.register_or_update_node(n1);
+        synth.register_or_update_node(n2);
+        synth.register_or_update_node(n3);
+
+        // Add 6 links (full mesh among 3 nodes)
+        synth.register_or_update_link(
+            IsspMeshLinkInfo::new(1, 2, "eth0")
+                .with_latency(1.0, 0.1)
+                .with_status("optimal", false),
+        );
+        synth.register_or_update_link(
+            IsspMeshLinkInfo::new(2, 1, "eth0")
+                .with_latency(1.0, 0.1)
+                .with_status("optimal", false),
+        );
+        synth.register_or_update_link(
+            IsspMeshLinkInfo::new(1, 3, "eth1")
+                .with_latency(2.0, 0.2)
+                .with_status("optimal", false),
+        );
+        synth.register_or_update_link(
+            IsspMeshLinkInfo::new(3, 1, "eth1")
+                .with_latency(2.0, 0.2)
+                .with_status("optimal", false),
+        );
+        synth.register_or_update_link(
+            IsspMeshLinkInfo::new(2, 3, "eth0")
+                .with_latency(1.5, 0.1)
+                .with_status("optimal", false),
+        );
+        synth.register_or_update_link(
+            IsspMeshLinkInfo::new(3, 2, "eth0")
+                .with_latency(5.5, 0.8) // High latency bottleneck
+                .with_loss(0.08, 0.08) // High loss
+                .with_status("congested", true),
+        );
+
+        let snap = synth.synthesize(now_ns);
+        assert_eq!(snap.total_nodes, 3);
+        assert_eq!(snap.healthy_nodes, 3);
+        assert_eq!(snap.total_links, 6);
+        assert_eq!(snap.active_links, 5); // 5 optimal, 1 congested
+        assert_eq!(snap.cluster_total_sessions, 1000);
+        assert_eq!(snap.mesh_density_ratio, 5.0 / 6.0);
+        assert!(snap.cluster_health_score > 0.7);
+        assert!(snap
+            .bottlenecks
+            .iter()
+            .any(|b| b.contains("node-3->node-2")));
+
+        // Test heartbeat expiration on node 3
+        let stale_now_ns = now_ns + 15_000_000_000; // 15s later
+        let stale_snap = synth.synthesize(stale_now_ns);
+        assert_eq!(stale_snap.total_nodes, 3);
+        assert_eq!(stale_snap.healthy_nodes, 0); // all nodes expired
+    }
+
+    #[test]
+    fn test_issp_mesh_grafana_and_prometheus_export() {
+        let mut synth = IsspMultiNodeMeshSynthesizer::new("ifa-supervision-cluster");
+        let now_ns = 1_700_000_000_000_000_000;
+
+        let mut n1 = IsspMeshNodeInfo::new(1, "ifa-gw-eu", "gateway", "10.0.1.1:9090")
+            .with_sessions(450, 2)
+            .with_throughput(35_000_000.0, 30_000_000.0)
+            .with_quality(0.95, 0.0, 0.0);
+        n1.last_heartbeat_unix_ns = now_ns;
+
+        let mut n2 = IsspMeshNodeInfo::new(2, "ifa-edge-eu", "worker", "10.0.1.2:9090")
+            .with_sessions(250, 1)
+            .with_throughput(20_000_000.0, 18_000_000.0)
+            .with_quality(1.10, 0.0, 0.0);
+        n2.last_heartbeat_unix_ns = now_ns;
+
+        synth.register_or_update_node(n1);
+        synth.register_or_update_node(n2);
+        synth.register_or_update_link(
+            IsspMeshLinkInfo::new(1, 2, "eth0-wan")
+                .with_latency(0.85, 0.05)
+                .with_throughput(15_000_000.0, 14_000_000.0)
+                .with_status("optimal", false),
+        );
+
+        let snap = synth.synthesize(now_ns);
+
+        // 1. Grafana Node Graph Panel JSON verification
+        let node_graph_json = snap.to_grafana_node_graph_json();
+        let parsed_ng = MiniJsonValue::parse(&node_graph_json).unwrap();
+        assert!(parsed_ng.get("nodes").is_some());
+        assert!(parsed_ng.get("edges").is_some());
+        assert_eq!(parsed_ng.get("nodes").unwrap().as_array().unwrap().len(), 2);
+        assert_eq!(parsed_ng.get("edges").unwrap().as_array().unwrap().len(), 1);
+
+        // 2. Grafana Supervisor Summary JSON verification
+        let summary_json = snap.to_grafana_topology_summary_json();
+        let parsed_summary = MiniJsonValue::parse(&summary_json).unwrap();
+        assert_eq!(
+            parsed_summary.get("cluster_id").unwrap().as_str(),
+            Some("ifa-supervision-cluster")
+        );
+        assert_eq!(
+            parsed_summary.get("total_nodes").unwrap().as_f64(),
+            Some(2.0)
+        );
+        assert_eq!(
+            parsed_summary
+                .get("cluster_total_sessions")
+                .unwrap()
+                .as_f64(),
+            Some(700.0)
+        );
+
+        // 3. Prometheus Mesh Exposition text verification
+        let prom = snap.to_prometheus_mesh_exposition();
+        assert!(
+            prom.contains("ifa_mesh_cluster_nodes_total{cluster=\"ifa-supervision-cluster\"} 2")
+        );
+        assert!(prom
+            .contains("ifa_mesh_cluster_sessions_total{cluster=\"ifa-supervision-cluster\"} 700"));
+        assert!(
+            prom.contains("ifa_mesh_node_status{cluster=\"ifa-supervision-cluster\",node_id=\"1\"")
+        );
+        assert!(prom.contains("ifa_mesh_link_latency_ms{cluster=\"ifa-supervision-cluster\",source=\"1\",target=\"2\",interface=\"eth0-wan\"} 0.850000"));
+    }
+
+    #[test]
+    fn test_issp_mesh_report_json_ingestion() {
+        let mut synth = IsspMultiNodeMeshSynthesizer::new("ifa-cluster");
+        let now_ns = 1_700_000_000_000_000_000;
+
+        let report_json = r#"{
+            "cluster_id": "ifa-ingest-test",
+            "node": {
+                "node_id": 42,
+                "node_name": "ifa-relay-42",
+                "role": "relay",
+                "endpoint": "192.168.1.42:9090",
+                "active_paths": 2,
+                "total_sessions": 180,
+                "tx_bytes_per_sec": 12000000.0,
+                "rx_bytes_per_sec": 11000000.0,
+                "avg_latency_ms": 0.75,
+                "tcp_retrans_ratio": 0.0005,
+                "issp_retrans_ratio": 0.0,
+                "is_healthy": true
+            },
+            "links": [
+                {
+                    "source_node_id": 42,
+                    "target_node_id": 1,
+                    "interface_name": "eth0",
+                    "latency_ms": 0.65,
+                    "jitter_ms": 0.04,
+                    "loss_ratio": 0.0,
+                    "retransmit_rate": 0.0,
+                    "tx_bytes_per_sec": 6000000.0,
+                    "rx_bytes_per_sec": 5500000.0,
+                    "weight": 100,
+                    "status": "optimal"
+                }
+            ]
+        }"#;
+
+        synth.ingest_mesh_report_json(report_json, now_ns).unwrap();
+        assert_eq!(synth.cluster_id, "ifa-ingest-test");
+        assert_eq!(synth.nodes.len(), 1);
+        assert_eq!(synth.links.len(), 1);
+
+        let snap = synth.synthesize(now_ns);
+        let n = snap.find_node(42).unwrap();
+        assert_eq!(n.node_name, "ifa-relay-42");
+        assert_eq!(n.role, "relay");
+        assert_eq!(n.total_sessions, 180);
+
+        let l = snap.find_link(42, 1, "eth0").unwrap();
+        assert_eq!(l.latency_ms, 0.65);
+        assert_eq!(l.status, "optimal");
+    }
+
+    #[test]
+    fn test_issp_telemetry_http_handler_mesh_routes() {
+        use crate::session_sync::{IsspDynamicMultipathRouter, IsspRoutingPolicy};
+
+        let router = IsspDynamicMultipathRouter::new(10, IsspRoutingPolicy::BandwidthAggregation);
+        let snap = router.balancing_snapshot(1_700_000_000_000_000_000);
+        let handler = IsspTelemetryHttpHandler::new("ifa-gateway");
+
+        // 1. /api/mesh/topology (Grafana Node Graph)
+        let (code, ctype, body) =
+            handler.handle_snapshot_with_quorum("/api/mesh/topology", "application/json", &snap, 2);
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "application/json");
+        assert!(body.contains("\"nodes\":"));
+        assert!(body.contains("\"edges\":"));
+
+        // 2. /api/mesh/summary (Grafana Supervisor Summary)
+        let (code, ctype, body) =
+            handler.handle_snapshot_with_quorum("/api/mesh/summary", "application/json", &snap, 2);
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "application/json");
+        assert!(body.contains("\"total_nodes\":"));
+        assert!(body.contains("\"mesh_density_ratio\":"));
+
+        // 3. /api/mesh/metrics (Prometheus Mesh Exposition)
+        let (code, ctype, body) =
+            handler.handle_snapshot_with_quorum("/api/mesh/metrics", "*/*", &snap, 2);
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "text/plain; version=0.0.4; charset=utf-8");
+        assert!(body.contains("ifa_mesh_cluster_nodes_total"));
+
+        // 4. /metrics?format=mesh
+        let (code, ctype, body) =
+            handler.handle_snapshot_with_quorum("/metrics?format=mesh", "*/*", &snap, 2);
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "text/plain; version=0.0.4; charset=utf-8");
+        assert!(body.contains("ifa_mesh_cluster_nodes_total"));
+    }
+
+    #[test]
+    fn test_issp_telemetry_server_real_tcp_mesh_endpoints() {
+        use crate::session_sync::SessionRegistry;
+
+        let reg = SessionRegistry::new(99);
+        reg.register_peer(101).unwrap();
+        let server = IsspTelemetryServer::bind("127.0.0.1:0", "ifa-mesh-srv", reg).unwrap();
+        let addr = server.local_addr().unwrap();
+
+        // 1. Client POST /v1/mesh/report
+        let client1 = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            let body = r#"{"cluster_id":"ifa-mesh-srv","node":{"node_id":101,"node_name":"peer-101","role":"relay","endpoint":"10.0.0.101:9090","active_paths":1,"total_sessions":75,"tx_bytes_per_sec":5000000.0,"rx_bytes_per_sec":4000000.0,"avg_latency_ms":1.1,"is_healthy":true}}"#;
+            let req = format!(
+                "POST /v1/mesh/report HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s.write_all(req.as_bytes()).unwrap();
+            s.flush().unwrap();
+
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).unwrap();
+            let resp_str = String::from_utf8_lossy(&resp);
+            assert!(resp_str.contains("HTTP/1.1 200 OK"));
+            assert!(resp_str.contains("\"status\": \"acknowledged\""));
+        });
+
+        let (stream1, _) = server.listener.accept().unwrap();
+        server.serve_one_connection(stream1).unwrap();
+        client1.join().unwrap();
+
+        // 2. Client GET /api/mesh/topology
+        let client2 = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            let req = "GET /api/mesh/topology HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n";
+            s.write_all(req.as_bytes()).unwrap();
+            s.flush().unwrap();
+
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).unwrap();
+            let resp_str = String::from_utf8_lossy(&resp);
+            assert!(resp_str.contains("HTTP/1.1 200 OK"));
+            assert!(resp_str.contains("application/json"));
+            assert!(resp_str.contains("\"nodes\":"));
+            assert!(resp_str.contains("\"edges\":"));
+        });
+
+        let (stream2, _) = server.listener.accept().unwrap();
+        server.serve_one_connection(stream2).unwrap();
+        client2.join().unwrap();
+
+        // 3. Client GET /api/mesh/metrics
+        let client3 = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            let req = "GET /api/mesh/metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            s.write_all(req.as_bytes()).unwrap();
+            s.flush().unwrap();
+
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).unwrap();
+            let resp_str = String::from_utf8_lossy(&resp);
+            assert!(resp_str.contains("HTTP/1.1 200 OK"));
+            assert!(resp_str.contains("ifa_mesh_cluster_nodes_total"));
+        });
+
+        let (stream3, _) = server.listener.accept().unwrap();
+        server.serve_one_connection(stream3).unwrap();
+        client3.join().unwrap();
     }
 }
