@@ -2,7 +2,8 @@
 
 use clap::Subcommand;
 use ifa_runtime::{
-    run_issp_failover_benchmark_suite, run_issp_scenario, IsspBandwidthEstimate, IsspCapsule,
+    run_issp_failover_benchmark_suite, run_issp_scenario,
+    run_telemetry_streaming_vs_polling_benchmark, IsspBandwidthEstimate, IsspCapsule,
     IsspClusterQuorumConfig, IsspCongestionPhase, IsspFailoverBenchmarkSuiteReport,
     IsspFlapDampingConfig, IsspHeartbeatProbe, IsspMultipathRoute, IsspNetworkProfile,
     IsspPathState, IsspProbationConfig, IsspRoutingPolicy, IsspTelemetryServer, SecurityPolicy,
@@ -182,6 +183,18 @@ pub enum SessionCommand {
         /// Quorum ratio threshold [0.0 - 1.0] below which cluster is degraded (/readyz)
         #[arg(long, default_value = "0.5")]
         quorum_ratio: f64,
+    },
+    /// Benchmark comparative throughput and wire overhead of streaming WebSocket vs HTTP polling under 100k session saturation
+    TelemetryBench {
+        /// Number of concurrent sessions tracked under saturation (default: 100000)
+        #[arg(short, long, default_value = "100000")]
+        sessions: usize,
+        /// Number of benchmark sample iterations per transport protocol
+        #[arg(short, long, default_value = "1000")]
+        iterations: usize,
+        /// Output formatted as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1679,6 +1692,19 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
+        SessionCommand::TelemetryBench {
+            sessions,
+            iterations,
+            json,
+        } => {
+            let report = run_telemetry_streaming_vs_polling_benchmark(sessions, iterations);
+            if json {
+                println!("{}", report.to_json());
+            } else {
+                println!("{}", report.to_markdown_table());
+            }
+            ExitCode::SUCCESS
+        }
     }
 }
 
@@ -1981,5 +2007,24 @@ mod tests {
         assert!(r1.contains("OK\n"));
         assert!(r2.starts_with("HTTP/1.1 200 OK"));
         assert!(r2.contains("READY:"));
+    }
+
+    #[test]
+    fn test_session_command_telemetry_bench_execution() {
+        let cmd = SessionCommand::TelemetryBench {
+            sessions: 100_000,
+            iterations: 50,
+            json: false,
+        };
+        let code = execute_session_command(cmd);
+        assert_eq!(code, ExitCode::SUCCESS);
+
+        let cmd_json = SessionCommand::TelemetryBench {
+            sessions: 100_000,
+            iterations: 50,
+            json: true,
+        };
+        let code_json = execute_session_command(cmd_json);
+        assert_eq!(code_json, ExitCode::SUCCESS);
     }
 }

@@ -23,10 +23,12 @@ pub use allocator::{
     ThreadLocalCallArena, CALL_ARENA_INITIAL_CAPACITY, DEFAULT_PAGE_CAPACITY, GLOBAL_ALLOCATOR,
 };
 pub use benchmarks::{
-    profile_allocator_engine, run_allocator_multithread_suite, run_generational_benchmark_suite,
-    run_issp_failover_benchmark_suite, run_issp_scenario, AllocatorEngine,
-    AllocatorThroughputResult, BenchmarkReport, BenchmarkResult, IsspBenchmarkScenarioResult,
-    IsspFailoverBenchmarkSuiteReport, IsspNetworkProfile, MultithreadBenchmarkSuiteReport,
+    create_saturated_multipath_snapshot, profile_allocator_engine, run_allocator_multithread_suite,
+    run_generational_benchmark_suite, run_issp_failover_benchmark_suite, run_issp_scenario,
+    run_telemetry_streaming_vs_polling_benchmark, AllocatorEngine, AllocatorThroughputResult,
+    BenchmarkReport, BenchmarkResult, IsspBenchmarkScenarioResult, IsspFailoverBenchmarkSuiteReport,
+    IsspNetworkProfile, MultithreadBenchmarkSuiteReport, TelemetryComparativeReport,
+    TelemetryLoadResult, TelemetryTransportKind,
 };
 pub use blocking::{
     ifa_rt_blocking_call, ifa_rt_blocking_pool_active_workers, ifa_rt_blocking_pool_capacity,
@@ -83,7 +85,8 @@ pub use session_sync::{
 };
 pub use string::IfaString;
 pub use telemetry::{
-    supervise_command, IsspClusterQuorumConfig, IsspMultipathBalancingSnapshot, IsspQuorumStatus,
+    snapshot_to_compact_json, supervise_command, ws_build_close_frame, ws_build_text_frame,
+    IsspClusterQuorumConfig, IsspMultipathBalancingSnapshot, IsspQuorumStatus,
     IsspSubpathBalancingMetrics, IsspTelemetryHttpHandler, IsspTelemetryServer, LatencyHistogram,
     OtelMultipathBalancingExporter, PrometheusMultipathBalancingExporter, ResourceAuditScope,
     ResourceUsage, DEFAULT_LATENCY_BUCKETS_SECONDS,

@@ -2406,7 +2406,7 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 /// Build a RFC 6455 text frame (FIN=1, opcode=0x1, server→client, unmasked).
-fn ws_build_text_frame(payload: &[u8]) -> Vec<u8> {
+pub fn ws_build_text_frame(payload: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(payload.len() + 10);
     frame.push(0x81); // FIN=1, opcode=1 (text)
     let len = payload.len();
@@ -2427,12 +2427,12 @@ fn ws_build_text_frame(payload: &[u8]) -> Vec<u8> {
 }
 
 /// Build a RFC 6455 close frame (opcode 0x8, 2-byte status code, unmasked).
-fn ws_build_close_frame(code: u16) -> Vec<u8> {
+pub fn ws_build_close_frame(code: u16) -> Vec<u8> {
     vec![0x88, 0x02, (code >> 8) as u8, (code & 0xFF) as u8]
 }
 
 /// Serialise an `IsspMultipathBalancingSnapshot` as compact JSON for WebSocket push.
-fn snapshot_to_compact_json(s: &IsspMultipathBalancingSnapshot) -> String {
+pub fn snapshot_to_compact_json(s: &IsspMultipathBalancingSnapshot) -> String {
     let mut out = String::with_capacity(512);
     out.push_str("{\"ts\":");
     out.push_str(&s.timestamp_unix_ns.to_string());

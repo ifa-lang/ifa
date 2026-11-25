@@ -1,7 +1,8 @@
 //! Integration tests and resilience assertions for ISSP transparent failover & throughput benchmarks.
 
 use ifa_runtime::benchmarks::{
-    run_issp_failover_benchmark_suite, run_issp_scenario, IsspNetworkProfile,
+    run_issp_failover_benchmark_suite, run_issp_scenario,
+    run_telemetry_streaming_vs_polling_benchmark, IsspNetworkProfile,
 };
 
 #[test]
@@ -98,4 +99,52 @@ fn test_issp_custom_heavy_loss_and_jitter_scenario() {
     assert!(result.state_integrity_verified);
     assert!(result.zero_loss_migration);
     assert!(result.p95_frame_latency_us > 50_000.0);
+}
+
+#[test]
+fn test_telemetry_streaming_vs_polling_saturation_100k_sessions() {
+    let report = run_telemetry_streaming_vs_polling_benchmark(100_000, 200);
+
+    assert_eq!(report.concurrent_sessions, 100_000);
+    assert_eq!(report.iterations_per_transport, 200);
+    assert!(report.saturation_verified);
+
+    println!("\n=== TELEMETRY LOAD BENCHMARK (100k SESSIONS SATURATION) ===");
+    println!("{}", report.to_markdown_table());
+
+    // WebSocket framing overhead must remain minimal (< 1%)
+    assert!(
+        report.websocket_result.framing_overhead_pct < 1.0,
+        "WebSocket framing overhead must be under 1.0% at 200 samples, was {:.2}%",
+        report.websocket_result.framing_overhead_pct
+    );
+
+    // HTTP polling must exhibit significant header overhead compared to streaming framing
+    assert!(
+        report.http_prometheus_result.framing_overhead_bytes > report.websocket_result.framing_overhead_bytes * 10,
+        "Prometheus HTTP polling header overhead bytes must be at least 10x higher than WebSocket framing"
+    );
+    assert!(
+        report.http_otel_result.framing_overhead_bytes > report.websocket_result.framing_overhead_bytes * 10,
+        "OTLP HTTP polling header overhead bytes must be at least 10x higher than WebSocket framing"
+    );
+
+    // WebSocket speedup: must be at least 1.0x (streaming avoids repeated HTTP headers and route matching)
+    assert!(report.websocket_speedup_vs_prometheus >= 1.0);
+    assert!(report.websocket_speedup_vs_otel >= 1.0);
+
+    // Wire bandwidth reduction: WebSocket must reduce total wire bytes transferred
+    assert!(
+        report.websocket_bandwidth_reduction_vs_prometheus_pct > 0.0,
+        "WebSocket must reduce wire bandwidth compared to Prometheus HTTP polling"
+    );
+    assert!(
+        report.websocket_bandwidth_reduction_vs_otel_pct > 0.0,
+        "WebSocket must reduce wire bandwidth compared to OTLP JSON HTTP polling"
+    );
+
+    // Latency distributions must be sane
+    assert!(report.websocket_result.p50_latency_us > 0.0);
+    assert!(report.websocket_result.p95_latency_us >= report.websocket_result.p50_latency_us);
+    assert!(report.websocket_result.p99_latency_us >= report.websocket_result.p95_latency_us);
 }
