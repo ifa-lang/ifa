@@ -2312,6 +2312,7 @@ pub struct IsspDynamicMultipathRouter {
     pub constraint_config: SubpathConstraintConfig,
     pub constraint_metrics: SubpathConstraintMetrics,
     pub flow_slicing: crate::traffic_slicing::FlowSliceNegotiator,
+    pub cost_gradient_balancer: crate::cost_gradient::CostGradientLoadBalancer,
 }
 
 impl IsspDynamicMultipathRouter {
@@ -2341,6 +2342,7 @@ impl IsspDynamicMultipathRouter {
             constraint_config: SubpathConstraintConfig::default(),
             constraint_metrics: SubpathConstraintMetrics::default(),
             flow_slicing: crate::traffic_slicing::FlowSliceNegotiator::new(),
+            cost_gradient_balancer: crate::cost_gradient::CostGradientLoadBalancer::default(),
         }
     }
 
@@ -3341,6 +3343,39 @@ impl IsspDynamicMultipathRouter {
             self.session_bindings.insert(m.session_id, m.to_path_id);
         }
         migrations
+    }
+
+    /// Rebalance multipath load according to convex marginal cost gradients under flow QoS slice constraints.
+    pub fn rebalance_cost_gradient(
+        &mut self,
+        now_ms: u64,
+        measured_throughput_bps: Option<&HashMap<u32, u64>>,
+        flow_demands: Option<&HashMap<SessionId, u64>>,
+    ) -> crate::cost_gradient::CostGradientRebalancePlan {
+        if let Some(demands) = flow_demands {
+            for (sid, &demand) in demands {
+                self.cost_gradient_balancer.set_flow_demand(*sid, demand);
+            }
+        }
+        let caps = self.snapshot_subpath_qos_capabilities(measured_throughput_bps);
+        let plan = self
+            .cost_gradient_balancer
+            .orchestrate_rebalance(&caps, &mut self.flow_slicing, now_ms);
+
+        for action in &plan.actions {
+            self.session_bindings.insert(action.session_id, action.to_path_id);
+            if let Some(r) = self.paths.get_mut(&action.to_path_id) {
+                if r.state == IsspPathState::Standby {
+                    r.state = IsspPathState::Active;
+                }
+            }
+        }
+        plan
+    }
+
+    /// Read access to cost-gradient load balancer metrics.
+    pub fn cost_gradient_metrics(&self) -> &crate::cost_gradient::CostGradientMetrics {
+        self.cost_gradient_balancer.metrics()
     }
 
     /// Return an iterator over all registered routes.
@@ -7911,5 +7946,55 @@ mod tests {
 
         assert_eq!(router.get_session_path(&s1), Some(1));
         assert_eq!(router.get_session_path(&s2), Some(1));
+    }
+
+    #[test]
+    fn test_router_cost_gradient_rebalance_integration() {
+        let mut router = IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::ActiveStandby);
+
+        // Subpath 1: Fast low-latency (5ms), 100 Mbps capacity (weight 1)
+        let mut r1 = IsspMultipathRoute::new(1, 1, "eth0", 1, 1);
+        r1.metrics.smoothed_rtt_us = 5_000;
+        r1.metrics.jitter_us = 500;
+        r1.congestion.ledbat.queuing_delay_us = 1_000;
+
+        // Subpath 2: High throughput bulk tunnel (45ms), 1 Gbps capacity (weight 10)
+        let mut r2 = IsspMultipathRoute::new(2, 2, "tun0", 2, 10);
+        r2.metrics.smoothed_rtt_us = 45_000;
+        r2.metrics.jitter_us = 2_000;
+        r2.congestion.ledbat.queuing_delay_us = 2_000;
+        r2.state = IsspPathState::Standby;
+
+        router.add_route(r1);
+        router.add_route(r2);
+
+        let s_urllc = SessionId::new(501, 1, 0);
+        let s_embb = SessionId::new(502, 1, 0);
+
+        router.register_flow_qos_profile(s_urllc, crate::traffic_slicing::FlowQoSProfile::ultra_low_latency());
+        router.register_flow_qos_profile(s_embb, crate::traffic_slicing::FlowQoSProfile::high_throughput(50_000_000));
+
+        // Both assigned to path 1 initially
+        router.bind_session(s_urllc, 1).expect("bind urllc");
+        router.bind_session(s_embb, 1).expect("bind embb");
+        router.flow_slicing.force_reassign_flow(&s_urllc, 1, 1000);
+        router.flow_slicing.force_reassign_flow(&s_embb, 1, 1000);
+
+        let mut demands = HashMap::new();
+        demands.insert(s_urllc, 5_000_000u64);
+        demands.insert(s_embb, 75_000_000u64); // 75 Mbps load -> heavy congestion on 100 Mbps link
+
+        let plan = router.rebalance_cost_gradient(2000, None, Some(&demands));
+
+        // Rebalance orchestrator must migrate s_embb to tun0 (path 2) and leave s_urllc on eth0 (path 1)
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].session_id, s_embb);
+        assert_eq!(plan.actions[0].from_path_id, 1);
+        assert_eq!(plan.actions[0].to_path_id, 2);
+        assert_eq!(router.get_session_path(&s_embb), Some(2));
+        assert_eq!(router.get_session_path(&s_urllc), Some(1));
+        assert_eq!(router.get_route(2).unwrap().state, IsspPathState::Active);
+        assert_eq!(router.cost_gradient_metrics().total_flows_migrated, 1);
+        assert!(plan.total_cost_reduction > 0.0);
     }
 }

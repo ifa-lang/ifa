@@ -183,7 +183,7 @@ impl SubpathQoSCapability {
             available_bandwidth_bps,
             saturation_ratio,
             loss_ppm,
-            is_usable: route.state.is_usable(),
+            is_usable: route.state.is_usable() || route.state == crate::session_sync::IsspPathState::Standby,
         }
     }
 }
@@ -368,6 +368,52 @@ impl FlowSliceNegotiator {
             .values()
             .filter(|a| a.slice_class == slice_class)
             .count()
+    }
+
+    /// Iterator over active flow assignments.
+    pub fn assignments_iter(&self) -> impl Iterator<Item = (&SessionId, &FlowSliceAssignment)> {
+        self.assignments.iter()
+    }
+
+    /// Explicitly reassign a flow to a target subpath (e.g. following cost-gradient rebalance orchestration).
+    pub fn force_reassign_flow(
+        &mut self,
+        session_id: &SessionId,
+        target_path_id: u32,
+        now_ms: u64,
+    ) -> Option<FlowSliceAssignment> {
+        let profile = self.profiles.get(session_id)?.clone();
+        let prev_path_id = self
+            .assignments
+            .get(session_id)
+            .map(|a| a.assigned_path_id)
+            .unwrap_or(target_path_id);
+
+        let new_assignment = FlowSliceAssignment {
+            session_id: *session_id,
+            slice_class: profile.slice_class,
+            assigned_path_id: target_path_id,
+            fitness_score: 100.0,
+            negotiated_at_unix_ms: now_ms,
+            is_degraded: false,
+        };
+
+        if prev_path_id != target_path_id {
+            let event = FlowSliceMigrationEvent {
+                session_id: *session_id,
+                slice_class: profile.slice_class,
+                from_path_id: prev_path_id,
+                to_path_id: target_path_id,
+                reason: SliceMigrationReason::RebalanceOptimization,
+                migration_timestamp_ms: now_ms,
+                cutover_latency_us: 100.0,
+            };
+            self.metrics.total_slice_migrations += 1;
+            self.migration_history.push(event);
+        }
+
+        self.assignments.insert(*session_id, new_assignment.clone());
+        Some(new_assignment)
     }
 
     /// Read access to operational metrics.

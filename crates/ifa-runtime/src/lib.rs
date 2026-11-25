@@ -4,6 +4,7 @@ pub mod allocator;
 pub mod benchmarks;
 pub mod blocking;
 pub mod collections;
+pub mod cost_gradient;
 pub mod ffi;
 pub mod fiber;
 pub mod header;
@@ -50,6 +51,10 @@ pub use blocking::{
     GLOBAL_BLOCKING_POOL,
 };
 pub use collections::{IfaList, IfaMap};
+pub use cost_gradient::{
+    CostGradientConfig, CostGradientLoadBalancer, CostGradientMetrics, CostGradientRebalanceAction,
+    CostGradientRebalancePlan, CostGradientWeights, SubpathCostGradient,
+};
 pub use ffi::*;
 pub use fiber::{
     AtomicRingBuffer, Channel, CoroDestroyFn, CoroResumeFn, CoroStatus, FiberId, FiberScheduler,

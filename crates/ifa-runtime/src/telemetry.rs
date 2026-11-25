@@ -353,6 +353,10 @@ pub struct IsspMultipathBalancingSnapshot {
     pub cspf_resilience: Option<CspfResilienceSnapshot>,
     /// Total dynamic flow slice migrations across subpaths.
     pub total_slice_migrations: u64,
+    /// Total cost-gradient flow migrations across subpaths.
+    pub total_cost_gradient_migrations: u64,
+    /// Instantaneous variance of marginal gradients across subpaths.
+    pub last_gradient_variance: f64,
     /// Active flows partitioned by slice class name.
     pub active_flows_by_slice: BTreeMap<String, usize>,
     /// Accumulated SLA violations partitioned by slice class name.
@@ -561,6 +565,8 @@ impl IsspMultipathBalancingSnapshot {
             last_cutover_latency_us: router.subpath_constraint_metrics().last_cutover_latency_us,
             cspf_resilience: router.cspf_group().map(CspfResilienceSnapshot::from_group),
             total_slice_migrations: router.flow_slicing.metrics().total_slice_migrations,
+            total_cost_gradient_migrations: router.cost_gradient_metrics().total_flows_migrated,
+            last_gradient_variance: router.cost_gradient_metrics().last_gradient_variance,
             active_flows_by_slice: {
                 let mut m = BTreeMap::new();
                 for class in &[
@@ -1452,6 +1458,25 @@ impl PrometheusMultipathBalancingExporter {
                 slice_lbl, count
             ));
         }
+
+        // Cost Gradient Rebalance Metrics
+        out.push_str(
+            "# HELP ifa_multipath_cost_gradient_migrations_total Dynamic cost-gradient flow migrations.\n",
+        );
+        out.push_str("# TYPE ifa_multipath_cost_gradient_migrations_total counter\n");
+        out.push_str(&format!(
+            "ifa_multipath_cost_gradient_migrations_total{} {}\n",
+            base_lbl, s.total_cost_gradient_migrations
+        ));
+
+        out.push_str(
+            "# HELP ifa_multipath_cost_gradient_variance Instantaneous variance of marginal cost gradients.\n",
+        );
+        out.push_str("# TYPE ifa_multipath_cost_gradient_variance gauge\n");
+        out.push_str(&format!(
+            "ifa_multipath_cost_gradient_variance{} {:.6}\n",
+            base_lbl, s.last_gradient_variance
+        ));
 
         out
     }

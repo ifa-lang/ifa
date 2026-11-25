@@ -1366,6 +1366,8 @@ pub fn create_saturated_multipath_snapshot(
         last_cutover_latency_us: 0.0,
         cspf_resilience: None,
         total_slice_migrations: 0,
+        total_cost_gradient_migrations: 0,
+        last_gradient_variance: 0.0,
         active_flows_by_slice: BTreeMap::new(),
         sla_violations_by_slice: BTreeMap::new(),
     }
