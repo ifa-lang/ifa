@@ -2423,18 +2423,10 @@ impl IsspDynamicMultipathRouter {
         let multi_seq = self.next_multipath_seq;
         self.next_multipath_seq += 1;
 
-        let header = IsspSessionHeader::new(
-            *session_id,
-            multi_seq,
-            curr_sub_seq,
-            now_ms,
-            flags,
-            path_id,
-        );
+        let header =
+            IsspSessionHeader::new(*session_id, multi_seq, curr_sub_seq, now_ms, flags, path_id);
 
-        let (is_full, header_wire) = self
-            .header_compressor
-            .compress_header(&header, loss_rate);
+        let (is_full, header_wire) = self.header_compressor.compress_header(&header, loss_rate);
 
         let crypto = self
             .subpath_crypto
@@ -2447,8 +2439,7 @@ impl IsspDynamicMultipathRouter {
         aad[12..20].copy_from_slice(&curr_sub_seq.to_le_bytes());
         aad[20..22].copy_from_slice(&flags.to_le_bytes());
 
-        let (is_enc, nonce_seq, final_payload, auth_tag) =
-            crypto.encrypt_payload(&aad, payload)?;
+        let (is_enc, nonce_seq, final_payload, auth_tag) = crypto.encrypt_payload(&aad, payload)?;
 
         route.metrics.total_frames_sent += 1;
         route.metrics.total_bytes_sent += (header_wire.len() + final_payload.len()) as u64;
@@ -2517,19 +2508,21 @@ impl IsspDynamicMultipathRouter {
 
     /// Retrieve subpath crypto telemetry for a given path ID.
     pub fn subpath_crypto_telemetry(&self, path_id: u32) -> Option<SubpathCryptoTelemetry> {
-        self.subpath_crypto.get(&path_id).map(|c| SubpathCryptoTelemetry {
-            path_id: c.path_id,
-            security_level: c.security_level,
-            has_key: c.key.is_some(),
-            tx_nonce_seq: c.tx_nonce_seq,
-            rx_nonce_seq: c.rx_nonce_seq,
-            packets_encrypted: c.packets_encrypted,
-            packets_decrypted: c.packets_decrypted,
-            bytes_encrypted: c.bytes_encrypted,
-            auth_failures: c.auth_failures,
-            replay_drops: c.replay_drops,
-            plain_transmissions: c.plain_transmissions,
-        })
+        self.subpath_crypto
+            .get(&path_id)
+            .map(|c| SubpathCryptoTelemetry {
+                path_id: c.path_id,
+                security_level: c.security_level,
+                has_key: c.key.is_some(),
+                tx_nonce_seq: c.tx_nonce_seq,
+                rx_nonce_seq: c.rx_nonce_seq,
+                packets_encrypted: c.packets_encrypted,
+                packets_decrypted: c.packets_decrypted,
+                bytes_encrypted: c.bytes_encrypted,
+                auth_failures: c.auth_failures,
+                replay_drops: c.replay_drops,
+                plain_transmissions: c.plain_transmissions,
+            })
     }
 
     /// Retrieve adaptive header compression telemetry report.
@@ -3618,7 +3611,10 @@ impl std::fmt::Display for SyncError {
                 write!(f, "invalid ISSP heartbeat probe wire packet")
             }
             SyncError::EncryptionRequired => {
-                write!(f, "encryption required on subpath tunnel but no key configured")
+                write!(
+                    f,
+                    "encryption required on subpath tunnel but no key configured"
+                )
             }
             SyncError::AuthenticationFailed => {
                 write!(f, "subpath AEAD authentication verification failed")
@@ -3627,7 +3623,10 @@ impl std::fmt::Display for SyncError {
                 write!(f, "subpath packet rejected by anti-replay sliding window")
             }
             SyncError::HeaderDecompressionFailed => {
-                write!(f, "session header decompression failed or context desynchronized")
+                write!(
+                    f,
+                    "session header decompression failed or context desynchronized"
+                )
             }
             SyncError::BadHeaderMagic => write!(f, "invalid ISSP session header magic tag"),
             SyncError::InvalidHeaderLength(len) => {
@@ -3752,11 +3751,7 @@ impl IsspSubpathCryptoTunnel {
     }
 
     /// Encrypt payload with AEAD ChaCha20-Poly1305 if subpath key is present.
-    pub fn encrypt_payload(
-        &mut self,
-        aad: &[u8],
-        plaintext: &[u8],
-    ) -> SubpathEncryptResult {
+    pub fn encrypt_payload(&mut self, aad: &[u8], plaintext: &[u8]) -> SubpathEncryptResult {
         match (&self.key, self.security_level) {
             (Some(k), _) => {
                 let seq = self.tx_nonce_seq;
@@ -4051,7 +4046,9 @@ impl IsspAdaptiveHeaderCompressor {
             let entry = self.entries.get_mut(&context_id).unwrap();
             let seq_incr_1 = header.multipath_seq == entry.last_multipath_seq.wrapping_add(1);
             let sub_incr_1 = header.subpath_seq == entry.last_subpath_seq.wrapping_add(1);
-            let ts_diff = header.timestamp_unix_ms.saturating_sub(entry.last_timestamp_ms);
+            let ts_diff = header
+                .timestamp_unix_ms
+                .saturating_sub(entry.last_timestamp_ms);
             let ts_delta_u8 = ts_diff <= 255;
             let flags_same = header.flags == entry.last_flags;
 
@@ -4232,7 +4229,9 @@ impl IsspAdaptiveHeaderCompressor {
     }
 
     pub fn telemetry(&self) -> IsspHeaderCompressionTelemetry {
-        let bytes_saved = self.uncompressed_bytes.saturating_sub(self.compressed_bytes);
+        let bytes_saved = self
+            .uncompressed_bytes
+            .saturating_sub(self.compressed_bytes);
         let ratio = if self.uncompressed_bytes > 0 {
             (bytes_saved as f64 / self.uncompressed_bytes as f64) * 100.0
         } else {
@@ -5872,7 +5871,12 @@ mod tests {
             let (is_full, w) = comp.compress_header(&h, 0);
             assert!(!is_full);
             // In nominal sequential mode: control byte (1) + context id (1) + ts delta (1) = 3 bytes
-            assert_eq!(w.len(), 3, "packet {} compressed header size should be 3", i);
+            assert_eq!(
+                w.len(),
+                3,
+                "packet {} compressed header size should be 3",
+                i
+            );
 
             let d = decomp.decompress_header(&w).unwrap();
             assert_eq!(d, h);
@@ -5907,7 +5911,9 @@ mod tests {
         let mut tunnel_req_nokey =
             IsspSubpathCryptoTunnel::new(2, OpportunisticSecurityLevel::Required, None);
         assert_eq!(
-            tunnel_req_nokey.encrypt_payload(aad, plaintext).unwrap_err(),
+            tunnel_req_nokey
+                .encrypt_payload(aad, plaintext)
+                .unwrap_err(),
             SyncError::EncryptionRequired
         );
 

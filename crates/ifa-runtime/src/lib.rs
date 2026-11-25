@@ -72,14 +72,13 @@ pub use session_sync::{
     IsspScheduledPacket, IsspSessionHeader, IsspSubpathCryptoTunnel, IsspSubpathKey,
     IsspSubpathPacket, OpportunisticSecurityLevel, RawGossipError, RejectReason, SecureGossipFrame,
     SecurityError, SecurityPolicy, SessionId, SessionRecord, SessionRegistry, SessionSnapshot,
-    SessionTickConfig, SessionTickOutcome, SubpathCryptoTelemetry, SubpathEncryptResult,
-    SyncError, SyncTelemetry,
-    GOSSIP_FRAME_SIZE, ISSP_CAPSULE_HEADER_SIZE, ISSP_CAPSULE_MAGIC, ISSP_DUMP_HEADER_SIZE,
-    ISSP_DUMP_MAGIC, ISSP_DUMP_VERSION_V1, ISSP_HEARTBEAT_MAGIC, ISSP_HEARTBEAT_SIZE, ISSP_MAGIC,
-    ISSP_PKT_FLAG_COMPRESSED, ISSP_PKT_FLAG_ENCRYPTED, ISSP_PKT_FLAG_FULL_HEADER,
-    ISSP_SESSION_HEADER_UNCOMPRESSED_SIZE, ISSP_SESSION_MAGIC, ISSP_SUBPATH_PACKET_MAGIC,
-    ISSP_VERSION_V1, ISSP_VERSION_V2_ENCRYPTED, MAX_PEER_NODES, MAX_SESSIONS,
-    SECURE_GOSSIP_FRAME_SIZE, SNAPSHOT_MAX_AGE,
+    SessionTickConfig, SessionTickOutcome, SubpathCryptoTelemetry, SubpathEncryptResult, SyncError,
+    SyncTelemetry, GOSSIP_FRAME_SIZE, ISSP_CAPSULE_HEADER_SIZE, ISSP_CAPSULE_MAGIC,
+    ISSP_DUMP_HEADER_SIZE, ISSP_DUMP_MAGIC, ISSP_DUMP_VERSION_V1, ISSP_HEARTBEAT_MAGIC,
+    ISSP_HEARTBEAT_SIZE, ISSP_MAGIC, ISSP_PKT_FLAG_COMPRESSED, ISSP_PKT_FLAG_ENCRYPTED,
+    ISSP_PKT_FLAG_FULL_HEADER, ISSP_SESSION_HEADER_UNCOMPRESSED_SIZE, ISSP_SESSION_MAGIC,
+    ISSP_SUBPATH_PACKET_MAGIC, ISSP_VERSION_V1, ISSP_VERSION_V2_ENCRYPTED, MAX_PEER_NODES,
+    MAX_SESSIONS, SECURE_GOSSIP_FRAME_SIZE, SNAPSHOT_MAX_AGE,
 };
 pub use string::IfaString;
 pub use telemetry::{supervise_command, ResourceAuditScope, ResourceUsage};
