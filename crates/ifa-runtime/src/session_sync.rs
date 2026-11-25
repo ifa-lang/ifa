@@ -2459,6 +2459,30 @@ impl IsspDynamicMultipathRouter {
             .ok_or(SyncError::PathNotFound(path_id))
     }
 
+    /// Return an iterator over all registered routes.
+    pub fn routes(&self) -> impl Iterator<Item = &IsspMultipathRoute> {
+        self.paths.values()
+    }
+
+    /// Return the local cluster node identifier.
+    pub fn node_id(&self) -> u32 {
+        self.local_node_id
+    }
+
+    /// Return the active routing policy.
+    pub fn policy(&self) -> IsspRoutingPolicy {
+        self.policy
+    }
+
+    /// Capture a real-time telemetry snapshot of dynamic multipath bandwidth balancing,
+    /// traffic allocations, RTT gradient, BBR bottleneck bandwidth, and LEDBAT CWND.
+    pub fn balancing_snapshot(
+        &self,
+        timestamp_unix_ns: u64,
+    ) -> crate::telemetry::IsspMultipathBalancingSnapshot {
+        crate::telemetry::IsspMultipathBalancingSnapshot::from_router(self, timestamp_unix_ns)
+    }
+
     /// Generate an aggregated telemetry report across all paths.
     pub fn telemetry(&self) -> IsspMultipathTelemetry {
         let mut active = 0;
@@ -3768,6 +3792,18 @@ impl SessionRegistry {
             .lock()
             .map_err(|_| SyncError::LockPoisoned)?;
         router.path_bandwidth_estimate(path_id)
+    }
+
+    /// Retrieve real-time dynamic multipath balancing telemetry snapshot.
+    pub fn multipath_balancing_snapshot(
+        &self,
+        timestamp_unix_ns: u64,
+    ) -> Result<crate::telemetry::IsspMultipathBalancingSnapshot, SyncError> {
+        let router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        Ok(router.balancing_snapshot(timestamp_unix_ns))
     }
 }
 

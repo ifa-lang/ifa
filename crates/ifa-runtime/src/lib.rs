@@ -82,5 +82,9 @@ pub use session_sync::{
     MAX_SESSIONS, SECURE_GOSSIP_FRAME_SIZE, SNAPSHOT_MAX_AGE,
 };
 pub use string::IfaString;
-pub use telemetry::{supervise_command, ResourceAuditScope, ResourceUsage};
+pub use telemetry::{
+    supervise_command, IsspMultipathBalancingSnapshot, IsspSubpathBalancingMetrics,
+    OtelMultipathBalancingExporter, PrometheusMultipathBalancingExporter, ResourceAuditScope,
+    ResourceUsage,
+};
 pub use wasi::*;
