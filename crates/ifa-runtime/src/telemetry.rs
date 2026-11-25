@@ -385,6 +385,14 @@ pub struct IsspMultipathBalancingSnapshot {
     pub total_subpath_scheduled_packets: u64,
     /// Total packets dropped across all egress subpaths due to queue buffer exhaustion.
     pub total_subpath_dropped_packets: u64,
+    /// Total packets delivered in order by receiver reorder engine.
+    pub total_reorder_delivered_packets: u64,
+    /// Total sequence gaps detected by receiver reorder engine.
+    pub total_reorder_gaps_detected: u64,
+    /// Total sequence advancements forced by hold timeout in reorder engine.
+    pub total_reorder_timeouts_forced: u64,
+    /// Maximum estimated differential path skew in nanoseconds across subpaths.
+    pub max_reorder_path_skew_ns: u64,
     /// Instantaneous variance of marginal gradients across subpaths.
     pub last_gradient_variance: f64,
     /// Active flows partitioned by slice class name.
@@ -656,6 +664,19 @@ impl IsspMultipathBalancingSnapshot {
                         .sum::<u64>()
                 })
                 .sum(),
+            total_reorder_delivered_packets: router
+                .reorder_engine()
+                .metrics_summary()
+                .total_delivered_packets,
+            total_reorder_gaps_detected: router
+                .reorder_engine()
+                .metrics_summary()
+                .total_gaps_detected,
+            total_reorder_timeouts_forced: router
+                .reorder_engine()
+                .metrics_summary()
+                .total_timeouts_forced,
+            max_reorder_path_skew_ns: router.reorder_engine().metrics_summary().max_path_skew_ns,
             last_gradient_variance: router.cost_gradient_metrics().last_gradient_variance,
             active_flows_by_slice: {
                 let mut m = BTreeMap::new();
@@ -1702,6 +1723,42 @@ impl PrometheusMultipathBalancingExporter {
         out.push_str(&format!(
             "ifa_subpath_dropped_packets_total{} {}\n",
             base_lbl, s.total_subpath_dropped_packets
+        ));
+
+        out.push_str(
+            "# HELP ifa_subpath_reorder_delivered_packets_total Total packets delivered in order from reorder buffer.\n",
+        );
+        out.push_str("# TYPE ifa_subpath_reorder_delivered_packets_total counter\n");
+        out.push_str(&format!(
+            "ifa_subpath_reorder_delivered_packets_total{} {}\n",
+            base_lbl, s.total_reorder_delivered_packets
+        ));
+
+        out.push_str(
+            "# HELP ifa_subpath_reorder_gaps_detected_total Total sequence gaps detected by reorder engine.\n",
+        );
+        out.push_str("# TYPE ifa_subpath_reorder_gaps_detected_total counter\n");
+        out.push_str(&format!(
+            "ifa_subpath_reorder_gaps_detected_total{} {}\n",
+            base_lbl, s.total_reorder_gaps_detected
+        ));
+
+        out.push_str(
+            "# HELP ifa_subpath_reorder_timeouts_forced_total Total deliveries forced by hold timeout expiration.\n",
+        );
+        out.push_str("# TYPE ifa_subpath_reorder_timeouts_forced_total counter\n");
+        out.push_str(&format!(
+            "ifa_subpath_reorder_timeouts_forced_total{} {}\n",
+            base_lbl, s.total_reorder_timeouts_forced
+        ));
+
+        out.push_str(
+            "# HELP ifa_subpath_reorder_path_skew_nanoseconds Maximum estimated path skew.\n",
+        );
+        out.push_str("# TYPE ifa_subpath_reorder_path_skew_nanoseconds gauge\n");
+        out.push_str(&format!(
+            "ifa_subpath_reorder_path_skew_nanoseconds{} {}\n",
+            base_lbl, s.max_reorder_path_skew_ns
         ));
 
         out

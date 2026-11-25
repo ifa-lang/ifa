@@ -2318,6 +2318,7 @@ pub struct IsspDynamicMultipathRouter {
     pub multi_node_sla: crate::multi_node_sla::MultiNodeSlaSynthesizer,
     pub ingress_gatekeeper: crate::ingress_admission::IngressAdmissionGatekeeper,
     pub subpath_scheduler: crate::subpath_scheduler::SubpathSchedulerGroup,
+    pub reorder_engine: crate::reorder_engine::MultipathReorderEngine,
 }
 
 impl IsspDynamicMultipathRouter {
@@ -2356,6 +2357,7 @@ impl IsspDynamicMultipathRouter {
                     local_node_id,
                 ),
             subpath_scheduler: crate::subpath_scheduler::SubpathSchedulerGroup::new(),
+            reorder_engine: crate::reorder_engine::MultipathReorderEngine::new(),
         }
     }
 
@@ -3551,6 +3553,35 @@ impl IsspDynamicMultipathRouter {
         now_ns: u64,
     ) -> Option<crate::subpath_scheduler::ScheduledPacket> {
         self.subpath_scheduler.schedule_next(path_id, now_ns)
+    }
+
+    /// Read access to the multipath reorder and de-jitter engine.
+    pub fn reorder_engine(&self) -> &crate::reorder_engine::MultipathReorderEngine {
+        &self.reorder_engine
+    }
+
+    /// Mutable access to the multipath reorder and de-jitter engine.
+    pub fn reorder_engine_mut(&mut self) -> &mut crate::reorder_engine::MultipathReorderEngine {
+        &mut self.reorder_engine
+    }
+
+    /// Ingest an incoming multipath packet into the receiver reorder engine.
+    pub fn ingest_reorder_packet(
+        &mut self,
+        packet: crate::reorder_engine::MultipathPacket,
+    ) -> (
+        crate::reorder_engine::IngestResult,
+        Vec<crate::reorder_engine::DeliveredPacket>,
+    ) {
+        self.reorder_engine.ingest_packet(packet)
+    }
+
+    /// Check hold timeouts across all flows in the reorder engine and force playout.
+    pub fn tick_reorder_timeouts(
+        &mut self,
+        now_ns: u64,
+    ) -> Vec<crate::reorder_engine::DeliveredPacket> {
+        self.reorder_engine.tick_timeouts(now_ns)
     }
 
     /// Return an iterator over all registered routes.
@@ -8423,5 +8454,82 @@ mod tests {
             pkt2.slice_class,
             crate::traffic_slicing::FlowSliceClass::HighThroughput
         );
+    }
+
+    #[test]
+    fn test_router_multipath_reorder_integration() {
+        let mut router =
+            IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::BandwidthAggregation);
+        let path1 = IsspMultipathRoute::new(1, 2, "eth0-fast", 1, 100);
+        let path2 = IsspMultipathRoute::new(2, 2, "wwan0-slow", 2, 80);
+        router.add_route(path1);
+        router.add_route(path2);
+
+        let now_ns = 1_000_000_000;
+        let flow_id = 42;
+        let slice = crate::traffic_slicing::FlowSliceClass::UltraLowLatency;
+
+        // Packet 1 received over fast path 1
+        let p1 = crate::reorder_engine::MultipathPacket::new(
+            1,
+            flow_id,
+            1,
+            slice,
+            1,
+            64,
+            now_ns,
+            now_ns + 2_000_000,
+        );
+        let (r1, del1) = router.ingest_reorder_packet(p1);
+        assert!(matches!(
+            r1,
+            crate::reorder_engine::IngestResult::DeliveredImmediate(_)
+        ));
+        assert_eq!(del1.len(), 1);
+        assert_eq!(del1[0].packet.sequence_number, 1);
+
+        // Packet 3 received over fast path 1 before packet 2 arrives (packet 2 delayed on slow path 2)
+        let p3 = crate::reorder_engine::MultipathPacket::new(
+            3,
+            flow_id,
+            1,
+            slice,
+            3,
+            64,
+            now_ns + 100_000,
+            now_ns + 2_100_000,
+        );
+        let (r3, del3) = router.ingest_reorder_packet(p3);
+        assert!(matches!(
+            r3,
+            crate::reorder_engine::IngestResult::Buffered { .. }
+        ));
+        assert!(del3.is_empty());
+
+        // Packet 2 arrives later on slow path 2
+        let p2 = crate::reorder_engine::MultipathPacket::new(
+            2,
+            flow_id,
+            2,
+            slice,
+            2,
+            64,
+            now_ns + 50_000,
+            now_ns + 4_000_000,
+        );
+        let (r2, del2) = router.ingest_reorder_packet(p2);
+        assert!(matches!(
+            r2,
+            crate::reorder_engine::IngestResult::Buffered { .. }
+        ));
+        assert_eq!(del2.len(), 2);
+        assert_eq!(del2[0].packet.sequence_number, 2);
+        assert_eq!(del2[1].packet.sequence_number, 3);
+
+        let summary = router.reorder_engine().metrics_summary();
+        assert_eq!(summary.total_received_packets, 3);
+        assert_eq!(summary.total_delivered_packets, 3);
+        assert_eq!(summary.total_immediate_in_order, 1);
+        assert_eq!(summary.total_reordered_packets, 2);
     }
 }

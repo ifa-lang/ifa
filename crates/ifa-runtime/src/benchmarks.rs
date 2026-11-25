@@ -1382,6 +1382,10 @@ pub fn create_saturated_multipath_snapshot(
         total_ingress_backpressures_applied: 0,
         total_subpath_scheduled_packets: 0,
         total_subpath_dropped_packets: 0,
+        total_reorder_delivered_packets: 0,
+        total_reorder_gaps_detected: 0,
+        total_reorder_timeouts_forced: 0,
+        max_reorder_path_skew_ns: 0,
         last_gradient_variance: 0.0,
         active_flows_by_slice: BTreeMap::new(),
         sla_violations_by_slice: BTreeMap::new(),
@@ -3407,6 +3411,9 @@ pub use crate::ingress_admission::{
     run_ingress_admission_benchmark, IngressAdmissionBenchmarkReport,
 };
 pub use crate::multi_node_sla::{run_multi_node_sla_benchmark, MultiNodeSlaReport};
+pub use crate::reorder_engine::{
+    run_multipath_reordering_benchmark, MultipathReorderingBenchmarkReport,
+};
 pub use crate::slice_resilience::{run_slice_resilience_benchmark, SliceResilienceBenchmarkReport};
 pub use crate::subpath_scheduler::{
     run_subpath_scheduler_benchmark, SubpathSchedulerBenchmarkReport,
@@ -4384,6 +4391,25 @@ mod tests {
         let md = report.to_markdown_table();
         assert!(md.contains("URLLC Strict Priority Guard"));
         assert!(md.contains("BestEffort Starvation Prevention"));
+        assert!(md.contains("PASSED"));
+
+        let json = report.to_json();
+        assert!(json.contains("\"verification_passed\":true"));
+    }
+
+    #[test]
+    fn test_multipath_reordering_benchmark_suite_runs() {
+        let report = run_multipath_reordering_benchmark();
+        assert!(report.verification_passed);
+        assert!(report.urllc_reordering_sojourn_compliant);
+        assert!(report.embb_in_order_delivery_ratio >= 0.99);
+        assert!(report.mission_critical_loss_detected);
+        assert!(report.mission_critical_gaps_flagged >= 1);
+        assert!(report.total_packets_processed > 500);
+
+        let md = report.to_markdown_table();
+        assert!(md.contains("URLLC Max Playout Sojourn"));
+        assert!(md.contains("eMBB In-Order Delivery Ratio"));
         assert!(md.contains("PASSED"));
 
         let json = report.to_json();

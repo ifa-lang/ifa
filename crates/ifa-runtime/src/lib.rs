@@ -17,6 +17,7 @@ pub mod mtls_attestation;
 pub mod multi_node_sla;
 pub mod panic;
 pub mod reactor;
+pub mod reorder_engine;
 pub mod session_sync;
 pub mod simd_classifier;
 pub mod slice_resilience;
@@ -124,6 +125,11 @@ pub use reactor::{
     ifa_rt_async_udp_set_broadcast, ifa_rt_async_udp_set_ttl, ifa_rt_async_write, AsyncReactor,
     AsyncTcpListener, AsyncTcpStream, AsyncTimer, AsyncUdpSocket, IoUringConnector, IocpConnector,
     KernelTimespec, GLOBAL_REACTOR,
+};
+pub use reorder_engine::{
+    run_multipath_reordering_benchmark, DeliveredPacket, FlowReorderBuffer, FlowReorderPolicy,
+    IngestResult, MultipathPacket, MultipathReorderEngine, MultipathReorderingBenchmarkReport,
+    ReorderEngineMetricsSummary, ReorderGapEvent, ReorderGapKind,
 };
 pub use session_sync::{
     ClusterPsk, FailoverAction, GossipFrame, GossipResult, IsspAdaptiveHeaderCompressor,
