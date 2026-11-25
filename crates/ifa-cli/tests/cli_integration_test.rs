@@ -1242,5 +1242,54 @@ fn test_cli_net_session_list_inspect_migrate() {
     assert_eq!(prob_val["probation_steps"].as_array().unwrap().len(), 4);
     assert_eq!(prob_val["telemetry"]["total_paths"], 2);
 
+    // 18. Test `ifa net session balance` table output
+    let bal_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("balance")
+        .arg("--rounds")
+        .arg("5")
+        .arg("--gradient-us")
+        .arg("80000")
+        .arg("--packets")
+        .arg("60")
+        .output()
+        .expect("execute balance");
+    assert!(
+        bal_out.status.success(),
+        "balance failed: {}",
+        String::from_utf8_lossy(&bal_out.stderr)
+    );
+    let bal_str = String::from_utf8_lossy(&bal_out.stdout);
+    assert!(bal_str.contains("ISSP DYNAMIC BANDWIDTH BALANCING (RTT GRADIENT / BBR / LEDBAT)"));
+    assert!(bal_str.contains("RTT GRADIENT DYNAMICS & CONGESTION FEEDBACK ROUNDS"));
+    assert!(bal_str.contains("TRAFFIC STEERING REBALANCING SUMMARY"));
+    assert!(bal_str.contains("DYNAMIC RTT GRADIENT CONGESTION BALANCING VERIFIED"));
+
+    // 19. Test `ifa net session balance --json`
+    let bal_json_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("balance")
+        .arg("--rounds")
+        .arg("5")
+        .arg("--gradient-us")
+        .arg("80000")
+        .arg("--packets")
+        .arg("60")
+        .arg("--json")
+        .output()
+        .expect("execute balance json");
+    assert!(bal_json_out.status.success());
+    let bal_val: serde_json::Value =
+        serde_json::from_slice(&bal_json_out.stdout).expect("valid JSON balance output");
+    assert_eq!(bal_val["rounds_evaluated"], 5);
+    assert_eq!(bal_val["gradient_surge_us"], 80000);
+    assert_eq!(bal_val["packets_per_round"], 60);
+    assert_eq!(bal_val["dynamic_rebalancing_verified"], true);
+    assert_eq!(bal_val["rounds"].as_array().unwrap().len(), 5);
+    assert_eq!(bal_val["telemetry"]["total_paths"], 2);
+    assert_eq!(bal_val["telemetry"]["routes"].as_array().unwrap().len(), 2);
+
     let _ = fs::remove_dir_all(&temp_dir);
 }

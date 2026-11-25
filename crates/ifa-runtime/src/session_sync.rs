@@ -3723,6 +3723,49 @@ impl SessionRegistry {
             .map_err(|_| SyncError::LockPoisoned)?;
         Ok(router.reintegration_history().to_vec())
     }
+
+    /// Configure the active multipath routing and load-balancing policy.
+    pub fn set_multipath_routing_policy(&self, policy: IsspRoutingPolicy) -> Result<(), SyncError> {
+        let mut router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        router.policy = policy;
+        Ok(())
+    }
+
+    /// Update congestion feedback for a multipath route (BBR bottleneck estimation + LEDBAT gradient delay).
+    pub fn update_congestion_feedback(
+        &self,
+        path_id: u32,
+        rtt_us: u64,
+        lost_bytes: u64,
+        delivered_bytes: u64,
+    ) -> Result<f64, SyncError> {
+        let mut router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        router.update_congestion_feedback(path_id, rtt_us, lost_bytes, delivered_bytes)
+    }
+
+    /// Retrieve per-subpath bandwidth estimates for all registered routes.
+    pub fn bandwidth_estimates(&self) -> Result<Vec<(u32, IsspBandwidthEstimate)>, SyncError> {
+        let router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        Ok(router.bandwidth_estimates())
+    }
+
+    /// Retrieve bandwidth estimate for a specific route.
+    pub fn path_bandwidth_estimate(&self, path_id: u32) -> Result<IsspBandwidthEstimate, SyncError> {
+        let router = self
+            .multipath_router
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
+        router.path_bandwidth_estimate(path_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6525,5 +6568,42 @@ mod tests {
         let c_tele = sender.subpath_crypto_telemetry(1).unwrap();
         assert_eq!(c_tele.packets_encrypted, 10);
         assert_eq!(c_tele.auth_failures, 0);
+    }
+
+    #[test]
+    fn test_session_registry_congestion_feedback_and_bandwidth_estimates() {
+        let reg = SessionRegistry::new(1);
+        reg.set_multipath_routing_policy(IsspRoutingPolicy::BandwidthAggregation)
+            .unwrap();
+        reg.add_multipath_route(IsspMultipathRoute::new(1, 2, "eth0-fiber", 1, 100))
+            .unwrap();
+        reg.add_multipath_route(IsspMultipathRoute::new(2, 2, "wwan0-5g", 2, 50))
+            .unwrap();
+
+        // Feed nominal feedback on path 1
+        for _ in 0..8 {
+            let factor = reg
+                .update_congestion_feedback(1, 10_000, 0, 125_000)
+                .expect("valid congestion feedback update");
+            assert!(factor > 0.0 && factor <= 1.0);
+        }
+
+        // Feed loss and congestion on path 2
+        reg.update_congestion_feedback(2, 60_000, 1500, 10_000)
+            .expect("valid congestion feedback on path 2");
+
+        let estimates = reg.bandwidth_estimates().expect("fetch bandwidth estimates");
+        assert_eq!(estimates.len(), 2);
+
+        let est1 = reg.path_bandwidth_estimate(1).expect("path 1 estimate");
+        assert_eq!(est1.available_bps, 100_000_000);
+        assert_eq!(est1.phase, IsspCongestionPhase::CongestionAvoidance);
+
+        let est2 = reg.path_bandwidth_estimate(2).expect("path 2 estimate");
+        assert_eq!(est2.phase, IsspCongestionPhase::Recovery);
+
+        // Unknown path should return error
+        let err = reg.path_bandwidth_estimate(99);
+        assert!(err.is_err());
     }
 }

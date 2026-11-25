@@ -2,10 +2,11 @@
 
 use clap::Subcommand;
 use ifa_runtime::{
-    run_issp_failover_benchmark_suite, run_issp_scenario, IsspCapsule,
-    IsspFailoverBenchmarkSuiteReport, IsspFlapDampingConfig, IsspHeartbeatProbe,
-    IsspMultipathRoute, IsspNetworkProfile, IsspPathState, IsspProbationConfig, IsspRoutingPolicy,
-    SecurityPolicy, SessionId, SessionRecord, SessionRegistry, SessionSnapshot,
+    run_issp_failover_benchmark_suite, run_issp_scenario, IsspBandwidthEstimate, IsspCapsule,
+    IsspCongestionPhase, IsspFailoverBenchmarkSuiteReport, IsspFlapDampingConfig,
+    IsspHeartbeatProbe, IsspMultipathRoute, IsspNetworkProfile, IsspPathState,
+    IsspProbationConfig, IsspRoutingPolicy, SecurityPolicy, SessionId, SessionRecord,
+    SessionRegistry, SessionSnapshot,
 };
 use serde_json::json;
 use std::fs;
@@ -126,6 +127,24 @@ pub enum SessionCommand {
         /// Number of consecutive test probes to simulate during probation
         #[arg(long, default_value = "4")]
         probes: u32,
+        /// Path to persistent cluster state dump (.issp or binary dump)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+        /// Output formatted as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Benchmark dynamic bandwidth balancing and traffic steering via RTT gradient (BBR / LEDBAT feedback)
+    Balance {
+        /// Number of measurement and feedback rounds to evaluate
+        #[arg(short, long, default_value = "5")]
+        rounds: usize,
+        /// Differential latency gradient surge in microseconds on congested path (e.g. 80000 µs = 80ms)
+        #[arg(long, default_value = "80000")]
+        gradient_us: u64,
+        /// Number of packets to schedule per round to observe traffic distribution
+        #[arg(short, long, default_value = "60")]
+        packets: usize,
         /// Path to persistent cluster state dump (.issp or binary dump)
         #[arg(short, long)]
         file: Option<PathBuf>,
@@ -1205,5 +1224,312 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        SessionCommand::Balance {
+            rounds,
+            gradient_us,
+            packets,
+            file,
+            json,
+        } => {
+            let registry = match resolve_state_file(file.as_ref()) {
+                Some(p) if p.exists() => match SessionRegistry::load_from_file(&p) {
+                    Ok(reg) => reg,
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: failed loading state from {:?} ({}), using active registry",
+                            p, e
+                        );
+                        SessionRegistry::new(1)
+                    }
+                },
+                _ => SessionRegistry::new(1),
+            };
+
+            let _ = registry.set_multipath_routing_policy(IsspRoutingPolicy::BandwidthAggregation);
+
+            // Ensure baseline routes are present (primary fiber WAN path #1 and secondary 5G path #2)
+            if let Ok(routes) = registry.list_multipath_routes() {
+                if !routes.iter().any(|r| r.path_id == 1) {
+                    let mut r1 = IsspMultipathRoute::new(1, 10, "eth0-fiber-wan", 1, 100)
+                        .with_state(IsspPathState::Active);
+                    r1.metrics.smoothed_rtt_us = 10_000;
+                    let _ = registry.add_multipath_route(r1);
+                }
+                if !routes.iter().any(|r| r.path_id == 2) {
+                    let mut r2 = IsspMultipathRoute::new(2, 10, "wwan0-5g-edge", 2, 50)
+                        .with_state(IsspPathState::Active);
+                    r2.metrics.smoothed_rtt_us = 25_000;
+                    let _ = registry.add_multipath_route(r2);
+                }
+            }
+
+            let session_id = SessionId::new(0x4000_2001, 1, 100);
+            let mut round_reports = Vec::new();
+            let mut sim_clock_ms = current_unix_secs() * 1000;
+
+            let mut share1_steady = 0.0;
+            let mut share1_congested = 0.0;
+            let mut rebalancing_detected = false;
+
+            for r_idx in 1..=rounds {
+                sim_clock_ms += 1000;
+
+                // Determine dynamic RTT gradient conditions per round
+                let (condition_label, rtt1_us, lost1_b, deliv1_b, rtt2_us, lost2_b, deliv2_b) =
+                    match r_idx {
+                        1 => (
+                            "Baseline Initial Probe",
+                            10_000,
+                            0,
+                            125_000,
+                            25_000,
+                            0,
+                            62_500,
+                        ),
+                        2 => (
+                            "Steady-State Balanced",
+                            10_200,
+                            0,
+                            125_000,
+                            25_100,
+                            0,
+                            62_500,
+                        ),
+                        3 => (
+                            "Asymmetric Latency Gradient Surge",
+                            10_000 + gradient_us,
+                            3_000,
+                            20_000,
+                            25_000,
+                            0,
+                            125_000,
+                        ),
+                        4 => (
+                            "Congestion Mitigation & LEDBAT Backoff",
+                            10_000 + (gradient_us / 4),
+                            0,
+                            60_000,
+                            25_800,
+                            0,
+                            100_000,
+                        ),
+                        _ => (
+                            "Stabilized Convergence",
+                            10_100,
+                            0,
+                            125_000,
+                            25_000,
+                            0,
+                            62_500,
+                        ),
+                    };
+
+                // Update real congestion models (BBR + LEDBAT) via SessionRegistry
+                let factor1 = registry
+                    .update_congestion_feedback(1, rtt1_us, lost1_b, deliv1_b)
+                    .unwrap_or(1.0);
+                let factor2 = registry
+                    .update_congestion_feedback(2, rtt2_us, lost2_b, deliv2_b)
+                    .unwrap_or(1.0);
+
+                let est1 = registry
+                    .path_bandwidth_estimate(1)
+                    .unwrap_or(IsspBandwidthEstimate {
+                        available_bps: 0,
+                        queuing_delay_us: 0,
+                        weight_factor: factor1,
+                        phase: IsspCongestionPhase::SlowStart,
+                    });
+                let est2 = registry
+                    .path_bandwidth_estimate(2)
+                    .unwrap_or(IsspBandwidthEstimate {
+                        available_bps: 0,
+                        queuing_delay_us: 0,
+                        weight_factor: factor2,
+                        phase: IsspCongestionPhase::SlowStart,
+                    });
+
+                let (eff_w1, eff_w2) = if let Ok(router) = registry.multipath_router.lock() {
+                    let w1 = router.get_route(1).map(|r| r.effective_weight()).unwrap_or(1);
+                    let w2 = router.get_route(2).map(|r| r.effective_weight()).unwrap_or(1);
+                    (w1, w2)
+                } else {
+                    (1, 1)
+                };
+
+                // Schedule packets to observe traffic distribution
+                let mut path1_scheduled = 0usize;
+                let mut path2_scheduled = 0usize;
+
+                for p_idx in 0..packets {
+                    let send_time = sim_clock_ms + (p_idx as u64 * 2);
+                    let payload = format!("bal-pkt-{r_idx}-{p_idx}").into_bytes();
+                    if let Ok(sched) =
+                        registry.schedule_multipath_packet(&session_id, payload, send_time)
+                    {
+                        if sched.path_id == 1 {
+                            path1_scheduled += 1;
+                        } else if sched.path_id == 2 {
+                            path2_scheduled += 1;
+                        }
+                    }
+                }
+
+                let total_sched = (path1_scheduled + path2_scheduled).max(1);
+                let share1_pct = (path1_scheduled as f64 / total_sched as f64) * 100.0;
+                let share2_pct = (path2_scheduled as f64 / total_sched as f64) * 100.0;
+
+                if r_idx == 2 {
+                    share1_steady = share1_pct;
+                } else if r_idx == 3 {
+                    share1_congested = share1_pct;
+                    if share1_congested < share1_steady {
+                        rebalancing_detected = true;
+                    }
+                }
+
+                round_reports.push((
+                    r_idx,
+                    condition_label,
+                    rtt1_us,
+                    est1,
+                    eff_w1,
+                    path1_scheduled,
+                    share1_pct,
+                    rtt2_us,
+                    est2,
+                    eff_w2,
+                    path2_scheduled,
+                    share2_pct,
+                ));
+            }
+
+            let telem = registry.multipath_telemetry().unwrap_or_default();
+
+            if json {
+                let val = json!({
+                    "rounds_evaluated": rounds,
+                    "gradient_surge_us": gradient_us,
+                    "packets_per_round": packets,
+                    "dynamic_rebalancing_verified": rebalancing_detected,
+                    "share1_steady_pct": share1_steady,
+                    "share1_congested_pct": share1_congested,
+                    "rounds": round_reports.iter().map(|(r_idx, cond, rtt1, est1, eff_w1, p1_cnt, s1_pct, rtt2, est2, eff_w2, p2_cnt, s2_pct)| json!({
+                        "round": r_idx,
+                        "condition": cond,
+                        "path_1": {
+                            "interface": "eth0-fiber-wan",
+                            "rtt_us": rtt1,
+                            "rtt_ms": (*rtt1 as f64) / 1000.0,
+                            "queuing_delay_us": est1.queuing_delay_us,
+                            "available_bps": est1.available_bps,
+                            "phase": format!("{:?}", est1.phase),
+                            "weight_factor": est1.weight_factor,
+                            "effective_weight": eff_w1,
+                            "packets_scheduled": p1_cnt,
+                            "traffic_share_pct": s1_pct,
+                        },
+                        "path_2": {
+                            "interface": "wwan0-5g-edge",
+                            "rtt_us": rtt2,
+                            "rtt_ms": (*rtt2 as f64) / 1000.0,
+                            "queuing_delay_us": est2.queuing_delay_us,
+                            "available_bps": est2.available_bps,
+                            "phase": format!("{:?}", est2.phase),
+                            "weight_factor": est2.weight_factor,
+                            "effective_weight": eff_w2,
+                            "packets_scheduled": p2_cnt,
+                            "traffic_share_pct": s2_pct,
+                        }
+                    })).collect::<Vec<_>>(),
+                    "telemetry": {
+                        "total_paths": telem.total_paths,
+                        "active_paths": telem.active_paths,
+                        "total_heartbeats_sent": telem.total_heartbeats_sent,
+                        "total_heartbeats_received": telem.total_heartbeats_received,
+                        "routes": telem.routes.iter().map(|r| json!({
+                            "path_id": r.path_id,
+                            "interface": r.interface_name,
+                            "weight": r.weight,
+                            "effective_weight": r.effective_weight(),
+                            "total_frames_sent": r.metrics.total_frames_sent,
+                            "total_frames_received": r.metrics.total_frames_received,
+                        })).collect::<Vec<_>>(),
+                    }
+                });
+                println!("{}", serde_json::to_string_pretty(&val).unwrap());
+            } else {
+                println!("\n=== ISSP DYNAMIC BANDWIDTH BALANCING (RTT GRADIENT / BBR / LEDBAT) ===");
+                println!(
+                    "Rounds: {} | Gradient Surge: {:.2} ms ({} µs) | Packets/Round: {}",
+                    rounds,
+                    (gradient_us as f64) / 1000.0,
+                    gradient_us,
+                    packets
+                );
+
+                println!("\n[1. RTT GRADIENT DYNAMICS & CONGESTION FEEDBACK ROUNDS]");
+                println!("| Round | Condition | Path 1 RTT (Queue) | Path 1 EffW | Path 1 Share | Path 2 RTT (Queue) | Path 2 EffW | Path 2 Share |");
+                println!("| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |");
+
+                for (r_idx, cond, rtt1, est1, eff_w1, _, s1_pct, rtt2, est2, eff_w2, _, s2_pct) in &round_reports {
+                    println!(
+                        "| Round {} | {} | {:.1} ms (+{:.1} ms) | {} ({:?}) | {:.1}% | {:.1} ms (+{:.1} ms) | {} ({:?}) | {:.1}% |",
+                        r_idx,
+                        cond,
+                        (*rtt1 as f64) / 1000.0,
+                        (est1.queuing_delay_us as f64) / 1000.0,
+                        eff_w1,
+                        est1.phase,
+                        s1_pct,
+                        (*rtt2 as f64) / 1000.0,
+                        (est2.queuing_delay_us as f64) / 1000.0,
+                        eff_w2,
+                        est2.phase,
+                        s2_pct
+                    );
+                }
+
+                println!("\n[2. TRAFFIC STEERING REBALANCING SUMMARY]");
+                println!("- Nominal Pre-Congestion Allocation (Round 2): Path #1: {:.1}% | Path #2: {:.1}%", share1_steady, 100.0 - share1_steady);
+                println!("- Peak Congestion Allocation (Round 3):         Path #1: {:.1}% | Path #2: {:.1}%", share1_congested, 100.0 - share1_congested);
+
+                if rebalancing_detected {
+                    println!("\nStatus: DYNAMIC RTT GRADIENT CONGESTION BALANCING VERIFIED (ADAPTIVE BACKOFF & TRAFFIC STEERING CONFIRMED)\n");
+                } else {
+                    println!("\nStatus: CONGESTION BALANCING COMPLETED\n");
+                }
+            }
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_execute_session_command_balance_json() {
+        let code = execute_session_command(SessionCommand::Balance {
+            rounds: 5,
+            gradient_us: 80_000,
+            packets: 30,
+            file: None,
+            json: true,
+        });
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_execute_session_command_balance_text() {
+        let code = execute_session_command(SessionCommand::Balance {
+            rounds: 3,
+            gradient_us: 40_000,
+            packets: 20,
+            file: None,
+            json: false,
+        });
+        assert_eq!(code, ExitCode::SUCCESS);
     }
 }
