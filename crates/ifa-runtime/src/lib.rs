@@ -17,6 +17,7 @@ pub mod mtls_attestation;
 pub mod multi_node_sla;
 pub mod multipath_congestion;
 pub mod multipath_fec;
+pub mod multipath_retransmit;
 pub mod panic;
 pub mod reactor;
 pub mod reorder_engine;
@@ -122,6 +123,12 @@ pub use multipath_fec::{
     solve_gf_linear_system, FecDataPacket, FecParityPacket, FecProfile, FecUnrecoverableGapEvent,
     MultipathFecBenchmarkReport, MultipathFecDecoder, MultipathFecEncoder, MultipathFecEngine,
     MultipathFecTelemetrySummary,
+};
+pub use multipath_retransmit::{
+    run_subpath_retransmit_benchmark, select_priority_fallback_subpath, InflightPacketRecord,
+    ReceiverNackGenerator, RetransmitSlicePolicy, RetransmittedPacket, SelectiveAckRange,
+    SenderRetransmitBuffer, SubpathNackPacket, SubpathRetransmitBenchmarkReport,
+    SubpathRetransmitManager, SubpathRetransmitTelemetrySummary, SubpathSackPacket,
 };
 pub use panic::{
     catch_panic, clear_last_panic, dispatch_panic, get_last_panic, get_last_panic_raw_ptr,

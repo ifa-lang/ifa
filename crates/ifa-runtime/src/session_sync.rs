@@ -2321,6 +2321,7 @@ pub struct IsspDynamicMultipathRouter {
     pub reorder_engine: crate::reorder_engine::MultipathReorderEngine,
     pub fec_engine: crate::multipath_fec::MultipathFecEngine,
     pub congestion_manager: crate::multipath_congestion::MultipathCongestionManager,
+    pub retransmit_manager: crate::multipath_retransmit::SubpathRetransmitManager,
 }
 
 impl IsspDynamicMultipathRouter {
@@ -2362,6 +2363,7 @@ impl IsspDynamicMultipathRouter {
             reorder_engine: crate::reorder_engine::MultipathReorderEngine::new(),
             fec_engine: crate::multipath_fec::MultipathFecEngine::new(),
             congestion_manager: crate::multipath_congestion::MultipathCongestionManager::new(),
+            retransmit_manager: crate::multipath_retransmit::SubpathRetransmitManager::new(),
         }
     }
 
@@ -3705,6 +3707,80 @@ impl IsspDynamicMultipathRouter {
             rtt_us,
             now_ns,
         );
+    }
+
+    /// Read access to the multipath targeted selective retransmission manager.
+    pub fn retransmit_manager(&self) -> &crate::multipath_retransmit::SubpathRetransmitManager {
+        &self.retransmit_manager
+    }
+
+    /// Mutable access to the multipath targeted selective retransmission manager.
+    pub fn retransmit_manager_mut(
+        &mut self,
+    ) -> &mut crate::multipath_retransmit::SubpathRetransmitManager {
+        &mut self.retransmit_manager
+    }
+
+    /// Buffer an outbound packet for selective retransmission tracking.
+    #[allow(clippy::too_many_arguments)]
+    pub fn buffer_outbound_for_retransmission(
+        &mut self,
+        packet_id: u64,
+        flow_id: u32,
+        slice_class: crate::traffic_slicing::FlowSliceClass,
+        sequence_number: u64,
+        payload: Vec<u8>,
+        subpath_id: u32,
+        dispatched_at_ns: u64,
+    ) {
+        self.retransmit_manager.record_outbound_packet(
+            packet_id,
+            flow_id,
+            slice_class,
+            sequence_number,
+            payload,
+            subpath_id,
+            dispatched_at_ns,
+        );
+    }
+
+    /// Process an incoming Subpath NACK packet and trigger selective retransmissions over priority fallback subpaths.
+    pub fn process_incoming_subpath_nack(
+        &mut self,
+        nack: &crate::multipath_retransmit::SubpathNackPacket,
+        now_ns: u64,
+    ) -> (
+        Vec<crate::multipath_retransmit::RetransmittedPacket>,
+        Vec<u64>,
+    ) {
+        self.retransmit_manager
+            .handle_incoming_nack(nack, &self.paths, now_ns)
+    }
+
+    /// Process an incoming Subpath SACK packet, acknowledging delivered packets.
+    pub fn process_incoming_subpath_sack(
+        &mut self,
+        sack: &crate::multipath_retransmit::SubpathSackPacket,
+    ) -> usize {
+        self.retransmit_manager.handle_incoming_sack(sack)
+    }
+
+    /// Handle unrecoverable FEC gap event and trigger immediate Subpath NACK targeting fallback subpaths.
+    pub fn handle_fec_unrecoverable_gap(
+        &mut self,
+        event: &crate::multipath_fec::FecUnrecoverableGapEvent,
+        slice_class: crate::traffic_slicing::FlowSliceClass,
+        failed_subpath_id: u32,
+        suggested_fallback: Option<u32>,
+        now_ns: u64,
+    ) -> Option<crate::multipath_retransmit::SubpathNackPacket> {
+        self.retransmit_manager.handle_fec_unrecoverable_event(
+            event,
+            slice_class,
+            failed_subpath_id,
+            suggested_fallback,
+            now_ns,
+        )
     }
 
     /// Return an iterator over all registered routes.
@@ -8711,5 +8787,91 @@ mod tests {
         let fec_summary = router.fec_engine().telemetry_summary();
         assert_eq!(fec_summary.total_packets_recovered, 1);
         assert_eq!(fec_summary.total_blocks_encoded, 1);
+    }
+
+    #[test]
+    fn test_router_subpath_nack_and_fallback_retransmit_integration() {
+        let mut router = IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::ActiveStandby);
+
+        let mut r1 = IsspMultipathRoute::new(1, 2, "eth0-wan", 1, 100);
+        r1.metrics.smoothed_rtt_us = 10_000;
+        r1.metrics.loss_rate_ppm = 500_000; // Heavy loss on primary path
+        router.add_route(r1);
+
+        let mut r2 = IsspMultipathRoute::new(2, 2, "eth1-lte", 2, 80);
+        r2.metrics.smoothed_rtt_us = 12_000;
+        r2.metrics.loss_rate_ppm = 1_000; // Clean backup path
+        router.add_route(r2);
+
+        let flow_id = 101;
+        let slice = crate::traffic_slicing::FlowSliceClass::MissionCritical;
+        let now_ns = 1_000_000_000;
+
+        // Buffer outbound packets 1..=5 transmitted over path 1
+        for seq in 1..=5 {
+            router.buffer_outbound_for_retransmission(
+                seq,
+                flow_id,
+                slice,
+                seq,
+                format!("mission-critical-payload-{}", seq).into_bytes(),
+                1,
+                now_ns,
+            );
+        }
+        assert_eq!(
+            router
+                .retransmit_manager()
+                .sender_buffers
+                .get(&flow_id)
+                .unwrap()
+                .inflight_count(),
+            5
+        );
+
+        // Simulate an FEC unrecoverable gap event for sequence 3 on subpath 1
+        let gap_ev = crate::multipath_fec::FecUnrecoverableGapEvent {
+            flow_id,
+            block_index: 0,
+            missing_seq_start: 3,
+            missing_seq_end: 3,
+            missing_count: 1,
+            available_parity: 0,
+            timestamp_ns: now_ns + 5_000_000,
+        };
+
+        let maybe_nack =
+            router.handle_fec_unrecoverable_gap(&gap_ev, slice, 1, Some(2), now_ns + 5_000_000);
+        assert!(maybe_nack.is_some());
+        let nack = maybe_nack.unwrap();
+        assert_eq!(nack.failed_subpath_id, 1);
+        assert_eq!(nack.suggested_fallback_subpath_id, Some(2));
+
+        // Process NACK: retransmit missing seq 3 over fallback subpath 2
+        let (retx_pkts, abandoned) =
+            router.process_incoming_subpath_nack(&nack, now_ns + 6_000_000);
+        assert_eq!(abandoned.len(), 0);
+        assert_eq!(retx_pkts.len(), 1);
+        assert_eq!(retx_pkts[0].sequence_number, 3);
+        assert_eq!(retx_pkts[0].assigned_fallback_subpath_id, 2); // Retransmitted over backup path 2!
+        assert!(retx_pkts[0].is_fec_fallback);
+
+        // Process SACK acknowledging cumulative seq 5
+        let sack = crate::multipath_retransmit::SubpathSackPacket {
+            flow_id,
+            slice_class: slice,
+            cumulative_ack_seq: 5,
+            sack_blocks: Vec::new(),
+            timestamp_ns: now_ns + 10_000_000,
+        };
+        let acked = router.process_incoming_subpath_sack(&sack);
+        assert_eq!(acked, 5);
+
+        let summary = router.retransmit_manager().telemetry_summary();
+        assert_eq!(summary.total_nacks_sent, 1);
+        assert_eq!(summary.total_nacks_received, 1);
+        assert_eq!(summary.total_retransmissions_dispatched, 1);
+        assert_eq!(summary.total_fallback_switches, 1);
+        assert_eq!(summary.active_inflight_packets, 0);
     }
 }

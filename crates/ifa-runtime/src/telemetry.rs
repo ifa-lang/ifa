@@ -407,6 +407,14 @@ pub struct IsspMultipathBalancingSnapshot {
     pub total_session_cwnd_bytes: u64,
     /// Total aggregate multipath in-flight bytes.
     pub total_session_inflight_bytes: u64,
+    /// Total selective retransmitted packets dispatched over fallback subpaths.
+    pub total_retransmissions_dispatched: u64,
+    /// Total retransmitted packets acknowledged and recovered.
+    pub total_retransmissions_recovered: u64,
+    /// Total packets abandoned after exceeding max retry attempts.
+    pub total_retransmissions_abandoned: u64,
+    /// Total retransmissions dynamically switched to alternate priority fallback subpaths.
+    pub total_retransmit_fallback_switches: u64,
     /// Instantaneous variance of marginal gradients across subpaths.
     pub last_gradient_variance: f64,
     /// Active flows partitioned by slice class name.
@@ -711,6 +719,18 @@ impl IsspMultipathBalancingSnapshot {
                 .congestion_manager()
                 .telemetry_summary()
                 .total_session_inflight_bytes,
+            total_retransmissions_dispatched: router
+                .retransmit_manager()
+                .total_retransmissions_dispatched,
+            total_retransmissions_recovered: router
+                .retransmit_manager()
+                .total_retransmissions_recovered,
+            total_retransmissions_abandoned: router
+                .retransmit_manager()
+                .total_retransmissions_abandoned,
+            total_retransmit_fallback_switches: router
+                .retransmit_manager()
+                .total_fallback_subpath_switches,
             last_gradient_variance: router.cost_gradient_metrics().last_gradient_variance,
             active_flows_by_slice: {
                 let mut m = BTreeMap::new();
@@ -1847,6 +1867,42 @@ impl PrometheusMultipathBalancingExporter {
         out.push_str(&format!(
             "ifa_issp_session_cwnd_bytes{} {}\n",
             base_lbl, s.total_session_cwnd_bytes
+        ));
+
+        out.push_str(
+            "# HELP ifa_issp_retransmissions_dispatched_total Total selective retransmitted packets dispatched over fallback subpaths.\n",
+        );
+        out.push_str("# TYPE ifa_issp_retransmissions_dispatched_total counter\n");
+        out.push_str(&format!(
+            "ifa_issp_retransmissions_dispatched_total{} {}\n",
+            base_lbl, s.total_retransmissions_dispatched
+        ));
+
+        out.push_str(
+            "# HELP ifa_issp_retransmissions_recovered_total Total retransmitted packets acknowledged and recovered.\n",
+        );
+        out.push_str("# TYPE ifa_issp_retransmissions_recovered_total counter\n");
+        out.push_str(&format!(
+            "ifa_issp_retransmissions_recovered_total{} {}\n",
+            base_lbl, s.total_retransmissions_recovered
+        ));
+
+        out.push_str(
+            "# HELP ifa_issp_retransmissions_abandoned_total Total packets abandoned after exceeding max retry attempts.\n",
+        );
+        out.push_str("# TYPE ifa_issp_retransmissions_abandoned_total counter\n");
+        out.push_str(&format!(
+            "ifa_issp_retransmissions_abandoned_total{} {}\n",
+            base_lbl, s.total_retransmissions_abandoned
+        ));
+
+        out.push_str(
+            "# HELP ifa_issp_retransmit_fallback_switches_total Total retransmissions dynamically switched to alternate priority fallback subpaths.\n",
+        );
+        out.push_str("# TYPE ifa_issp_retransmit_fallback_switches_total counter\n");
+        out.push_str(&format!(
+            "ifa_issp_retransmit_fallback_switches_total{} {}\n",
+            base_lbl, s.total_retransmit_fallback_switches
         ));
 
         out

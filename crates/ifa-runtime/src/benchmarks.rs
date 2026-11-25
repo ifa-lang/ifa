@@ -1393,6 +1393,10 @@ pub fn create_saturated_multipath_snapshot(
         total_congestion_window_migrations: 0,
         total_session_cwnd_bytes: 0,
         total_session_inflight_bytes: 0,
+        total_retransmissions_dispatched: 0,
+        total_retransmissions_recovered: 0,
+        total_retransmissions_abandoned: 0,
+        total_retransmit_fallback_switches: 0,
         last_gradient_variance: 0.0,
         active_flows_by_slice: BTreeMap::new(),
         sla_violations_by_slice: BTreeMap::new(),
@@ -3422,6 +3426,9 @@ pub use crate::multipath_congestion::{
     run_multipath_congestion_benchmark, MultipathCongestionBenchmarkReport,
 };
 pub use crate::multipath_fec::{run_multipath_fec_benchmark, MultipathFecBenchmarkReport};
+pub use crate::multipath_retransmit::{
+    run_subpath_retransmit_benchmark, SubpathRetransmitBenchmarkReport,
+};
 pub use crate::reorder_engine::{
     run_multipath_reordering_benchmark, MultipathReorderingBenchmarkReport,
 };
@@ -4462,5 +4469,15 @@ mod tests {
 
         let json = report.to_json();
         assert!(json.contains("\"verification_passed\":true"));
+    }
+
+    #[test]
+    fn test_subpath_retransmit_benchmark_suite_runs() {
+        let report = run_subpath_retransmit_benchmark();
+        assert_eq!(report.packets_ingested, 200);
+        assert_eq!(report.unrecoverable_fec_gaps, 1);
+        assert_eq!(report.retransmissions_dispatched, 6);
+        assert_eq!(report.fallback_subpaths_utilized, 6);
+        assert!(report.retransmission_success_rate > 0.99);
     }
 }
