@@ -2319,6 +2319,7 @@ pub struct IsspDynamicMultipathRouter {
     pub ingress_gatekeeper: crate::ingress_admission::IngressAdmissionGatekeeper,
     pub subpath_scheduler: crate::subpath_scheduler::SubpathSchedulerGroup,
     pub reorder_engine: crate::reorder_engine::MultipathReorderEngine,
+    pub fec_engine: crate::multipath_fec::MultipathFecEngine,
 }
 
 impl IsspDynamicMultipathRouter {
@@ -2358,6 +2359,7 @@ impl IsspDynamicMultipathRouter {
                 ),
             subpath_scheduler: crate::subpath_scheduler::SubpathSchedulerGroup::new(),
             reorder_engine: crate::reorder_engine::MultipathReorderEngine::new(),
+            fec_engine: crate::multipath_fec::MultipathFecEngine::new(),
         }
     }
 
@@ -3582,6 +3584,78 @@ impl IsspDynamicMultipathRouter {
         now_ns: u64,
     ) -> Vec<crate::reorder_engine::DeliveredPacket> {
         self.reorder_engine.tick_timeouts(now_ns)
+    }
+
+    /// Read access to the multipath FEC and cross-subpath erasure coding engine.
+    pub fn fec_engine(&self) -> &crate::multipath_fec::MultipathFecEngine {
+        &self.fec_engine
+    }
+
+    /// Mutable access to the multipath FEC and cross-subpath erasure coding engine.
+    pub fn fec_engine_mut(&mut self) -> &mut crate::multipath_fec::MultipathFecEngine {
+        &mut self.fec_engine
+    }
+
+    /// Ingest a source data packet into the router's FEC encoder, emitting any completed parity packets.
+    pub fn encode_fec_packet(
+        &mut self,
+        packet: crate::multipath_fec::FecDataPacket,
+        alternate_subpaths: &[u32],
+        now_ns: u64,
+    ) -> Option<Vec<crate::multipath_fec::FecParityPacket>> {
+        self.fec_engine
+            .encoder
+            .ingest_source_packet(packet, alternate_subpaths, now_ns)
+    }
+
+    /// Ingest an incoming data packet into the router's FEC decoder and forward to the reorder engine.
+    pub fn ingest_fec_data_packet(
+        &mut self,
+        packet: crate::multipath_fec::FecDataPacket,
+        block_index: u64,
+        now_ns: u64,
+    ) -> (
+        Vec<crate::multipath_fec::FecDataPacket>,
+        Vec<crate::reorder_engine::DeliveredPacket>,
+    ) {
+        let mp_pkt = packet.to_multipath_packet(now_ns);
+        let recovered = self
+            .fec_engine
+            .decoder
+            .ingest_data_packet(packet, block_index, now_ns)
+            .unwrap_or_default();
+        let (_ingest_res, mut delivered) = self.reorder_engine.ingest_packet(mp_pkt);
+        for rec in &recovered {
+            let rec_mp = rec.to_multipath_packet(now_ns);
+            let (_r, mut rec_del) = self.reorder_engine.ingest_packet(rec_mp);
+            delivered.append(&mut rec_del);
+        }
+        (recovered, delivered)
+    }
+
+    /// Ingest an incoming parity packet into the router's FEC decoder.
+    /// If an erasure is recovered, the reconstructed packets are fed directly into the reorder engine.
+    pub fn ingest_fec_parity_packet(
+        &mut self,
+        parity: crate::multipath_fec::FecParityPacket,
+        slice_class: crate::traffic_slicing::FlowSliceClass,
+        now_ns: u64,
+    ) -> (
+        Vec<crate::multipath_fec::FecDataPacket>,
+        Vec<crate::reorder_engine::DeliveredPacket>,
+    ) {
+        let recovered = self
+            .fec_engine
+            .decoder
+            .ingest_parity_packet(parity, slice_class, now_ns)
+            .unwrap_or_default();
+        let mut delivered = Vec::new();
+        for rec in &recovered {
+            let rec_mp = rec.to_multipath_packet(now_ns);
+            let (_r, mut rec_del) = self.reorder_engine.ingest_packet(rec_mp);
+            delivered.append(&mut rec_del);
+        }
+        (recovered, delivered)
     }
 
     /// Return an iterator over all registered routes.
@@ -8531,5 +8605,62 @@ mod tests {
         assert_eq!(summary.total_delivered_packets, 3);
         assert_eq!(summary.total_immediate_in_order, 1);
         assert_eq!(summary.total_reordered_packets, 2);
+    }
+
+    #[test]
+    fn test_router_multipath_fec_and_reorder_recovery_integration() {
+        let mut router = IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::LowestLatency);
+        let now_ns = 1_000_000_000;
+        let flow_id = 99;
+        let slice = crate::traffic_slicing::FlowSliceClass::UltraLowLatency;
+
+        // Ingest source packets 1 and 2, which triggers parity emission over alternate subpath 2
+        let p1 = crate::multipath_fec::FecDataPacket::new(
+            flow_id,
+            1,
+            1,
+            slice,
+            vec![10, 20, 30],
+            now_ns,
+        );
+        let p2 = crate::multipath_fec::FecDataPacket::new(
+            flow_id,
+            2,
+            1,
+            slice,
+            vec![40, 50, 60],
+            now_ns + 10_000,
+        );
+
+        let parities1 = router.encode_fec_packet(p1.clone(), &[2], now_ns);
+        assert!(parities1.is_none()); // 1 packet accumulated (K=2)
+
+        let parities2 = router
+            .encode_fec_packet(p2.clone(), &[2], now_ns + 10_000)
+            .expect("Parity packet emitted");
+        assert_eq!(parities2.len(), 1);
+        let parity = parities2[0].clone();
+        assert_eq!(parity.subpath_id, 2); // Sent on alternate subpath 2
+
+        // Receiver: p1 is lost on subpath 1! Only p2 arrives first
+        let (rec_data, del_data) = router.ingest_fec_data_packet(p2, 0, now_ns + 20_000);
+        assert!(rec_data.is_empty());
+        assert!(del_data.is_empty()); // p2 buffered in reorder engine waiting for p1
+
+        // Parity packet arrives over subpath 2! Reconstructs missing p1 and delivers p1 then p2!
+        let (rec_par, del_par) = router.ingest_fec_parity_packet(parity, slice, now_ns + 25_000);
+        assert_eq!(rec_par.len(), 1);
+        assert_eq!(rec_par[0].sequence_number, 1);
+        assert_eq!(rec_par[0].payload, p1.payload);
+        assert!(rec_par[0].was_recovered_via_fec);
+
+        // Reorder engine received reconstructed p1, delivered p1 and then unblocked p2!
+        assert_eq!(del_par.len(), 2);
+        assert_eq!(del_par[0].packet.sequence_number, 1);
+        assert_eq!(del_par[1].packet.sequence_number, 2);
+
+        let fec_summary = router.fec_engine().telemetry_summary();
+        assert_eq!(fec_summary.total_packets_recovered, 1);
+        assert_eq!(fec_summary.total_blocks_encoded, 1);
     }
 }

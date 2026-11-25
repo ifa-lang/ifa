@@ -15,6 +15,7 @@ pub mod latency_drift;
 pub mod mesh_lsa;
 pub mod mtls_attestation;
 pub mod multi_node_sla;
+pub mod multipath_fec;
 pub mod panic;
 pub mod reactor;
 pub mod reorder_engine;
@@ -107,6 +108,12 @@ pub use multi_node_sla::{
     run_multi_node_sla_benchmark, ClosedLoopAdaptationResult, ClosedLoopControlAction,
     EndToEndPathSlaAudit, InterSliceInterferenceEvent, MultiNodeSlaMetrics, MultiNodeSlaReport,
     MultiNodeSlaSynthesizer, MultiNodeSliceTelemetryRecord, NodeSlaEvaluation, SliceSlaTarget,
+};
+pub use multipath_fec::{
+    build_cauchy_matrix, gf_add, gf_div, gf_inv, gf_mul, gf_sub, run_multipath_fec_benchmark,
+    solve_gf_linear_system, FecDataPacket, FecParityPacket, FecProfile, FecUnrecoverableGapEvent,
+    MultipathFecBenchmarkReport, MultipathFecDecoder, MultipathFecEncoder, MultipathFecEngine,
+    MultipathFecTelemetrySummary,
 };
 pub use panic::{
     catch_panic, clear_last_panic, dispatch_panic, get_last_panic, get_last_panic_raw_ptr,

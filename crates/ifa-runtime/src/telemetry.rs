@@ -393,6 +393,12 @@ pub struct IsspMultipathBalancingSnapshot {
     pub total_reorder_timeouts_forced: u64,
     /// Maximum estimated differential path skew in nanoseconds across subpaths.
     pub max_reorder_path_skew_ns: u64,
+    /// Total erased packets recovered via FEC without round-trip retransmission.
+    pub total_fec_recovered_packets: u64,
+    /// Total parity packets emitted by FEC engine across diversity subpaths.
+    pub total_fec_parity_packets: u64,
+    /// FEC 0-RTT recovery success ratio.
+    pub fec_recovery_ratio: f64,
     /// Instantaneous variance of marginal gradients across subpaths.
     pub last_gradient_variance: f64,
     /// Active flows partitioned by slice class name.
@@ -677,6 +683,12 @@ impl IsspMultipathBalancingSnapshot {
                 .metrics_summary()
                 .total_timeouts_forced,
             max_reorder_path_skew_ns: router.reorder_engine().metrics_summary().max_path_skew_ns,
+            total_fec_recovered_packets: router.fec_engine().decoder.total_packets_recovered,
+            total_fec_parity_packets: router.fec_engine().encoder.total_parity_packets_generated,
+            fec_recovery_ratio: router
+                .fec_engine()
+                .telemetry_summary()
+                .recovery_success_ratio,
             last_gradient_variance: router.cost_gradient_metrics().last_gradient_variance,
             active_flows_by_slice: {
                 let mut m = BTreeMap::new();
@@ -1759,6 +1771,33 @@ impl PrometheusMultipathBalancingExporter {
         out.push_str(&format!(
             "ifa_subpath_reorder_path_skew_nanoseconds{} {}\n",
             base_lbl, s.max_reorder_path_skew_ns
+        ));
+
+        out.push_str(
+            "# HELP ifa_issp_fec_recovered_packets_total Total packets recovered via FEC without retransmission.\n",
+        );
+        out.push_str("# TYPE ifa_issp_fec_recovered_packets_total counter\n");
+        out.push_str(&format!(
+            "ifa_issp_fec_recovered_packets_total{} {}\n",
+            base_lbl, s.total_fec_recovered_packets
+        ));
+
+        out.push_str(
+            "# HELP ifa_issp_fec_parity_packets_total Total parity packets generated for cross-subpath diversity.\n",
+        );
+        out.push_str("# TYPE ifa_issp_fec_parity_packets_total counter\n");
+        out.push_str(&format!(
+            "ifa_issp_fec_parity_packets_total{} {}\n",
+            base_lbl, s.total_fec_parity_packets
+        ));
+
+        out.push_str(
+            "# HELP ifa_issp_fec_recovery_ratio Instantaneous ratio of successful FEC recoveries.\n",
+        );
+        out.push_str("# TYPE ifa_issp_fec_recovery_ratio gauge\n");
+        out.push_str(&format!(
+            "ifa_issp_fec_recovery_ratio{} {:.4}\n",
+            base_lbl, s.fec_recovery_ratio
         ));
 
         out
