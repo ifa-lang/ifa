@@ -47,6 +47,12 @@ pub const GOSSIP_FRAME_SIZE: usize = 112;
 /// Wire size of a serialised encrypted `SecureGossipFrame` (v2) in bytes.
 pub const SECURE_GOSSIP_FRAME_SIZE: usize = 136;
 
+/// Capsule header magic tag for ISSP capsules transmitted inside RFC 9297 HTTP tunnels.
+pub const ISSP_CAPSULE_MAGIC: u32 = 0x4953_4350; // 'ISCP'
+
+/// Wire size of the ISSP capsule container header in bytes.
+pub const ISSP_CAPSULE_HEADER_SIZE: usize = 12;
+
 // ---------------------------------------------------------------------------
 // Session identifier
 // ---------------------------------------------------------------------------
@@ -186,8 +192,9 @@ impl SessionSnapshot {
         buf[40..48].copy_from_slice(&self.reorder_bitmap.to_le_bytes());
         buf[48..56].copy_from_slice(&self.token_bucket_scaled.to_le_bytes());
         buf[56..64].copy_from_slice(&self.token_rate_scaled.to_le_bytes());
-        buf[64..72].copy_from_slice(&self.codel_target_ns.to_le_bytes());
-        buf[72..80].copy_from_slice(&self.codel_interval_ns.to_le_bytes());
+        buf[64..68].copy_from_slice(&(self.codel_target_ns as u32).to_le_bytes());
+        buf[68..72].copy_from_slice(&(self.codel_interval_ns as u32).to_le_bytes());
+        buf[72..80].copy_from_slice(&self.captured_unix_secs.to_le_bytes());
         let mut misc = [0u8; 16];
         misc[0..4].copy_from_slice(&self.codel_drop_count.to_le_bytes());
         misc[4..8].copy_from_slice(&self.fec_block_idx.to_le_bytes());
@@ -207,8 +214,9 @@ impl SessionSnapshot {
         let reorder_bitmap = u64::from_le_bytes(buf[40..48].try_into().unwrap());
         let token_bucket_scaled = u64::from_le_bytes(buf[48..56].try_into().unwrap());
         let token_rate_scaled = u64::from_le_bytes(buf[56..64].try_into().unwrap());
-        let codel_target_ns = u64::from_le_bytes(buf[64..72].try_into().unwrap());
-        let codel_interval_ns = u64::from_le_bytes(buf[72..80].try_into().unwrap());
+        let codel_target_ns = u32::from_le_bytes(buf[64..68].try_into().unwrap()) as u64;
+        let codel_interval_ns = u32::from_le_bytes(buf[68..72].try_into().unwrap()) as u64;
+        let captured_unix_secs = u64::from_le_bytes(buf[72..80].try_into().unwrap());
         let misc = &buf[80..96];
         let codel_drop_count = u32::from_le_bytes(misc[0..4].try_into().unwrap());
         let fec_block_idx = u32::from_le_bytes(misc[4..8].try_into().unwrap());
@@ -230,7 +238,7 @@ impl SessionSnapshot {
             fec_src_count,
             fec_repair_count,
             crypto_epoch,
-            captured_unix_secs: 0,
+            captured_unix_secs,
         }
     }
 }
@@ -659,6 +667,129 @@ impl SecureGossipFrame {
 }
 
 // ---------------------------------------------------------------------------
+// ISSP Capsule Transport Frame
+// ---------------------------------------------------------------------------
+
+/// ISSP Capsule wire container for encapsulating gossip frames inside RFC 9297 HTTP tunnels.
+///
+/// Contains either a plaintext v1 GossipFrame (112 bytes) or an AEAD-encrypted v2
+/// SecureGossipFrame (136 bytes), prefixed by an ISSP capsule subheader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsspCapsule {
+    /// Capsule wire protocol version (`ISSP_VERSION_V1` or `ISSP_VERSION_V2_ENCRYPTED`).
+    pub version: u32,
+    /// Identifier of the gateway node originating or transmitting this capsule.
+    pub origin_node_id: u32,
+    /// Wire payload containing the gossip frame.
+    pub payload: Vec<u8>,
+}
+
+impl IsspCapsule {
+    /// Create an ISSP capsule wrapping a plaintext v1 GossipFrame.
+    pub fn from_gossip_frame(frame: &GossipFrame) -> Self {
+        Self {
+            version: ISSP_VERSION_V1,
+            origin_node_id: frame.sender_node_id,
+            payload: frame.encode().to_vec(),
+        }
+    }
+
+    /// Create an ISSP capsule wrapping an AEAD-encrypted v2 SecureGossipFrame.
+    pub fn from_secure_frame(
+        origin_node_id: u32,
+        frame_bytes: &[u8; SECURE_GOSSIP_FRAME_SIZE],
+    ) -> Self {
+        Self {
+            version: ISSP_VERSION_V2_ENCRYPTED,
+            origin_node_id,
+            payload: frame_bytes.to_vec(),
+        }
+    }
+
+    /// Encode into a compact binary representation for transport within an RFC 9297 capsule.
+    /// Layout:
+    ///   0..4  : magic (0x49534350)
+    ///   4..8  : version (u32 LE)
+    ///   8..12 : origin_node_id (u32 LE)
+    ///   12..  : frame payload (112 or 136 bytes)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(ISSP_CAPSULE_HEADER_SIZE + self.payload.len());
+        buf.extend_from_slice(&ISSP_CAPSULE_MAGIC.to_be_bytes());
+        buf.extend_from_slice(&self.version.to_le_bytes());
+        buf.extend_from_slice(&self.origin_node_id.to_le_bytes());
+        buf.extend_from_slice(&self.payload);
+        buf
+    }
+
+    /// Decode from raw RFC 9297 capsule payload bytes.
+    pub fn from_bytes(slice: &[u8]) -> Result<Self, SyncError> {
+        if slice.len() < ISSP_CAPSULE_HEADER_SIZE {
+            return Err(SyncError::InvalidCapsuleLength(slice.len()));
+        }
+        let magic = u32::from_be_bytes(slice[0..4].try_into().unwrap());
+        if magic != ISSP_CAPSULE_MAGIC {
+            return Err(SyncError::BadCapsuleMagic);
+        }
+        let version = u32::from_le_bytes(slice[4..8].try_into().unwrap());
+        let origin_node_id = u32::from_le_bytes(slice[8..12].try_into().unwrap());
+        let payload = slice[ISSP_CAPSULE_HEADER_SIZE..].to_vec();
+        Ok(Self {
+            version,
+            origin_node_id,
+            payload,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session Tick Configuration & Outcome
+// ---------------------------------------------------------------------------
+
+/// Configuration for periodic session tick processing in the ISSP pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionTickConfig {
+    /// Interval in seconds between periodic snapshot broadcasts for primary sessions.
+    /// Default: 1 second.
+    pub snapshot_interval_secs: u64,
+    /// Threshold of silence in seconds from the primary node before a standby replica
+    /// initiates automatic transparent migration.
+    /// Default: 2 seconds.
+    pub primary_silence_threshold_secs: u64,
+    /// Whether standby nodes should automatically trigger migration when the primary is silent.
+    /// Default: true.
+    pub auto_migrate_on_silence: bool,
+    /// Threshold in seconds after which completely abandoned/unmigratable sessions are pruned.
+    /// Default: 10 seconds.
+    pub stale_eviction_secs: u64,
+}
+
+impl Default for SessionTickConfig {
+    fn default() -> Self {
+        Self {
+            snapshot_interval_secs: 1,
+            primary_silence_threshold_secs: 2,
+            auto_migrate_on_silence: true,
+            stale_eviction_secs: 10,
+        }
+    }
+}
+
+/// Outcome produced during an ISSP session tick cycle.
+#[derive(Debug, Clone)]
+pub struct SessionTickOutcome {
+    /// Outbound plaintext gossip frames generated for primary sessions requiring sync.
+    pub outbound_plaintext_frames: Vec<GossipFrame>,
+    /// Outbound secure AEAD gossip frames generated (if PSK is configured).
+    pub outbound_secure_frames: Vec<[u8; SECURE_GOSSIP_FRAME_SIZE]>,
+    /// Outbound capsules ready for transmission over the capsule transport pipeline.
+    pub outbound_capsules: Vec<IsspCapsule>,
+    /// Sessions that were automatically migrated to this node due to primary silence.
+    pub auto_migrated_sessions: Vec<SessionSnapshot>,
+    /// Stale session IDs evicted from the registry during this tick.
+    pub evicted_sessions: Vec<SessionId>,
+}
+
+// ---------------------------------------------------------------------------
 // Local session registry
 // ---------------------------------------------------------------------------
 
@@ -985,6 +1116,131 @@ impl SessionRegistry {
             gossip_replay_failed_count: self.gossip_replay_failed_count.load(Ordering::Relaxed),
         }
     }
+
+    /// Produce an ISSP capsule frame for encapsulation in RFC 9297 HTTP tunnels.
+    ///
+    /// Encapsulates a v2 encrypted frame if a PSK is configured, otherwise falls back to a v1 plaintext frame.
+    pub fn build_issp_capsule(&self, session_id: &SessionId) -> Option<IsspCapsule> {
+        if self.psk.is_some() {
+            let enc = self.build_secure_gossip_frame(session_id)?;
+            Some(IsspCapsule::from_secure_frame(self.node_id, &enc))
+        } else {
+            let plain = self.build_gossip_frame(session_id)?;
+            Some(IsspCapsule::from_gossip_frame(&plain))
+        }
+    }
+
+    /// Ingest an ISSP capsule received from an RFC 9297 HTTP tunnel, enforcing security policies.
+    pub fn ingest_issp_capsule(
+        &self,
+        capsule: &IsspCapsule,
+    ) -> Result<GossipResult, RawGossipError> {
+        self.apply_raw_gossip(&capsule.payload)
+    }
+
+    /// Periodic tick hook evaluating session progress, triggering auto-migration upon primary silence,
+    /// and generating snapshots for active primary sessions.
+    ///
+    /// - For primary sessions: generates periodic snapshot gossip frames and capsules whenever
+    ///   `elapsed >= config.snapshot_interval_secs`.
+    /// - For shadow/standby sessions: detects silence of the primary node (`silence_age >= config.primary_silence_threshold_secs`).
+    ///   If `config.auto_migrate_on_silence` is true and the snapshot is not stale (<= `SNAPSHOT_MAX_AGE`),
+    ///   the session is transparently promoted to primary with an incremented migration epoch,
+    ///   and an immediate cutover frame/capsule is generated for cluster broadcast.
+    /// - Stale sessions exceeding `config.stale_eviction_secs` are pruned.
+    pub fn on_session_tick(
+        &self,
+        now_unix_secs: u64,
+        config: &SessionTickConfig,
+    ) -> Result<SessionTickOutcome, SyncError> {
+        let mut guard = self.sessions.lock().map_err(|_| SyncError::LockPoisoned)?;
+
+        let mut outbound_plaintext_frames = Vec::new();
+        let mut outbound_secure_frames = Vec::new();
+        let mut outbound_capsules = Vec::new();
+        let mut auto_migrated_sessions = Vec::new();
+        let mut to_evict = Vec::new();
+
+        for (&session_id, record) in guard.iter_mut() {
+            if record.is_primary {
+                // Periodic snapshot for primary sessions
+                let elapsed = now_unix_secs.saturating_sub(record.snapshot.captured_unix_secs);
+                if elapsed >= config.snapshot_interval_secs {
+                    record.snapshot.captured_unix_secs = now_unix_secs;
+                    record.last_captured = Instant::now();
+
+                    if let Some(psk) = self.psk.as_ref() {
+                        let nonce_seq = self.tx_nonce_seq.fetch_add(1, Ordering::Relaxed);
+                        let frame = SecureGossipFrame {
+                            sender_node_id: self.node_id,
+                            nonce_seq,
+                            snapshot: record.snapshot,
+                        };
+                        let enc = frame.encode(psk);
+                        outbound_secure_frames.push(enc);
+                        outbound_capsules.push(IsspCapsule::from_secure_frame(self.node_id, &enc));
+                    } else {
+                        let frame = GossipFrame {
+                            sender_node_id: self.node_id,
+                            snapshot: record.snapshot,
+                        };
+                        outbound_plaintext_frames.push(frame);
+                        outbound_capsules.push(IsspCapsule::from_gossip_frame(&frame));
+                    }
+                }
+            } else {
+                // Standby / shadow session: check for primary silence
+                let silence_age = now_unix_secs.saturating_sub(record.snapshot.captured_unix_secs);
+                if config.auto_migrate_on_silence
+                    && silence_age >= config.primary_silence_threshold_secs
+                    && silence_age <= SNAPSHOT_MAX_AGE.as_secs()
+                {
+                    // Primary is silent: trigger automatic transparent migration
+                    record.snapshot.migration_epoch += 1;
+                    record.snapshot.captured_unix_secs = now_unix_secs;
+                    record.is_primary = true;
+                    record.last_captured = Instant::now();
+                    self.migration_count.fetch_add(1, Ordering::Relaxed);
+
+                    auto_migrated_sessions.push(record.snapshot);
+
+                    // Immediately broadcast cutover / takeover announcement to cluster
+                    if let Some(psk) = self.psk.as_ref() {
+                        let nonce_seq = self.tx_nonce_seq.fetch_add(1, Ordering::Relaxed);
+                        let frame = SecureGossipFrame {
+                            sender_node_id: self.node_id,
+                            nonce_seq,
+                            snapshot: record.snapshot,
+                        };
+                        let enc = frame.encode(psk);
+                        outbound_secure_frames.push(enc);
+                        outbound_capsules.push(IsspCapsule::from_secure_frame(self.node_id, &enc));
+                    } else {
+                        let frame = GossipFrame {
+                            sender_node_id: self.node_id,
+                            snapshot: record.snapshot,
+                        };
+                        outbound_plaintext_frames.push(frame);
+                        outbound_capsules.push(IsspCapsule::from_gossip_frame(&frame));
+                    }
+                } else if silence_age >= config.stale_eviction_secs {
+                    to_evict.push(session_id);
+                }
+            }
+        }
+
+        for id in &to_evict {
+            guard.remove(id);
+        }
+
+        Ok(SessionTickOutcome {
+            outbound_plaintext_frames,
+            outbound_secure_frames,
+            outbound_capsules,
+            auto_migrated_sessions,
+            evicted_sessions: to_evict,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1117,6 +1373,10 @@ pub enum SyncError {
     RegistryFull,
     /// Internal mutex was poisoned.
     LockPoisoned,
+    /// ISSP capsule magic does not match ISSP_CAPSULE_MAGIC.
+    BadCapsuleMagic,
+    /// ISSP capsule buffer length is invalid.
+    InvalidCapsuleLength(usize),
 }
 
 impl std::fmt::Display for SyncError {
@@ -1133,6 +1393,10 @@ impl std::fmt::Display for SyncError {
             }
             SyncError::RegistryFull => write!(f, "registry capacity ({MAX_SESSIONS}) reached"),
             SyncError::LockPoisoned => write!(f, "internal mutex poisoned"),
+            SyncError::BadCapsuleMagic => write!(f, "invalid ISSP capsule magic tag"),
+            SyncError::InvalidCapsuleLength(len) => {
+                write!(f, "invalid ISSP capsule length: {len} bytes")
+            }
         }
     }
 }
@@ -1190,6 +1454,7 @@ mod tests {
         assert_eq!(decoded.tx_seq, snap.tx_seq);
         assert_eq!(decoded.rx_seq_high, snap.rx_seq_high);
         assert_eq!(decoded.crypto_epoch, snap.crypto_epoch);
+        assert_eq!(decoded.captured_unix_secs, snap.captured_unix_secs);
     }
 
     // ---- GossipFrame CRC integrity ----
@@ -1678,5 +1943,256 @@ mod tests {
         let tel = reg.telemetry_snapshot();
         assert_eq!(tel.gossip_auth_failed_count, 1);
         assert_eq!(tel.gossip_replay_failed_count, 0);
+    }
+
+    // ---- ISSP Capsule Transport & on_session_tick Tests ----
+
+    #[test]
+    fn test_issp_capsule_wire_roundtrip_v1_plaintext() {
+        let id = make_id(400);
+        let snap = make_snap(id, 2, 1_700_004_000);
+        let frame = GossipFrame {
+            sender_node_id: 8,
+            snapshot: snap,
+        };
+
+        let cap = IsspCapsule::from_gossip_frame(&frame);
+        assert_eq!(cap.version, ISSP_VERSION_V1);
+        assert_eq!(cap.origin_node_id, 8);
+        assert_eq!(cap.payload.len(), GOSSIP_FRAME_SIZE);
+
+        let wire = cap.to_bytes();
+        assert_eq!(wire.len(), ISSP_CAPSULE_HEADER_SIZE + GOSSIP_FRAME_SIZE);
+
+        let decoded = IsspCapsule::from_bytes(&wire).expect("decode capsule");
+        assert_eq!(decoded.version, ISSP_VERSION_V1);
+        assert_eq!(decoded.origin_node_id, 8);
+        assert_eq!(decoded.payload, cap.payload);
+
+        // Verify payload can be unpacked back to GossipFrame
+        let gf = GossipFrame::decode(decoded.payload.as_slice().try_into().unwrap())
+            .expect("decode gossip frame");
+        assert_eq!(gf.sender_node_id, 8);
+        assert_eq!(gf.snapshot.id, id);
+    }
+
+    #[test]
+    fn test_issp_capsule_wire_roundtrip_v2_encrypted() {
+        let psk = ClusterPsk::from_passphrase(b"capsule-psk");
+        let id = make_id(401);
+        let snap = make_snap(id, 3, 1_700_004_001);
+        let frame = SecureGossipFrame {
+            sender_node_id: 15,
+            nonce_seq: 77,
+            snapshot: snap,
+        };
+        let encoded_sec = frame.encode(&psk);
+
+        let cap = IsspCapsule::from_secure_frame(15, &encoded_sec);
+        assert_eq!(cap.version, ISSP_VERSION_V2_ENCRYPTED);
+        assert_eq!(cap.origin_node_id, 15);
+        assert_eq!(cap.payload.len(), SECURE_GOSSIP_FRAME_SIZE);
+
+        let wire = cap.to_bytes();
+        assert_eq!(
+            wire.len(),
+            ISSP_CAPSULE_HEADER_SIZE + SECURE_GOSSIP_FRAME_SIZE
+        );
+
+        let decoded = IsspCapsule::from_bytes(&wire).expect("decode capsule");
+        assert_eq!(decoded.version, ISSP_VERSION_V2_ENCRYPTED);
+        assert_eq!(decoded.origin_node_id, 15);
+
+        let sec_decoded =
+            SecureGossipFrame::decode(decoded.payload.as_slice().try_into().unwrap(), &psk)
+                .expect("decode secure frame");
+        assert_eq!(sec_decoded.sender_node_id, 15);
+        assert_eq!(sec_decoded.nonce_seq, 77);
+        assert_eq!(sec_decoded.snapshot.id, id);
+    }
+
+    #[test]
+    fn test_issp_capsule_corrupt_magic_and_length() {
+        let mut wire = vec![0u8; ISSP_CAPSULE_HEADER_SIZE + 10];
+        wire[0..4].copy_from_slice(&0xDEADBEEF_u32.to_be_bytes()); // wrong magic
+        assert_eq!(
+            IsspCapsule::from_bytes(&wire).unwrap_err(),
+            SyncError::BadCapsuleMagic
+        );
+
+        let short_wire = vec![0u8; 8];
+        assert_eq!(
+            IsspCapsule::from_bytes(&short_wire).unwrap_err(),
+            SyncError::InvalidCapsuleLength(8)
+        );
+    }
+
+    #[test]
+    fn test_on_session_tick_periodic_snapshot_primary() {
+        let reg = SessionRegistry::new(1);
+        let id = make_id(402);
+        let snap = make_snap(id, 0, 100);
+        reg.upsert_primary(snap).unwrap();
+
+        let config = SessionTickConfig {
+            snapshot_interval_secs: 2,
+            primary_silence_threshold_secs: 3,
+            auto_migrate_on_silence: true,
+            stale_eviction_secs: 10,
+        };
+
+        // Tick at t = 101: elapsed 1s < snapshot_interval (2s) -> no frame generated
+        let outcome1 = reg.on_session_tick(101, &config).unwrap();
+        assert_eq!(outcome1.outbound_plaintext_frames.len(), 0);
+        assert_eq!(outcome1.outbound_capsules.len(), 0);
+
+        // Tick at t = 102: elapsed 2s >= snapshot_interval (2s) -> snapshot frame generated
+        let outcome2 = reg.on_session_tick(102, &config).unwrap();
+        assert_eq!(outcome2.outbound_plaintext_frames.len(), 1);
+        assert_eq!(outcome2.outbound_capsules.len(), 1);
+        assert_eq!(
+            outcome2.outbound_plaintext_frames[0]
+                .snapshot
+                .captured_unix_secs,
+            102
+        );
+        assert_eq!(outcome2.auto_migrated_sessions.len(), 0);
+    }
+
+    #[test]
+    fn test_on_session_tick_auto_migrate_on_silence() {
+        // Node 2 has a shadow replica of a session from primary node 1
+        let reg = SessionRegistry::new(2);
+        let id = make_id(403);
+        let snap = make_snap(id, 1, 100); // last captured at t = 100 by primary
+        let frame = GossipFrame {
+            sender_node_id: 1,
+            snapshot: snap,
+        };
+        reg.apply_gossip(&frame);
+
+        let config = SessionTickConfig {
+            snapshot_interval_secs: 1,
+            primary_silence_threshold_secs: 2,
+            auto_migrate_on_silence: true,
+            stale_eviction_secs: 10,
+        };
+
+        // At t = 101: silence = 1s < 2s -> no migration
+        let outcome1 = reg.on_session_tick(101, &config).unwrap();
+        assert_eq!(outcome1.auto_migrated_sessions.len(), 0);
+
+        // At t = 102: silence = 2s >= threshold (2s) -> primary is silent!
+        // Node 2 must auto-migrate session, bump epoch to 2, and emit immediate announcement!
+        let outcome2 = reg.on_session_tick(102, &config).unwrap();
+        assert_eq!(outcome2.auto_migrated_sessions.len(), 1);
+        assert_eq!(outcome2.auto_migrated_sessions[0].migration_epoch, 2);
+        assert_eq!(outcome2.auto_migrated_sessions[0].captured_unix_secs, 102);
+
+        // Verify cutover broadcast was generated
+        assert_eq!(outcome2.outbound_plaintext_frames.len(), 1);
+        assert_eq!(
+            outcome2.outbound_plaintext_frames[0]
+                .snapshot
+                .migration_epoch,
+            2
+        );
+        assert_eq!(outcome2.outbound_capsules.len(), 1);
+
+        // Verify node 2 is now primary
+        assert_eq!(reg.telemetry_snapshot().migration_count, 1);
+
+        // Next tick at t = 103: node 2 is now primary, so it emits periodic snapshots
+        let outcome3 = reg.on_session_tick(103, &config).unwrap();
+        assert_eq!(outcome3.auto_migrated_sessions.len(), 0);
+        assert_eq!(outcome3.outbound_plaintext_frames.len(), 1);
+    }
+
+    #[test]
+    fn test_on_session_tick_disabled_auto_migrate() {
+        let reg = SessionRegistry::new(2);
+        let id = make_id(404);
+        let snap = make_snap(id, 1, 100);
+        let frame = GossipFrame {
+            sender_node_id: 1,
+            snapshot: snap,
+        };
+        reg.apply_gossip(&frame);
+
+        let config = SessionTickConfig {
+            snapshot_interval_secs: 1,
+            primary_silence_threshold_secs: 2,
+            auto_migrate_on_silence: false, // disabled
+            stale_eviction_secs: 10,
+        };
+
+        // Silence = 3s but auto_migrate is false -> no migration
+        let outcome = reg.on_session_tick(103, &config).unwrap();
+        assert_eq!(outcome.auto_migrated_sessions.len(), 0);
+        assert_eq!(outcome.outbound_plaintext_frames.len(), 0);
+    }
+
+    #[test]
+    fn test_on_session_tick_stale_eviction() {
+        let reg = SessionRegistry::new(2);
+        let id = make_id(405);
+        let snap = make_snap(id, 1, 100);
+        let frame = GossipFrame {
+            sender_node_id: 1,
+            snapshot: snap,
+        };
+        reg.apply_gossip(&frame);
+
+        let config = SessionTickConfig {
+            snapshot_interval_secs: 1,
+            primary_silence_threshold_secs: 2,
+            auto_migrate_on_silence: false,
+            stale_eviction_secs: 10,
+        };
+
+        // At t = 111: age = 11s > stale_eviction_secs (10s) -> evicted
+        let outcome = reg.on_session_tick(111, &config).unwrap();
+        assert_eq!(outcome.evicted_sessions.len(), 1);
+        assert_eq!(outcome.evicted_sessions[0], id);
+        assert_eq!(reg.session_count(), 0);
+    }
+
+    #[test]
+    fn test_session_tick_capsule_ingest_pipeline() {
+        let psk = ClusterPsk::from_passphrase(b"tick-capsule-pipeline-secret");
+        let node_a = SessionRegistry::with_psk(1, psk, SecurityPolicy::StrictPsk);
+        let node_b = SessionRegistry::with_psk(2, psk, SecurityPolicy::StrictPsk);
+
+        let id = make_id(406);
+        let snap = make_snap(id, 0, 1_000);
+        node_a.upsert_primary(snap).unwrap();
+
+        // Node A produces capsule
+        let capsule = node_a.build_issp_capsule(&id).expect("build capsule");
+        let wire_bytes = capsule.to_bytes();
+
+        // Wire transmission into Node B
+        let decoded_cap = IsspCapsule::from_bytes(&wire_bytes).expect("decode wire");
+        let res = node_b
+            .ingest_issp_capsule(&decoded_cap)
+            .expect("ingest capsule");
+        assert_eq!(res, GossipResult::Inserted);
+
+        // Node B now has the session in shadow state
+        assert_eq!(node_b.session_count(), 1);
+
+        // Node A becomes silent, Node B ticks at t = 1_003 (silence = 3s)
+        let config = SessionTickConfig {
+            snapshot_interval_secs: 1,
+            primary_silence_threshold_secs: 2,
+            auto_migrate_on_silence: true,
+            stale_eviction_secs: 10,
+        };
+
+        let outcome = node_b.on_session_tick(1_003, &config).unwrap();
+        assert_eq!(outcome.auto_migrated_sessions.len(), 1);
+        assert_eq!(outcome.auto_migrated_sessions[0].migration_epoch, 1);
+        assert_eq!(outcome.outbound_secure_frames.len(), 1);
+        assert_eq!(outcome.outbound_capsules.len(), 1);
     }
 }

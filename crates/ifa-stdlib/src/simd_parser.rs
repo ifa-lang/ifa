@@ -5456,6 +5456,8 @@ pub enum CapsuleType {
     FlowMigrationComplete,
     /// Distributed Datagram Flow Migration Abort & Rollback (type 0x3177).
     FlowMigrationAbort,
+    /// IFA Session Synchronization Protocol (ISSP) Gossip Frame / Capsule (type 0x3178).
+    IsspGossipSync,
     /// Unknown or custom capsule type identified by its 62-bit VarInt value.
     Unknown(u64),
 }
@@ -5490,6 +5492,7 @@ impl From<u64> for CapsuleType {
             0x3175 => CapsuleType::FlowMigrationCutover,
             0x3176 => CapsuleType::FlowMigrationComplete,
             0x3177 => CapsuleType::FlowMigrationAbort,
+            0x3178 => CapsuleType::IsspGossipSync,
             other => CapsuleType::Unknown(other),
         }
     }
@@ -5525,6 +5528,7 @@ impl From<CapsuleType> for u64 {
             CapsuleType::FlowMigrationCutover => 0x3175,
             CapsuleType::FlowMigrationComplete => 0x3176,
             CapsuleType::FlowMigrationAbort => 0x3177,
+            CapsuleType::IsspGossipSync => 0x3178,
             CapsuleType::Unknown(other) => other,
         }
     }
@@ -5673,6 +5677,19 @@ impl HttpCapsule {
     /// Construct a datagram flow migration abort capsule.
     pub fn flow_migration_abort(payload: Vec<u8>) -> Self {
         Self::new(CapsuleType::FlowMigrationAbort, payload)
+    }
+
+    /// Construct an IFA Session Synchronization Protocol (ISSP) gossip frame capsule.
+    pub fn issp_gossip(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::IsspGossipSync, payload)
+    }
+
+    /// Decode the raw byte payload of an ISSP gossip frame capsule.
+    pub fn decode_issp_gossip(&self) -> Result<&[u8], FastHttpError> {
+        if self.capsule_type != CapsuleType::IsspGossipSync {
+            return Err(FastHttpError::InvalidFrame);
+        }
+        Ok(&self.payload)
     }
 
     /// Encode this capsule into QUIC VarInt-framed wire format appended to `out`.
@@ -8511,6 +8528,7 @@ mod http2_tests {
         let c_mig_cut = HttpCapsule::flow_migration_cutover(vec![0xFF, 0x06]);
         let c_mig_comp = HttpCapsule::flow_migration_complete(vec![0x11, 0x07]);
         let c_mig_abort = HttpCapsule::flow_migration_abort(vec![0x22, 0x08]);
+        let c_issp = HttpCapsule::issp_gossip(vec![0x49, 0x53, 0x53, 0x50, 0x01]);
 
         let mut wire = Vec::new();
         c_sync_ann.encode(&mut wire);
@@ -8521,9 +8539,10 @@ mod http2_tests {
         c_mig_cut.encode(&mut wire);
         c_mig_comp.encode(&mut wire);
         c_mig_abort.encode(&mut wire);
+        c_issp.encode(&mut wire);
 
         let decoded = HttpCapsule::decode_all(&wire).expect("decode migration capsules");
-        assert_eq!(decoded.len(), 8);
+        assert_eq!(decoded.len(), 9);
         assert_eq!(decoded[0], c_sync_ann);
         assert_eq!(decoded[1], c_sync_req);
         assert_eq!(decoded[2], c_sync_ack);
@@ -8532,6 +8551,11 @@ mod http2_tests {
         assert_eq!(decoded[5], c_mig_cut);
         assert_eq!(decoded[6], c_mig_comp);
         assert_eq!(decoded[7], c_mig_abort);
+        assert_eq!(decoded[8], c_issp);
+        assert_eq!(
+            c_issp.decode_issp_gossip().unwrap(),
+            &[0x49, 0x53, 0x53, 0x50, 0x01]
+        );
     }
 
     #[test]

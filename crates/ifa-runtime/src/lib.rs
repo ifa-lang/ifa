@@ -62,10 +62,12 @@ pub use reactor::{
     KernelTimespec, GLOBAL_REACTOR,
 };
 pub use session_sync::{
-    ClusterPsk, GossipFrame, GossipResult, RawGossipError, RejectReason, SecureGossipFrame,
-    SecurityError, SecurityPolicy, SessionId, SessionRegistry, SessionSnapshot, SyncError,
-    SyncTelemetry, GOSSIP_FRAME_SIZE, ISSP_MAGIC, ISSP_VERSION_V1, ISSP_VERSION_V2_ENCRYPTED,
-    MAX_PEER_NODES, MAX_SESSIONS, SECURE_GOSSIP_FRAME_SIZE, SNAPSHOT_MAX_AGE,
+    ClusterPsk, GossipFrame, GossipResult, IsspCapsule, RawGossipError, RejectReason,
+    SecureGossipFrame, SecurityError, SecurityPolicy, SessionId, SessionRegistry, SessionSnapshot,
+    SessionTickConfig, SessionTickOutcome, SyncError, SyncTelemetry, GOSSIP_FRAME_SIZE,
+    ISSP_CAPSULE_HEADER_SIZE, ISSP_CAPSULE_MAGIC, ISSP_MAGIC, ISSP_VERSION_V1,
+    ISSP_VERSION_V2_ENCRYPTED, MAX_PEER_NODES, MAX_SESSIONS, SECURE_GOSSIP_FRAME_SIZE,
+    SNAPSHOT_MAX_AGE,
 };
 pub use string::IfaString;
 pub use telemetry::{supervise_command, ResourceAuditScope, ResourceUsage};

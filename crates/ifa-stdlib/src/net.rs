@@ -13277,6 +13277,24 @@ impl ExtendedConnectTunnel {
         Ok(None)
     }
 
+    /// Send an ISSP gossip frame capsule over this tunnel.
+    pub fn send_issp_gossip_capsule(&mut self, payload: &[u8]) -> Result<(), String> {
+        let capsule = crate::simd_parser::HttpCapsule::issp_gossip(payload.to_vec());
+        self.send_secure_capsule(&capsule)
+    }
+
+    /// Receive an ISSP gossip frame capsule from this tunnel.
+    pub fn recv_issp_gossip_capsule(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if let Some(cap) = self.recv_secure_capsule()? {
+            if cap.capsule_type == crate::simd_parser::CapsuleType::IsspGossipSync {
+                return Ok(Some(cap.payload));
+            } else {
+                self.capsule_queue.push_front(cap);
+            }
+        }
+        Ok(None)
+    }
+
     /// Send a UDP datagram adaptively: if payload fits within path PMTU (accounting for RFC 9297
     /// Capsule & Context ID overhead), it is transmitted directly as a single DATAGRAM capsule.
     /// If payload exceeds PMTU, it is fragmented into RFC 9297/9298 compatible chunks.
@@ -28457,6 +28475,53 @@ impl MultiNodeSessionSyncEngine {
             .filter(|s| s.role == SessionRole::Standby)
             .count()
     }
+
+    /// Periodic tick hook evaluating session progress, triggering auto-migration upon primary silence,
+    /// and generating snapshots for active primary sessions.
+    pub fn on_session_tick(
+        &mut self,
+        now_ms: u64,
+        snapshot_interval_ms: u64,
+        silence_threshold_ms: u64,
+    ) -> (Vec<SessionStateSyncAnnounce>, Vec<String>) {
+        let mut outbound_announces = Vec::new();
+        let mut auto_migrated_sessions = Vec::new();
+
+        for (session_id, session) in self.sessions.iter_mut() {
+            if session.role == SessionRole::Primary {
+                let elapsed = now_ms.saturating_sub(session.last_sync_time_ms);
+                if elapsed >= snapshot_interval_ms {
+                    session.snapshot.updated_at_ms = now_ms;
+                    session.last_sync_time_ms = now_ms;
+                    outbound_announces.push(SessionStateSyncAnnounce {
+                        origin_node_id: self.local_node_id.clone(),
+                        snapshot: session.snapshot.clone(),
+                        is_heartbeat: true,
+                    });
+                }
+            } else if session.role == SessionRole::Standby {
+                let silence_age = now_ms.saturating_sub(session.last_sync_time_ms);
+                if silence_age >= silence_threshold_ms {
+                    // Primary node silence detected: auto-promote standby replica to primary
+                    session.role = SessionRole::Primary;
+                    session.snapshot.state_epoch += 1;
+                    session.snapshot.updated_at_ms = now_ms;
+                    session.last_sync_time_ms = now_ms;
+                    auto_migrated_sessions.push(session_id.clone());
+
+                    // Immediately broadcast takeover announcement
+                    outbound_announces.push(SessionStateSyncAnnounce {
+                        origin_node_id: self.local_node_id.clone(),
+                        snapshot: session.snapshot.clone(),
+                        is_heartbeat: false,
+                    });
+                }
+            }
+        }
+
+        self.total_sync_announces_sent += outbound_announces.len() as u64;
+        (outbound_announces, auto_migrated_sessions)
+    }
 }
 
 /// Tracking context for an in-flight session migration across gateways.
@@ -42595,5 +42660,71 @@ mod tls_alpn_tests {
 
         let telem = mig_mgr.telemetry();
         assert_eq!(telem.total_migrations_aborted, 1);
+    }
+
+    #[test]
+    fn test_issp_capsule_pipeline_and_silence_migration() {
+        // 1. Set up interconnected ExtendedConnectTunnel instances
+        let mut tunnel_a =
+            ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "gw-backup:443");
+        tunnel_a.mark_established();
+        let mut tunnel_b =
+            ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "gw-backup:443");
+        tunnel_b.mark_established();
+
+        // 2. Validate ISSP capsule transport through the tunnel
+        let issp_raw_frame = b"ISSP_AEAD_GOSSIP_FRAME_SAMPLE_PAYLOAD";
+        tunnel_a
+            .send_issp_gossip_capsule(issp_raw_frame)
+            .expect("send issp gossip capsule");
+
+        for f in tunnel_a.drain_egress_data() {
+            tunnel_b.ingest_network_data(&f);
+        }
+
+        let recv_issp = tunnel_b
+            .recv_issp_gossip_capsule()
+            .expect("recv issp capsule")
+            .expect("payload exists");
+        assert_eq!(recv_issp, issp_raw_frame);
+
+        // 3. Multi-node session tick & automatic migration on primary silence
+        let mut engine_a = MultiNodeSessionSyncEngine::new("gw-primary");
+        let mut engine_b = MultiNodeSessionSyncEngine::new("gw-standby");
+
+        // Primary registers session
+        engine_a.register_primary_session("sess-issp-01", "client-55", 1001, 10_000);
+
+        // Primary on_session_tick generates periodic snapshot at t = 11_000 (elapsed = 1000ms)
+        let (announces, auto_migrated) = engine_a.on_session_tick(11_000, 1_000, 2_000);
+        assert_eq!(announces.len(), 1);
+        assert_eq!(auto_migrated.len(), 0);
+        assert!(announces[0].is_heartbeat);
+
+        // Ingest announcement on Standby node B
+        let ack = engine_b.handle_sync_announce(&announces[0], 11_000);
+        assert!(ack.success);
+        assert_eq!(engine_b.standby_sessions_count(), 1);
+
+        // Standby ticks at t = 11_500: silence = 500ms < threshold (2000ms) -> no migration
+        let (announces_b, auto_b) = engine_b.on_session_tick(11_500, 1_000, 2_000);
+        assert_eq!(announces_b.len(), 0);
+        assert_eq!(auto_b.len(), 0);
+
+        // Primary node goes completely silent!
+        // Standby ticks at t = 13_100: silence = 2100ms >= threshold (2000ms)
+        // Standby automatically triggers migration, becomes Primary and emits takeover announce!
+        let (announces_mig, auto_mig) = engine_b.on_session_tick(13_100, 1_000, 2_000);
+        assert_eq!(auto_mig.len(), 1);
+        assert_eq!(auto_mig[0], "sess-issp-01");
+        assert_eq!(announces_mig.len(), 1);
+        assert!(!announces_mig[0].is_heartbeat);
+        assert_eq!(announces_mig[0].snapshot.state_epoch, 2);
+
+        // Verify Node B now owns the session as Primary
+        assert_eq!(engine_b.primary_sessions_count(), 1);
+        assert_eq!(engine_b.standby_sessions_count(), 0);
+        let session = engine_b.get_session("sess-issp-01").unwrap();
+        assert_eq!(session.role, SessionRole::Primary);
     }
 }
