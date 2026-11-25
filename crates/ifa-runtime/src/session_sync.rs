@@ -3759,7 +3759,10 @@ impl SessionRegistry {
     }
 
     /// Retrieve bandwidth estimate for a specific route.
-    pub fn path_bandwidth_estimate(&self, path_id: u32) -> Result<IsspBandwidthEstimate, SyncError> {
+    pub fn path_bandwidth_estimate(
+        &self,
+        path_id: u32,
+    ) -> Result<IsspBandwidthEstimate, SyncError> {
         let router = self
             .multipath_router
             .lock()
@@ -6592,7 +6595,9 @@ mod tests {
         reg.update_congestion_feedback(2, 60_000, 1500, 10_000)
             .expect("valid congestion feedback on path 2");
 
-        let estimates = reg.bandwidth_estimates().expect("fetch bandwidth estimates");
+        let estimates = reg
+            .bandwidth_estimates()
+            .expect("fetch bandwidth estimates");
         assert_eq!(estimates.len(), 2);
 
         let est1 = reg.path_bandwidth_estimate(1).expect("path 1 estimate");

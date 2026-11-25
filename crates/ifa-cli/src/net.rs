@@ -4,9 +4,8 @@ use clap::Subcommand;
 use ifa_runtime::{
     run_issp_failover_benchmark_suite, run_issp_scenario, IsspBandwidthEstimate, IsspCapsule,
     IsspCongestionPhase, IsspFailoverBenchmarkSuiteReport, IsspFlapDampingConfig,
-    IsspHeartbeatProbe, IsspMultipathRoute, IsspNetworkProfile, IsspPathState,
-    IsspProbationConfig, IsspRoutingPolicy, SecurityPolicy, SessionId, SessionRecord,
-    SessionRegistry, SessionSnapshot,
+    IsspHeartbeatProbe, IsspMultipathRoute, IsspNetworkProfile, IsspPathState, IsspProbationConfig,
+    IsspRoutingPolicy, SecurityPolicy, SessionId, SessionRecord, SessionRegistry, SessionSnapshot,
 };
 use serde_json::json;
 use std::fs;
@@ -1350,8 +1349,14 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                     });
 
                 let (eff_w1, eff_w2) = if let Ok(router) = registry.multipath_router.lock() {
-                    let w1 = router.get_route(1).map(|r| r.effective_weight()).unwrap_or(1);
-                    let w2 = router.get_route(2).map(|r| r.effective_weight()).unwrap_or(1);
+                    let w1 = router
+                        .get_route(1)
+                        .map(|r| r.effective_weight())
+                        .unwrap_or(1);
+                    let w2 = router
+                        .get_route(2)
+                        .map(|r| r.effective_weight())
+                        .unwrap_or(1);
                     (w1, w2)
                 } else {
                     (1, 1)
@@ -1459,7 +1464,9 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 });
                 println!("{}", serde_json::to_string_pretty(&val).unwrap());
             } else {
-                println!("\n=== ISSP DYNAMIC BANDWIDTH BALANCING (RTT GRADIENT / BBR / LEDBAT) ===");
+                println!(
+                    "\n=== ISSP DYNAMIC BANDWIDTH BALANCING (RTT GRADIENT / BBR / LEDBAT) ==="
+                );
                 println!(
                     "Rounds: {} | Gradient Surge: {:.2} ms ({} µs) | Packets/Round: {}",
                     rounds,
@@ -1472,7 +1479,9 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 println!("| Round | Condition | Path 1 RTT (Queue) | Path 1 EffW | Path 1 Share | Path 2 RTT (Queue) | Path 2 EffW | Path 2 Share |");
                 println!("| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |");
 
-                for (r_idx, cond, rtt1, est1, eff_w1, _, s1_pct, rtt2, est2, eff_w2, _, s2_pct) in &round_reports {
+                for (r_idx, cond, rtt1, est1, eff_w1, _, s1_pct, rtt2, est2, eff_w2, _, s2_pct) in
+                    &round_reports
+                {
                     println!(
                         "| Round {} | {} | {:.1} ms (+{:.1} ms) | {} ({:?}) | {:.1}% | {:.1} ms (+{:.1} ms) | {} ({:?}) | {:.1}% |",
                         r_idx,
