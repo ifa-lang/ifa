@@ -8,6 +8,7 @@ pub mod cost_gradient;
 pub mod ffi;
 pub mod fiber;
 pub mod header;
+pub mod ingress_admission;
 pub mod io;
 pub mod jitter_anomaly;
 pub mod latency_drift;
@@ -67,6 +68,11 @@ pub use fiber::{
 pub use header::{
     EpochTransition, GenHeader, GenRef, ARENA_THREAD_LOCAL_CALL, FLAG_ACTIVE, FLAG_ARENA_SCOPED,
     FLAG_EPOCH_1, FLAG_FREE, FLAG_PINNED, FLAG_QUARANTINED, FLAG_READONLY,
+};
+pub use ingress_admission::{
+    run_ingress_admission_benchmark, ActiveBackpressure, AdmissionDecision,
+    IngressAdmissionBenchmarkReport, IngressAdmissionConfig, IngressAdmissionGatekeeper,
+    IngressAdmissionMetrics, IngressRejectionReason, SliceTokenBucket,
 };
 pub use jitter_anomaly::{
     apply_dynamic_thresholds, AnomalySeverity, DynamicCongestionThresholds, JitterAnomalyDetector,

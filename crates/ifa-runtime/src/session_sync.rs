@@ -2316,6 +2316,7 @@ pub struct IsspDynamicMultipathRouter {
     pub latency_drift_monitor: crate::latency_drift::LatencyDriftMonitor,
     pub slice_resilience: crate::slice_resilience::SliceResilienceManager,
     pub multi_node_sla: crate::multi_node_sla::MultiNodeSlaSynthesizer,
+    pub ingress_gatekeeper: crate::ingress_admission::IngressAdmissionGatekeeper,
 }
 
 impl IsspDynamicMultipathRouter {
@@ -2349,6 +2350,10 @@ impl IsspDynamicMultipathRouter {
             latency_drift_monitor: crate::latency_drift::LatencyDriftMonitor::default(),
             slice_resilience: crate::slice_resilience::SliceResilienceManager::default(),
             multi_node_sla: crate::multi_node_sla::MultiNodeSlaSynthesizer::new(local_node_id),
+            ingress_gatekeeper:
+                crate::ingress_admission::IngressAdmissionGatekeeper::default_for_node(
+                    local_node_id,
+                ),
         }
     }
 
@@ -3477,6 +3482,38 @@ impl IsspDynamicMultipathRouter {
         tick: u64,
     ) -> crate::multi_node_sla::ClosedLoopAdaptationResult {
         self.multi_node_sla.evaluate_and_adapt(tick)
+    }
+
+    /// Read access to ingress admission gatekeeper.
+    pub fn ingress_gatekeeper(&self) -> &crate::ingress_admission::IngressAdmissionGatekeeper {
+        &self.ingress_gatekeeper
+    }
+
+    /// Mutable access to ingress admission gatekeeper.
+    pub fn ingress_gatekeeper_mut(
+        &mut self,
+    ) -> &mut crate::ingress_admission::IngressAdmissionGatekeeper {
+        &mut self.ingress_gatekeeper
+    }
+
+    /// Apply an upstream backpressure signal directly to the ingress gatekeeper.
+    pub fn apply_closed_loop_backpressure(
+        &mut self,
+        signal: &crate::multi_node_sla::ClosedLoopControlAction,
+        now_ns: u64,
+    ) -> bool {
+        self.ingress_gatekeeper.apply_backpressure(signal, now_ns)
+    }
+
+    /// Process packet admission at the ingress gatekeeper before scheduling.
+    pub fn admit_ingress_packet(
+        &mut self,
+        slice: crate::traffic_slicing::FlowSliceClass,
+        packet_bytes: usize,
+        now_ns: u64,
+    ) -> crate::ingress_admission::AdmissionDecision {
+        self.ingress_gatekeeper
+            .admit_packet(slice, packet_bytes, now_ns)
     }
 
     /// Return an iterator over all registered routes.

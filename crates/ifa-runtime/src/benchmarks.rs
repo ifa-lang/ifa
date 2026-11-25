@@ -1377,6 +1377,9 @@ pub fn create_saturated_multipath_snapshot(
         global_sla_compliance_ratio: 1.0,
         total_closed_loop_sla_actions: 0,
         total_sla_backpressure_signals: 0,
+        total_ingress_admitted_packets: 0,
+        total_ingress_throttled_packets: 0,
+        total_ingress_backpressures_applied: 0,
         last_gradient_variance: 0.0,
         active_flows_by_slice: BTreeMap::new(),
         sla_violations_by_slice: BTreeMap::new(),
@@ -3398,6 +3401,9 @@ pub fn run_mesh_lsa_synchronization_benchmark(
 }
 
 /// Comprehensive benchmark report evaluating dynamic traffic slicing performance under heterogeneous load (URLLC vs eMBB).
+pub use crate::ingress_admission::{
+    run_ingress_admission_benchmark, IngressAdmissionBenchmarkReport,
+};
 pub use crate::multi_node_sla::{run_multi_node_sla_benchmark, MultiNodeSlaReport};
 pub use crate::slice_resilience::{run_slice_resilience_benchmark, SliceResilienceBenchmarkReport};
 

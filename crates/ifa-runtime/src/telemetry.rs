@@ -375,6 +375,12 @@ pub struct IsspMultipathBalancingSnapshot {
     pub total_closed_loop_sla_actions: u64,
     /// Total upstream backpressure signals emitted to ingress nodes.
     pub total_sla_backpressure_signals: u64,
+    /// Total ingress packets admitted through the gatekeeper.
+    pub total_ingress_admitted_packets: u64,
+    /// Total ingress packets throttled/policed at the gatekeeper.
+    pub total_ingress_throttled_packets: u64,
+    /// Total upstream backpressure signals applied to ingress policing.
+    pub total_ingress_backpressures_applied: u64,
     /// Instantaneous variance of marginal gradients across subpaths.
     pub last_gradient_variance: f64,
     /// Active flows partitioned by slice class name.
@@ -612,6 +618,18 @@ impl IsspMultipathBalancingSnapshot {
                 .multi_node_sla()
                 .metrics()
                 .total_backpressure_signals,
+            total_ingress_admitted_packets: router
+                .ingress_gatekeeper()
+                .metrics()
+                .total_admitted_packets,
+            total_ingress_throttled_packets: router
+                .ingress_gatekeeper()
+                .metrics()
+                .total_throttled_packets,
+            total_ingress_backpressures_applied: router
+                .ingress_gatekeeper()
+                .metrics()
+                .total_backpressures_received,
             last_gradient_variance: router.cost_gradient_metrics().last_gradient_variance,
             active_flows_by_slice: {
                 let mut m = BTreeMap::new();
@@ -1613,6 +1631,33 @@ impl PrometheusMultipathBalancingExporter {
         out.push_str(&format!(
             "ifa_slice_backpressure_signals_total{} {}\n",
             base_lbl, s.total_sla_backpressure_signals
+        ));
+
+        out.push_str(
+            "# HELP ifa_ingress_admitted_packets_total Total packets admitted through ingress gatekeeper.\n",
+        );
+        out.push_str("# TYPE ifa_ingress_admitted_packets_total counter\n");
+        out.push_str(&format!(
+            "ifa_ingress_admitted_packets_total{} {}\n",
+            base_lbl, s.total_ingress_admitted_packets
+        ));
+
+        out.push_str(
+            "# HELP ifa_ingress_throttled_packets_total Total packets throttled by ingress rate policer.\n",
+        );
+        out.push_str("# TYPE ifa_ingress_throttled_packets_total counter\n");
+        out.push_str(&format!(
+            "ifa_ingress_throttled_packets_total{} {}\n",
+            base_lbl, s.total_ingress_throttled_packets
+        ));
+
+        out.push_str(
+            "# HELP ifa_ingress_backpressures_applied_total Total backpressure signals applied to ingress.\n",
+        );
+        out.push_str("# TYPE ifa_ingress_backpressures_applied_total counter\n");
+        out.push_str(&format!(
+            "ifa_ingress_backpressures_applied_total{} {}\n",
+            base_lbl, s.total_ingress_backpressures_applied
         ));
 
         out
