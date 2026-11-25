@@ -12218,6 +12218,17 @@ impl ExtendedConnectTunnel {
     pub fn byte_stats(&self) -> (usize, usize) {
         (self.total_bytes_sent, self.total_bytes_received)
     }
+
+    /// Convert this ExtendedConnectTunnel into a BondedTunnelPath for multipath bonding.
+    pub fn into_bonded_path(
+        self,
+        tunnel_id: u64,
+        name: impl Into<String>,
+        weight: u32,
+        now: std::time::Instant,
+    ) -> BondedTunnelPath {
+        BondedTunnelPath::new(tunnel_id, name, self, weight, now)
+    }
 }
 
 /// Coordinates Extended CONNECT protocol negotiation, tunnel registration, and multiplexed dispatch.
@@ -12333,6 +12344,1031 @@ impl ExtendedConnectManager {
             telem.capsules_received += tunnel.capsule_queue.len();
         }
         telem
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Flow-Hashing Multipath Datagram Bonding & Dynamic Load Balancer (RFC 9297 / 9298)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Magic identifier for multiplexed bonding datagram wire headers (ASCII "IFAB").
+pub const BONDING_HEADER_MAGIC: [u8; 4] = [0x49, 0x46, 0x41, 0x42];
+
+/// Flag indicating the datagram is replicated across multiple bonded paths for zero-loss redundancy.
+pub const BONDING_FLAG_REPLICATED: u16 = 0x0001;
+/// Flag indicating Explicit Congestion Notification - Congestion Experienced (ECN CE).
+pub const BONDING_FLAG_ECN_CE: u16 = 0x0002;
+/// Flag indicating an active in-band RTT heartbeat probe ping request.
+pub const BONDING_FLAG_PROBE_PING: u16 = 0x0004;
+/// Flag indicating an in-band RTT heartbeat probe pong response.
+pub const BONDING_FLAG_PROBE_PONG: u16 = 0x0008;
+/// Flag indicating latency-sensitive low-latency traffic (e.g. L4S ECT(1), VoIP, gaming).
+pub const BONDING_FLAG_LATENCY_SENSITIVE: u16 = 0x0010;
+
+/// Wire header prepended to encapsulated datagrams and capsules in a multi-tunnel bonding pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BondingDatagramHeader {
+    /// 4-byte magic signature ("IFAB").
+    pub magic: [u8; 4],
+    /// Monotonically increasing aggregate sequence number across the bonded tunnel group.
+    pub bonding_seq_num: u64,
+    /// Per-flow sequence number ensuring deterministic in-order reconstruction per flow.
+    pub flow_seq_num: u32,
+    /// Tunnel ID through which this datagram was transmitted.
+    pub tunnel_id: u32,
+    /// Bitwise combination of `BONDING_FLAG_*` flags.
+    pub flags: u16,
+    /// Outbound transmission timestamp in microseconds (relative to engine start).
+    pub timestamp_micros: u64,
+}
+
+impl BondingDatagramHeader {
+    /// Construct a new bonding wire header.
+    pub fn new(
+        bonding_seq_num: u64,
+        flow_seq_num: u32,
+        tunnel_id: u32,
+        flags: u16,
+        timestamp_micros: u64,
+    ) -> Self {
+        Self {
+            magic: BONDING_HEADER_MAGIC,
+            bonding_seq_num,
+            flow_seq_num,
+            tunnel_id,
+            flags,
+            timestamp_micros,
+        }
+    }
+
+    /// Serialize header into a fixed 32-byte wire buffer.
+    pub fn encode(&self) -> [u8; 32] {
+        let mut buf = [0u8; 32];
+        buf[0..4].copy_from_slice(&self.magic);
+        buf[4..12].copy_from_slice(&self.bonding_seq_num.to_be_bytes());
+        buf[12..16].copy_from_slice(&self.flow_seq_num.to_be_bytes());
+        buf[16..20].copy_from_slice(&self.tunnel_id.to_be_bytes());
+        buf[20..22].copy_from_slice(&self.flags.to_be_bytes());
+        buf[22..24].copy_from_slice(&[0, 0]); // Reserved
+        buf[24..32].copy_from_slice(&self.timestamp_micros.to_be_bytes());
+        buf
+    }
+
+    /// Decode header from raw wire bytes, returning the header and remaining payload slice.
+    pub fn decode(bytes: &[u8]) -> Result<(Self, &[u8]), BondingError> {
+        if bytes.len() < 32 {
+            return Err(BondingError::PacketTooShort(bytes.len()));
+        }
+        let magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        if magic != BONDING_HEADER_MAGIC {
+            return Err(BondingError::InvalidMagic(magic));
+        }
+        let bonding_seq_num = u64::from_be_bytes([
+            bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+        ]);
+        let flow_seq_num = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        let tunnel_id = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let flags = u16::from_be_bytes([bytes[20], bytes[21]]);
+        let timestamp_micros = u64::from_be_bytes([
+            bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
+        ]);
+
+        Ok((
+            Self {
+                magic,
+                bonding_seq_num,
+                flow_seq_num,
+                tunnel_id,
+                flags,
+                timestamp_micros,
+            },
+            &bytes[32..],
+        ))
+    }
+
+    /// Whether this datagram was replicated across paths.
+    pub fn is_replicated(&self) -> bool {
+        (self.flags & BONDING_FLAG_REPLICATED) != 0
+    }
+
+    /// Whether this datagram traversed a congested bottleneck (ECN CE).
+    pub fn is_ecn_ce(&self) -> bool {
+        (self.flags & BONDING_FLAG_ECN_CE) != 0
+    }
+
+    /// Whether this datagram is an in-band probe ping request.
+    pub fn is_probe_ping(&self) -> bool {
+        (self.flags & BONDING_FLAG_PROBE_PING) != 0
+    }
+
+    /// Whether this datagram is an in-band probe pong response.
+    pub fn is_probe_pong(&self) -> bool {
+        (self.flags & BONDING_FLAG_PROBE_PONG) != 0
+    }
+
+    /// Whether this datagram is tagged as latency-sensitive.
+    pub fn is_latency_sensitive(&self) -> bool {
+        (self.flags & BONDING_FLAG_LATENCY_SENSITIVE) != 0
+    }
+}
+
+/// Canonical 5-tuple / capsule context key identifying an individual micro-flow.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FlowKey {
+    /// Source IP address.
+    pub src_ip: IpAddr,
+    /// Destination IP address.
+    pub dst_ip: IpAddr,
+    /// Source port number.
+    pub src_port: u16,
+    /// Destination port number.
+    pub dst_port: u16,
+    /// Transport protocol number (e.g. 17 for UDP).
+    pub protocol: u8,
+    /// Optional MASQUE or capsule context identifier.
+    pub context_id: Option<u64>,
+}
+
+impl FlowKey {
+    /// Create a standard 5-tuple flow key.
+    pub fn new(src_ip: IpAddr, dst_ip: IpAddr, src_port: u16, dst_port: u16, protocol: u8) -> Self {
+        Self {
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            protocol,
+            context_id: None,
+        }
+    }
+
+    /// Attach a capsule context ID to the flow key.
+    pub fn with_context_id(mut self, ctx_id: u64) -> Self {
+        self.context_id = Some(ctx_id);
+        self
+    }
+
+    /// Construct flow key from standard socket addresses.
+    pub fn from_socket_addrs(src: SocketAddr, dst: SocketAddr, protocol: u8) -> Self {
+        Self {
+            src_ip: src.ip(),
+            dst_ip: dst.ip(),
+            src_port: src.port(),
+            dst_port: dst.port(),
+            protocol,
+            context_id: None,
+        }
+    }
+
+    /// 64-bit salted FNV-1a hash of the flow tuple for consistent flow hashing.
+    pub fn flow_hash(&self, seed: u64) -> u64 {
+        let mut h = 0xcbf29ce484222325u64 ^ seed;
+        let mix_byte = |h: &mut u64, b: u8| {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x100000001b3);
+        };
+        match self.src_ip {
+            IpAddr::V4(v4) => {
+                for b in v4.octets() {
+                    mix_byte(&mut h, b);
+                }
+            }
+            IpAddr::V6(v6) => {
+                for b in v6.octets() {
+                    mix_byte(&mut h, b);
+                }
+            }
+        }
+        match self.dst_ip {
+            IpAddr::V4(v4) => {
+                for b in v4.octets() {
+                    mix_byte(&mut h, b);
+                }
+            }
+            IpAddr::V6(v6) => {
+                for b in v6.octets() {
+                    mix_byte(&mut h, b);
+                }
+            }
+        }
+        for b in self.src_port.to_be_bytes() {
+            mix_byte(&mut h, b);
+        }
+        for b in self.dst_port.to_be_bytes() {
+            mix_byte(&mut h, b);
+        }
+        mix_byte(&mut h, self.protocol);
+        if let Some(ctx) = self.context_id {
+            for b in ctx.to_be_bytes() {
+                mix_byte(&mut h, b);
+            }
+        }
+        h
+    }
+}
+
+/// Operational status of an individual member tunnel path in the bonding group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BondedPathState {
+    /// Fully healthy and actively accepting primary and bonded traffic.
+    #[default]
+    Active,
+    /// Experiencing elevated latency or packet loss; traffic is reduced or deprioritized.
+    Degraded,
+    /// Backup path kept alive with heartbeats, activated on primary failure.
+    Standby,
+    /// Path unreachable or persistently failing health checks.
+    Failed,
+}
+
+/// Encapsulates an active member tunnel path within the multipath bonding group.
+#[derive(Debug, Clone)]
+pub struct BondedTunnelPath {
+    /// Unique path identifier within the bonding group.
+    pub tunnel_id: u64,
+    /// Human-readable label (e.g. "wan0-fiber", "wan1-cellular", "wan2-satellite").
+    pub name: String,
+    /// Underlying Extended CONNECT tunnel instance.
+    pub tunnel: ExtendedConnectTunnel,
+    /// Configured bandwidth/capacity weight for proportional load distribution (min 1).
+    pub weight: u32,
+    /// Operational state of this path.
+    pub state: BondedPathState,
+    /// Smoothed round-trip time (EWMA).
+    pub smoothed_rtt: Duration,
+    /// RTT variation / jitter estimate (EWMA).
+    pub rtt_variance: Duration,
+    /// Estimated packet loss ratio (0.0 to 1.0).
+    pub loss_rate: f64,
+    /// Whether explicit congestion notification (CE) was recently signaled on this path.
+    pub congestion_experienced: bool,
+    /// Cumulative count of packets sent through this tunnel.
+    pub packets_sent: u64,
+    /// Cumulative count of bytes sent through this tunnel.
+    pub bytes_sent: u64,
+    /// Cumulative count of packets received on this tunnel.
+    pub packets_received: u64,
+    /// Cumulative count of bytes received on this tunnel.
+    pub bytes_received: u64,
+    /// Consecutive health probe check failures.
+    pub consecutive_failures: u32,
+    /// Last successful activity or heartbeat timestamp.
+    pub last_heartbeat: std::time::Instant,
+}
+
+impl BondedTunnelPath {
+    /// Create a new bonded tunnel path descriptor.
+    pub fn new(
+        tunnel_id: u64,
+        name: impl Into<String>,
+        tunnel: ExtendedConnectTunnel,
+        weight: u32,
+        now: std::time::Instant,
+    ) -> Self {
+        Self {
+            tunnel_id,
+            name: name.into(),
+            tunnel,
+            weight: weight.max(1),
+            state: BondedPathState::Active,
+            smoothed_rtt: Duration::from_millis(20),
+            rtt_variance: Duration::from_millis(5),
+            loss_rate: 0.0,
+            congestion_experienced: false,
+            packets_sent: 0,
+            bytes_sent: 0,
+            packets_received: 0,
+            bytes_received: 0,
+            consecutive_failures: 0,
+            last_heartbeat: now,
+        }
+    }
+
+    /// Set initial path state.
+    pub fn with_state(mut self, state: BondedPathState) -> Self {
+        self.state = state;
+        self
+    }
+
+    /// Set initial baseline RTT.
+    pub fn with_rtt(mut self, rtt: Duration) -> Self {
+        self.smoothed_rtt = rtt;
+        self
+    }
+
+    /// Update smoothed RTT and RTT variance using standard EWMA (RFC 6298 / RFC 9002).
+    pub fn update_rtt(&mut self, sample_rtt: Duration) {
+        if self.smoothed_rtt.is_zero() {
+            self.smoothed_rtt = sample_rtt;
+            self.rtt_variance = sample_rtt / 2;
+        } else {
+            let sample_ms = sample_rtt.as_secs_f64() * 1000.0;
+            let current_ms = self.smoothed_rtt.as_secs_f64() * 1000.0;
+            let diff_ms = (sample_ms - current_ms).abs();
+
+            let new_var_ms = 0.75 * (self.rtt_variance.as_secs_f64() * 1000.0) + 0.25 * diff_ms;
+            let new_srtt_ms = 0.875 * current_ms + 0.125 * sample_ms;
+
+            self.rtt_variance = Duration::from_secs_f64(new_var_ms / 1000.0);
+            self.smoothed_rtt = Duration::from_secs_f64(new_srtt_ms / 1000.0);
+        }
+    }
+
+    /// Update packet loss rate estimate via exponential moving average.
+    pub fn record_loss_sample(&mut self, sample_loss: f64) {
+        let clamped = sample_loss.clamp(0.0, 1.0);
+        self.loss_rate = 0.8 * self.loss_rate + 0.2 * clamped;
+    }
+
+    /// Mark whether explicit congestion (ECN CE) was observed.
+    pub fn mark_ecn_congestion(&mut self, is_ce: bool) {
+        self.congestion_experienced = is_ce;
+    }
+
+    /// Dynamic path quality metric incorporating capacity weight, latency penalty, loss penalty, and state multiplier.
+    pub fn quality_score(&self) -> f64 {
+        let state_mult = match self.state {
+            BondedPathState::Active => 1.0,
+            BondedPathState::Degraded => 0.25,
+            BondedPathState::Standby => 0.05,
+            BondedPathState::Failed => 0.0,
+        };
+        if state_mult == 0.0 {
+            return 0.0;
+        }
+        let rtt_secs = self.smoothed_rtt.as_secs_f64();
+        let latency_factor = 1.0 / (1.0 + rtt_secs * 15.0);
+        let loss_factor = (1.0 - self.loss_rate).max(0.01);
+        let congestion_factor = if self.congestion_experienced {
+            0.7
+        } else {
+            1.0
+        };
+
+        (self.weight as f64) * latency_factor * loss_factor * congestion_factor * state_mult
+    }
+
+    /// Whether this path is operational and eligible to carry traffic.
+    pub fn is_usable(&self) -> bool {
+        matches!(
+            self.state,
+            BondedPathState::Active | BondedPathState::Degraded
+        )
+    }
+}
+
+/// Load balancing and traffic steering strategy across the bonded tunnel paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MultipathBalancingPolicy {
+    /// Consistent 5-tuple flow hashing ensures all datagrams for a given flow stay on the same tunnel,
+    /// avoiding reordering while balancing flows across active tunnels according to capacity weights.
+    #[default]
+    FlowHashing,
+    /// Routes each flow/packet to the active tunnel path with the lowest smoothed RTT.
+    LowestLatency,
+    /// Round-robin across active paths weighted by path capacity weights.
+    WeightedRoundRobin,
+    /// Duplicates / broadcasts packets across all active tunnels for ultra-low latency & zero-loss resilience.
+    RedundantReplication,
+    /// Adaptive hybrid: latency-sensitive (e.g. L4S ECT(1) / voice) uses LowestLatency;
+    /// critical capsules use RedundantReplication; standard datagram flows use FlowHashing.
+    AdaptiveHybrid,
+}
+
+/// Error conditions arising during multi-tunnel bonding and packet routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BondingError {
+    /// No active or degraded tunnel paths are available to transmit traffic.
+    NoUsablePaths,
+    /// Specified tunnel ID is not registered in the bonding engine.
+    TunnelNotFound(u64),
+    /// Received packet is too small to contain a valid 32-byte bonding header.
+    PacketTooShort(usize),
+    /// Wire packet header does not match expected magic bytes ("IFAB").
+    InvalidMagic([u8; 4]),
+    /// Wire packet does not contain a valid probe ping or pong format.
+    InvalidProbe,
+    /// Serialization or formatting failure.
+    SerializationError(String),
+}
+
+impl std::fmt::Display for BondingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoUsablePaths => write!(f, "No usable active or degraded bonded paths available"),
+            Self::TunnelNotFound(id) => write!(f, "Bonded tunnel ID {} not found", id),
+            Self::PacketTooShort(len) => {
+                write!(f, "Bonding packet header too short ({} bytes, min 32)", len)
+            }
+            Self::InvalidMagic(m) => write!(f, "Invalid bonding packet magic: {:?}", m),
+            Self::InvalidProbe => write!(f, "Invalid bonding probe packet format"),
+            Self::SerializationError(msg) => write!(f, "Bonding serialization error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for BondingError {}
+
+/// Flow tracking entry maintaining path affinity and traffic statistics.
+#[derive(Debug, Clone)]
+pub struct FlowAffinityEntry {
+    /// Tunnel ID assigned to this flow.
+    pub assigned_tunnel_id: u64,
+    /// Flow creation timestamp.
+    pub created_at: std::time::Instant,
+    /// Last packet transmission or reception timestamp.
+    pub last_seen: std::time::Instant,
+    /// Total packets routed for this flow.
+    pub packet_count: u64,
+    /// Total payload bytes routed for this flow.
+    pub byte_count: u64,
+}
+
+/// Outbound dispatch target describing which tunnel should transmit an encapsulated wire datagram.
+#[derive(Debug, Clone)]
+pub struct BondingDispatchTarget {
+    /// Target bonded tunnel ID.
+    pub tunnel_id: u64,
+    /// Aggregate bonding sequence number.
+    pub bonding_seq_num: u64,
+    /// Flow-specific sequence number.
+    pub flow_seq_num: u32,
+    /// Complete wire packet buffer (header + payload).
+    pub wire_packet: Vec<u8>,
+    /// Whether this dispatch is a duplicate copy sent over multiple paths.
+    pub is_replicated: bool,
+}
+
+/// Inbound datagram received from a bonded tunnel, unpacked from wire framing.
+#[derive(Debug, Clone)]
+pub struct ReceivedBondedDatagram {
+    /// Decoded wire header.
+    pub header: BondingDatagramHeader,
+    /// Ingress tunnel ID that delivered the packet.
+    pub tunnel_id: u64,
+    /// Raw payload bytes stripped of bonding header.
+    pub payload: Vec<u8>,
+    /// Local arrival timestamp.
+    pub received_at: std::time::Instant,
+}
+
+/// Instantaneous telemetry metrics for an individual member tunnel path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathTelemetrySnapshot {
+    pub tunnel_id: u64,
+    pub name: String,
+    pub state: BondedPathState,
+    pub weight: u32,
+    pub smoothed_rtt_ms: f64,
+    pub loss_rate: f64,
+    pub quality_score: f64,
+    pub packets_sent: u64,
+    pub bytes_sent: u64,
+    pub packets_received: u64,
+    pub bytes_received: u64,
+}
+
+/// Comprehensive telemetry metrics across the entire multipath bonding engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultipathBondingTelemetry {
+    pub total_packets_sent: u64,
+    pub total_bytes_sent: u64,
+    pub total_packets_received: u64,
+    pub total_bytes_received: u64,
+    pub total_replicated_packets: u64,
+    pub total_failover_events: u64,
+    pub active_paths: usize,
+    pub degraded_paths: usize,
+    pub standby_paths: usize,
+    pub failed_paths: usize,
+    pub active_flows: usize,
+    pub paths: Vec<PathTelemetrySnapshot>,
+}
+
+/// Multi-tunnel bonding and adaptive flow-balancing engine for Extended CONNECT tunnels.
+#[derive(Debug, Clone)]
+pub struct MultipathTunnelBondingEngine {
+    paths: std::collections::BTreeMap<u64, BondedTunnelPath>,
+    policy: MultipathBalancingPolicy,
+    flow_table: std::collections::HashMap<FlowKey, FlowAffinityEntry>,
+    flow_seq_counters: std::collections::HashMap<FlowKey, u32>,
+    next_bonding_seq: u64,
+    wrr_index: usize,
+    wrr_current_weight: u32,
+    total_failovers: u64,
+    total_replications: u64,
+    rtt_degrade_threshold: Duration,
+    loss_degrade_threshold: f64,
+    flow_idle_timeout: Duration,
+    start_time: std::time::Instant,
+}
+
+impl MultipathTunnelBondingEngine {
+    /// Create a new bonding engine with the specified load balancing policy.
+    pub fn new(policy: MultipathBalancingPolicy) -> Self {
+        Self {
+            paths: std::collections::BTreeMap::new(),
+            policy,
+            flow_table: std::collections::HashMap::new(),
+            flow_seq_counters: std::collections::HashMap::new(),
+            next_bonding_seq: 1,
+            wrr_index: 0,
+            wrr_current_weight: 0,
+            total_failovers: 0,
+            total_replications: 0,
+            rtt_degrade_threshold: Duration::from_millis(300),
+            loss_degrade_threshold: 0.15,
+            flow_idle_timeout: Duration::from_secs(60),
+            start_time: std::time::Instant::now(),
+        }
+    }
+
+    /// Set RTT threshold above which a path is marked Degraded.
+    pub fn with_rtt_degrade_threshold(mut self, threshold: Duration) -> Self {
+        self.rtt_degrade_threshold = threshold;
+        self
+    }
+
+    /// Set packet loss threshold above which a path is marked Degraded.
+    pub fn with_loss_degrade_threshold(mut self, threshold: f64) -> Self {
+        self.loss_degrade_threshold = threshold;
+        self
+    }
+
+    /// Set idle timeout for flow table entries.
+    pub fn with_flow_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.flow_idle_timeout = timeout;
+        self
+    }
+
+    /// Register a new bonded tunnel path.
+    pub fn add_path(&mut self, path: BondedTunnelPath) {
+        self.paths.insert(path.tunnel_id, path);
+    }
+
+    /// Deregister and remove a bonded tunnel path.
+    pub fn remove_path(&mut self, tunnel_id: u64) -> Option<BondedTunnelPath> {
+        self.paths.remove(&tunnel_id)
+    }
+
+    /// Reference a registered tunnel path.
+    pub fn get_path(&self, tunnel_id: u64) -> Option<&BondedTunnelPath> {
+        self.paths.get(&tunnel_id)
+    }
+
+    /// Mutably reference a registered tunnel path.
+    pub fn get_path_mut(&mut self, tunnel_id: u64) -> Option<&mut BondedTunnelPath> {
+        self.paths.get_mut(&tunnel_id)
+    }
+
+    /// Total count of registered paths.
+    pub fn path_count(&self) -> usize {
+        self.paths.len()
+    }
+
+    /// Count of currently active paths.
+    pub fn active_path_count(&self) -> usize {
+        self.paths
+            .values()
+            .filter(|p| p.state == BondedPathState::Active)
+            .count()
+    }
+
+    /// Resolve or select the target tunnel for a given flow key based on balancing policy.
+    pub fn select_tunnel_for_flow(
+        &mut self,
+        flow_key: &FlowKey,
+        is_latency_sensitive: bool,
+        now: std::time::Instant,
+    ) -> Result<u64, BondingError> {
+        let usable_paths: Vec<u64> = self
+            .paths
+            .iter()
+            .filter(|(_, p)| p.is_usable())
+            .map(|(&id, _)| id)
+            .collect();
+
+        if usable_paths.is_empty() {
+            let standby: Vec<u64> = self
+                .paths
+                .iter()
+                .filter(|(_, p)| p.state == BondedPathState::Standby)
+                .map(|(&id, _)| id)
+                .collect();
+            if let Some(&first_standby) = standby.first() {
+                if let Some(p) = self.paths.get_mut(&first_standby) {
+                    p.state = BondedPathState::Active;
+                    return Ok(first_standby);
+                }
+            }
+            return Err(BondingError::NoUsablePaths);
+        }
+
+        if let Some(entry) = self.flow_table.get_mut(flow_key) {
+            if let Some(path) = self.paths.get(&entry.assigned_tunnel_id) {
+                if path.is_usable() {
+                    entry.last_seen = now;
+                    return Ok(entry.assigned_tunnel_id);
+                }
+            }
+            self.total_failovers += 1;
+        }
+
+        let chosen_id = match self.policy {
+            MultipathBalancingPolicy::LowestLatency => usable_paths
+                .iter()
+                .min_by_key(|&&id| {
+                    self.paths
+                        .get(&id)
+                        .map(|p| p.smoothed_rtt)
+                        .unwrap_or(Duration::MAX)
+                })
+                .copied()
+                .unwrap_or(usable_paths[0]),
+            MultipathBalancingPolicy::WeightedRoundRobin => {
+                let max_weight = self.paths.values().map(|p| p.weight).max().unwrap_or(1);
+                loop {
+                    self.wrr_index = (self.wrr_index + 1) % usable_paths.len();
+                    if self.wrr_index == 0 {
+                        self.wrr_current_weight = self.wrr_current_weight.saturating_sub(1);
+                        if self.wrr_current_weight == 0 {
+                            self.wrr_current_weight = max_weight;
+                        }
+                    }
+                    let candidate_id = usable_paths[self.wrr_index];
+                    if let Some(cand) = self.paths.get(&candidate_id) {
+                        if cand.weight >= self.wrr_current_weight {
+                            break candidate_id;
+                        }
+                    }
+                }
+            }
+            MultipathBalancingPolicy::FlowHashing => {
+                let mut best_id = usable_paths[0];
+                let mut best_score = -1.0f64;
+                for &id in &usable_paths {
+                    if let Some(path) = self.paths.get(&id) {
+                        let hash = flow_key.flow_hash(id);
+                        let score = (hash as f64) * path.quality_score();
+                        if score > best_score {
+                            best_score = score;
+                            best_id = id;
+                        }
+                    }
+                }
+                best_id
+            }
+            MultipathBalancingPolicy::AdaptiveHybrid => {
+                if is_latency_sensitive {
+                    usable_paths
+                        .iter()
+                        .min_by_key(|&&id| {
+                            self.paths
+                                .get(&id)
+                                .map(|p| p.smoothed_rtt)
+                                .unwrap_or(Duration::MAX)
+                        })
+                        .copied()
+                        .unwrap_or(usable_paths[0])
+                } else {
+                    let mut best_id = usable_paths[0];
+                    let mut best_score = -1.0f64;
+                    for &id in &usable_paths {
+                        if let Some(path) = self.paths.get(&id) {
+                            let hash = flow_key.flow_hash(id);
+                            let score = (hash as f64) * path.quality_score();
+                            if score > best_score {
+                                best_score = score;
+                                best_id = id;
+                            }
+                        }
+                    }
+                    best_id
+                }
+            }
+            MultipathBalancingPolicy::RedundantReplication => usable_paths[0],
+        };
+
+        self.flow_table.insert(
+            flow_key.clone(),
+            FlowAffinityEntry {
+                assigned_tunnel_id: chosen_id,
+                created_at: now,
+                last_seen: now,
+                packet_count: 0,
+                byte_count: 0,
+            },
+        );
+
+        Ok(chosen_id)
+    }
+
+    /// Transmit a UDP datagram through the bonded tunnel pipeline.
+    pub fn send_datagram(
+        &mut self,
+        flow_key: &FlowKey,
+        datagram_payload: &[u8],
+        is_latency_sensitive: bool,
+        is_critical: bool,
+        now: std::time::Instant,
+    ) -> Result<Vec<BondingDispatchTarget>, BondingError> {
+        let b_seq = self.next_bonding_seq;
+        self.next_bonding_seq = self.next_bonding_seq.wrapping_add(1);
+
+        let f_counter = self.flow_seq_counters.entry(flow_key.clone()).or_insert(0);
+        let f_seq = *f_counter;
+        *f_counter = f_counter.wrapping_add(1);
+
+        let timestamp_micros = now.duration_since(self.start_time).as_micros() as u64;
+
+        let should_replicate = is_critical
+            || self.policy == MultipathBalancingPolicy::RedundantReplication
+            || (self.policy == MultipathBalancingPolicy::AdaptiveHybrid && is_critical);
+
+        if should_replicate {
+            let active_ids: Vec<u64> = self
+                .paths
+                .iter()
+                .filter(|(_, p)| p.is_usable())
+                .map(|(&id, _)| id)
+                .collect();
+            if active_ids.is_empty() {
+                return Err(BondingError::NoUsablePaths);
+            }
+
+            let mut targets = Vec::with_capacity(active_ids.len());
+            let is_multi = active_ids.len() > 1;
+            if is_multi {
+                self.total_replications += 1;
+            }
+
+            for &id in &active_ids {
+                let mut flags = BONDING_FLAG_REPLICATED;
+                if is_latency_sensitive {
+                    flags |= BONDING_FLAG_LATENCY_SENSITIVE;
+                }
+                let header =
+                    BondingDatagramHeader::new(b_seq, f_seq, id as u32, flags, timestamp_micros);
+                let hdr_bytes = header.encode();
+                let mut wire = Vec::with_capacity(hdr_bytes.len() + datagram_payload.len());
+                wire.extend_from_slice(&hdr_bytes);
+                wire.extend_from_slice(datagram_payload);
+
+                if let Some(path) = self.paths.get_mut(&id) {
+                    path.tunnel.send_udp_packet(&wire);
+                    path.packets_sent += 1;
+                    path.bytes_sent += wire.len() as u64;
+                }
+
+                targets.push(BondingDispatchTarget {
+                    tunnel_id: id,
+                    bonding_seq_num: b_seq,
+                    flow_seq_num: f_seq,
+                    wire_packet: wire,
+                    is_replicated: true,
+                });
+            }
+
+            if let Some(entry) = self.flow_table.get_mut(flow_key) {
+                entry.last_seen = now;
+                entry.packet_count += 1;
+                entry.byte_count += datagram_payload.len() as u64;
+            }
+
+            Ok(targets)
+        } else {
+            let target_id = self.select_tunnel_for_flow(flow_key, is_latency_sensitive, now)?;
+
+            let mut flags = 0u16;
+            if is_latency_sensitive {
+                flags |= BONDING_FLAG_LATENCY_SENSITIVE;
+            }
+            let header =
+                BondingDatagramHeader::new(b_seq, f_seq, target_id as u32, flags, timestamp_micros);
+            let hdr_bytes = header.encode();
+            let mut wire = Vec::with_capacity(hdr_bytes.len() + datagram_payload.len());
+            wire.extend_from_slice(&hdr_bytes);
+            wire.extend_from_slice(datagram_payload);
+
+            if let Some(path) = self.paths.get_mut(&target_id) {
+                path.tunnel.send_udp_packet(&wire);
+                path.packets_sent += 1;
+                path.bytes_sent += wire.len() as u64;
+            }
+
+            if let Some(entry) = self.flow_table.get_mut(flow_key) {
+                entry.last_seen = now;
+                entry.packet_count += 1;
+                entry.byte_count += datagram_payload.len() as u64;
+            }
+
+            Ok(vec![BondingDispatchTarget {
+                tunnel_id: target_id,
+                bonding_seq_num: b_seq,
+                flow_seq_num: f_seq,
+                wire_packet: wire,
+                is_replicated: false,
+            }])
+        }
+    }
+
+    /// Transmit an RFC 9297 HTTP capsule through the bonded tunnel pipeline.
+    pub fn send_capsule(
+        &mut self,
+        flow_key: &FlowKey,
+        capsule: &crate::simd_parser::HttpCapsule,
+        is_critical: bool,
+        now: std::time::Instant,
+    ) -> Result<Vec<BondingDispatchTarget>, BondingError> {
+        let mut capsule_bytes = Vec::new();
+        capsule.encode(&mut capsule_bytes);
+        self.send_datagram(flow_key, &capsule_bytes, false, is_critical, now)
+    }
+
+    /// Ingest a wire packet received from a specific tunnel, stripping bonding framing and updating metrics.
+    pub fn receive_wire_packet(
+        &mut self,
+        from_tunnel_id: u64,
+        wire_bytes: &[u8],
+        now: std::time::Instant,
+    ) -> Result<ReceivedBondedDatagram, BondingError> {
+        let (header, payload) = BondingDatagramHeader::decode(wire_bytes)?;
+        if let Some(path) = self.paths.get_mut(&from_tunnel_id) {
+            path.packets_received += 1;
+            path.bytes_received += wire_bytes.len() as u64;
+            path.last_heartbeat = now;
+            if header.is_ecn_ce() {
+                path.mark_ecn_congestion(true);
+            }
+        }
+        Ok(ReceivedBondedDatagram {
+            header,
+            tunnel_id: from_tunnel_id,
+            payload: payload.to_vec(),
+            received_at: now,
+        })
+    }
+
+    /// Construct an in-band heartbeat probe ping packet to measure path RTT and connectivity.
+    pub fn create_probe_ping(
+        &mut self,
+        tunnel_id: u64,
+        now: std::time::Instant,
+    ) -> Result<Vec<u8>, BondingError> {
+        if !self.paths.contains_key(&tunnel_id) {
+            return Err(BondingError::TunnelNotFound(tunnel_id));
+        }
+        let b_seq = self.next_bonding_seq;
+        self.next_bonding_seq = self.next_bonding_seq.wrapping_add(1);
+        let timestamp_micros = now.duration_since(self.start_time).as_micros() as u64;
+
+        let header = BondingDatagramHeader::new(
+            b_seq,
+            0,
+            tunnel_id as u32,
+            BONDING_FLAG_PROBE_PING,
+            timestamp_micros,
+        );
+        let hdr_bytes = header.encode();
+        let mut wire = Vec::with_capacity(32 + 8);
+        wire.extend_from_slice(&hdr_bytes);
+        wire.extend_from_slice(b"PINGPROB");
+        Ok(wire)
+    }
+
+    /// Process a probe packet. If Ping, returns generated Pong wire packet to reply. If Pong, updates RTT telemetry.
+    pub fn process_probe_packet(
+        &mut self,
+        from_tunnel_id: u64,
+        probe_wire: &[u8],
+        now: std::time::Instant,
+    ) -> Result<Option<Vec<u8>>, BondingError> {
+        let (header, _payload) = BondingDatagramHeader::decode(probe_wire)?;
+        if header.is_probe_ping() {
+            let pong_hdr = BondingDatagramHeader::new(
+                header.bonding_seq_num,
+                header.flow_seq_num,
+                from_tunnel_id as u32,
+                BONDING_FLAG_PROBE_PONG,
+                header.timestamp_micros,
+            );
+            let mut wire = Vec::with_capacity(32 + 8);
+            wire.extend_from_slice(&pong_hdr.encode());
+            wire.extend_from_slice(b"PONGRESP");
+            Ok(Some(wire))
+        } else if header.is_probe_pong() {
+            let now_micros = now.duration_since(self.start_time).as_micros() as u64;
+            if now_micros >= header.timestamp_micros {
+                let rtt_micros = now_micros - header.timestamp_micros;
+                let rtt = Duration::from_micros(rtt_micros);
+                if let Some(path) = self.paths.get_mut(&from_tunnel_id) {
+                    path.update_rtt(rtt);
+                    path.last_heartbeat = now;
+                    path.consecutive_failures = 0;
+                }
+            }
+            Ok(None)
+        } else {
+            Err(BondingError::InvalidProbe)
+        }
+    }
+
+    /// Evaluate path metrics against degrade thresholds and update path operational states.
+    pub fn evaluate_health_and_failover(&mut self, _now: std::time::Instant) {
+        for path in self.paths.values_mut() {
+            if path.state == BondedPathState::Active
+                && (path.smoothed_rtt > self.rtt_degrade_threshold
+                    || path.loss_rate > self.loss_degrade_threshold)
+            {
+                path.state = BondedPathState::Degraded;
+            } else if path.state == BondedPathState::Degraded
+                && path.smoothed_rtt <= self.rtt_degrade_threshold
+                && path.loss_rate <= self.loss_degrade_threshold
+            {
+                path.state = BondedPathState::Active;
+            }
+        }
+    }
+
+    /// Purge inactive flow affinity entries that exceeded the flow idle timeout.
+    pub fn cleanup_idle_flows(&mut self, now: std::time::Instant) -> usize {
+        let timeout = self.flow_idle_timeout;
+        let mut pruned = 0;
+        self.flow_table.retain(|_, entry| {
+            if now.saturating_duration_since(entry.last_seen) > timeout {
+                pruned += 1;
+                false
+            } else {
+                true
+            }
+        });
+        pruned
+    }
+
+    /// Drain all queued egress data frames across all member tunnels.
+    pub fn drain_all_egress_frames(&mut self) -> std::collections::BTreeMap<u64, Vec<Vec<u8>>> {
+        let mut res = std::collections::BTreeMap::new();
+        for (&id, path) in &mut self.paths {
+            let egress = path.tunnel.drain_egress_data();
+            if !egress.is_empty() {
+                res.insert(id, egress);
+            }
+        }
+        res
+    }
+
+    /// Generate an aggregated telemetry report across all bonded tunnels and active flows.
+    pub fn telemetry(&self) -> MultipathBondingTelemetry {
+        let mut total_sent = 0u64;
+        let mut total_bytes_s = 0u64;
+        let mut total_recv = 0u64;
+        let mut total_bytes_r = 0u64;
+        let mut active = 0;
+        let mut degraded = 0;
+        let mut standby = 0;
+        let mut failed = 0;
+        let mut path_snapshots = Vec::with_capacity(self.paths.len());
+
+        for path in self.paths.values() {
+            total_sent += path.packets_sent;
+            total_bytes_s += path.bytes_sent;
+            total_recv += path.packets_received;
+            total_bytes_r += path.bytes_received;
+            match path.state {
+                BondedPathState::Active => active += 1,
+                BondedPathState::Degraded => degraded += 1,
+                BondedPathState::Standby => standby += 1,
+                BondedPathState::Failed => failed += 1,
+            }
+            path_snapshots.push(PathTelemetrySnapshot {
+                tunnel_id: path.tunnel_id,
+                name: path.name.clone(),
+                state: path.state,
+                weight: path.weight,
+                smoothed_rtt_ms: path.smoothed_rtt.as_secs_f64() * 1000.0,
+                loss_rate: path.loss_rate,
+                quality_score: path.quality_score(),
+                packets_sent: path.packets_sent,
+                bytes_sent: path.bytes_sent,
+                packets_received: path.packets_received,
+                bytes_received: path.bytes_received,
+            });
+        }
+
+        MultipathBondingTelemetry {
+            total_packets_sent: total_sent,
+            total_bytes_sent: total_bytes_s,
+            total_packets_received: total_recv,
+            total_bytes_received: total_bytes_r,
+            total_replicated_packets: self.total_replications,
+            total_failover_events: self.total_failovers,
+            active_paths: active,
+            degraded_paths: degraded,
+            standby_paths: standby,
+            failed_paths: failed,
+            active_flows: self.flow_table.len(),
+            paths: path_snapshots,
+        }
     }
 }
 
@@ -33352,5 +34388,343 @@ mod tls_alpn_tests {
         assert_eq!(telem.total_enqueued_packets, 2);
         assert_eq!(telem.total_dequeued_packets, 2);
         assert_eq!(telem.total_early_dropped_packets, 0);
+    }
+
+    #[test]
+    fn test_flow_key_hashing_consistency() {
+        let ip_src = "192.168.1.10".parse::<IpAddr>().unwrap();
+        let ip_dst = "10.0.0.1".parse::<IpAddr>().unwrap();
+        let key1 = FlowKey::new(ip_src, ip_dst, 4433, 443, 17);
+        let key2 = FlowKey::new(ip_src, ip_dst, 4433, 443, 17);
+        let key3 = FlowKey::new(ip_src, ip_dst, 4434, 443, 17);
+
+        assert_eq!(key1.flow_hash(0), key2.flow_hash(0));
+        assert_ne!(key1.flow_hash(0), key3.flow_hash(0));
+
+        let ctx_key1 = key1.clone().with_context_id(42);
+        let ctx_key2 = key2.clone().with_context_id(42);
+        assert_eq!(ctx_key1.flow_hash(0), ctx_key2.flow_hash(0));
+        assert_ne!(ctx_key1.flow_hash(0), key1.flow_hash(0));
+    }
+
+    #[test]
+    fn test_bonding_datagram_header_encode_decode() {
+        let hdr = BondingDatagramHeader::new(
+            1001,
+            42,
+            7,
+            BONDING_FLAG_REPLICATED | BONDING_FLAG_LATENCY_SENSITIVE,
+            500_000,
+        );
+        let encoded = hdr.encode();
+        assert_eq!(encoded.len(), 32);
+
+        let mut payload = encoded.to_vec();
+        payload.extend_from_slice(b"PAYLOAD_TEST_DATA");
+
+        let (decoded, remaining) = BondingDatagramHeader::decode(&payload).expect("decode");
+        assert_eq!(decoded.bonding_seq_num, 1001);
+        assert_eq!(decoded.flow_seq_num, 42);
+        assert_eq!(decoded.tunnel_id, 7);
+        assert!(decoded.is_replicated());
+        assert!(decoded.is_latency_sensitive());
+        assert!(!decoded.is_ecn_ce());
+        assert_eq!(decoded.timestamp_micros, 500_000);
+        assert_eq!(remaining, b"PAYLOAD_TEST_DATA");
+
+        // Error cases
+        assert!(matches!(
+            BondingDatagramHeader::decode(&payload[..20]),
+            Err(BondingError::PacketTooShort(20))
+        ));
+
+        let mut bad_magic = payload.clone();
+        bad_magic[0] = 0xFF;
+        assert!(matches!(
+            BondingDatagramHeader::decode(&bad_magic),
+            Err(BondingError::InvalidMagic(_))
+        ));
+    }
+
+    #[test]
+    fn test_multipath_flow_hashing_stickiness() {
+        let now = std::time::Instant::now();
+        let mut engine = MultipathTunnelBondingEngine::new(MultipathBalancingPolicy::FlowHashing);
+
+        let t1 = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "tunnel1.example.com")
+            .into_bonded_path(1, "wan0-fiber", 100, now);
+        let t2 = ExtendedConnectTunnel::new(2, TunnelProtocol::ConnectUdp, "tunnel2.example.com")
+            .into_bonded_path(2, "wan1-5g", 50, now);
+        let t3 = ExtendedConnectTunnel::new(3, TunnelProtocol::ConnectUdp, "tunnel3.example.com")
+            .into_bonded_path(3, "wan2-starlink", 20, now);
+
+        engine.add_path(t1);
+        engine.add_path(t2);
+        engine.add_path(t3);
+
+        let key_a = FlowKey::new(
+            "192.168.1.100".parse().unwrap(),
+            "1.1.1.1".parse().unwrap(),
+            12345,
+            53,
+            17,
+        );
+
+        // First dispatch sets affinity
+        let targets_1 = engine
+            .send_datagram(&key_a, b"DNS_QUERY_1", false, false, now)
+            .expect("send 1");
+        assert_eq!(targets_1.len(), 1);
+        let assigned_id = targets_1[0].tunnel_id;
+
+        // Subsequent dispatches for same flow MUST stick to the exact same tunnel ID
+        for i in 2..=10 {
+            let data = format!("DNS_QUERY_{}", i).into_bytes();
+            let targets = engine
+                .send_datagram(&key_a, &data, false, false, now)
+                .expect("send subsequent");
+            assert_eq!(targets.len(), 1);
+            assert_eq!(
+                targets[0].tunnel_id, assigned_id,
+                "Flow packet {} must remain sticky to tunnel {}",
+                i, assigned_id
+            );
+            assert_eq!(targets[0].flow_seq_num, (i - 1) as u32);
+        }
+
+        let telem = engine.telemetry();
+        assert_eq!(telem.total_packets_sent, 10);
+        assert_eq!(telem.active_flows, 1);
+        assert_eq!(telem.total_failover_events, 0);
+    }
+
+    #[test]
+    fn test_multipath_lowest_latency_policy() {
+        let now = std::time::Instant::now();
+        let mut engine = MultipathTunnelBondingEngine::new(MultipathBalancingPolicy::LowestLatency);
+
+        let t1 = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "t1.com")
+            .into_bonded_path(1, "wan0", 10, now)
+            .with_rtt(Duration::from_millis(60));
+        let t2 = ExtendedConnectTunnel::new(2, TunnelProtocol::ConnectUdp, "t2.com")
+            .into_bonded_path(2, "wan1", 10, now)
+            .with_rtt(Duration::from_millis(15)); // Lowest RTT
+        let t3 = ExtendedConnectTunnel::new(3, TunnelProtocol::ConnectUdp, "t3.com")
+            .into_bonded_path(3, "wan2", 10, now)
+            .with_rtt(Duration::from_millis(120));
+
+        engine.add_path(t1);
+        engine.add_path(t2);
+        engine.add_path(t3);
+
+        let key = FlowKey::new(
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            5000,
+            5000,
+            17,
+        );
+        let targets = engine
+            .send_datagram(&key, b"LOW_LATENCY_DATA", true, false, now)
+            .expect("send");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].tunnel_id, 2,
+            "Must select path with lowest RTT (t2)"
+        );
+    }
+
+    #[test]
+    fn test_multipath_redundant_replication() {
+        let now = std::time::Instant::now();
+        let mut engine =
+            MultipathTunnelBondingEngine::new(MultipathBalancingPolicy::RedundantReplication);
+
+        let t1 = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "t1.com")
+            .into_bonded_path(1, "wan0", 10, now);
+        let t2 = ExtendedConnectTunnel::new(2, TunnelProtocol::ConnectUdp, "t2.com")
+            .into_bonded_path(2, "wan1", 10, now);
+
+        engine.add_path(t1);
+        engine.add_path(t2);
+
+        let key = FlowKey::new(
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            6000,
+            6000,
+            17,
+        );
+        let targets = engine
+            .send_datagram(&key, b"CRITICAL_CONTROL_FRAME", false, false, now)
+            .expect("send");
+
+        assert_eq!(targets.len(), 2, "Must replicate across all 2 active paths");
+        assert_eq!(targets[0].tunnel_id, 1);
+        assert_eq!(targets[1].tunnel_id, 2);
+        assert!(targets[0].is_replicated);
+        assert!(targets[1].is_replicated);
+        assert_eq!(targets[0].bonding_seq_num, targets[1].bonding_seq_num);
+
+        let telem = engine.telemetry();
+        assert_eq!(telem.total_replicated_packets, 1);
+    }
+
+    #[test]
+    fn test_multipath_adaptive_hybrid_steering() {
+        let now = std::time::Instant::now();
+        let mut engine =
+            MultipathTunnelBondingEngine::new(MultipathBalancingPolicy::AdaptiveHybrid);
+
+        let t1 = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "t1.com")
+            .into_bonded_path(1, "wan0", 50, now)
+            .with_rtt(Duration::from_millis(80));
+        let t2 = ExtendedConnectTunnel::new(2, TunnelProtocol::ConnectUdp, "t2.com")
+            .into_bonded_path(2, "wan1", 50, now)
+            .with_rtt(Duration::from_millis(8)); // Ultra-low RTT
+
+        engine.add_path(t1);
+        engine.add_path(t2);
+
+        let key_voice = FlowKey::new(
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            7000,
+            7000,
+            17,
+        );
+        // Latency-sensitive packet should route to t2 (8ms)
+        let targets_voice = engine
+            .send_datagram(&key_voice, b"VOICE_RTP_PACKET", true, false, now)
+            .expect("send voice");
+        assert_eq!(targets_voice.len(), 1);
+        assert_eq!(targets_voice[0].tunnel_id, 2);
+
+        // Critical packet should be replicated to both t1 and t2
+        let key_crit = FlowKey::new(
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            8000,
+            8000,
+            17,
+        );
+        let targets_crit = engine
+            .send_datagram(&key_crit, b"HANDSHAKE_SECRET", false, true, now)
+            .expect("send critical");
+        assert_eq!(targets_crit.len(), 2);
+    }
+
+    #[test]
+    fn test_multipath_automatic_failover_on_path_failure() {
+        let now = std::time::Instant::now();
+        let mut engine = MultipathTunnelBondingEngine::new(MultipathBalancingPolicy::FlowHashing);
+
+        let t1 = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "t1.com")
+            .into_bonded_path(1, "wan0", 100, now);
+        let t2 = ExtendedConnectTunnel::new(2, TunnelProtocol::ConnectUdp, "t2.com")
+            .into_bonded_path(2, "wan1", 100, now);
+
+        engine.add_path(t1);
+        engine.add_path(t2);
+
+        let key = FlowKey::new(
+            "172.16.0.1".parse().unwrap(),
+            "172.16.0.2".parse().unwrap(),
+            9000,
+            9000,
+            17,
+        );
+        let targets1 = engine
+            .send_datagram(&key, b"FLOW_PACKET_1", false, false, now)
+            .expect("send 1");
+        let initial_tunnel = targets1[0].tunnel_id;
+
+        // Simulate path failure on the assigned tunnel
+        if let Some(p) = engine.get_path_mut(initial_tunnel) {
+            p.state = BondedPathState::Failed;
+        }
+
+        // Next transmission must trigger failover to remaining path
+        let targets2 = engine
+            .send_datagram(&key, b"FLOW_PACKET_2", false, false, now)
+            .expect("send 2 post failover");
+        assert_eq!(targets2.len(), 1);
+        assert_ne!(
+            targets2[0].tunnel_id, initial_tunnel,
+            "Must migrate away from failed tunnel"
+        );
+
+        let telem = engine.telemetry();
+        assert_eq!(telem.total_failover_events, 1);
+    }
+
+    #[test]
+    fn test_multipath_inband_heartbeat_probe_ping_pong() {
+        let now = std::time::Instant::now();
+        let mut engine = MultipathTunnelBondingEngine::new(MultipathBalancingPolicy::FlowHashing);
+
+        let t1 = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "t1.com")
+            .into_bonded_path(1, "wan0", 50, now)
+            .with_rtt(Duration::from_millis(50));
+        engine.add_path(t1);
+
+        // Generate probe ping
+        let ping_wire = engine.create_probe_ping(1, now).expect("create ping");
+        assert!(ping_wire.len() >= 32);
+
+        // Process ping on remote peer side -> generates pong
+        let pong_wire = engine
+            .process_probe_packet(1, &ping_wire, now + Duration::from_millis(5))
+            .expect("process ping")
+            .expect("must produce pong");
+
+        // Receive pong on sender side 20ms later
+        let t_recv = now + Duration::from_millis(20);
+        let resp = engine
+            .process_probe_packet(1, &pong_wire, t_recv)
+            .expect("process pong");
+        assert!(resp.is_none());
+
+        let path = engine.get_path(1).expect("path 1");
+        assert!(path.smoothed_rtt < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn test_multipath_capsule_bonding_and_egress_drain() {
+        let now = std::time::Instant::now();
+        let mut engine = MultipathTunnelBondingEngine::new(MultipathBalancingPolicy::FlowHashing);
+
+        let t1 = ExtendedConnectTunnel::new(1, TunnelProtocol::ConnectUdp, "t1.com")
+            .into_bonded_path(1, "wan0", 100, now);
+        engine.add_path(t1);
+
+        let cap = crate::simd_parser::HttpCapsule::new(
+            crate::simd_parser::CapsuleType::AddressAssign,
+            vec![192, 168, 1, 55],
+        );
+
+        let key = FlowKey::new(
+            "10.10.10.1".parse().unwrap(),
+            "10.10.10.2".parse().unwrap(),
+            1111,
+            2222,
+            17,
+        );
+        let targets = engine
+            .send_capsule(&key, &cap, false, now)
+            .expect("send capsule");
+        assert_eq!(targets.len(), 1);
+
+        // Drain egress frames from underlying tunnels
+        let egress_map = engine.drain_all_egress_frames();
+        assert!(egress_map.contains_key(&1));
+        assert_eq!(egress_map[&1].len(), 1);
+
+        // Receive the wire packet
+        let rx = engine
+            .receive_wire_packet(1, &targets[0].wire_packet, now)
+            .expect("receive packet");
+        assert_eq!(rx.tunnel_id, 1);
+        assert!(!rx.payload.is_empty());
     }
 }
