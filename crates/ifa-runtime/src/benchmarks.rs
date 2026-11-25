@@ -1335,6 +1335,7 @@ pub fn create_saturated_multipath_snapshot(
         aggregate_tcp_retrans_ratio: agg_tcp,
         aggregate_issp_retrans_ratio: agg_issp,
         total_failovers: 0,
+        cspf_resilience: None,
     }
 }
 

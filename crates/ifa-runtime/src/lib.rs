@@ -117,14 +117,15 @@ pub use simd_classifier::{
 pub use string::IfaString;
 pub use telemetry::{
     snapshot_to_compact_json, supervise_command, ws_build_close_frame, ws_build_text_frame,
-    AlertFailoverPolicy, AlertmanagerWebhookAlert, AlertmanagerWebhookPayload, GrpcFrame,
-    GrpcFrameError, IsspClusterQuorumConfig, IsspMeshLinkInfo, IsspMeshNodeInfo,
-    IsspMeshTopologySnapshot, IsspMultiNodeMeshSynthesizer, IsspMultipathBalancingSnapshot,
-    IsspQuorumStatus, IsspSubpathBalancingMetrics, IsspTelemetryHttpHandler, IsspTelemetryServer,
-    LatencyHistogram, MiniJsonValue, OtelMultipathBalancingExporter,
-    OtelMultipathBalancingGrpcExporter, OtelProtobufMultipathExporter, OtlpGrpcError,
-    OtlpGrpcExportResult, PrometheusMultipathBalancingExporter, ProtobufWriter, ResourceAuditScope,
-    ResourceUsage, DEFAULT_LATENCY_BUCKETS_SECONDS,
+    AlertFailoverPolicy, AlertmanagerWebhookAlert, AlertmanagerWebhookPayload, CspfPathMetricItem,
+    CspfResilienceSnapshot, GrpcFrame, GrpcFrameError, IsspClusterQuorumConfig, IsspMeshLinkInfo,
+    IsspMeshNodeInfo, IsspMeshTopologySnapshot, IsspMultiNodeMeshSynthesizer,
+    IsspMultipathBalancingSnapshot, IsspQuorumStatus, IsspSubpathBalancingMetrics,
+    IsspTelemetryHttpHandler, IsspTelemetryServer, LatencyHistogram, MiniJsonValue,
+    OtelMultipathBalancingExporter, OtelMultipathBalancingGrpcExporter,
+    OtelProtobufMultipathExporter, OtlpGrpcError, OtlpGrpcExportResult,
+    PrometheusMultipathBalancingExporter, ProtobufWriter, ResourceAuditScope, ResourceUsage,
+    DEFAULT_LATENCY_BUCKETS_SECONDS,
 };
 pub use telemetry_queue::{
     PriorityTelemetryRing, TelemetryEvent, TelemetryPriority, TierStats, CRITICAL_RING_CAPACITY,

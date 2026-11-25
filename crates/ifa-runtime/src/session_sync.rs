@@ -2238,6 +2238,7 @@ pub struct IsspDynamicMultipathRouter {
     header_compressor: IsspAdaptiveHeaderCompressor,
     header_decompressor: IsspAdaptiveHeaderCompressor,
     subpath_seqs: HashMap<u32, u64>,
+    pub cspf_group: Option<crate::topology_cspf::CspfMultipathGroup>,
 }
 
 impl IsspDynamicMultipathRouter {
@@ -2263,6 +2264,7 @@ impl IsspDynamicMultipathRouter {
             header_compressor: IsspAdaptiveHeaderCompressor::new(64),
             header_decompressor: IsspAdaptiveHeaderCompressor::new(64),
             subpath_seqs: HashMap::new(),
+            cspf_group: None,
         }
     }
 
@@ -2313,6 +2315,112 @@ impl IsspDynamicMultipathRouter {
         self.session_bindings.get(session_id).copied()
     }
 
+    /// Attach a CSPF multipath forwarding group to the router.
+    pub fn attach_cspf_group(&mut self, group: crate::topology_cspf::CspfMultipathGroup) {
+        self.cspf_group = Some(group);
+        self.sync_routes_from_cspf();
+    }
+
+    /// Builder variant to attach a CSPF multipath forwarding group.
+    pub fn with_cspf_group(mut self, group: crate::topology_cspf::CspfMultipathGroup) -> Self {
+        self.attach_cspf_group(group);
+        self
+    }
+
+    /// Access the active CSPF multipath group if attached.
+    pub fn cspf_group(&self) -> Option<&crate::topology_cspf::CspfMultipathGroup> {
+        self.cspf_group.as_ref()
+    }
+
+    /// Mutably access the active CSPF multipath group if attached.
+    pub fn cspf_group_mut(&mut self) -> Option<&mut crate::topology_cspf::CspfMultipathGroup> {
+        self.cspf_group.as_mut()
+    }
+
+    /// Synchronize routing table (`self.paths`) with the attached CSPF multipath group.
+    /// Converts each CSPF path into an operational `IsspMultipathRoute`.
+    pub fn sync_routes_from_cspf(&mut self) {
+        if let Some(group) = &self.cspf_group {
+            let dst_id = group.dst.0;
+            for (i, p) in group.paths.iter().enumerate() {
+                let path_id = (i as u32) + 1;
+                let is_healthy = group.path_healthy.get(i).copied().unwrap_or(true);
+                let weight = group.traffic_weights.get(i).copied().unwrap_or(100).max(1);
+                let hop_node = p.nodes.get(1).map(|n| n.0).unwrap_or(dst_id);
+                let iface = format!("cspf-hop-{}-{}", group.src.0, hop_node);
+
+                if let Some(r) = self.paths.get_mut(&path_id) {
+                    r.peer_node_id = dst_id;
+                    r.weight = weight;
+                    r.interface_name = iface;
+                    r.metrics.smoothed_rtt_us = p.total_rtt_us;
+                    if is_healthy {
+                        if r.state == IsspPathState::Failed {
+                            r.state = IsspPathState::Active;
+                        }
+                    } else {
+                        r.state = IsspPathState::Failed;
+                    }
+                } else {
+                    let mut route =
+                        IsspMultipathRoute::new(path_id, dst_id, &iface, (i + 1) as u32, weight);
+                    route.metrics.smoothed_rtt_us = p.total_rtt_us;
+                    if !is_healthy {
+                        route.state = IsspPathState::Failed;
+                    }
+                    self.paths.insert(path_id, route);
+                }
+            }
+        }
+    }
+
+    /// Notify link failure on the topology graph and failover impacted routes.
+    /// Returns the number of affected CSPF paths.
+    pub fn handle_cspf_link_failure(
+        &mut self,
+        from: crate::topology_cspf::NodeId,
+        to: crate::topology_cspf::NodeId,
+    ) -> usize {
+        let affected = if let Some(group) = self.cspf_group.as_mut() {
+            group.mark_link_failed(from, to)
+        } else {
+            0
+        };
+
+        if affected > 0 {
+            self.total_failovers = self.total_failovers.saturating_add(affected as u64);
+            self.sync_routes_from_cspf();
+
+            // Remap any session currently bound to an unhealthy path
+            let unhealthy_pids: Vec<u32> = self
+                .paths
+                .iter()
+                .filter(|(_, r)| !r.state.is_usable())
+                .map(|(&pid, _)| pid)
+                .collect();
+
+            let sessions_to_remap: Vec<SessionId> = self
+                .session_bindings
+                .iter()
+                .filter(|(_, &pid)| unhealthy_pids.contains(&pid))
+                .map(|(&s, _)| s)
+                .collect();
+
+            for sid in sessions_to_remap {
+                let _ = self.resolve_path_for_session(&sid, 0);
+            }
+        }
+        affected
+    }
+
+    /// Restore all CSPF paths and resynchronize routing table.
+    pub fn handle_cspf_recovery(&mut self) {
+        if let Some(group) = self.cspf_group.as_mut() {
+            group.restore_all_paths();
+        }
+        self.sync_routes_from_cspf();
+    }
+
     /// Resolve or choose optimal operational path for a session.
     pub fn resolve_path_for_session(
         &mut self,
@@ -2324,6 +2432,26 @@ impl IsspDynamicMultipathRouter {
             if let Some(route) = self.paths.get(&pid) {
                 if route.state.is_usable() {
                     return Ok(pid);
+                }
+            }
+        }
+
+        // If a CSPF multipath group is attached, select optimal path via CSPF flow hashing
+        if let Some(group) = &self.cspf_group {
+            let flow_hash = session_id.flow_hash.wrapping_mul(0x517cc1b727220a95);
+            if let Some(selected_path) = group.select_path_for_flow(flow_hash) {
+                if let Some(pos) = group
+                    .paths
+                    .iter()
+                    .position(|p| p.nodes == selected_path.nodes)
+                {
+                    let pid = (pos as u32) + 1;
+                    if let Some(r) = self.paths.get_mut(&pid) {
+                        if r.state.is_usable() {
+                            self.session_bindings.insert(*session_id, pid);
+                            return Ok(pid);
+                        }
+                    }
                 }
             }
         }
@@ -7206,5 +7334,81 @@ mod tests {
         // Unknown path should return error
         let err = reg.path_bandwidth_estimate(99);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_cspf_multipath_router_integration_and_failover() {
+        use crate::topology_cspf::{
+            cspf_k_disjoint_paths, CspfConstraints, CspfMultipathGroup, DisjointMode, NodeId,
+            TopologyGraph,
+        };
+
+        // Diamond topology: 0 -> 1 -> 3 (low rtt) and 0 -> 2 -> 3 (slightly higher rtt)
+        let mut g = TopologyGraph::new();
+        g.add_symmetric_edge(NodeId(0), NodeId(1), 100_000_000, 5_000, 0);
+        g.add_symmetric_edge(NodeId(1), NodeId(3), 100_000_000, 5_000, 0);
+        g.add_symmetric_edge(NodeId(0), NodeId(2), 80_000_000, 10_000, 100);
+        g.add_symmetric_edge(NodeId(2), NodeId(3), 80_000_000, 10_000, 100);
+
+        let paths = cspf_k_disjoint_paths(
+            &g,
+            NodeId(0),
+            NodeId(3),
+            &CspfConstraints::unconstrained(),
+            2,
+            DisjointMode::EdgeDisjoint,
+        );
+        assert_eq!(paths.len(), 2);
+
+        let group = CspfMultipathGroup::new(NodeId(0), NodeId(3), paths);
+        let mut router =
+            IsspDynamicMultipathRouter::new(0, IsspRoutingPolicy::BandwidthAggregation)
+                .with_cspf_group(group);
+
+        assert_eq!(router.list_routes().len(), 2);
+        assert!(router.get_route(1).is_some());
+        assert!(router.get_route(2).is_some());
+
+        // Resolve sessions - should map according to flow hashing
+        let s1 = SessionId {
+            flow_hash: 101,
+            origin_node: 0,
+            nonce: 1,
+        };
+        let s2 = SessionId {
+            flow_hash: 202,
+            origin_node: 0,
+            nonce: 2,
+        };
+        let p1 = router.resolve_path_for_session(&s1, 0).expect("resolve s1");
+        let p2 = router.resolve_path_for_session(&s2, 0).expect("resolve s2");
+        assert!(p1 == 1 || p1 == 2);
+        assert!(p2 == 1 || p2 == 2);
+
+        // Fail link 1 -> 3
+        let affected = router.handle_cspf_link_failure(NodeId(1), NodeId(3));
+        assert_eq!(affected, 1);
+        assert_eq!(router.total_failovers, 1);
+
+        // Path 1 traversing 1->3 should now be Failed in the router
+        let r1 = router.get_route(1).expect("route 1");
+        assert_eq!(r1.state, IsspPathState::Failed);
+        let r2 = router.get_route(2).expect("route 2");
+        assert_eq!(r2.state, IsspPathState::Active);
+
+        // All sessions must now be remapped to healthy path 2
+        let p1_after = router
+            .resolve_path_for_session(&s1, 0)
+            .expect("resolve s1 after failover");
+        assert_eq!(p1_after, 2);
+        let p2_after = router
+            .resolve_path_for_session(&s2, 0)
+            .expect("resolve s2 after failover");
+        assert_eq!(p2_after, 2);
+
+        // Recovery
+        router.handle_cspf_recovery();
+        let r1_recovered = router.get_route(1).expect("route 1 recovered");
+        assert_eq!(r1_recovered.state, IsspPathState::Active);
     }
 }

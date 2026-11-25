@@ -241,6 +241,65 @@ impl LatencyHistogram {
     }
 }
 
+/// Detailed QoS and health telemetry for a single CSPF path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CspfPathMetricItem {
+    pub path_index: usize,
+    pub nodes: Vec<u32>,
+    pub is_healthy: bool,
+    pub weight: u32,
+    pub bottleneck_bw_bps: u64,
+    pub total_rtt_us: u64,
+    pub total_cost: u64,
+}
+
+/// Topological resilience snapshot captured from a CSPF multipath forwarding group.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CspfResilienceSnapshot {
+    pub src_node_id: u32,
+    pub dst_node_id: u32,
+    pub total_paths: usize,
+    pub healthy_paths: usize,
+    pub total_failovers: u64,
+    pub paths: Vec<CspfPathMetricItem>,
+}
+
+impl CspfResilienceSnapshot {
+    pub fn from_group(group: &crate::topology_cspf::CspfMultipathGroup) -> Self {
+        let mut items = Vec::with_capacity(group.paths.len());
+        for (i, p) in group.paths.iter().enumerate() {
+            let is_healthy = group.path_healthy.get(i).copied().unwrap_or(false);
+            let weight = group.traffic_weights.get(i).copied().unwrap_or(0);
+            items.push(CspfPathMetricItem {
+                path_index: i,
+                nodes: p.nodes.iter().map(|n| n.0).collect(),
+                is_healthy,
+                weight,
+                bottleneck_bw_bps: p.bottleneck_bw_bps,
+                total_rtt_us: p.total_rtt_us,
+                total_cost: p.total_cost,
+            });
+        }
+        Self {
+            src_node_id: group.src.0,
+            dst_node_id: group.dst.0,
+            total_paths: group.total_paths(),
+            healthy_paths: group.healthy_count(),
+            total_failovers: group.total_failovers,
+            paths: items,
+        }
+    }
+
+    /// Diversity / resilience ratio (healthy_paths / total_paths).
+    pub fn diversity_ratio(&self) -> f64 {
+        if self.total_paths == 0 {
+            0.0
+        } else {
+            (self.healthy_paths as f64) / (self.total_paths as f64)
+        }
+    }
+}
+
 /// Telemetry metrics snapshot for dynamic multipath ISSP bandwidth balancing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IsspMultipathBalancingSnapshot {
@@ -280,6 +339,8 @@ pub struct IsspMultipathBalancingSnapshot {
     pub aggregate_issp_retrans_ratio: f64,
     /// Total automatic interface and subpath failovers recorded.
     pub total_failovers: u64,
+    /// Optional CSPF topological resilience snapshot.
+    pub cspf_resilience: Option<CspfResilienceSnapshot>,
 }
 
 impl IsspMultipathBalancingSnapshot {
@@ -448,6 +509,7 @@ impl IsspMultipathBalancingSnapshot {
             aggregate_tcp_retrans_ratio: agg_tcp_ratio,
             aggregate_issp_retrans_ratio: agg_issp_ratio,
             total_failovers: router.total_failovers,
+            cspf_resilience: router.cspf_group().map(CspfResilienceSnapshot::from_group),
         }
     }
 
@@ -1059,6 +1121,161 @@ impl PrometheusMultipathBalancingExporter {
             }
         }
 
+        // 5. CSPF Topological Resilience Metrics
+        if let Some(cspf) = &s.cspf_resilience {
+            let src_str = cspf.src_node_id.to_string();
+            let dst_str = cspf.dst_node_id.to_string();
+            let cspf_base_lbl = self.format_labels(&[
+                ("node_id", &node_str),
+                ("src_node", &src_str),
+                ("dst_node", &dst_str),
+            ]);
+
+            out.push_str("# HELP ifa_mesh_cspf_paths_total Total computed CSPF loop-free paths in forwarding group.\n");
+            out.push_str("# TYPE ifa_mesh_cspf_paths_total gauge\n");
+            out.push_str(&format!(
+                "ifa_mesh_cspf_paths_total{} {}\n",
+                cspf_base_lbl, cspf.total_paths
+            ));
+
+            out.push_str(
+                "# HELP ifa_mesh_cspf_healthy_paths Number of currently healthy CSPF paths.\n",
+            );
+            out.push_str("# TYPE ifa_mesh_cspf_healthy_paths gauge\n");
+            out.push_str(&format!(
+                "ifa_mesh_cspf_healthy_paths{} {}\n",
+                cspf_base_lbl, cspf.healthy_paths
+            ));
+
+            out.push_str("# HELP ifa_mesh_cspf_failovers_total Total link failover events recorded on CSPF group.\n");
+            out.push_str("# TYPE ifa_mesh_cspf_failovers_total counter\n");
+            out.push_str(&format!(
+                "ifa_mesh_cspf_failovers_total{} {}\n",
+                cspf_base_lbl, cspf.total_failovers
+            ));
+
+            out.push_str("# HELP ifa_mesh_cspf_diversity_ratio Ratio of healthy paths to total disjoint paths (0.0 to 1.0).\n");
+            out.push_str("# TYPE ifa_mesh_cspf_diversity_ratio gauge\n");
+            out.push_str(&format!(
+                "ifa_mesh_cspf_diversity_ratio{} {:.6}\n",
+                cspf_base_lbl,
+                cspf.diversity_ratio()
+            ));
+
+            out.push_str("# HELP ifa_mesh_cspf_path_healthy Health status of individual CSPF path (1 = healthy, 0 = failed).\n");
+            out.push_str("# TYPE ifa_mesh_cspf_path_healthy gauge\n");
+            for p in &cspf.paths {
+                let p_idx = p.path_index.to_string();
+                let hops = p
+                    .nodes
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("-");
+                let p_lbl = self.format_labels(&[
+                    ("node_id", &node_str),
+                    ("src_node", &src_str),
+                    ("dst_node", &dst_str),
+                    ("path_index", &p_idx),
+                    ("hops", &hops),
+                ]);
+                let h_val = if p.is_healthy { 1 } else { 0 };
+                out.push_str(&format!("ifa_mesh_cspf_path_healthy{} {}\n", p_lbl, h_val));
+            }
+
+            out.push_str("# HELP ifa_mesh_cspf_path_weight Effective scheduling traffic weight of CSPF path.\n");
+            out.push_str("# TYPE ifa_mesh_cspf_path_weight gauge\n");
+            for p in &cspf.paths {
+                let p_idx = p.path_index.to_string();
+                let hops = p
+                    .nodes
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("-");
+                let p_lbl = self.format_labels(&[
+                    ("node_id", &node_str),
+                    ("src_node", &src_str),
+                    ("dst_node", &dst_str),
+                    ("path_index", &p_idx),
+                    ("hops", &hops),
+                ]);
+                out.push_str(&format!(
+                    "ifa_mesh_cspf_path_weight{} {}\n",
+                    p_lbl, p.weight
+                ));
+            }
+
+            out.push_str("# HELP ifa_mesh_cspf_path_bottleneck_bw_bytes Bottleneck link bandwidth on CSPF path in bytes/s.\n");
+            out.push_str("# TYPE ifa_mesh_cspf_path_bottleneck_bw_bytes gauge\n");
+            for p in &cspf.paths {
+                let p_idx = p.path_index.to_string();
+                let hops = p
+                    .nodes
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("-");
+                let p_lbl = self.format_labels(&[
+                    ("node_id", &node_str),
+                    ("src_node", &src_str),
+                    ("dst_node", &dst_str),
+                    ("path_index", &p_idx),
+                    ("hops", &hops),
+                ]);
+                out.push_str(&format!(
+                    "ifa_mesh_cspf_path_bottleneck_bw_bytes{} {}\n",
+                    p_lbl, p.bottleneck_bw_bps
+                ));
+            }
+
+            out.push_str("# HELP ifa_mesh_cspf_path_rtt_microseconds Total accumulated RTT along CSPF path in microseconds.\n");
+            out.push_str("# TYPE ifa_mesh_cspf_path_rtt_microseconds gauge\n");
+            for p in &cspf.paths {
+                let p_idx = p.path_index.to_string();
+                let hops = p
+                    .nodes
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("-");
+                let p_lbl = self.format_labels(&[
+                    ("node_id", &node_str),
+                    ("src_node", &src_str),
+                    ("dst_node", &dst_str),
+                    ("path_index", &p_idx),
+                    ("hops", &hops),
+                ]);
+                out.push_str(&format!(
+                    "ifa_mesh_cspf_path_rtt_microseconds{} {}\n",
+                    p_lbl, p.total_rtt_us
+                ));
+            }
+
+            out.push_str("# HELP ifa_mesh_cspf_path_cost Composite routing cost of CSPF path.\n");
+            out.push_str("# TYPE ifa_mesh_cspf_path_cost gauge\n");
+            for p in &cspf.paths {
+                let p_idx = p.path_index.to_string();
+                let hops = p
+                    .nodes
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("-");
+                let p_lbl = self.format_labels(&[
+                    ("node_id", &node_str),
+                    ("src_node", &src_str),
+                    ("dst_node", &dst_str),
+                    ("path_index", &p_idx),
+                    ("hops", &hops),
+                ]);
+                out.push_str(&format!(
+                    "ifa_mesh_cspf_path_cost{} {}\n",
+                    p_lbl, p.total_cost
+                ));
+            }
+        }
+
         out
     }
 }
@@ -1609,6 +1826,114 @@ impl OtelMultipathBalancingExporter {
                     "            }}"
                 ),
                 hist_dps.join(",\n")
+            ));
+        }
+
+        // 14. CSPF Topological Resilience Metrics (OTLP)
+        if let Some(cspf) = &s.cspf_resilience {
+            let src_str = cspf.src_node_id.to_string();
+            let dst_str = cspf.dst_node_id.to_string();
+
+            // CSPF total paths gauge
+            metric_entries.push(format!(
+                concat!(
+                    "            {{\n",
+                    "              \"name\": \"ifa.mesh.cspf.paths_total\",\n",
+                    "              \"description\": \"Total computed CSPF paths in forwarding group\",\n",
+                    "              \"unit\": \"1\",\n",
+                    "              \"gauge\": {{\n",
+                    "                \"dataPoints\": [\n",
+                    "                  {{\n",
+                    "                    \"timeUnixNano\": \"{}\",\n",
+                    "                    \"asInt\": \"{}\",\n",
+                    "                    \"attributes\": [\n",
+                    "                      {{\"key\": \"node_id\", \"value\": {{\"stringValue\": \"{}\"}}}},\n",
+                    "                      {{\"key\": \"src_node\", \"value\": {{\"stringValue\": \"{}\"}}}},\n",
+                    "                      {{\"key\": \"dst_node\", \"value\": {{\"stringValue\": \"{}\"}}}}\n",
+                    "                    ]\n",
+                    "                  }}\n",
+                    "                ]\n",
+                    "              }}\n",
+                    "            }}"
+                ),
+                ts_str, cspf.total_paths, node_str, src_str, dst_str
+            ));
+
+            // CSPF healthy paths gauge
+            metric_entries.push(format!(
+                concat!(
+                    "            {{\n",
+                    "              \"name\": \"ifa.mesh.cspf.healthy_paths\",\n",
+                    "              \"description\": \"Number of currently operational CSPF paths\",\n",
+                    "              \"unit\": \"1\",\n",
+                    "              \"gauge\": {{\n",
+                    "                \"dataPoints\": [\n",
+                    "                  {{\n",
+                    "                    \"timeUnixNano\": \"{}\",\n",
+                    "                    \"asInt\": \"{}\",\n",
+                    "                    \"attributes\": [\n",
+                    "                      {{\"key\": \"node_id\", \"value\": {{\"stringValue\": \"{}\"}}}},\n",
+                    "                      {{\"key\": \"src_node\", \"value\": {{\"stringValue\": \"{}\"}}}},\n",
+                    "                      {{\"key\": \"dst_node\", \"value\": {{\"stringValue\": \"{}\"}}}}\n",
+                    "                    ]\n",
+                    "                  }}\n",
+                    "                ]\n",
+                    "              }}\n",
+                    "            }}"
+                ),
+                ts_str, cspf.healthy_paths, node_str, src_str, dst_str
+            ));
+
+            // CSPF diversity ratio gauge
+            metric_entries.push(format!(
+                concat!(
+                    "            {{\n",
+                    "              \"name\": \"ifa.mesh.cspf.diversity_ratio\",\n",
+                    "              \"description\": \"Ratio of healthy paths to total disjoint paths\",\n",
+                    "              \"unit\": \"1\",\n",
+                    "              \"gauge\": {{\n",
+                    "                \"dataPoints\": [\n",
+                    "                  {{\n",
+                    "                    \"timeUnixNano\": \"{}\",\n",
+                    "                    \"asDouble\": {:.6},\n",
+                    "                    \"attributes\": [\n",
+                    "                      {{\"key\": \"node_id\", \"value\": {{\"stringValue\": \"{}\"}}}},\n",
+                    "                      {{\"key\": \"src_node\", \"value\": {{\"stringValue\": \"{}\"}}}},\n",
+                    "                      {{\"key\": \"dst_node\", \"value\": {{\"stringValue\": \"{}\"}}}}\n",
+                    "                    ]\n",
+                    "                  }}\n",
+                    "                ]\n",
+                    "              }}\n",
+                    "            }}"
+                ),
+                ts_str, cspf.diversity_ratio(), node_str, src_str, dst_str
+            ));
+
+            // CSPF total failovers counter
+            metric_entries.push(format!(
+                concat!(
+                    "            {{\n",
+                    "              \"name\": \"ifa.mesh.cspf.failovers_total\",\n",
+                    "              \"description\": \"Total link failover events recorded on CSPF group\",\n",
+                    "              \"unit\": \"1\",\n",
+                    "              \"sum\": {{\n",
+                    "                \"isMonotonic\": true,\n",
+                    "                \"aggregationTemporality\": 2,\n",
+                    "                \"dataPoints\": [\n",
+                    "                  {{\n",
+                    "                    \"timeUnixNano\": \"{}\",\n",
+                    "                    \"asInt\": \"{}\",\n",
+                    "                    \"attributes\": [\n",
+                    "                      {{\"key\": \"node_id\", \"value\": {{\"stringValue\": \"{}\"}}}},\n",
+                    "                      {{\"key\": \"src_node\", \"value\": {{\"stringValue\": \"{}\"}}}},\n",
+                    "                      {{\"key\": \"dst_node\", \"value\": {{\"stringValue\": \"{}\"}}}}\n",
+                    "                    ]\n",
+                    "                  }}\n",
+                    "                ]\n",
+                    "              }}\n",
+                    "            }}"
+                ),
+                ts_str, cspf.total_failovers, node_str, src_str, dst_str
             ));
         }
 
@@ -7350,5 +7675,88 @@ mod tests {
         let (stream3, _) = server.listener.accept().unwrap();
         server.serve_one_connection(stream3).unwrap();
         client3.join().unwrap();
+    }
+
+    #[test]
+    fn test_cspf_topological_resilience_prometheus_and_otlp_export() {
+        use crate::session_sync::{IsspDynamicMultipathRouter, IsspRoutingPolicy};
+        use crate::topology_cspf::{
+            cspf_k_disjoint_paths, CspfConstraints, CspfMultipathGroup, DisjointMode, NodeId,
+            TopologyGraph,
+        };
+
+        let mut g = TopologyGraph::new();
+        g.add_symmetric_edge(NodeId(1), NodeId(2), 100_000_000, 4_000, 0);
+        g.add_symmetric_edge(NodeId(2), NodeId(4), 100_000_000, 4_000, 0);
+        g.add_symmetric_edge(NodeId(1), NodeId(3), 50_000_000, 8_000, 200);
+        g.add_symmetric_edge(NodeId(3), NodeId(4), 50_000_000, 8_000, 200);
+
+        let paths = cspf_k_disjoint_paths(
+            &g,
+            NodeId(1),
+            NodeId(4),
+            &CspfConstraints::unconstrained(),
+            2,
+            DisjointMode::EdgeDisjoint,
+        );
+        let group = CspfMultipathGroup::new(NodeId(1), NodeId(4), paths);
+        let mut router = IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::LowestLatency)
+            .with_cspf_group(group);
+
+        let snap_initial = router.balancing_snapshot(1_700_000_000_000_000_000);
+        let cspf_initial = snap_initial
+            .cspf_resilience
+            .as_ref()
+            .expect("cspf resilience snap");
+        assert_eq!(cspf_initial.total_paths, 2);
+        assert_eq!(cspf_initial.healthy_paths, 2);
+        assert_eq!(cspf_initial.diversity_ratio(), 1.0);
+
+        // Prometheus check
+        let prom = snap_initial.export_prometheus();
+        assert!(prom
+            .contains("ifa_mesh_cspf_paths_total{dst_node=\"4\",node_id=\"1\",src_node=\"1\"} 2"));
+        assert!(prom.contains(
+            "ifa_mesh_cspf_healthy_paths{dst_node=\"4\",node_id=\"1\",src_node=\"1\"} 2"
+        ));
+        assert!(prom.contains(
+            "ifa_mesh_cspf_diversity_ratio{dst_node=\"4\",node_id=\"1\",src_node=\"1\"} 1.000000"
+        ));
+        assert!(prom.contains("ifa_mesh_cspf_path_healthy{"));
+        assert!(prom.contains("ifa_mesh_cspf_path_weight{"));
+        assert!(prom.contains("ifa_mesh_cspf_path_bottleneck_bw_bytes{"));
+        assert!(prom.contains("ifa_mesh_cspf_path_rtt_microseconds{"));
+        assert!(prom.contains("ifa_mesh_cspf_path_cost{"));
+
+        // OTLP JSON check
+        let otlp = snap_initial.export_otlp_json("ifa-core-gateway");
+        assert!(otlp.contains("ifa.mesh.cspf.paths_total"));
+        assert!(otlp.contains("ifa.mesh.cspf.healthy_paths"));
+        assert!(otlp.contains("ifa.mesh.cspf.diversity_ratio"));
+        assert!(otlp.contains("ifa.mesh.cspf.failovers_total"));
+
+        // Simulate link failure
+        let affected = router.handle_cspf_link_failure(NodeId(2), NodeId(4));
+        assert_eq!(affected, 1);
+
+        let snap_failed = router.balancing_snapshot(1_700_000_000_100_000_000);
+        let cspf_failed = snap_failed
+            .cspf_resilience
+            .as_ref()
+            .expect("cspf resilience snap");
+        assert_eq!(cspf_failed.healthy_paths, 1);
+        assert_eq!(cspf_failed.total_failovers, 1);
+        assert_eq!(cspf_failed.diversity_ratio(), 0.5);
+
+        let prom_failed = snap_failed.export_prometheus();
+        assert!(prom_failed.contains(
+            "ifa_mesh_cspf_healthy_paths{dst_node=\"4\",node_id=\"1\",src_node=\"1\"} 1"
+        ));
+        assert!(prom_failed.contains(
+            "ifa_mesh_cspf_failovers_total{dst_node=\"4\",node_id=\"1\",src_node=\"1\"} 1"
+        ));
+        assert!(prom_failed.contains(
+            "ifa_mesh_cspf_diversity_ratio{dst_node=\"4\",node_id=\"1\",src_node=\"1\"} 0.500000"
+        ));
     }
 }
