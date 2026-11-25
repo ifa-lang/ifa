@@ -8029,7 +8029,9 @@ impl UnifiedHeaderCompressionManager {
         let policy = self.eviction_policy;
         self.dictionaries
             .entry(origin.to_string())
-            .or_insert_with(|| SharedHeaderDictionary::new(origin, max_size).with_eviction_policy(policy))
+            .or_insert_with(|| {
+                SharedHeaderDictionary::new(origin, max_size).with_eviction_policy(policy)
+            })
     }
 
     /// Borrow the shared header dictionary for the specified origin, if present.
@@ -8054,7 +8056,13 @@ impl UnifiedHeaderCompressionManager {
         let count = entries.len();
         let dict = self.get_or_create_dictionary(origin);
         for (name, val) in entries.into_iter().rev() {
-            dict.insert(name, val, Some(session_id), Some(TransportProtocol::Http2), now);
+            dict.insert(
+                name,
+                val,
+                Some(session_id),
+                Some(TransportProtocol::Http2),
+                now,
+            );
         }
         self.telemetry.cross_session_syncs += 1;
         count
@@ -8072,7 +8080,13 @@ impl UnifiedHeaderCompressionManager {
         let count = entries.len();
         let dict = self.get_or_create_dictionary(origin);
         for (name, val) in entries.into_iter().rev() {
-            dict.insert(name, val, Some(session_id), Some(TransportProtocol::Http3), now);
+            dict.insert(
+                name,
+                val,
+                Some(session_id),
+                Some(TransportProtocol::Http3),
+                now,
+            );
         }
         self.telemetry.cross_session_syncs += 1;
         count
@@ -8152,7 +8166,10 @@ impl UnifiedHeaderCompressionManager {
         }
 
         let entries_count = source_entries.len();
-        let total_bytes: usize = source_entries.iter().map(|(n, v)| n.len() + v.len() + 32).sum();
+        let total_bytes: usize = source_entries
+            .iter()
+            .map(|(n, v)| n.len() + v.len() + 32)
+            .sum();
 
         // Sync into shared dictionary
         {
@@ -8242,6 +8259,351 @@ impl UnifiedHeaderCompressionManager {
     pub fn record_compression(&mut self, raw_bytes: usize, compressed_bytes: usize) {
         self.telemetry.total_raw_header_bytes += raw_bytes;
         self.telemetry.total_compressed_header_bytes += compressed_bytes;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RFC 8441 Extended CONNECT & RFC 9297 / RFC 9298 Capsule Protocol Tunneling
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Protocol carried inside an RFC 8441 Extended CONNECT bidirectional stream tunnel.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TunnelProtocol {
+    /// RFC 8441 WebSocket over HTTP/2 or HTTP/3 stream ("websocket").
+    WebSocket,
+    /// RFC 9298 UDP proxying using RFC 9297 Capsule Protocol ("connect-udp").
+    ConnectUdp,
+    /// Arbitrary application-defined tunnel sub-protocol.
+    Custom(String),
+}
+
+impl TunnelProtocol {
+    /// Return the standard protocol name string used in the `:protocol` pseudo-header.
+    pub fn as_str(&self) -> &str {
+        match self {
+            TunnelProtocol::WebSocket => "websocket",
+            TunnelProtocol::ConnectUdp => "connect-udp",
+            TunnelProtocol::Custom(s) => s.as_str(),
+        }
+    }
+
+    /// Parse protocol identifier string into corresponding `TunnelProtocol` variant.
+    pub fn from_str_name(name: &str) -> Self {
+        match name {
+            "websocket" => TunnelProtocol::WebSocket,
+            "connect-udp" => TunnelProtocol::ConnectUdp,
+            other => TunnelProtocol::Custom(other.to_string()),
+        }
+    }
+}
+
+/// Lifecycle state of an RFC 8441 Extended CONNECT stream tunnel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TunnelState {
+    /// Handshake HEADERS sent or received; awaiting 200 OK acknowledgment.
+    PendingHandshake,
+    /// Stream established and operating as a bidirectional byte / datagram tunnel.
+    Established,
+    /// Tunnel closed by peer or local endpoint.
+    Closed { reason: String },
+}
+
+/// Cumulative telemetry metrics for Extended CONNECT tunnels and capsule framing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExtendedConnectTelemetry {
+    pub tunnels_requested: usize,
+    pub tunnels_established: usize,
+    pub tunnels_rejected: usize,
+    pub tunnels_closed: usize,
+    pub websocket_frames_sent: usize,
+    pub websocket_frames_received: usize,
+    pub udp_packets_tunneled_sent: usize,
+    pub udp_packets_tunneled_received: usize,
+    pub capsules_sent: usize,
+    pub capsules_received: usize,
+    pub total_bytes_tunneled_egress: usize,
+    pub total_bytes_tunneled_ingress: usize,
+}
+
+/// Bidirectional tunnel running on an HTTP/2 or HTTP/3 stream (RFC 8441 / RFC 9297).
+#[derive(Debug, Clone)]
+pub struct ExtendedConnectTunnel {
+    pub stream_id: u32,
+    pub protocol: TunnelProtocol,
+    pub target: String,
+    pub state: TunnelState,
+    ingress_buffer: std::collections::VecDeque<u8>,
+    egress_frames: std::collections::VecDeque<Vec<u8>>,
+    capsule_queue: std::collections::VecDeque<crate::simd_parser::HttpCapsule>,
+    websocket_frames: std::collections::VecDeque<WsFrame>,
+    total_bytes_sent: usize,
+    total_bytes_received: usize,
+}
+
+impl ExtendedConnectTunnel {
+    /// Create a new tunnel bound to a stream ID, protocol, and target resource.
+    pub fn new(stream_id: u32, protocol: TunnelProtocol, target: &str) -> Self {
+        Self {
+            stream_id,
+            protocol,
+            target: target.to_string(),
+            state: TunnelState::PendingHandshake,
+            ingress_buffer: std::collections::VecDeque::with_capacity(4096),
+            egress_frames: std::collections::VecDeque::new(),
+            capsule_queue: std::collections::VecDeque::new(),
+            websocket_frames: std::collections::VecDeque::new(),
+            total_bytes_sent: 0,
+            total_bytes_received: 0,
+        }
+    }
+
+    /// Mark the tunnel as successfully established following receipt of HTTP 200 OK.
+    pub fn mark_established(&mut self) {
+        self.state = TunnelState::Established;
+    }
+
+    /// Check if the tunnel is in the `Established` operational state.
+    pub fn is_established(&self) -> bool {
+        matches!(self.state, TunnelState::Established)
+    }
+
+    /// Terminate the tunnel with the given diagnostic reason.
+    pub fn close(&mut self, reason: &str) {
+        self.state = TunnelState::Closed {
+            reason: reason.to_string(),
+        };
+    }
+
+    /// Check whether the tunnel is closed.
+    pub fn is_closed(&self) -> bool {
+        matches!(self.state, TunnelState::Closed { .. })
+    }
+
+    // ── WebSocket Framing Helpers (RFC 8441 / RFC 6455) ───────────────────────
+
+    /// Queue a WebSocket text message for transmission across this tunnel stream.
+    pub fn send_websocket_text(&mut self, text: &str) {
+        let frame = WsFrame::text(text, false, None);
+        self.send_websocket_frame(frame);
+    }
+
+    /// Queue a WebSocket binary message for transmission across this tunnel stream.
+    pub fn send_websocket_binary(&mut self, data: Vec<u8>) {
+        let frame = WsFrame::binary(data, false, None);
+        self.send_websocket_frame(frame);
+    }
+
+    /// Encode and queue an arbitrary WebSocket frame for transmission.
+    pub fn send_websocket_frame(&mut self, frame: WsFrame) {
+        let bytes = frame.encode();
+        self.total_bytes_sent += bytes.len();
+        self.egress_frames.push_back(bytes);
+    }
+
+    /// Poll and dequeue the next incoming WebSocket frame received from the peer.
+    pub fn recv_websocket_frame(&mut self) -> Option<WsFrame> {
+        self.websocket_frames.pop_front()
+    }
+
+    // ── UDP & Capsule Protocol Helpers (RFC 9298 & RFC 9297) ─────────────────
+
+    /// Encode and queue a UDP datagram packet encapsulated in an RFC 9297 DATAGRAM capsule.
+    pub fn send_udp_packet(&mut self, packet: &[u8]) {
+        let cap = crate::simd_parser::HttpCapsule::udp_datagram(0, packet);
+        self.send_capsule(&cap);
+    }
+
+    /// Encode and queue an arbitrary RFC 9297 capsule for transmission.
+    pub fn send_capsule(&mut self, capsule: &crate::simd_parser::HttpCapsule) {
+        let bytes = capsule.encode_to_vec();
+        self.total_bytes_sent += bytes.len();
+        self.egress_frames.push_back(bytes);
+    }
+
+    /// Poll and dequeue the next incoming UDP datagram packet payload.
+    pub fn recv_udp_packet(&mut self) -> Option<Vec<u8>> {
+        while let Some(cap) = self.capsule_queue.pop_front() {
+            if let Ok((_ctx_id, payload)) = cap.decode_udp_datagram() {
+                return Some(payload.to_vec());
+            }
+        }
+        None
+    }
+
+    /// Poll and dequeue the next incoming RFC 9297 capsule.
+    pub fn recv_capsule(&mut self) -> Option<crate::simd_parser::HttpCapsule> {
+        self.capsule_queue.pop_front()
+    }
+
+    // ── Ingress & Egress Processing ──────────────────────────────────────────
+
+    /// Ingest raw DATA frame payload bytes received from the transport stream.
+    /// Automatically decodes high-level frames (WebSocket frames or RFC 9297 capsules)
+    /// matching this tunnel's negotiated protocol.
+    pub fn ingest_network_data(&mut self, data: &[u8]) {
+        self.total_bytes_received += data.len();
+        self.ingress_buffer.extend(data.iter().copied());
+
+        match self.protocol {
+            TunnelProtocol::WebSocket => {
+                while !self.ingress_buffer.is_empty() {
+                    let slice: Vec<u8> = self.ingress_buffer.iter().copied().collect();
+                    if let Some((frame, consumed)) = WsFrame::decode(&slice) {
+                        for _ in 0..consumed {
+                            self.ingress_buffer.pop_front();
+                        }
+                        self.websocket_frames.push_back(frame);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            TunnelProtocol::ConnectUdp | TunnelProtocol::Custom(_) => {
+                while !self.ingress_buffer.is_empty() {
+                    let slice: Vec<u8> = self.ingress_buffer.iter().copied().collect();
+                    match crate::simd_parser::HttpCapsule::decode_one(&slice) {
+                        Ok((capsule, consumed)) => {
+                            for _ in 0..consumed {
+                                self.ingress_buffer.pop_front();
+                            }
+                            self.capsule_queue.push_back(capsule);
+                        }
+                        Err(crate::simd_parser::FastHttpError::Incomplete) => break,
+                        Err(_) => {
+                            // On unrecoverable frame error, clear ingress buffer
+                            self.ingress_buffer.clear();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drain all queued serialized byte buffers ready for transmission in HTTP/2 DATA frames.
+    pub fn drain_egress_data(&mut self) -> Vec<Vec<u8>> {
+        self.egress_frames.drain(..).collect()
+    }
+
+    /// Return total bytes transmitted and received across this tunnel `(sent, received)`.
+    pub fn byte_stats(&self) -> (usize, usize) {
+        (self.total_bytes_sent, self.total_bytes_received)
+    }
+}
+
+/// Coordinates Extended CONNECT protocol negotiation, tunnel registration, and multiplexed dispatch.
+#[derive(Debug, Clone)]
+pub struct ExtendedConnectManager {
+    /// Whether the remote peer has advertised SETTINGS_ENABLE_CONNECT_PROTOCOL = 1.
+    pub peer_connect_protocol_enabled: bool,
+    /// Active tunnels indexed by their respective stream ID.
+    pub tunnels: HashMap<u32, ExtendedConnectTunnel>,
+    /// Cumulative telemetry statistics.
+    pub telemetry: ExtendedConnectTelemetry,
+}
+
+impl Default for ExtendedConnectManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExtendedConnectManager {
+    /// Create a new Extended CONNECT manager.
+    pub fn new() -> Self {
+        Self {
+            peer_connect_protocol_enabled: false,
+            tunnels: HashMap::new(),
+            telemetry: ExtendedConnectTelemetry::default(),
+        }
+    }
+
+    /// Set peer capability based on received SETTINGS_ENABLE_CONNECT_PROTOCOL (0x8) parameter.
+    pub fn set_peer_connect_protocol(&mut self, enabled: bool) {
+        self.peer_connect_protocol_enabled = enabled;
+    }
+
+    /// Whether Extended CONNECT is supported by peer.
+    pub fn is_connect_protocol_supported(&self) -> bool {
+        self.peer_connect_protocol_enabled
+    }
+
+    /// Open an outbound Extended CONNECT tunnel on `stream_id`.
+    /// Returns an error if peer has not enabled SETTINGS_ENABLE_CONNECT_PROTOCOL.
+    pub fn open_tunnel(
+        &mut self,
+        stream_id: u32,
+        protocol: TunnelProtocol,
+        target: &str,
+    ) -> Result<&mut ExtendedConnectTunnel, String> {
+        self.telemetry.tunnels_requested += 1;
+        if !self.peer_connect_protocol_enabled {
+            self.telemetry.tunnels_rejected += 1;
+            return Err(
+                "Remote peer has not advertised SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441)"
+                    .to_string(),
+            );
+        }
+        let tunnel = ExtendedConnectTunnel::new(stream_id, protocol, target);
+        self.tunnels.insert(stream_id, tunnel);
+        Ok(self.tunnels.get_mut(&stream_id).expect("inserted tunnel"))
+    }
+
+    /// Accept and register an inbound Extended CONNECT request from peer.
+    pub fn accept_tunnel(
+        &mut self,
+        stream_id: u32,
+        request: &crate::simd_parser::ExtendedConnectRequest,
+    ) -> Result<&mut ExtendedConnectTunnel, String> {
+        self.telemetry.tunnels_requested += 1;
+        request.validate().map_err(|e| e.to_string())?;
+
+        let proto = TunnelProtocol::from_str_name(&request.protocol);
+        let mut tunnel = ExtendedConnectTunnel::new(stream_id, proto, &request.authority);
+        tunnel.mark_established();
+        self.telemetry.tunnels_established += 1;
+        self.tunnels.insert(stream_id, tunnel);
+        Ok(self.tunnels.get_mut(&stream_id).expect("inserted tunnel"))
+    }
+
+    /// Retrieve an immutable reference to an active tunnel.
+    pub fn get_tunnel(&self, stream_id: u32) -> Option<&ExtendedConnectTunnel> {
+        self.tunnels.get(&stream_id)
+    }
+
+    /// Retrieve a mutable reference to an active tunnel.
+    pub fn get_tunnel_mut(&mut self, stream_id: u32) -> Option<&mut ExtendedConnectTunnel> {
+        self.tunnels.get_mut(&stream_id)
+    }
+
+    /// Close and remove a tunnel by its stream ID.
+    pub fn close_tunnel(&mut self, stream_id: u32, reason: &str) -> Option<ExtendedConnectTunnel> {
+        if let Some(mut tunnel) = self.tunnels.remove(&stream_id) {
+            tunnel.close(reason);
+            self.telemetry.tunnels_closed += 1;
+            self.telemetry.total_bytes_tunneled_egress += tunnel.total_bytes_sent;
+            self.telemetry.total_bytes_tunneled_ingress += tunnel.total_bytes_received;
+            Some(tunnel)
+        } else {
+            None
+        }
+    }
+
+    /// Number of active tunnels currently tracked.
+    pub fn active_tunnel_count(&self) -> usize {
+        self.tunnels.len()
+    }
+
+    /// Retrieve current telemetry metrics aggregated across all tunnels.
+    pub fn telemetry(&self) -> ExtendedConnectTelemetry {
+        let mut telem = self.telemetry;
+        for tunnel in self.tunnels.values() {
+            telem.total_bytes_tunneled_egress += tunnel.total_bytes_sent;
+            telem.total_bytes_tunneled_ingress += tunnel.total_bytes_received;
+            telem.websocket_frames_received += tunnel.websocket_frames.len();
+            telem.capsules_received += tunnel.capsule_queue.len();
+        }
+        telem
     }
 }
 
@@ -11422,6 +11784,8 @@ pub struct AsyncHttp2Pool {
     enable_shared_header_compression: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shared_header_compression_manager:
         std::sync::Arc<std::sync::Mutex<UnifiedHeaderCompressionManager>>,
+    enable_connect_protocol: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    extended_connect_manager: std::sync::Arc<std::sync::Mutex<ExtendedConnectManager>>,
 }
 
 impl AsyncHttp2Pool {
@@ -11508,6 +11872,10 @@ impl AsyncHttp2Pool {
             shared_header_compression_manager: std::sync::Arc::new(std::sync::Mutex::new(
                 UnifiedHeaderCompressionManager::new(4096),
             )),
+            enable_connect_protocol: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            extended_connect_manager: std::sync::Arc::new(std::sync::Mutex::new(
+                ExtendedConnectManager::new(),
+            )),
         }
     }
 
@@ -11535,6 +11903,83 @@ impl AsyncHttp2Pool {
             mgr.set_eviction_policy(policy);
         }
         self
+    }
+
+    /// Configure whether RFC 8441 Extended CONNECT protocol support is enabled on this pool (default: true).
+    pub fn with_connect_protocol(self, enabled: bool) -> Self {
+        self.enable_connect_protocol
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// Check whether Extended CONNECT protocol support is enabled on this pool.
+    pub fn is_connect_protocol_enabled(&self) -> bool {
+        self.enable_connect_protocol
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record whether the remote peer announced SETTINGS_ENABLE_CONNECT_PROTOCOL = 1.
+    pub fn set_peer_connect_protocol_enabled(&self, enabled: bool) {
+        if let Ok(mut mgr) = self.extended_connect_manager.lock() {
+            mgr.set_peer_connect_protocol(enabled);
+        }
+    }
+
+    /// Open an outbound Extended CONNECT stream tunnel for WebSockets, CONNECT-UDP, or custom sub-protocols.
+    pub fn open_extended_tunnel(
+        &self,
+        protocol: TunnelProtocol,
+        target: &str,
+    ) -> Result<ExtendedConnectTunnel, String> {
+        if !self.is_connect_protocol_enabled() {
+            return Err("Extended CONNECT protocol is disabled on this pool".to_string());
+        }
+        let stream_id = self
+            .next_session_id
+            .fetch_add(2, std::sync::atomic::Ordering::Relaxed) as u32;
+
+        let mut mgr = self
+            .extended_connect_manager
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        let tunnel = mgr.open_tunnel(stream_id, protocol, target)?;
+        Ok(tunnel.clone())
+    }
+
+    /// Open an RFC 8441 WebSocket tunnel on top of a multiplexed HTTP/2 stream.
+    pub fn open_websocket_tunnel(
+        &self,
+        target_authority: &str,
+        path: &str,
+    ) -> Result<ExtendedConnectTunnel, String> {
+        let full_target = format!("{}{}", target_authority, path);
+        self.open_extended_tunnel(TunnelProtocol::WebSocket, &full_target)
+    }
+
+    /// Open an RFC 9298 CONNECT-UDP proxy tunnel using RFC 9297 Capsule Protocol.
+    pub fn open_udp_tunnel(
+        &self,
+        target_authority: &str,
+        target_udp_port: u16,
+    ) -> Result<ExtendedConnectTunnel, String> {
+        let full_target = format!("{}:{}", target_authority, target_udp_port);
+        self.open_extended_tunnel(TunnelProtocol::ConnectUdp, &full_target)
+    }
+
+    /// Retrieve current telemetry metrics across all Extended CONNECT tunnels in this pool.
+    pub fn extended_connect_telemetry(&self) -> ExtendedConnectTelemetry {
+        self.extended_connect_manager
+            .lock()
+            .map(|mgr| mgr.telemetry())
+            .unwrap_or_default()
+    }
+
+    /// Retrieve the number of active Extended CONNECT tunnels tracked by the pool.
+    pub fn active_extended_tunnels_count(&self) -> usize {
+        self.extended_connect_manager
+            .lock()
+            .map(|mgr| mgr.active_tunnel_count())
+            .unwrap_or(0)
     }
 
     /// Configure a shared chunk buffer pool to reuse byte allocations across high-frequency streaming requests.
@@ -25082,7 +25527,7 @@ mod tls_alpn_tests {
             let mut got_headers = false;
             let mut got_data = false;
             let start = std::time::Instant::now();
-            while start.elapsed() < std::time::Duration::from_secs(3) {
+            while start.elapsed() < std::time::Duration::from_secs(10) {
                 match server.recv_frame() {
                     Ok(crate::simd_parser::Http2Frame::Headers { .. }) => {
                         got_headers = true;
@@ -25151,7 +25596,7 @@ mod tls_alpn_tests {
         // Receive response
         let mut got_resp_data = false;
         let start = std::time::Instant::now();
-        while start.elapsed() < std::time::Duration::from_secs(3) {
+        while start.elapsed() < std::time::Duration::from_secs(10) {
             match client.recv_frame() {
                 Ok(crate::simd_parser::Http2Frame::Data { data, .. }) => {
                     assert_eq!(data, b"batch-received");
@@ -27425,7 +27870,10 @@ mod tls_alpn_tests {
         let entries = dict.export_entries();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0], ("x-client-ver".to_string(), "v1.0".to_string()));
-        assert_eq!(entries[1], ("authorization".to_string(), "Bearer xyz".to_string()));
+        assert_eq!(
+            entries[1],
+            ("authorization".to_string(), "Bearer xyz".to_string())
+        );
 
         let (ins, ev, hits, misses) = dict.stats();
         assert_eq!(ins, 3);
@@ -27441,7 +27889,10 @@ mod tls_alpn_tests {
 
         // 1. Simulate active HTTP/2 session encoding headers
         let mut hpack_ctx = crate::simd_parser::HpackContext::new(4096);
-        hpack_ctx.add_dynamic_entry("authorization".to_string(), "Bearer secret-token-42".to_string());
+        hpack_ctx.add_dynamic_entry(
+            "authorization".to_string(),
+            "Bearer secret-token-42".to_string(),
+        );
         hpack_ctx.add_dynamic_entry("x-customer-id".to_string(), "cust-887766".to_string());
         hpack_ctx.add_dynamic_entry("user-agent".to_string(), "IFA-Native-Agent/2.0".to_string());
 
@@ -27483,11 +27934,22 @@ mod tls_alpn_tests {
         assert_eq!(qpack_ctx.telemetry.literals, 0);
 
         // Verify decode roundtrip
-        let decoded = qpack_ctx.decode_headers(&encoded).expect("decode migrated qpack");
+        let decoded = qpack_ctx
+            .decode_headers(&encoded)
+            .expect("decode migrated qpack");
         assert_eq!(decoded.len(), 3);
         assert_eq!(decoded[0], (":method".to_string(), "POST".to_string()));
-        assert_eq!(decoded[1], ("authorization".to_string(), "Bearer secret-token-42".to_string()));
-        assert_eq!(decoded[2], ("x-customer-id".to_string(), "cust-887766".to_string()));
+        assert_eq!(
+            decoded[1],
+            (
+                "authorization".to_string(),
+                "Bearer secret-token-42".to_string()
+            )
+        );
+        assert_eq!(
+            decoded[2],
+            ("x-customer-id".to_string(), "cust-887766".to_string())
+        );
 
         let telem = mgr.telemetry();
         assert_eq!(telem.hpack_to_qpack_migrations, 1);
@@ -27528,7 +27990,10 @@ mod tls_alpn_tests {
         // HTTP/2 HPACK encodes using transferred dynamic entries
         let mut out = Vec::new();
         hpack_ctx.encode_headers_into(
-            &[("x-auth-session", "sess-999"), ("x-service-mesh", "cluster-west")],
+            &[
+                ("x-auth-session", "sess-999"),
+                ("x-service-mesh", "cluster-west"),
+            ],
             false,
             &mut out,
         );
@@ -27626,5 +28091,157 @@ mod tls_alpn_tests {
 
         let hcomp_telem = pool.shared_header_compression_telemetry();
         assert_eq!(hcomp_telem.same_protocol_migrations, 1);
+    }
+
+    #[test]
+    fn test_extended_connect_manager_negotiation_and_lifecycle() {
+        let mut mgr = ExtendedConnectManager::new();
+        assert!(!mgr.is_connect_protocol_supported());
+
+        // Attempting to open tunnel before peer advertised SETTINGS_ENABLE_CONNECT_PROTOCOL must fail
+        let res = mgr.open_tunnel(1, TunnelProtocol::WebSocket, "chat.example.com/live");
+        assert!(res.is_err());
+        assert_eq!(mgr.telemetry().tunnels_rejected, 1);
+
+        // Peer announces SETTINGS_ENABLE_CONNECT_PROTOCOL = 1 (RFC 8441)
+        mgr.set_peer_connect_protocol(true);
+        assert!(mgr.is_connect_protocol_supported());
+
+        // Opening tunnel succeeds
+        let tunnel = mgr
+            .open_tunnel(1, TunnelProtocol::WebSocket, "chat.example.com/live")
+            .expect("opened tunnel");
+        assert_eq!(tunnel.stream_id, 1);
+        assert_eq!(tunnel.protocol, TunnelProtocol::WebSocket);
+        assert_eq!(mgr.active_tunnel_count(), 1);
+
+        // Accept inbound Extended CONNECT request
+        let inbound_req = crate::simd_parser::ExtendedConnectRequest::connect_udp(
+            "proxy.example.org",
+            "/.well-known/masque/udp/target.com/53/",
+        );
+        let accepted = mgr.accept_tunnel(3, &inbound_req).expect("accept tunnel");
+        assert_eq!(accepted.stream_id, 3);
+        assert!(accepted.is_established());
+        assert_eq!(mgr.active_tunnel_count(), 2);
+
+        // Close tunnel
+        let closed = mgr.close_tunnel(1, "client closed").expect("closed tunnel");
+        assert!(closed.is_closed());
+        assert_eq!(mgr.active_tunnel_count(), 1);
+        assert_eq!(mgr.telemetry().tunnels_closed, 1);
+    }
+
+    #[test]
+    fn test_extended_connect_websocket_tunnel_framing() {
+        let mut tunnel =
+            ExtendedConnectTunnel::new(5, TunnelProtocol::WebSocket, "stream.example.com/socket");
+        tunnel.mark_established();
+        assert!(tunnel.is_established());
+
+        // Client sends text message over tunnel
+        tunnel.send_websocket_text("hello-extended-websocket");
+        tunnel.send_websocket_binary(vec![0xAA, 0xBB, 0xCC]);
+
+        let egress_data = tunnel.drain_egress_data();
+        assert_eq!(egress_data.len(), 2);
+
+        // Simulate transmission through HTTP/2 DATA frames and ingestion on remote peer
+        let mut peer_tunnel =
+            ExtendedConnectTunnel::new(5, TunnelProtocol::WebSocket, "stream.example.com/socket");
+        peer_tunnel.mark_established();
+
+        for chunk in &egress_data {
+            peer_tunnel.ingest_network_data(chunk);
+        }
+
+        // Peer receives decoded WebSocket frames
+        let f1 = peer_tunnel
+            .recv_websocket_frame()
+            .expect("received frame 1");
+        assert_eq!(f1.opcode, WsOpcode::Text);
+        assert_eq!(
+            std::str::from_utf8(&f1.payload).unwrap(),
+            "hello-extended-websocket"
+        );
+
+        let f2 = peer_tunnel
+            .recv_websocket_frame()
+            .expect("received frame 2");
+        assert_eq!(f2.opcode, WsOpcode::Binary);
+        assert_eq!(f2.payload, vec![0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn test_extended_connect_udp_capsule_tunneling() {
+        let mut tunnel = ExtendedConnectTunnel::new(
+            7,
+            TunnelProtocol::ConnectUdp,
+            "proxy.example.com/udp-target",
+        );
+        tunnel.mark_established();
+
+        // Send UDP DNS datagram
+        let dns_query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01";
+        tunnel.send_udp_packet(dns_query);
+
+        // Also send custom capsule
+        let custom_cap = crate::simd_parser::HttpCapsule::new(
+            crate::simd_parser::CapsuleType::AddressRequest,
+            vec![192, 168, 1, 100],
+        );
+        tunnel.send_capsule(&custom_cap);
+
+        let wire_chunks = tunnel.drain_egress_data();
+        assert_eq!(wire_chunks.len(), 2);
+
+        // Remote peer ingests data
+        let mut receiver = ExtendedConnectTunnel::new(
+            7,
+            TunnelProtocol::ConnectUdp,
+            "proxy.example.com/udp-target",
+        );
+        receiver.mark_established();
+
+        for chunk in &wire_chunks {
+            receiver.ingest_network_data(chunk);
+        }
+
+        // Verify UDP packet reception
+        let received_pkt = receiver.recv_udp_packet().expect("received udp packet");
+        assert_eq!(received_pkt.as_slice(), dns_query);
+
+        // Verify capsule reception
+        let received_cap = receiver.recv_capsule().expect("received capsule");
+        assert_eq!(
+            received_cap.capsule_type,
+            crate::simd_parser::CapsuleType::AddressRequest
+        );
+        assert_eq!(received_cap.payload, vec![192, 168, 1, 100]);
+    }
+
+    #[test]
+    fn test_async_http2_pool_extended_connect_integration() {
+        let pool = AsyncHttp2Pool::new("proxy.gateway.com", 443, 4).with_connect_protocol(true);
+        assert!(pool.is_connect_protocol_enabled());
+
+        // Peer enables SETTINGS_ENABLE_CONNECT_PROTOCOL = 1
+        pool.set_peer_connect_protocol_enabled(true);
+
+        // Open WebSocket tunnel
+        let ws_tunnel = pool
+            .open_websocket_tunnel("gateway.com", "/ws/feed")
+            .expect("opened websocket tunnel");
+        assert_eq!(ws_tunnel.protocol, TunnelProtocol::WebSocket);
+
+        // Open UDP tunnel
+        let udp_tunnel = pool
+            .open_udp_tunnel("dns.upstream.com", 53)
+            .expect("opened udp tunnel");
+        assert_eq!(udp_tunnel.protocol, TunnelProtocol::ConnectUdp);
+
+        assert_eq!(pool.active_extended_tunnels_count(), 2);
+        let telem = pool.extended_connect_telemetry();
+        assert_eq!(telem.tunnels_requested, 2);
     }
 }

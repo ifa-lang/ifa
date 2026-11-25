@@ -117,16 +117,17 @@ pub use net::{
     AltSvcRouteMetrics, AltSvcSelectionStrategy, AsyncHttp2Connection, AsyncHttp2Pool,
     AsyncSseClient, AsyncSseServer, AsyncTcpListener, AsyncTcpStream, AsyncTimer, AsyncUdpSocket,
     AsyncWsConnection, AsyncWsPool, BufferedTcpStream, ConnectionInfo, Datagram, EventHub,
-    Http2ClientRequest, Http2MultiplexBenchmarkConfig, Http2MultiplexBenchmarkResult,
-    Http2MultiplexComparisonReport, Http2PoolBenchmarkResult, Http2PoolCacheEntry, Http2PoolStats,
-    Http2PrioritizedRequest, Http2RequestInterceptor, Http2ResponseInterceptor, Http3ChunkHandler,
-    Http3Transport, HubMessage, NetBenchmarkReport, NetBenchmarkResult, SessionId, SessionSink,
-    SharedHeaderDictionary, SharedHeaderEntry, HeaderCompressionTelemetry, HeaderStateMigrationReport,
-    UnifiedHeaderCompressionManager,
-    SocketConfig, SseClientStats, SseDecoder, SseServerStats, TcpListener as NetTcpListener,
-    TcpListener, TcpServer, TcpStream as NetTcpStream, TcpStream, TokenBucket,
-    UdpSocket as NetUdpSocket, UdpSocket, WsClient, WsDemux, WsFrame, WsMessage, WsOpcode,
-    WsPoolStats, WsServer, WsSession,
+    ExtendedConnectManager, ExtendedConnectTelemetry, ExtendedConnectTunnel,
+    HeaderCompressionTelemetry, HeaderStateMigrationReport, Http2ClientRequest,
+    Http2MultiplexBenchmarkConfig, Http2MultiplexBenchmarkResult, Http2MultiplexComparisonReport,
+    Http2PoolBenchmarkResult, Http2PoolCacheEntry, Http2PoolStats, Http2PrioritizedRequest,
+    Http2RequestInterceptor, Http2ResponseInterceptor, Http3ChunkHandler, Http3Transport,
+    HubMessage, NetBenchmarkReport, NetBenchmarkResult, SessionId, SessionSink,
+    SharedHeaderDictionary, SharedHeaderEntry, SocketConfig, SseClientStats, SseDecoder,
+    SseServerStats, TcpListener as NetTcpListener, TcpListener, TcpServer,
+    TcpStream as NetTcpStream, TcpStream, TokenBucket, TunnelProtocol, TunnelState,
+    UdpSocket as NetUdpSocket, UdpSocket, UnifiedHeaderCompressionManager, WsClient, WsDemux,
+    WsFrame, WsMessage, WsOpcode, WsPoolStats, WsServer, WsSession,
 };
 pub use process::{
     find_best_assembler, find_best_linker, find_system_tool, invoke_assembler, invoke_linker,
@@ -135,10 +136,11 @@ pub use process::{
 };
 pub use simd_parser::{
     find_byte_vectorized, find_crlf_vectorized, parse_http_request_fast, parse_http_response_fast,
-    qpack_static_lookup, quic_decode_varint, quic_encode_varint, AltSvcRoute, DynamicTableEvictionPolicy,
-    FastHttpError, FastHttpRequest, FastHttpResponse, HpackContext, HpackEvictionPolicy, Http2ErrorCode,
-    Http2Frame, Http2FrameBatchSerializer, Http2FrameHeader, Http2FrameType, Http2Session,
-    Http2Setting, Http2SettingId, Http2Stream, Http2StreamState, Http3Frame, Http3FrameType,
+    qpack_static_lookup, quic_decode_varint, quic_encode_varint, AltSvcRoute, CapsuleType,
+    DynamicTableEvictionPolicy, ExtendedConnectRequest, FastHttpError, FastHttpRequest,
+    FastHttpResponse, HpackContext, HpackEvictionPolicy, Http2ErrorCode, Http2Frame,
+    Http2FrameBatchSerializer, Http2FrameHeader, Http2FrameType, Http2Session, Http2Setting,
+    Http2SettingId, Http2Stream, Http2StreamState, Http3Frame, Http3FrameType, HttpCapsule,
     QpackContext, QpackTelemetry, HPACK_STATIC_TABLE, QPACK_STATIC_TABLE,
 };
 pub use sync::{

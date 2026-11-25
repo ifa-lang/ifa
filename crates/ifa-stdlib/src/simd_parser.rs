@@ -150,6 +150,7 @@ pub enum FastHttpError {
     Incomplete,
     InvalidRequestLine,
     InvalidHeader,
+    InvalidFrame,
 }
 
 impl fmt::Display for FastHttpError {
@@ -158,6 +159,7 @@ impl fmt::Display for FastHttpError {
             FastHttpError::Incomplete => write!(f, "Incomplete HTTP message"),
             FastHttpError::InvalidRequestLine => write!(f, "Invalid HTTP request line"),
             FastHttpError::InvalidHeader => write!(f, "Invalid HTTP header syntax"),
+            FastHttpError::InvalidFrame => write!(f, "Invalid frame or capsule structure"),
         }
     }
 }
@@ -487,7 +489,7 @@ impl From<Http2ErrorCode> for u32 {
     }
 }
 
-/// HTTP/2 Settings Parameter Identifier (RFC 7540 Section 6.5.2).
+/// HTTP/2 Settings Parameter Identifier (RFC 7540 Section 6.5.2 & RFC 8441 Section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Http2SettingId {
     HeaderTableSize,
@@ -496,7 +498,10 @@ pub enum Http2SettingId {
     InitialWindowSize,
     MaxFrameSize,
     MaxHeaderListSize,
-    /// RFC 9218: SETTINGS_ENABLE_CONNECT_PROTOCOL or SETTINGS parameter (0x10 / etc.)
+    /// RFC 8441: SETTINGS_ENABLE_CONNECT_PROTOCOL (0x8).
+    /// Value 1 signals support for Extended CONNECT (:protocol pseudo-header).
+    EnableConnectProtocol,
+    /// RFC 9218: SETTINGS parameter (0x9) indicating no RFC 7540 priorities.
     NoRfc7540Priorities,
     Unknown(u16),
 }
@@ -510,6 +515,7 @@ impl From<u16> for Http2SettingId {
             0x4 => Http2SettingId::InitialWindowSize,
             0x5 => Http2SettingId::MaxFrameSize,
             0x6 => Http2SettingId::MaxHeaderListSize,
+            0x8 => Http2SettingId::EnableConnectProtocol,
             0x9 => Http2SettingId::NoRfc7540Priorities,
             other => Http2SettingId::Unknown(other),
         }
@@ -525,6 +531,7 @@ impl From<Http2SettingId> for u16 {
             Http2SettingId::InitialWindowSize => 0x4,
             Http2SettingId::MaxFrameSize => 0x5,
             Http2SettingId::MaxHeaderListSize => 0x6,
+            Http2SettingId::EnableConnectProtocol => 0x8,
             Http2SettingId::NoRfc7540Priorities => 0x9,
             Http2SettingId::Unknown(other) => other,
         }
@@ -2878,7 +2885,11 @@ impl QpackContext {
                     // 3. Literal Field Line with Literal Name (RFC 9204 §4.5.6): 0010xxxx (N=0, 3-bit prefix 0x20)
                     self.telemetry.literals += 1;
                     out.push(0x20);
-                    hpack_encode_string_custom(name.to_ascii_lowercase().as_bytes(), out, use_huffman);
+                    hpack_encode_string_custom(
+                        name.to_ascii_lowercase().as_bytes(),
+                        out,
+                        use_huffman,
+                    );
                     hpack_encode_string_custom(value.as_bytes(), out, use_huffman);
                 }
             }
@@ -5383,6 +5394,286 @@ impl Http2Session {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// RFC 9297 Capsule Protocol & RFC 8441 Extended CONNECT Definitions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Standard Capsule Types defined in RFC 9297 (HTTP Datagrams and the Capsule Protocol)
+/// and RFC 9298 (Proxying UDP in HTTP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CapsuleType {
+    /// RFC 9297 / RFC 9298 DATAGRAM capsule (type 0x00).
+    Datagram,
+    /// RFC 9297 / WebTransport CLOSE_WEBTRANSPORT_SESSION (type 0x2843).
+    CloseWebTransportSession,
+    /// RFC 9297 / WebTransport DRAIN_WEBTRANSPORT_SESSION (type 0x78ae).
+    DrainWebTransportSession,
+    /// RFC 9298 / IP Proxying ADDRESS_ASSIGN (type 0x1e).
+    AddressAssign,
+    /// RFC 9298 / IP Proxying ADDRESS_REQUEST (type 0x1f).
+    AddressRequest,
+    /// RFC 9298 / IP Proxying ROUTE_ADVERTISEMENT (type 0x3f).
+    RouteAdvertisement,
+    /// Unknown or custom capsule type identified by its 62-bit VarInt value.
+    Unknown(u64),
+}
+
+impl From<u64> for CapsuleType {
+    fn from(val: u64) -> Self {
+        match val {
+            0x00 => CapsuleType::Datagram,
+            0x1e => CapsuleType::AddressAssign,
+            0x1f => CapsuleType::AddressRequest,
+            0x3f => CapsuleType::RouteAdvertisement,
+            0x2843 => CapsuleType::CloseWebTransportSession,
+            0x78ae => CapsuleType::DrainWebTransportSession,
+            other => CapsuleType::Unknown(other),
+        }
+    }
+}
+
+impl From<CapsuleType> for u64 {
+    fn from(val: CapsuleType) -> Self {
+        match val {
+            CapsuleType::Datagram => 0x00,
+            CapsuleType::AddressAssign => 0x1e,
+            CapsuleType::AddressRequest => 0x1f,
+            CapsuleType::RouteAdvertisement => 0x3f,
+            CapsuleType::CloseWebTransportSession => 0x2843,
+            CapsuleType::DrainWebTransportSession => 0x78ae,
+            CapsuleType::Unknown(other) => other,
+        }
+    }
+}
+
+/// An individual RFC 9297 HTTP Capsule frame consisting of a VarInt type,
+/// a VarInt length, and an arbitrary payload byte sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpCapsule {
+    pub capsule_type: CapsuleType,
+    pub payload: Vec<u8>,
+}
+
+impl HttpCapsule {
+    /// Create a new capsule with the specified type and byte payload.
+    pub fn new(capsule_type: CapsuleType, payload: Vec<u8>) -> Self {
+        Self {
+            capsule_type,
+            payload,
+        }
+    }
+
+    /// Construct a standard DATAGRAM capsule (type 0x00) with raw payload.
+    pub fn datagram(payload: Vec<u8>) -> Self {
+        Self::new(CapsuleType::Datagram, payload)
+    }
+
+    /// Construct a RFC 9298 CONNECT-UDP datagram capsule containing a Context ID (VarInt)
+    /// followed by the uncompressed UDP payload bytes.
+    pub fn udp_datagram(context_id: u64, packet: &[u8]) -> Self {
+        let mut payload = Vec::with_capacity(8 + packet.len());
+        quic_encode_varint(context_id, &mut payload);
+        payload.extend_from_slice(packet);
+        Self::new(CapsuleType::Datagram, payload)
+    }
+
+    /// Decode the Context ID and UDP payload from a DATAGRAM capsule.
+    pub fn decode_udp_datagram(&self) -> Result<(u64, &[u8]), FastHttpError> {
+        if self.capsule_type != CapsuleType::Datagram {
+            return Err(FastHttpError::InvalidFrame);
+        }
+        let (ctx_id, consumed) = quic_decode_varint(&self.payload)?;
+        Ok((ctx_id, &self.payload[consumed..]))
+    }
+
+    /// Encode this capsule into QUIC VarInt-framed wire format appended to `out`.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        let type_num: u64 = self.capsule_type.into();
+        quic_encode_varint(type_num, out);
+        quic_encode_varint(self.payload.len() as u64, out);
+        out.extend_from_slice(&self.payload);
+    }
+
+    /// Encode this capsule into a newly allocated vector of bytes.
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16 + self.payload.len());
+        self.encode(&mut out);
+        out
+    }
+
+    /// Decode a single HTTP Capsule from `bytes`. Returns `(capsule, bytes_consumed)`.
+    pub fn decode_one(bytes: &[u8]) -> Result<(Self, usize), FastHttpError> {
+        if bytes.is_empty() {
+            return Err(FastHttpError::Incomplete);
+        }
+        let (type_num, t_len) = quic_decode_varint(bytes)?;
+        let rem = &bytes[t_len..];
+        let (payload_len, l_len) = quic_decode_varint(rem)?;
+        let total_header_len = t_len + l_len;
+        let total_len = total_header_len + payload_len as usize;
+
+        if bytes.len() < total_len {
+            return Err(FastHttpError::Incomplete);
+        }
+
+        let payload = bytes[total_header_len..total_len].to_vec();
+        Ok((
+            Self {
+                capsule_type: CapsuleType::from(type_num),
+                payload,
+            },
+            total_len,
+        ))
+    }
+
+    /// Decode all complete capsules available in `bytes`.
+    pub fn decode_all(mut bytes: &[u8]) -> Result<Vec<Self>, FastHttpError> {
+        let mut capsules = Vec::new();
+        while !bytes.is_empty() {
+            match Self::decode_one(bytes) {
+                Ok((cap, consumed)) => {
+                    capsules.push(cap);
+                    bytes = &bytes[consumed..];
+                }
+                Err(FastHttpError::Incomplete) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(capsules)
+    }
+}
+
+/// Represents an RFC 8441 Extended CONNECT request enabling bidirectional protocol
+/// tunneling (such as WebSockets or CONNECT-UDP) across HTTP/2 or HTTP/3 streams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtendedConnectRequest {
+    /// Target tunnel protocol name (e.g. "websocket", "connect-udp").
+    pub protocol: String,
+    /// Pseudo-header :scheme (e.g. "https", "http", "masque").
+    pub scheme: String,
+    /// Pseudo-header :authority (e.g. "example.com:443").
+    pub authority: String,
+    /// Pseudo-header :path (e.g. "/chat", "/.well-known/masque/udp/target.example/443/").
+    pub path: String,
+    /// Supplementary HTTP headers (e.g. sec-websocket-version, sec-websocket-protocol).
+    pub extra_headers: Vec<(String, String)>,
+}
+
+impl ExtendedConnectRequest {
+    /// Construct an RFC 8441 WebSocket Extended CONNECT request.
+    pub fn websocket(authority: &str, path: &str) -> Self {
+        Self {
+            protocol: "websocket".to_string(),
+            scheme: "https".to_string(),
+            authority: authority.to_string(),
+            path: path.to_string(),
+            extra_headers: vec![("sec-websocket-version".to_string(), "13".to_string())],
+        }
+    }
+
+    /// Construct an RFC 9298 CONNECT-UDP Extended CONNECT request.
+    pub fn connect_udp(authority: &str, path: &str) -> Self {
+        Self {
+            protocol: "connect-udp".to_string(),
+            scheme: "masque".to_string(),
+            authority: authority.to_string(),
+            path: path.to_string(),
+            extra_headers: vec![("capsule-protocol".to_string(), "?1".to_string())],
+        }
+    }
+
+    /// Validate that all mandatory RFC 8441 pseudo-headers and parameters are non-empty.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.protocol.trim().is_empty() {
+            return Err("Extended CONNECT request missing :protocol pseudo-header");
+        }
+        if self.scheme.trim().is_empty() {
+            return Err("Extended CONNECT request missing :scheme pseudo-header");
+        }
+        if self.authority.trim().is_empty() {
+            return Err("Extended CONNECT request missing :authority pseudo-header");
+        }
+        if self.path.trim().is_empty() {
+            return Err("Extended CONNECT request missing :path pseudo-header");
+        }
+        Ok(())
+    }
+
+    /// Convert request into HTTP pseudo-headers and extra header pairs as borrowed string slices.
+    pub fn to_headers(&self) -> Vec<(&str, &str)> {
+        let mut list = Vec::with_capacity(5 + self.extra_headers.len());
+        list.push((":method", "CONNECT"));
+        list.push((":protocol", self.protocol.as_str()));
+        list.push((":scheme", self.scheme.as_str()));
+        list.push((":authority", self.authority.as_str()));
+        list.push((":path", self.path.as_str()));
+        for (k, v) in &self.extra_headers {
+            list.push((k.as_str(), v.as_str()));
+        }
+        list
+    }
+
+    /// Convert request into owned HTTP header key-value pairs.
+    pub fn to_header_strings(&self) -> Vec<(String, String)> {
+        self.to_headers()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Parse and validate an RFC 8441 Extended CONNECT request from header name-value pairs.
+    pub fn from_headers(headers: &[(&str, &str)]) -> Result<Self, &'static str> {
+        let mut method = None;
+        let mut protocol = None;
+        let mut scheme = None;
+        let mut authority = None;
+        let mut path = None;
+        let mut extra = Vec::new();
+
+        for &(name, value) in headers {
+            match name {
+                ":method" => method = Some(value),
+                ":protocol" => protocol = Some(value),
+                ":scheme" => scheme = Some(value),
+                ":authority" => authority = Some(value),
+                ":path" => path = Some(value),
+                _ => {
+                    if !name.starts_with(':') {
+                        extra.push((name.to_string(), value.to_string()));
+                    }
+                }
+            }
+        }
+
+        if method != Some("CONNECT") {
+            return Err("Method is not CONNECT");
+        }
+        let protocol = protocol.ok_or("Missing :protocol pseudo-header")?;
+        let scheme = scheme.ok_or("Missing :scheme pseudo-header for Extended CONNECT")?;
+        let authority = authority.ok_or("Missing :authority pseudo-header")?;
+        let path = path.ok_or("Missing :path pseudo-header for Extended CONNECT")?;
+
+        let req = Self {
+            protocol: protocol.to_string(),
+            scheme: scheme.to_string(),
+            authority: authority.to_string(),
+            path: path.to_string(),
+            extra_headers: extra,
+        };
+        req.validate()?;
+        Ok(req)
+    }
+
+    /// Parse and validate an RFC 8441 Extended CONNECT request from owned string pairs.
+    pub fn from_header_strings(headers: &[(String, String)]) -> Result<Self, &'static str> {
+        let borrowed: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        Self::from_headers(&borrowed)
+    }
+}
+
 #[cfg(test)]
 mod http2_tests {
     use super::*;
@@ -6962,7 +7253,10 @@ mod http2_tests {
         ctx.add_dynamic_entry("x-auth-token".to_string(), "secret-token-123".to_string());
 
         assert_eq!(ctx.dynamic_table.len(), 2);
-        assert_eq!(ctx.get_dynamic_entry(0), Some(("x-auth-token", "secret-token-123")));
+        assert_eq!(
+            ctx.get_dynamic_entry(0),
+            Some(("x-auth-token", "secret-token-123"))
+        );
         assert_eq!(ctx.get_dynamic_entry(1), Some(("x-api-version", "v2.5")));
 
         let headers = [
@@ -6979,8 +7273,14 @@ mod http2_tests {
         let decoded = ctx.decode_headers(&encoded).expect("decode dynamic qpack");
         assert_eq!(decoded.len(), 3);
         assert_eq!(decoded[0], (":method".to_string(), "POST".to_string()));
-        assert_eq!(decoded[1], ("x-auth-token".to_string(), "secret-token-123".to_string()));
-        assert_eq!(decoded[2], ("x-api-version".to_string(), "v2.5".to_string()));
+        assert_eq!(
+            decoded[1],
+            ("x-auth-token".to_string(), "secret-token-123".to_string())
+        );
+        assert_eq!(
+            decoded[2],
+            ("x-api-version".to_string(), "v2.5".to_string())
+        );
 
         // Test export & import
         let exported = ctx.export_dynamic_table();
@@ -7160,5 +7460,62 @@ mod http2_tests {
         // Stream 1's deficit was redistributed to remaining incremental stream 3
         assert_eq!(session.drr_deficits.get(&1), None);
         assert_eq!(session.drr_deficits.get(&3), Some(&2000));
+    }
+
+    #[test]
+    fn test_rfc9297_capsule_encoding_and_decoding() {
+        let cap1 = HttpCapsule::datagram(b"test-datagram-payload".to_vec());
+        let cap2 = HttpCapsule::udp_datagram(0, b"raw-udp-dns-packet");
+        let cap3 = HttpCapsule::new(CapsuleType::CloseWebTransportSession, vec![0x01, 0x02]);
+
+        let mut wire = Vec::new();
+        cap1.encode(&mut wire);
+        cap2.encode(&mut wire);
+        cap3.encode(&mut wire);
+
+        let decoded = HttpCapsule::decode_all(&wire).expect("decode capsules");
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0], cap1);
+        assert_eq!(decoded[1], cap2);
+        assert_eq!(decoded[2], cap3);
+
+        let (ctx_id, udp_pkt) = decoded[1].decode_udp_datagram().expect("decode udp");
+        assert_eq!(ctx_id, 0);
+        assert_eq!(udp_pkt, b"raw-udp-dns-packet");
+    }
+
+    #[test]
+    fn test_rfc8441_extended_connect_validation_and_headers() {
+        let ws_req = ExtendedConnectRequest::websocket("chat.example.com", "/chat/v2");
+        assert!(ws_req.validate().is_ok());
+
+        let headers = ws_req.to_headers();
+        assert!(headers.contains(&(":method", "CONNECT")));
+        assert!(headers.contains(&(":protocol", "websocket")));
+        assert!(headers.contains(&(":scheme", "https")));
+        assert!(headers.contains(&(":authority", "chat.example.com")));
+        assert!(headers.contains(&(":path", "/chat/v2")));
+
+        let parsed = ExtendedConnectRequest::from_headers(&headers).expect("parse headers");
+        assert_eq!(parsed.protocol, "websocket");
+        assert_eq!(parsed.authority, "chat.example.com");
+        assert_eq!(parsed.path, "/chat/v2");
+
+        // Missing :protocol should fail
+        let invalid_headers = [
+            (":method", "CONNECT"),
+            (":scheme", "https"),
+            (":authority", "chat.example.com"),
+            (":path", "/chat/v2"),
+        ];
+        assert!(ExtendedConnectRequest::from_headers(&invalid_headers).is_err());
+    }
+
+    #[test]
+    fn test_http2_setting_enable_connect_protocol() {
+        let id_u16: u16 = 0x8;
+        let setting_id = Http2SettingId::from(id_u16);
+        assert_eq!(setting_id, Http2SettingId::EnableConnectProtocol);
+        assert_eq!(u16::from(setting_id), 0x8);
     }
 }
