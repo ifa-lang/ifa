@@ -9,6 +9,7 @@ pub mod fiber;
 pub mod header;
 pub mod io;
 pub mod jitter_anomaly;
+pub mod mesh_lsa;
 pub mod mtls_attestation;
 pub mod panic;
 pub mod reactor;
@@ -31,11 +32,12 @@ pub use allocator::{
 pub use benchmarks::{
     create_saturated_multipath_snapshot, profile_allocator_engine, run_allocator_multithread_suite,
     run_generational_benchmark_suite, run_issp_failover_benchmark_suite, run_issp_scenario,
-    run_jitter_anomaly_and_threshold_benchmark, run_mtls_attestation_and_key_rotation_benchmark,
-    run_simd_capsule_and_classification_benchmark, run_telemetry_streaming_vs_polling_benchmark,
-    run_topological_convergence_benchmark, run_zstd_trace_archive_benchmark, AllocatorEngine,
-    AllocatorThroughputResult, BenchmarkReport, BenchmarkResult, IsspBenchmarkScenarioResult,
-    IsspFailoverBenchmarkSuiteReport, IsspNetworkProfile, JitterAnomalyBenchmarkReport,
+    run_jitter_anomaly_and_threshold_benchmark, run_mesh_lsa_synchronization_benchmark,
+    run_mtls_attestation_and_key_rotation_benchmark, run_simd_capsule_and_classification_benchmark,
+    run_telemetry_streaming_vs_polling_benchmark, run_topological_convergence_benchmark,
+    run_zstd_trace_archive_benchmark, AllocatorEngine, AllocatorThroughputResult, BenchmarkReport,
+    BenchmarkResult, IsspBenchmarkScenarioResult, IsspFailoverBenchmarkSuiteReport,
+    IsspNetworkProfile, JitterAnomalyBenchmarkReport, MeshLsaSyncBenchmarkReport,
     MtlsAttestationBenchmarkReport, MultithreadBenchmarkSuiteReport,
     SimdClassificationBenchmarkReport, SimdPhaseResult, TelemetryComparativeReport,
     TelemetryLoadResult, TelemetryTransportKind, TopologicalConvergenceBenchmarkReport,
@@ -61,6 +63,14 @@ pub use jitter_anomaly::{
     apply_dynamic_thresholds, AnomalySeverity, DynamicCongestionThresholds, JitterAnomalyDetector,
     JitterAnomalyKind, JitterDetectorConfig, JitterDetectorStats, JitterMitigationAction,
     JitterMultipathBridge, JitterSampleEvaluation,
+};
+pub use mesh_lsa::{
+    lsa_phase_name, IsspLinkStateEntry, IsspLsaError, IsspLsaIngestSummary, IsspLsaLinkRecord,
+    IsspLsaSyncTelemetry, IsspLsaSynchronizer, IsspMeshLsaPacket, ISSP_COMPRESSED_LSA_HEADER_SIZE,
+    ISSP_COMPRESSED_LSA_MAGIC, ISSP_LSA_HEADER_SIZE, ISSP_LSA_LINK_RECORD_SIZE,
+    ISSP_MESH_LSA_MAGIC, LSA_FLAG_BOTTLENECK, LSA_FLAG_ECN_MARKED, LSA_FLAG_FAILOVER_TRIGGER,
+    LSA_FLAG_JITTER_SURGE, LSA_FLAG_LINK_DOWN, LSA_PHASE_CRUISE, LSA_PHASE_DAMP,
+    LSA_PHASE_PROBE_BW, LSA_PHASE_RECOVERY, LSA_PHASE_THROTTLE,
 };
 pub use mtls_attestation::{
     ifa_digest32, ifa_kdf_derive, ifa_mac, MeshAttestationCertificate, MeshNodeRole,
@@ -113,8 +123,8 @@ pub use session_sync::{
 pub use simd_classifier::{
     decode_capsule_header_simd, decode_capsule_headers_batch_simd, decode_capsule_view_simd,
     IsspCapsuleHeader, IsspCapsuleView, IsspClassifiedBatch, IsspPacketPriority,
-    IsspSimdPacketClassifier, IsspTelemetryPacketClass, ISSP_FAMILY_PREFIX, ISSP_MESH_LSA_MAGIC,
-    ISSP_MIGRATION_MAGIC, ISSP_TELEMETRY_MAGIC, ISSP_TRACE_MAGIC,
+    IsspSimdPacketClassifier, IsspTelemetryPacketClass, ISSP_FAMILY_PREFIX, ISSP_MIGRATION_MAGIC,
+    ISSP_TELEMETRY_MAGIC, ISSP_TRACE_MAGIC,
 };
 pub use string::IfaString;
 pub use telemetry::{

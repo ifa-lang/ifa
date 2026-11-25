@@ -18,6 +18,9 @@ pub const ISSP_TRACE_MAGIC: u32 = 0x4953_5452;
 /// ISSP Multi-Node Mesh Link-State Advertisement packet magic identifier ('ISMS').
 pub const ISSP_MESH_LSA_MAGIC: u32 = 0x4953_4d53;
 
+/// ISSP Compressed Multi-Node Mesh Link-State Advertisement packet magic identifier ('ISCL').
+pub const ISSP_COMPRESSED_LSA_MAGIC: u32 = 0x4953_434c;
+
 /// ISSP Transparent Migration Cutover packet magic identifier ('ISMG').
 pub const ISSP_MIGRATION_MAGIC: u32 = 0x4953_4d47;
 
@@ -200,6 +203,12 @@ pub enum IsspTelemetryPacketClass {
         lsa_seq: u64,
         link_count: u32,
     },
+    /// Mesh Link-State Advertisement compressed with RFC 8878 Zstandard ('ISCL').
+    MeshTopologyCompressedLsa {
+        sender_node_id: u32,
+        raw_size: u32,
+        compressed_size: u32,
+    },
     /// Transparent Session Cutover signal ('ISMG').
     MigrationCutover {
         session_id_prefix: u64,
@@ -229,7 +238,8 @@ impl IsspTelemetryPacketClass {
             Self::CapsuleSessionGossipV1 { .. }
             | Self::CapsuleSessionGossipV2Encrypted { .. }
             | Self::SubpathData { .. }
-            | Self::MeshTopologyLsa { .. } => IsspPacketPriority::NormalData,
+            | Self::MeshTopologyLsa { .. }
+            | Self::MeshTopologyCompressedLsa { .. } => IsspPacketPriority::NormalData,
             Self::Rfc9297Capsule { .. }
             | Self::RawDatagram { .. }
             | Self::UnknownOrMalformed { .. } => IsspPacketPriority::BulkBackground,
@@ -243,7 +253,8 @@ impl IsspTelemetryPacketClass {
             Self::CapsuleSessionGossipV1 { origin_node_id, .. }
             | Self::CapsuleSessionGossipV2Encrypted { origin_node_id, .. }
             | Self::TelemetryMetricsReport { origin_node_id, .. } => Some(*origin_node_id),
-            Self::MeshTopologyLsa { sender_node_id, .. } => Some(*sender_node_id),
+            Self::MeshTopologyLsa { sender_node_id, .. }
+            | Self::MeshTopologyCompressedLsa { sender_node_id, .. } => Some(*sender_node_id),
             Self::MigrationCutover { target_node_id, .. } => Some(*target_node_id),
             _ => None,
         }
@@ -285,6 +296,9 @@ impl IsspTelemetryPacketClass {
             | Self::Rfc9297Capsule { payload_len, .. } => *payload_len,
             Self::TelemetryTraceContext { .. } => 24,
             Self::MeshTopologyLsa { link_count, .. } => (*link_count as usize) * 32,
+            Self::MeshTopologyCompressedLsa {
+                compressed_size, ..
+            } => *compressed_size as usize,
             Self::MigrationCutover { .. } => 12,
             Self::RawDatagram { len, .. } | Self::UnknownOrMalformed { len, .. } => *len,
         }
@@ -480,6 +494,27 @@ impl IsspSimdPacketClassifier {
                         sender_node_id,
                         lsa_seq,
                         link_count,
+                    }
+                } else {
+                    IsspTelemetryPacketClass::UnknownOrMalformed {
+                        first_dword: magic,
+                        len: slice.len(),
+                    }
+                }
+            }
+
+            // Mesh Compressed Link-State Advertisement ('ISCL')
+            ISSP_COMPRESSED_LSA_MAGIC => {
+                if slice.len() >= 16 {
+                    let sender_node_id =
+                        u32::from_le_bytes([slice[4], slice[5], slice[6], slice[7]]);
+                    let raw_size = u32::from_le_bytes([slice[8], slice[9], slice[10], slice[11]]);
+                    let compressed_size =
+                        u32::from_le_bytes([slice[12], slice[13], slice[14], slice[15]]);
+                    IsspTelemetryPacketClass::MeshTopologyCompressedLsa {
+                        sender_node_id,
+                        raw_size,
+                        compressed_size,
                     }
                 } else {
                     IsspTelemetryPacketClass::UnknownOrMalformed {
@@ -877,5 +912,32 @@ mod tests {
 
         let t_indices = IsspSimdPacketClassifier::filter_telemetry_metrics_simd(&packets);
         assert_eq!(t_indices, vec![1]);
+    }
+
+    #[test]
+    fn test_compressed_lsa_simd_classification() {
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&ISSP_COMPRESSED_LSA_MAGIC.to_be_bytes());
+        pkt.extend_from_slice(&77u32.to_le_bytes()); // sender_node_id
+        pkt.extend_from_slice(&256u32.to_le_bytes()); // raw_size
+        pkt.extend_from_slice(&64u32.to_le_bytes()); // compressed_size
+        pkt.extend_from_slice(&[0xaa; 64]);
+
+        let class = IsspSimdPacketClassifier::classify_packet(&pkt);
+        match class {
+            IsspTelemetryPacketClass::MeshTopologyCompressedLsa {
+                sender_node_id,
+                raw_size,
+                compressed_size,
+            } => {
+                assert_eq!(sender_node_id, 77);
+                assert_eq!(raw_size, 256);
+                assert_eq!(compressed_size, 64);
+            }
+            other => panic!("expected MeshTopologyCompressedLsa, got {:?}", other),
+        }
+        assert_eq!(class.priority(), IsspPacketPriority::NormalData);
+        assert_eq!(class.origin_node(), Some(77));
+        assert_eq!(class.payload_size(), 64);
     }
 }
