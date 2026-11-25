@@ -1050,5 +1050,65 @@ fn test_cli_net_session_list_inspect_migrate() {
     let empty_list_str = String::from_utf8_lossy(&empty_list_out.stdout);
     assert!(empty_list_str.contains("No active or replicated tunnel sessions found in registry."));
 
+    // 9. Test `ifa net session bench` (standard suite table)
+    let bench_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("bench")
+        .arg("--sessions")
+        .arg("10")
+        .arg("--cycles")
+        .arg("3")
+        .output()
+        .expect("execute bench");
+    assert!(
+        bench_out.status.success(),
+        "bench failed: {}",
+        String::from_utf8_lossy(&bench_out.stderr)
+    );
+    let bench_str = String::from_utf8_lossy(&bench_out.stdout);
+    assert!(bench_str.contains("ISSP PROTOCOL FAILOVER & THROUGHPUT BENCHMARK"));
+    assert!(bench_str.contains("Optimal LAN"));
+    assert!(bench_str.contains("100% PASS"));
+    assert!(bench_str.contains("ALL SCENARIOS PASSED WITH 100% STATE INTEGRITY AND ZERO DATA LOSS"));
+
+    // 10. Test `ifa net session bench --json`
+    let bench_json_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("bench")
+        .arg("--sessions")
+        .arg("10")
+        .arg("--cycles")
+        .arg("3")
+        .arg("--json")
+        .output()
+        .expect("execute bench json");
+    assert!(bench_json_out.status.success());
+    let bench_val: serde_json::Value =
+        serde_json::from_slice(&bench_json_out.stdout).expect("valid JSON bench output");
+    assert_eq!(bench_val["all_integrity_passed"], true);
+    assert!(bench_val["scenarios"].as_array().unwrap().len() >= 5);
+
+    // 11. Test `ifa net session bench` with custom loss and jitter
+    let custom_bench_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("bench")
+        .arg("--sessions")
+        .arg("10")
+        .arg("--cycles")
+        .arg("3")
+        .arg("--loss")
+        .arg("5.0")
+        .arg("--jitter-ms")
+        .arg("15")
+        .output()
+        .expect("execute custom bench");
+    assert!(custom_bench_out.status.success());
+    let custom_str = String::from_utf8_lossy(&custom_bench_out.stdout);
+    assert!(custom_str.contains("Custom Profile (5.0% loss, 15ms jitter)"));
+    assert!(custom_str.contains("100% PASS"));
+
     let _ = fs::remove_dir_all(&temp_dir);
 }

@@ -964,13 +964,35 @@ impl SessionRegistry {
         let snap = &frame.snapshot;
 
         if let Some(record) = guard.get_mut(&snap.id) {
-            if snap.migration_epoch <= record.snapshot.migration_epoch {
+            if snap.migration_epoch < record.snapshot.migration_epoch {
                 self.gossip_rejected_count.fetch_add(1, Ordering::Relaxed);
                 return GossipResult::Rejected(RejectReason::StaleEpoch {
                     local: record.snapshot.migration_epoch,
                     received: snap.migration_epoch,
                 });
             }
+
+            if snap.migration_epoch == record.snapshot.migration_epoch {
+                if record.is_primary {
+                    // Local node is primary for this epoch: reject conflicting gossip for same epoch
+                    self.gossip_rejected_count.fetch_add(1, Ordering::Relaxed);
+                    return GossipResult::Rejected(RejectReason::StaleEpoch {
+                        local: record.snapshot.migration_epoch,
+                        received: snap.migration_epoch,
+                    });
+                }
+
+                // Shadow replica tracking primary progress: update snapshot on non-decreasing sequence / time
+                if snap.tx_seq >= record.snapshot.tx_seq
+                    || snap.captured_unix_secs >= record.snapshot.captured_unix_secs
+                {
+                    record.snapshot = *snap;
+                    record.last_captured = Instant::now();
+                    return GossipResult::Updated;
+                }
+                return GossipResult::Ignored;
+            }
+
             // Accept fresher epoch — demote ourselves to shadow.
             record.snapshot = *snap;
             record.last_captured = Instant::now();
@@ -1204,7 +1226,7 @@ impl SessionRegistry {
     /// - For primary sessions: generates periodic snapshot gossip frames and capsules whenever
     ///   `elapsed >= config.snapshot_interval_secs`.
     /// - For shadow/standby sessions: detects silence of the primary node (`silence_age >= config.primary_silence_threshold_secs`).
-    ///   If `config.auto_migrate_on_silence` is true and the snapshot is not stale (<= `SNAPSHOT_MAX_AGE`),
+    ///   If `config.auto_migrate_on_silence` is true and the snapshot is not stale (< `config.stale_eviction_secs`),
     ///   the session is transparently promoted to primary with an incremented migration epoch,
     ///   and an immediate cutover frame/capsule is generated for cluster broadcast.
     /// - Stale sessions exceeding `config.stale_eviction_secs` are pruned.
@@ -1253,7 +1275,7 @@ impl SessionRegistry {
                 let silence_age = now_unix_secs.saturating_sub(record.snapshot.captured_unix_secs);
                 if config.auto_migrate_on_silence
                     && silence_age >= config.primary_silence_threshold_secs
-                    && silence_age <= SNAPSHOT_MAX_AGE.as_secs()
+                    && silence_age < config.stale_eviction_secs
                 {
                     // Primary is silent: trigger automatic transparent migration
                     record.snapshot.migration_epoch += 1;

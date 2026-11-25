@@ -24,8 +24,9 @@ pub use allocator::{
 };
 pub use benchmarks::{
     profile_allocator_engine, run_allocator_multithread_suite, run_generational_benchmark_suite,
-    AllocatorEngine, AllocatorThroughputResult, BenchmarkReport, BenchmarkResult,
-    MultithreadBenchmarkSuiteReport,
+    run_issp_failover_benchmark_suite, run_issp_scenario, AllocatorEngine,
+    AllocatorThroughputResult, BenchmarkReport, BenchmarkResult, IsspBenchmarkScenarioResult,
+    IsspFailoverBenchmarkSuiteReport, IsspNetworkProfile, MultithreadBenchmarkSuiteReport,
 };
 pub use blocking::{
     ifa_rt_blocking_call, ifa_rt_blocking_pool_active_workers, ifa_rt_blocking_pool_capacity,

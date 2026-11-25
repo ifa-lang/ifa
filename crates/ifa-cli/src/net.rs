@@ -1,7 +1,11 @@
 //! Network commands for observing and operating the IFA Session Synchronization Protocol (ISSP).
 
 use clap::Subcommand;
-use ifa_runtime::{IsspCapsule, SecurityPolicy, SessionRecord, SessionRegistry};
+use ifa_runtime::{
+    run_issp_failover_benchmark_suite, run_issp_scenario, IsspCapsule,
+    IsspFailoverBenchmarkSuiteReport, IsspNetworkProfile, SecurityPolicy, SessionRecord,
+    SessionRegistry,
+};
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
@@ -58,6 +62,27 @@ pub enum SessionCommand {
         /// Optional path to export the resulting cutover ISSP capsule
         #[arg(long)]
         out_capsule: Option<PathBuf>,
+    },
+    /// Benchmark ISSP throughput and transparent failover under network impairments
+    Bench {
+        /// Number of concurrent sessions to benchmark
+        #[arg(short, long, default_value = "100")]
+        sessions: usize,
+        /// Number of synchronization sync cycles
+        #[arg(short, long, default_value = "10")]
+        cycles: usize,
+        /// Injected packet loss percentage (0.0 to 100.0)
+        #[arg(short, long)]
+        loss: Option<f64>,
+        /// Maximum transit jitter in milliseconds
+        #[arg(short, long)]
+        jitter_ms: Option<u64>,
+        /// Primary silence threshold in seconds before triggering failover
+        #[arg(short, long, default_value = "2")]
+        silence_secs: u64,
+        /// Output formatted as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -484,6 +509,51 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 );
             }
 
+            ExitCode::SUCCESS
+        }
+        SessionCommand::Bench {
+            sessions,
+            cycles,
+            loss,
+            jitter_ms,
+            silence_secs,
+            json,
+        } => {
+            let report = if loss.is_some() || jitter_ms.is_some() {
+                let loss_pct = loss.unwrap_or(0.0);
+                let jitter = jitter_ms.unwrap_or(0);
+                let prof = IsspNetworkProfile {
+                    name: format!(
+                        "Custom Profile ({:.1}% loss, {}ms jitter)",
+                        loss_pct, jitter
+                    ),
+                    loss_rate_percent: loss_pct,
+                    base_latency_us: 1000,
+                    jitter_max_us: jitter * 1000,
+                    reorder_rate_percent: 0.0,
+                    tamper_rate_percent: 0.0,
+                };
+                let scenario = run_issp_scenario(&prof, sessions, cycles, silence_secs);
+                let integrity = scenario.state_integrity_verified;
+                IsspFailoverBenchmarkSuiteReport {
+                    scenarios: vec![scenario],
+                    all_integrity_passed: integrity,
+                }
+            } else {
+                run_issp_failover_benchmark_suite(sessions, cycles)
+            };
+
+            if json {
+                println!("{}", report.to_json());
+            } else {
+                println!("\n=== ISSP PROTOCOL FAILOVER & THROUGHPUT BENCHMARK ===");
+                println!("{}", report.to_markdown_table());
+                if report.all_integrity_passed {
+                    println!("Status: ALL SCENARIOS PASSED WITH 100% STATE INTEGRITY AND ZERO DATA LOSS\n");
+                } else {
+                    println!("Status: ONE OR MORE SCENARIOS FAILED INTEGRITY VERIFICATION\n");
+                }
+            }
             ExitCode::SUCCESS
         }
     }
