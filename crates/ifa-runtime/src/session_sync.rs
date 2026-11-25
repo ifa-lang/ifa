@@ -62,6 +62,24 @@ pub const ISSP_DUMP_VERSION_V1: u32 = 1;
 /// Header size of an ISSP state dump file.
 pub const ISSP_DUMP_HEADER_SIZE: usize = 32;
 
+/// Magic tag for ISSP session packets ('ISSH').
+pub const ISSP_SESSION_MAGIC: u32 = 0x4953_5348;
+
+/// Magic tag for encapsulated ISSP subpath packets ('ISPK').
+pub const ISSP_SUBPATH_PACKET_MAGIC: u32 = 0x4953_504b;
+
+/// Wire size of an uncompressed session header in bytes.
+pub const ISSP_SESSION_HEADER_UNCOMPRESSED_SIZE: usize = 50;
+
+/// Wire flag indicating packet payload is AEAD encrypted.
+pub const ISSP_PKT_FLAG_ENCRYPTED: u16 = 0x0001;
+
+/// Wire flag indicating session header is compressed.
+pub const ISSP_PKT_FLAG_COMPRESSED: u16 = 0x0002;
+
+/// Wire flag indicating full header refresh frame.
+pub const ISSP_PKT_FLAG_FULL_HEADER: u16 = 0x0004;
+
 // ---------------------------------------------------------------------------
 // Session identifier
 // ---------------------------------------------------------------------------
@@ -1161,6 +1179,18 @@ pub struct IsspReintegrationEvent {
     pub restored_state: IsspPathState,
 }
 
+/// Subpath opportunistic encryption policy level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpportunisticSecurityLevel {
+    /// No subpath encryption applied (e.g. underlying secure link or trusted VLAN).
+    #[default]
+    Plaintext,
+    /// Opportunistic AEAD: encrypts if a subpath key is configured; falls back to plaintext if missing.
+    Opportunistic,
+    /// Mandatory AEAD encryption: packet transmission fails if no subpath key is present.
+    Required,
+}
+
 /// A member transport path within an ISSP dynamic multipath routing table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IsspMultipathRoute {
@@ -1188,6 +1218,8 @@ pub struct IsspMultipathRoute {
     pub flap_state: IsspRouteFlapState,
     /// Dynamic progressive probation state following recovery.
     pub probation_state: IsspProbationState,
+    /// Subpath opportunistic encryption level.
+    pub security_level: OpportunisticSecurityLevel,
 }
 
 impl IsspMultipathRoute {
@@ -1211,6 +1243,7 @@ impl IsspMultipathRoute {
             max_missed_heartbeats: 3,
             flap_state: IsspRouteFlapState::default(),
             probation_state: IsspProbationState::default(),
+            security_level: OpportunisticSecurityLevel::Plaintext,
         }
     }
 
@@ -1230,6 +1263,11 @@ impl IsspMultipathRoute {
 
     pub fn with_state(mut self, state: IsspPathState) -> Self {
         self.state = state;
+        self
+    }
+
+    pub fn with_security_level(mut self, security_level: OpportunisticSecurityLevel) -> Self {
+        self.security_level = security_level;
         self
     }
 
@@ -1740,6 +1778,10 @@ pub struct IsspDynamicMultipathRouter {
     pub total_reintegrations: u64,
     flap_history: Vec<IsspFlapEvent>,
     reintegration_history: Vec<IsspReintegrationEvent>,
+    subpath_crypto: HashMap<u32, IsspSubpathCryptoTunnel>,
+    header_compressor: IsspAdaptiveHeaderCompressor,
+    header_decompressor: IsspAdaptiveHeaderCompressor,
+    subpath_seqs: HashMap<u32, u64>,
 }
 
 impl IsspDynamicMultipathRouter {
@@ -1761,6 +1803,10 @@ impl IsspDynamicMultipathRouter {
             total_reintegrations: 0,
             flap_history: Vec::new(),
             reintegration_history: Vec::new(),
+            subpath_crypto: HashMap::new(),
+            header_compressor: IsspAdaptiveHeaderCompressor::new(64),
+            header_decompressor: IsspAdaptiveHeaderCompressor::new(64),
+            subpath_seqs: HashMap::new(),
         }
     }
 
@@ -2333,6 +2379,162 @@ impl IsspDynamicMultipathRouter {
                 reorder_rate_percent: reorder_rate,
             })
         }
+    }
+
+    /// Configure opportunistic security level and optional key on a subpath tunnel.
+    pub fn configure_subpath_security(
+        &mut self,
+        path_id: u32,
+        level: OpportunisticSecurityLevel,
+        key: Option<IsspSubpathKey>,
+    ) {
+        if let Some(route) = self.paths.get_mut(&path_id) {
+            route.security_level = level;
+        }
+        self.subpath_crypto
+            .insert(path_id, IsspSubpathCryptoTunnel::new(path_id, level, key));
+    }
+
+    /// Configure adaptive header compressor parameters.
+    pub fn configure_header_compression(&mut self, refresh_interval: u32) {
+        self.header_compressor.refresh_interval = refresh_interval.max(1);
+        self.header_decompressor.refresh_interval = refresh_interval.max(1);
+    }
+
+    /// Encapsulate a session packet with adaptive header compression and subpath opportunistic encryption.
+    pub fn encapsulate_subpath_packet(
+        &mut self,
+        path_id: u32,
+        session_id: &SessionId,
+        flags: u16,
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Result<Vec<u8>, SyncError> {
+        let route = self
+            .paths
+            .get_mut(&path_id)
+            .ok_or(SyncError::PathNotFound(path_id))?;
+        let loss_rate = route.metrics.loss_rate_ppm;
+
+        let sub_seq = self.subpath_seqs.entry(path_id).or_insert(1);
+        let curr_sub_seq = *sub_seq;
+        *sub_seq += 1;
+
+        let multi_seq = self.next_multipath_seq;
+        self.next_multipath_seq += 1;
+
+        let header = IsspSessionHeader::new(
+            *session_id,
+            multi_seq,
+            curr_sub_seq,
+            now_ms,
+            flags,
+            path_id,
+        );
+
+        let (is_full, header_wire) = self
+            .header_compressor
+            .compress_header(&header, loss_rate);
+
+        let crypto = self
+            .subpath_crypto
+            .entry(path_id)
+            .or_insert_with(|| IsspSubpathCryptoTunnel::new(path_id, route.security_level, None));
+
+        let mut aad = [0u8; 22];
+        aad[0..4].copy_from_slice(&path_id.to_le_bytes());
+        aad[4..12].copy_from_slice(&multi_seq.to_le_bytes());
+        aad[12..20].copy_from_slice(&curr_sub_seq.to_le_bytes());
+        aad[20..22].copy_from_slice(&flags.to_le_bytes());
+
+        let (is_enc, nonce_seq, final_payload, auth_tag) =
+            crypto.encrypt_payload(&aad, payload)?;
+
+        route.metrics.total_frames_sent += 1;
+        route.metrics.total_bytes_sent += (header_wire.len() + final_payload.len()) as u64;
+
+        let packet = IsspSubpathPacket {
+            path_id,
+            is_encrypted: is_enc,
+            is_compressed: true,
+            is_full_header: is_full,
+            nonce_seq,
+            auth_tag,
+            header_wire,
+            payload: final_payload,
+        };
+
+        Ok(packet.to_bytes())
+    }
+
+    /// Decapsulate and decrypt a subpath wire packet, decompressing its session header.
+    pub fn decapsulate_subpath_packet(
+        &mut self,
+        path_id: u32,
+        wire_bytes: &[u8],
+    ) -> Result<(IsspSessionHeader, Vec<u8>), SyncError> {
+        let packet = IsspSubpathPacket::from_bytes(wire_bytes)?;
+        if packet.path_id != path_id {
+            return Err(SyncError::PathNotFound(packet.path_id));
+        }
+
+        let header = self
+            .header_decompressor
+            .decompress_header(&packet.header_wire)?;
+
+        let route_sec = self
+            .paths
+            .get(&path_id)
+            .map(|r| r.security_level)
+            .unwrap_or(OpportunisticSecurityLevel::Plaintext);
+
+        let crypto = self
+            .subpath_crypto
+            .entry(path_id)
+            .or_insert_with(|| IsspSubpathCryptoTunnel::new(path_id, route_sec, None));
+
+        let mut aad = [0u8; 22];
+        aad[0..4].copy_from_slice(&path_id.to_le_bytes());
+        aad[4..12].copy_from_slice(&header.multipath_seq.to_le_bytes());
+        aad[12..20].copy_from_slice(&header.subpath_seq.to_le_bytes());
+        aad[20..22].copy_from_slice(&header.flags.to_le_bytes());
+
+        let decrypted_payload = crypto.decrypt_payload(
+            packet.is_encrypted,
+            packet.nonce_seq,
+            &aad,
+            &packet.payload,
+            packet.auth_tag.as_ref(),
+        )?;
+
+        if let Some(route) = self.paths.get_mut(&path_id) {
+            route.metrics.total_frames_received += 1;
+            route.metrics.total_bytes_received += wire_bytes.len() as u64;
+        }
+
+        Ok((header, decrypted_payload))
+    }
+
+    /// Retrieve subpath crypto telemetry for a given path ID.
+    pub fn subpath_crypto_telemetry(&self, path_id: u32) -> Option<SubpathCryptoTelemetry> {
+        self.subpath_crypto.get(&path_id).map(|c| SubpathCryptoTelemetry {
+            path_id: c.path_id,
+            security_level: c.security_level,
+            has_key: c.key.is_some(),
+            tx_nonce_seq: c.tx_nonce_seq,
+            rx_nonce_seq: c.rx_nonce_seq,
+            packets_encrypted: c.packets_encrypted,
+            packets_decrypted: c.packets_decrypted,
+            bytes_encrypted: c.bytes_encrypted,
+            auth_failures: c.auth_failures,
+            replay_drops: c.replay_drops,
+            plain_transmissions: c.plain_transmissions,
+        })
+    }
+
+    /// Retrieve adaptive header compression telemetry report.
+    pub fn header_compression_telemetry(&self) -> IsspHeaderCompressionTelemetry {
+        self.header_compressor.telemetry()
     }
 }
 
@@ -3367,6 +3569,22 @@ pub enum SyncError {
     NoUsablePaths,
     /// ISSP heartbeat probe packet wire format or CRC32 was invalid.
     InvalidHeartbeatProbe,
+    /// Encryption was required on this subpath, but no key was available or configured.
+    EncryptionRequired,
+    /// Cryptographic AEAD authentication or tag verification failed.
+    AuthenticationFailed,
+    /// Duplicate or out-of-window packet dropped by anti-replay protection.
+    ReplayPacketDropped,
+    /// Session header decompression failed or context was unknown.
+    HeaderDecompressionFailed,
+    /// ISSP session packet header magic does not match ISSP_SESSION_MAGIC.
+    BadHeaderMagic,
+    /// ISSP session header buffer length is invalid.
+    InvalidHeaderLength(usize),
+    /// ISSP subpath packet magic does not match ISSP_SUBPATH_PACKET_MAGIC.
+    BadSubpathPacketMagic,
+    /// ISSP subpath packet buffer length is invalid.
+    InvalidSubpathPacketLength(usize),
 }
 
 impl std::fmt::Display for SyncError {
@@ -3399,11 +3617,745 @@ impl std::fmt::Display for SyncError {
             SyncError::InvalidHeartbeatProbe => {
                 write!(f, "invalid ISSP heartbeat probe wire packet")
             }
+            SyncError::EncryptionRequired => {
+                write!(f, "encryption required on subpath tunnel but no key configured")
+            }
+            SyncError::AuthenticationFailed => {
+                write!(f, "subpath AEAD authentication verification failed")
+            }
+            SyncError::ReplayPacketDropped => {
+                write!(f, "subpath packet rejected by anti-replay sliding window")
+            }
+            SyncError::HeaderDecompressionFailed => {
+                write!(f, "session header decompression failed or context desynchronized")
+            }
+            SyncError::BadHeaderMagic => write!(f, "invalid ISSP session header magic tag"),
+            SyncError::InvalidHeaderLength(len) => {
+                write!(f, "invalid ISSP session header length: {len} bytes")
+            }
+            SyncError::BadSubpathPacketMagic => {
+                write!(f, "invalid ISSP subpath packet magic tag")
+            }
+            SyncError::InvalidSubpathPacketLength(len) => {
+                write!(f, "invalid ISSP subpath packet length: {len} bytes")
+            }
         }
     }
 }
 
 impl std::error::Error for SyncError {}
+
+// ---------------------------------------------------------------------------
+// Subpath Opportunistic Encryption & Adaptive Session Header Compression
+// ---------------------------------------------------------------------------
+
+/// Result type for subpath AEAD encrypt operations: (is_encrypted, nonce_seq, ciphertext, auth_tag).
+pub type SubpathEncryptResult = Result<(bool, u64, Vec<u8>, Option<[u8; 16]>), SyncError>;
+
+/// Cryptographic symmetric key associated with a specific subpath tunnel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsspSubpathKey(pub [u8; 32]);
+
+impl IsspSubpathKey {
+    pub fn new(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+
+    pub fn from_passphrase(passphrase: &str) -> Self {
+        let mut key = [0u8; 32];
+        let bytes = passphrase.as_bytes();
+        let mut h: u64 = 0xcbf29ce484222325;
+        for (i, &b) in bytes.iter().enumerate() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+            key[i % 32] ^= b.wrapping_add((h & 0xff) as u8);
+        }
+        for (i, byte) in key.iter_mut().enumerate() {
+            h ^= *byte as u64;
+            h = h.wrapping_mul(0x100000001b3);
+            *byte ^= ((h >> (i % 8)) & 0xff) as u8;
+        }
+        Self(key)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Cryptographic state and AEAD ChaCha20-Poly1305 engine for a subpath tunnel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspSubpathCryptoTunnel {
+    pub path_id: u32,
+    pub security_level: OpportunisticSecurityLevel,
+    pub key: Option<IsspSubpathKey>,
+    pub tx_nonce_seq: u64,
+    pub rx_nonce_seq: u64,
+    pub rx_replay_window: u64,
+    pub packets_encrypted: u64,
+    pub packets_decrypted: u64,
+    pub bytes_encrypted: u64,
+    pub auth_failures: u64,
+    pub replay_drops: u64,
+    pub plain_transmissions: u64,
+}
+
+impl IsspSubpathCryptoTunnel {
+    pub fn new(
+        path_id: u32,
+        security_level: OpportunisticSecurityLevel,
+        key: Option<IsspSubpathKey>,
+    ) -> Self {
+        Self {
+            path_id,
+            security_level,
+            key,
+            tx_nonce_seq: 1,
+            rx_nonce_seq: 0,
+            rx_replay_window: 0,
+            packets_encrypted: 0,
+            packets_decrypted: 0,
+            bytes_encrypted: 0,
+            auth_failures: 0,
+            replay_drops: 0,
+            plain_transmissions: 0,
+        }
+    }
+
+    /// Check and update 64-bit anti-replay sliding window.
+    pub fn check_and_update_replay(&mut self, seq: u64) -> bool {
+        if self.rx_nonce_seq == 0 {
+            self.rx_nonce_seq = seq;
+            self.rx_replay_window = 1;
+            return true;
+        }
+        if seq > self.rx_nonce_seq {
+            let diff = seq - self.rx_nonce_seq;
+            if diff < 64 {
+                self.rx_replay_window = (self.rx_replay_window << diff) | 1;
+            } else {
+                self.rx_replay_window = 1;
+            }
+            self.rx_nonce_seq = seq;
+            true
+        } else {
+            let diff = self.rx_nonce_seq - seq;
+            if diff >= 64 {
+                return false;
+            }
+            if (self.rx_replay_window & (1 << diff)) != 0 {
+                return false;
+            }
+            self.rx_replay_window |= 1 << diff;
+            true
+        }
+    }
+
+    /// Encrypt payload with AEAD ChaCha20-Poly1305 if subpath key is present.
+    pub fn encrypt_payload(
+        &mut self,
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> SubpathEncryptResult {
+        match (&self.key, self.security_level) {
+            (Some(k), _) => {
+                let seq = self.tx_nonce_seq;
+                self.tx_nonce_seq += 1;
+
+                let mut nonce = [0u8; 12];
+                nonce[0..4].copy_from_slice(&self.path_id.to_le_bytes());
+                nonce[4..12].copy_from_slice(&seq.to_le_bytes());
+
+                let poly_block = chacha20_block(k.as_bytes(), 0, &nonce);
+                let mut poly_key = [0u8; 32];
+                poly_key.copy_from_slice(&poly_block[0..32]);
+
+                let mut ciphertext = plaintext.to_vec();
+                chacha20_xor_slice(k.as_bytes(), &nonce, 1, &mut ciphertext);
+
+                let tag = poly1305_aead_tag(&poly_key, aad, &ciphertext);
+
+                self.packets_encrypted += 1;
+                self.bytes_encrypted += plaintext.len() as u64;
+
+                Ok((true, seq, ciphertext, Some(tag)))
+            }
+            (None, OpportunisticSecurityLevel::Required) => Err(SyncError::EncryptionRequired),
+            (None, _) => {
+                let seq = self.tx_nonce_seq;
+                self.tx_nonce_seq += 1;
+                self.plain_transmissions += 1;
+                Ok((false, seq, plaintext.to_vec(), None))
+            }
+        }
+    }
+
+    /// Decrypt payload verifying AEAD Poly1305 tag if encrypted.
+    pub fn decrypt_payload(
+        &mut self,
+        is_encrypted: bool,
+        seq: u64,
+        aad: &[u8],
+        ciphertext: &[u8],
+        tag: Option<&[u8; 16]>,
+    ) -> Result<Vec<u8>, SyncError> {
+        if is_encrypted {
+            let key_bytes = match &self.key {
+                Some(k) => *k.as_bytes(),
+                None => {
+                    self.auth_failures += 1;
+                    return Err(SyncError::AuthenticationFailed);
+                }
+            };
+            let stored_tag = tag.ok_or(SyncError::AuthenticationFailed)?;
+
+            if !self.check_and_update_replay(seq) {
+                self.replay_drops += 1;
+                return Err(SyncError::ReplayPacketDropped);
+            }
+
+            let mut nonce = [0u8; 12];
+            nonce[0..4].copy_from_slice(&self.path_id.to_le_bytes());
+            nonce[4..12].copy_from_slice(&seq.to_le_bytes());
+
+            let poly_block = chacha20_block(&key_bytes, 0, &nonce);
+            let mut poly_key = [0u8; 32];
+            poly_key.copy_from_slice(&poly_block[0..32]);
+
+            let expected_tag = poly1305_aead_tag(&poly_key, aad, ciphertext);
+            if !constant_time_eq(&expected_tag, stored_tag) {
+                self.auth_failures += 1;
+                return Err(SyncError::AuthenticationFailed);
+            }
+
+            let mut plaintext = ciphertext.to_vec();
+            chacha20_xor_slice(&key_bytes, &nonce, 1, &mut plaintext);
+
+            self.packets_decrypted += 1;
+            Ok(plaintext)
+        } else {
+            if self.security_level == OpportunisticSecurityLevel::Required {
+                self.auth_failures += 1;
+                return Err(SyncError::EncryptionRequired);
+            }
+            self.plain_transmissions += 1;
+            Ok(ciphertext.to_vec())
+        }
+    }
+}
+
+/// Telemetry metrics for subpath crypto operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubpathCryptoTelemetry {
+    pub path_id: u32,
+    pub security_level: OpportunisticSecurityLevel,
+    pub has_key: bool,
+    pub tx_nonce_seq: u64,
+    pub rx_nonce_seq: u64,
+    pub packets_encrypted: u64,
+    pub packets_decrypted: u64,
+    pub bytes_encrypted: u64,
+    pub auth_failures: u64,
+    pub replay_drops: u64,
+    pub plain_transmissions: u64,
+}
+
+/// Full session header for ISSP multipath packets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsspSessionHeader {
+    pub magic: u32,
+    pub session_id: SessionId,
+    pub multipath_seq: u64,
+    pub subpath_seq: u64,
+    pub timestamp_unix_ms: u64,
+    pub flags: u16,
+    pub path_id: u32,
+}
+
+impl IsspSessionHeader {
+    pub fn new(
+        session_id: SessionId,
+        multipath_seq: u64,
+        subpath_seq: u64,
+        timestamp_unix_ms: u64,
+        flags: u16,
+        path_id: u32,
+    ) -> Self {
+        Self {
+            magic: ISSP_SESSION_MAGIC,
+            session_id,
+            multipath_seq,
+            subpath_seq,
+            timestamp_unix_ms,
+            flags,
+            path_id,
+        }
+    }
+
+    pub fn encode_uncompressed(&self) -> [u8; ISSP_SESSION_HEADER_UNCOMPRESSED_SIZE] {
+        let mut buf = [0u8; ISSP_SESSION_HEADER_UNCOMPRESSED_SIZE];
+        buf[0..4].copy_from_slice(&self.magic.to_be_bytes());
+        buf[4..20].copy_from_slice(&self.session_id.to_bytes());
+        buf[20..28].copy_from_slice(&self.multipath_seq.to_le_bytes());
+        buf[28..36].copy_from_slice(&self.subpath_seq.to_le_bytes());
+        buf[36..44].copy_from_slice(&self.timestamp_unix_ms.to_le_bytes());
+        buf[44..46].copy_from_slice(&self.flags.to_le_bytes());
+        buf[46..50].copy_from_slice(&self.path_id.to_le_bytes());
+        buf
+    }
+
+    pub fn decode_uncompressed(buf: &[u8]) -> Result<Self, SyncError> {
+        if buf.len() < ISSP_SESSION_HEADER_UNCOMPRESSED_SIZE {
+            return Err(SyncError::InvalidHeaderLength(buf.len()));
+        }
+        let magic = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+        if magic != ISSP_SESSION_MAGIC {
+            return Err(SyncError::BadHeaderMagic);
+        }
+        let s_id_bytes: [u8; 16] = buf[4..20].try_into().unwrap();
+        let session_id = SessionId::from_bytes(&s_id_bytes);
+        let multipath_seq = u64::from_le_bytes(buf[20..28].try_into().unwrap());
+        let subpath_seq = u64::from_le_bytes(buf[28..36].try_into().unwrap());
+        let timestamp_unix_ms = u64::from_le_bytes(buf[36..44].try_into().unwrap());
+        let flags = u16::from_le_bytes(buf[44..46].try_into().unwrap());
+        let path_id = u32::from_le_bytes(buf[46..50].try_into().unwrap());
+        Ok(Self {
+            magic,
+            session_id,
+            multipath_seq,
+            subpath_seq,
+            timestamp_unix_ms,
+            flags,
+            path_id,
+        })
+    }
+}
+
+/// Dynamic compression context entry for an active session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspHeaderContextEntry {
+    pub context_id: u8,
+    pub session_id: SessionId,
+    pub last_multipath_seq: u64,
+    pub last_subpath_seq: u64,
+    pub last_timestamp_ms: u64,
+    pub last_flags: u16,
+    pub path_id: u32,
+    pub packets_since_refresh: u32,
+}
+
+/// Telemetry metrics for adaptive session header compression.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct IsspHeaderCompressionTelemetry {
+    pub total_packets: u64,
+    pub full_headers_count: u64,
+    pub compressed_headers_count: u64,
+    pub uncompressed_bytes: u64,
+    pub compressed_bytes: u64,
+    pub bytes_saved: u64,
+    pub compression_ratio_percent: f64,
+    pub decompression_resyncs: u64,
+}
+
+/// Adaptive session header compression engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspAdaptiveHeaderCompressor {
+    pub refresh_interval: u32,
+    pub session_to_context: HashMap<SessionId, u8>,
+    pub entries: HashMap<u8, IsspHeaderContextEntry>,
+    next_context_id: u8,
+    pub total_packets: u64,
+    pub full_headers_count: u64,
+    pub compressed_headers_count: u64,
+    pub uncompressed_bytes: u64,
+    pub compressed_bytes: u64,
+    pub decompression_resyncs: u64,
+}
+
+impl IsspAdaptiveHeaderCompressor {
+    pub fn new(refresh_interval: u32) -> Self {
+        Self {
+            refresh_interval: refresh_interval.max(1),
+            session_to_context: HashMap::new(),
+            entries: HashMap::new(),
+            next_context_id: 1,
+            total_packets: 0,
+            full_headers_count: 0,
+            compressed_headers_count: 0,
+            uncompressed_bytes: 0,
+            compressed_bytes: 0,
+            decompression_resyncs: 0,
+        }
+    }
+
+    pub fn compress_header(
+        &mut self,
+        header: &IsspSessionHeader,
+        path_loss_ppm: u32,
+    ) -> (bool, Vec<u8>) {
+        self.total_packets += 1;
+        self.uncompressed_bytes += ISSP_SESSION_HEADER_UNCOMPRESSED_SIZE as u64;
+
+        let eff_refresh = if path_loss_ppm > 20_000 {
+            (self.refresh_interval / 4).max(8)
+        } else {
+            self.refresh_interval
+        };
+
+        let context_id = if let Some(&cid) = self.session_to_context.get(&header.session_id) {
+            cid
+        } else {
+            let cid = self.next_context_id;
+            self.next_context_id = self.next_context_id.wrapping_add(1);
+            if self.next_context_id == 0 {
+                self.next_context_id = 1;
+            }
+            self.session_to_context.insert(header.session_id, cid);
+            cid
+        };
+
+        let needs_full = match self.entries.get(&context_id) {
+            None => true,
+            Some(entry) => entry.packets_since_refresh >= eff_refresh,
+        };
+
+        if needs_full {
+            let mut buf = Vec::with_capacity(47);
+            let ctrl = 0x80 | (context_id & 0x7f);
+            buf.push(ctrl);
+            buf.extend_from_slice(&header.session_id.to_bytes());
+            buf.extend_from_slice(&header.multipath_seq.to_le_bytes());
+            buf.extend_from_slice(&header.subpath_seq.to_le_bytes());
+            buf.extend_from_slice(&header.timestamp_unix_ms.to_le_bytes());
+            buf.extend_from_slice(&header.flags.to_le_bytes());
+            buf.extend_from_slice(&header.path_id.to_le_bytes());
+
+            self.entries.insert(
+                context_id,
+                IsspHeaderContextEntry {
+                    context_id,
+                    session_id: header.session_id,
+                    last_multipath_seq: header.multipath_seq,
+                    last_subpath_seq: header.subpath_seq,
+                    last_timestamp_ms: header.timestamp_unix_ms,
+                    last_flags: header.flags,
+                    path_id: header.path_id,
+                    packets_since_refresh: 0,
+                },
+            );
+
+            self.full_headers_count += 1;
+            self.compressed_bytes += buf.len() as u64;
+            (true, buf)
+        } else {
+            let entry = self.entries.get_mut(&context_id).unwrap();
+            let seq_incr_1 = header.multipath_seq == entry.last_multipath_seq.wrapping_add(1);
+            let sub_incr_1 = header.subpath_seq == entry.last_subpath_seq.wrapping_add(1);
+            let ts_diff = header.timestamp_unix_ms.saturating_sub(entry.last_timestamp_ms);
+            let ts_delta_u8 = ts_diff <= 255;
+            let flags_same = header.flags == entry.last_flags;
+
+            let mut ctrl = 0x00u8;
+            if seq_incr_1 {
+                ctrl |= 0x40;
+            }
+            if sub_incr_1 {
+                ctrl |= 0x20;
+            }
+            if ts_delta_u8 {
+                ctrl |= 0x10;
+            }
+            if flags_same {
+                ctrl |= 0x08;
+            }
+
+            let mut buf = Vec::with_capacity(16);
+            buf.push(ctrl);
+            buf.push(context_id);
+
+            if !seq_incr_1 {
+                buf.extend_from_slice(&header.multipath_seq.to_le_bytes());
+            }
+            if !sub_incr_1 {
+                buf.extend_from_slice(&header.subpath_seq.to_le_bytes());
+            }
+            if ts_delta_u8 {
+                buf.push(ts_diff as u8);
+            } else {
+                buf.extend_from_slice(&header.timestamp_unix_ms.to_le_bytes());
+            }
+            if !flags_same {
+                buf.extend_from_slice(&header.flags.to_le_bytes());
+            }
+
+            entry.last_multipath_seq = header.multipath_seq;
+            entry.last_subpath_seq = header.subpath_seq;
+            entry.last_timestamp_ms = header.timestamp_unix_ms;
+            entry.last_flags = header.flags;
+            entry.packets_since_refresh += 1;
+
+            self.compressed_headers_count += 1;
+            self.compressed_bytes += buf.len() as u64;
+            (false, buf)
+        }
+    }
+
+    pub fn decompress_header(&mut self, buf: &[u8]) -> Result<IsspSessionHeader, SyncError> {
+        if buf.is_empty() {
+            return Err(SyncError::HeaderDecompressionFailed);
+        }
+        let ctrl = buf[0];
+        if (ctrl & 0x80) != 0 {
+            // Full Header
+            let context_id = ctrl & 0x7f;
+            if buf.len() < 47 {
+                return Err(SyncError::InvalidHeaderLength(buf.len()));
+            }
+            let s_id_bytes: [u8; 16] = buf[1..17].try_into().unwrap();
+            let session_id = SessionId::from_bytes(&s_id_bytes);
+            let multipath_seq = u64::from_le_bytes(buf[17..25].try_into().unwrap());
+            let subpath_seq = u64::from_le_bytes(buf[25..33].try_into().unwrap());
+            let timestamp_unix_ms = u64::from_le_bytes(buf[33..41].try_into().unwrap());
+            let flags = u16::from_le_bytes(buf[41..43].try_into().unwrap());
+            let path_id = u32::from_le_bytes(buf[43..47].try_into().unwrap());
+
+            self.entries.insert(
+                context_id,
+                IsspHeaderContextEntry {
+                    context_id,
+                    session_id,
+                    last_multipath_seq: multipath_seq,
+                    last_subpath_seq: subpath_seq,
+                    last_timestamp_ms: timestamp_unix_ms,
+                    last_flags: flags,
+                    path_id,
+                    packets_since_refresh: 0,
+                },
+            );
+            self.full_headers_count += 1;
+
+            Ok(IsspSessionHeader::new(
+                session_id,
+                multipath_seq,
+                subpath_seq,
+                timestamp_unix_ms,
+                flags,
+                path_id,
+            ))
+        } else {
+            // Compressed Header
+            if buf.len() < 2 {
+                return Err(SyncError::InvalidHeaderLength(buf.len()));
+            }
+            let context_id = buf[1];
+            let entry = match self.entries.get_mut(&context_id) {
+                Some(e) => e,
+                None => {
+                    self.decompression_resyncs += 1;
+                    return Err(SyncError::HeaderDecompressionFailed);
+                }
+            };
+
+            let seq_incr_1 = (ctrl & 0x40) != 0;
+            let sub_incr_1 = (ctrl & 0x20) != 0;
+            let ts_delta_u8 = (ctrl & 0x10) != 0;
+            let flags_same = (ctrl & 0x08) != 0;
+
+            let mut offset = 2;
+            let multipath_seq = if seq_incr_1 {
+                entry.last_multipath_seq.wrapping_add(1)
+            } else {
+                if buf.len() < offset + 8 {
+                    return Err(SyncError::InvalidHeaderLength(buf.len()));
+                }
+                let val = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+                offset += 8;
+                val
+            };
+
+            let subpath_seq = if sub_incr_1 {
+                entry.last_subpath_seq.wrapping_add(1)
+            } else {
+                if buf.len() < offset + 8 {
+                    return Err(SyncError::InvalidHeaderLength(buf.len()));
+                }
+                let val = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+                offset += 8;
+                val
+            };
+
+            let timestamp_unix_ms = if ts_delta_u8 {
+                if buf.len() < offset + 1 {
+                    return Err(SyncError::InvalidHeaderLength(buf.len()));
+                }
+                let delta = buf[offset] as u64;
+                offset += 1;
+                entry.last_timestamp_ms.wrapping_add(delta)
+            } else {
+                if buf.len() < offset + 8 {
+                    return Err(SyncError::InvalidHeaderLength(buf.len()));
+                }
+                let val = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+                offset += 8;
+                val
+            };
+
+            let flags = if flags_same {
+                entry.last_flags
+            } else {
+                if buf.len() < offset + 2 {
+                    return Err(SyncError::InvalidHeaderLength(buf.len()));
+                }
+                u16::from_le_bytes(buf[offset..offset + 2].try_into().unwrap())
+            };
+
+            let session_id = entry.session_id;
+            let path_id = entry.path_id;
+
+            entry.last_multipath_seq = multipath_seq;
+            entry.last_subpath_seq = subpath_seq;
+            entry.last_timestamp_ms = timestamp_unix_ms;
+            entry.last_flags = flags;
+            entry.packets_since_refresh += 1;
+
+            self.compressed_headers_count += 1;
+
+            Ok(IsspSessionHeader::new(
+                session_id,
+                multipath_seq,
+                subpath_seq,
+                timestamp_unix_ms,
+                flags,
+                path_id,
+            ))
+        }
+    }
+
+    pub fn telemetry(&self) -> IsspHeaderCompressionTelemetry {
+        let bytes_saved = self.uncompressed_bytes.saturating_sub(self.compressed_bytes);
+        let ratio = if self.uncompressed_bytes > 0 {
+            (bytes_saved as f64 / self.uncompressed_bytes as f64) * 100.0
+        } else {
+            0.0
+        };
+        IsspHeaderCompressionTelemetry {
+            total_packets: self.total_packets,
+            full_headers_count: self.full_headers_count,
+            compressed_headers_count: self.compressed_headers_count,
+            uncompressed_bytes: self.uncompressed_bytes,
+            compressed_bytes: self.compressed_bytes,
+            bytes_saved,
+            compression_ratio_percent: ratio,
+            decompression_resyncs: self.decompression_resyncs,
+        }
+    }
+}
+
+/// Encapsulated wire packet for multi-tunnel subpaths.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsspSubpathPacket {
+    pub path_id: u32,
+    pub is_encrypted: bool,
+    pub is_compressed: bool,
+    pub is_full_header: bool,
+    pub nonce_seq: u64,
+    pub auth_tag: Option<[u8; 16]>,
+    pub header_wire: Vec<u8>,
+    pub payload: Vec<u8>,
+}
+
+impl IsspSubpathPacket {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut flags: u16 = 0;
+        if self.is_encrypted {
+            flags |= ISSP_PKT_FLAG_ENCRYPTED;
+        }
+        if self.is_compressed {
+            flags |= ISSP_PKT_FLAG_COMPRESSED;
+        }
+        if self.is_full_header {
+            flags |= ISSP_PKT_FLAG_FULL_HEADER;
+        }
+
+        let base_len = 4
+            + 2
+            + 4
+            + 8
+            + if self.is_encrypted { 16 } else { 0 }
+            + 2
+            + self.header_wire.len()
+            + self.payload.len();
+        let mut buf = Vec::with_capacity(base_len);
+        buf.extend_from_slice(&ISSP_SUBPATH_PACKET_MAGIC.to_be_bytes());
+        buf.extend_from_slice(&flags.to_le_bytes());
+        buf.extend_from_slice(&self.path_id.to_le_bytes());
+        buf.extend_from_slice(&self.nonce_seq.to_le_bytes());
+        if self.is_encrypted {
+            let tag = self.auth_tag.unwrap_or([0u8; 16]);
+            buf.extend_from_slice(&tag);
+        }
+        let h_len = self.header_wire.len() as u16;
+        buf.extend_from_slice(&h_len.to_le_bytes());
+        buf.extend_from_slice(&self.header_wire);
+        buf.extend_from_slice(&self.payload);
+        buf
+    }
+
+    pub fn from_bytes(raw: &[u8]) -> Result<Self, SyncError> {
+        if raw.len() < 20 {
+            return Err(SyncError::InvalidSubpathPacketLength(raw.len()));
+        }
+        let magic = u32::from_be_bytes(raw[0..4].try_into().unwrap());
+        if magic != ISSP_SUBPATH_PACKET_MAGIC {
+            return Err(SyncError::BadSubpathPacketMagic);
+        }
+        let flags = u16::from_le_bytes(raw[4..6].try_into().unwrap());
+        let is_encrypted = (flags & ISSP_PKT_FLAG_ENCRYPTED) != 0;
+        let is_compressed = (flags & ISSP_PKT_FLAG_COMPRESSED) != 0;
+        let is_full_header = (flags & ISSP_PKT_FLAG_FULL_HEADER) != 0;
+
+        let path_id = u32::from_le_bytes(raw[6..10].try_into().unwrap());
+        let nonce_seq = u64::from_le_bytes(raw[10..18].try_into().unwrap());
+
+        let mut offset = 18;
+        let auth_tag = if is_encrypted {
+            if raw.len() < offset + 16 + 2 {
+                return Err(SyncError::InvalidSubpathPacketLength(raw.len()));
+            }
+            let mut tag = [0u8; 16];
+            tag.copy_from_slice(&raw[offset..offset + 16]);
+            offset += 16;
+            Some(tag)
+        } else {
+            None
+        };
+
+        if raw.len() < offset + 2 {
+            return Err(SyncError::InvalidSubpathPacketLength(raw.len()));
+        }
+        let h_len = u16::from_le_bytes(raw[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+
+        if raw.len() < offset + h_len {
+            return Err(SyncError::InvalidSubpathPacketLength(raw.len()));
+        }
+        let header_wire = raw[offset..offset + h_len].to_vec();
+        offset += h_len;
+
+        let payload = raw[offset..].to_vec();
+
+        Ok(Self {
+            path_id,
+            is_encrypted,
+            is_compressed,
+            is_full_header,
+            nonce_seq,
+            auth_tag,
+            header_wire,
+            payload,
+        })
+    }
+}
 
 /// Telemetry counters exported by the session synchronization subsystem.
 #[derive(Debug, Clone, Copy)]
@@ -4884,5 +5836,187 @@ mod tests {
         assert_eq!(r1_aborted.probation_state.successful_probes, 0);
         assert_eq!(r1_aborted.effective_weight(), 0);
         assert!(r1_aborted.flap_state.flap_count >= 1);
+    }
+
+    #[test]
+    fn test_session_header_uncompressed_roundtrip() {
+        let s_id = SessionId::new(0x0123_4567_89ab_cdef, 1, 42);
+        let hdr = IsspSessionHeader::new(s_id, 101, 15, 1_700_000_000_123, 0x0003, 2);
+        let wire = hdr.encode_uncompressed();
+        assert_eq!(wire.len(), ISSP_SESSION_HEADER_UNCOMPRESSED_SIZE);
+
+        let decoded = IsspSessionHeader::decode_uncompressed(&wire).unwrap();
+        assert_eq!(decoded, hdr);
+    }
+
+    #[test]
+    fn test_adaptive_header_compression_ratio() {
+        let mut comp = IsspAdaptiveHeaderCompressor::new(32);
+        let mut decomp = IsspAdaptiveHeaderCompressor::new(32);
+
+        let s_id = SessionId::new(0xfeeb_daed_caf0_1234, 2, 99);
+        let base_ts = 1_000_000u64;
+
+        // Packet 1: Full Header
+        let h1 = IsspSessionHeader::new(s_id, 1, 1, base_ts, 0x10, 1);
+        let (is_full1, w1) = comp.compress_header(&h1, 0);
+        assert!(is_full1);
+        assert_eq!(w1.len(), 47);
+
+        let d1 = decomp.decompress_header(&w1).unwrap();
+        assert_eq!(d1, h1);
+
+        // Packets 2..30: Compressed Headers (nominal consecutive sequence, flags same, delta ts <= 255)
+        for i in 2..=30 {
+            let h = IsspSessionHeader::new(s_id, i, i, base_ts + (i - 1) * 20, 0x10, 1);
+            let (is_full, w) = comp.compress_header(&h, 0);
+            assert!(!is_full);
+            // In nominal sequential mode: control byte (1) + context id (1) + ts delta (1) = 3 bytes
+            assert_eq!(w.len(), 3, "packet {} compressed header size should be 3", i);
+
+            let d = decomp.decompress_header(&w).unwrap();
+            assert_eq!(d, h);
+        }
+
+        let tele = comp.telemetry();
+        assert_eq!(tele.total_packets, 30);
+        assert_eq!(tele.full_headers_count, 1);
+        assert_eq!(tele.compressed_headers_count, 29);
+        assert!(tele.compression_ratio_percent > 85.0);
+        assert_eq!(tele.decompression_resyncs, 0);
+    }
+
+    #[test]
+    fn test_subpath_crypto_tunnel_modes() {
+        let key = IsspSubpathKey::from_passphrase("cluster-subpath-test-secret");
+        let aad = b"test-aad-metadata";
+        let plaintext = b"Hello ISSP encrypted multi-tunnel packet!";
+
+        // Mode Plaintext
+        let mut tunnel_plain =
+            IsspSubpathCryptoTunnel::new(1, OpportunisticSecurityLevel::Plaintext, None);
+        let (enc, seq, ct, tag) = tunnel_plain.encrypt_payload(aad, plaintext).unwrap();
+        assert!(!enc);
+        assert_eq!(tag, None);
+        let dec = tunnel_plain
+            .decrypt_payload(enc, seq, aad, &ct, tag.as_ref())
+            .unwrap();
+        assert_eq!(dec, plaintext);
+
+        // Mode Required without key -> fails
+        let mut tunnel_req_nokey =
+            IsspSubpathCryptoTunnel::new(2, OpportunisticSecurityLevel::Required, None);
+        assert_eq!(
+            tunnel_req_nokey.encrypt_payload(aad, plaintext).unwrap_err(),
+            SyncError::EncryptionRequired
+        );
+
+        // Mode Required with key -> succeeds AEAD
+        let mut tunnel_req_key = IsspSubpathCryptoTunnel::new(
+            3,
+            OpportunisticSecurityLevel::Required,
+            Some(key.clone()),
+        );
+        let (enc2, seq2, ct2, tag2) = tunnel_req_key.encrypt_payload(aad, plaintext).unwrap();
+        assert!(enc2);
+        assert!(tag2.is_some());
+        assert_ne!(&ct2[..], plaintext);
+
+        // Receiver tunnel
+        let mut tunnel_rx = IsspSubpathCryptoTunnel::new(
+            3,
+            OpportunisticSecurityLevel::Required,
+            Some(key.clone()),
+        );
+        let dec2 = tunnel_rx
+            .decrypt_payload(enc2, seq2, aad, &ct2, tag2.as_ref())
+            .unwrap();
+        assert_eq!(dec2, plaintext);
+
+        // Tampering payload -> authentication failed
+        let mut tampered = ct2.clone();
+        tampered[0] ^= 0xff;
+        assert_eq!(
+            tunnel_rx
+                .decrypt_payload(enc2, seq2 + 1, aad, &tampered, tag2.as_ref())
+                .unwrap_err(),
+            SyncError::AuthenticationFailed
+        );
+    }
+
+    #[test]
+    fn test_subpath_crypto_anti_replay() {
+        let key = IsspSubpathKey::from_passphrase("anti-replay-secret-test");
+        let aad = b"aad";
+        let mut tx = IsspSubpathCryptoTunnel::new(
+            1,
+            OpportunisticSecurityLevel::Required,
+            Some(key.clone()),
+        );
+        let mut rx =
+            IsspSubpathCryptoTunnel::new(1, OpportunisticSecurityLevel::Required, Some(key));
+
+        let (enc, seq, ct, tag) = tx.encrypt_payload(aad, b"msg1").unwrap();
+        let _ = rx
+            .decrypt_payload(enc, seq, aad, &ct, tag.as_ref())
+            .unwrap();
+
+        // Replay of same seq -> rejected by anti-replay
+        let err = rx
+            .decrypt_payload(enc, seq, aad, &ct, tag.as_ref())
+            .unwrap_err();
+        assert_eq!(err, SyncError::ReplayPacketDropped);
+    }
+
+    #[test]
+    fn test_router_subpath_packet_roundtrip_with_compression_and_crypto() {
+        let mut sender = IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::ActiveStandby);
+        let mut receiver = IsspDynamicMultipathRouter::new(2, IsspRoutingPolicy::ActiveStandby);
+
+        let sub_key = IsspSubpathKey::from_passphrase("multi-tunnel-mesh-psk");
+
+        let r1 = IsspMultipathRoute::new(1, 2, "eth0-secure", 1, 100)
+            .with_security_level(OpportunisticSecurityLevel::Opportunistic);
+        sender.add_route(r1.clone());
+        receiver.add_route(r1);
+
+        sender.configure_subpath_security(
+            1,
+            OpportunisticSecurityLevel::Opportunistic,
+            Some(sub_key.clone()),
+        );
+        receiver.configure_subpath_security(
+            1,
+            OpportunisticSecurityLevel::Opportunistic,
+            Some(sub_key),
+        );
+
+        let s_id = SessionId::new(0xabcd_ef01_2345_6789, 1, 100);
+        sender.bind_session(s_id, 1).unwrap();
+        receiver.bind_session(s_id, 1).unwrap();
+
+        // Send 10 packets
+        for i in 1..=10 {
+            let payload = format!("Datagram payload stream chunk #{i}").into_bytes();
+            let wire = sender
+                .encapsulate_subpath_packet(1, &s_id, 0x01, &payload, 10_000 + i * 50)
+                .unwrap();
+
+            let (hdr, recv_payload) = receiver.decapsulate_subpath_packet(1, &wire).unwrap();
+            assert_eq!(hdr.session_id, s_id);
+            assert_eq!(hdr.multipath_seq, i);
+            assert_eq!(hdr.subpath_seq, i);
+            assert_eq!(recv_payload, payload);
+        }
+
+        let s_tele = sender.header_compression_telemetry();
+        assert_eq!(s_tele.total_packets, 10);
+        assert_eq!(s_tele.full_headers_count, 1);
+        assert_eq!(s_tele.compressed_headers_count, 9);
+        assert!(s_tele.compression_ratio_percent > 70.0);
+
+        let c_tele = sender.subpath_crypto_telemetry(1).unwrap();
+        assert_eq!(c_tele.packets_encrypted, 10);
+        assert_eq!(c_tele.auth_failures, 0);
     }
 }
