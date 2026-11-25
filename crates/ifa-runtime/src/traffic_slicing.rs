@@ -183,7 +183,8 @@ impl SubpathQoSCapability {
             available_bandwidth_bps,
             saturation_ratio,
             loss_ppm,
-            is_usable: route.state.is_usable() || route.state == crate::session_sync::IsspPathState::Standby,
+            is_usable: route.state.is_usable()
+                || route.state == crate::session_sync::IsspPathState::Standby,
         }
     }
 }

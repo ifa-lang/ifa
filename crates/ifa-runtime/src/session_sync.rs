@@ -3358,12 +3358,15 @@ impl IsspDynamicMultipathRouter {
             }
         }
         let caps = self.snapshot_subpath_qos_capabilities(measured_throughput_bps);
-        let plan = self
-            .cost_gradient_balancer
-            .orchestrate_rebalance(&caps, &mut self.flow_slicing, now_ms);
+        let plan = self.cost_gradient_balancer.orchestrate_rebalance(
+            &caps,
+            &mut self.flow_slicing,
+            now_ms,
+        );
 
         for action in &plan.actions {
-            self.session_bindings.insert(action.session_id, action.to_path_id);
+            self.session_bindings
+                .insert(action.session_id, action.to_path_id);
             if let Some(r) = self.paths.get_mut(&action.to_path_id) {
                 if r.state == IsspPathState::Standby {
                     r.state = IsspPathState::Active;
@@ -7971,8 +7974,14 @@ mod tests {
         let s_urllc = SessionId::new(501, 1, 0);
         let s_embb = SessionId::new(502, 1, 0);
 
-        router.register_flow_qos_profile(s_urllc, crate::traffic_slicing::FlowQoSProfile::ultra_low_latency());
-        router.register_flow_qos_profile(s_embb, crate::traffic_slicing::FlowQoSProfile::high_throughput(50_000_000));
+        router.register_flow_qos_profile(
+            s_urllc,
+            crate::traffic_slicing::FlowQoSProfile::ultra_low_latency(),
+        );
+        router.register_flow_qos_profile(
+            s_embb,
+            crate::traffic_slicing::FlowQoSProfile::high_throughput(50_000_000),
+        );
 
         // Both assigned to path 1 initially
         router.bind_session(s_urllc, 1).expect("bind urllc");

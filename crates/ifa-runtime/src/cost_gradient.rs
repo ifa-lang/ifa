@@ -48,10 +48,10 @@ impl Default for CostGradientWeights {
             w_queuing_delay: 20.0,
             w_loss: 10.0,
             w_jitter: 5.0,
-            rtt_ref_us: 50_000.0,        // 50ms baseline
+            rtt_ref_us: 50_000.0,           // 50ms baseline
             queuing_delay_ref_us: 10_000.0, // 10ms baseline
-            loss_ref_ppm: 1_000.0,       // 0.1% baseline
-            jitter_ref_us: 5_000.0,      // 5ms baseline
+            loss_ref_ppm: 1_000.0,          // 0.1% baseline
+            jitter_ref_us: 5_000.0,         // 5ms baseline
         }
     }
 }
@@ -288,7 +288,9 @@ impl CostGradientLoadBalancer {
         let mut loads_by_path: HashMap<u32, u64> = HashMap::new();
         for assignment in assignments.values() {
             let demand = self.get_flow_demand(&assignment.session_id);
-            *loads_by_path.entry(assignment.assigned_path_id).or_insert(0) += demand;
+            *loads_by_path
+                .entry(assignment.assigned_path_id)
+                .or_insert(0) += demand;
         }
 
         let mut gradients = HashMap::new();
@@ -344,7 +346,9 @@ impl CostGradientLoadBalancer {
         let residual_bw = cap.saturating_sub(projected_load_bps);
         let bw_ok = residual_bw >= profile.min_bandwidth_bps || profile.allow_fallback;
 
-        if !profile.allow_fallback && (!latency_ok || !jitter_ok || !queuing_ok || !loss_ok || !bw_ok) {
+        if !profile.allow_fallback
+            && (!latency_ok || !jitter_ok || !queuing_ok || !loss_ok || !bw_ok)
+        {
             return false;
         }
 
@@ -484,8 +488,10 @@ impl CostGradientLoadBalancer {
                         None => continue,
                     };
 
-                    let current_high_load = projected_loads.get(&high_sp.path_id).copied().unwrap_or(0);
-                    let current_low_load = projected_loads.get(&low_sp.path_id).copied().unwrap_or(0);
+                    let current_high_load =
+                        projected_loads.get(&high_sp.path_id).copied().unwrap_or(0);
+                    let current_low_load =
+                        projected_loads.get(&low_sp.path_id).copied().unwrap_or(0);
 
                     let projected_low_load = current_low_load + demand;
                     let projected_high_load = current_high_load.saturating_sub(demand);
@@ -497,7 +503,9 @@ impl CostGradientLoadBalancer {
                         projected_low_load,
                     ) {
                         let cap = low_sp_cap.capacity_bps.max(1_000_000);
-                        if (projected_low_load as f64 / cap as f64) > self.config.max_target_saturation {
+                        if (projected_low_load as f64 / cap as f64)
+                            > self.config.max_target_saturation
+                        {
                             self.metrics.total_skipped_saturation_limit += 1;
                         } else {
                             self.metrics.total_skipped_sla_constraint += 1;
@@ -543,7 +551,9 @@ impl CostGradientLoadBalancer {
                     let total_post = cost_high_post + cost_low_post;
                     let reduction = total_pre - total_post;
 
-                    if total_pre > 0.0 && (reduction / total_pre) >= self.config.min_cost_reduction_gain {
+                    if total_pre > 0.0
+                        && (reduction / total_pre) >= self.config.min_cost_reduction_gain
+                    {
                         match best_target {
                             None => best_target = Some((low_sp.path_id, reduction, low_post_grad)),
                             Some((_, best_red, _)) => {
@@ -580,8 +590,11 @@ impl CostGradientLoadBalancer {
                     };
 
                     // Update projected loads
-                    *projected_loads.entry(high_sp.path_id).or_insert(0) =
-                        projected_loads.get(&high_sp.path_id).copied().unwrap_or(0).saturating_sub(demand);
+                    *projected_loads.entry(high_sp.path_id).or_insert(0) = projected_loads
+                        .get(&high_sp.path_id)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_sub(demand);
                     *projected_loads.entry(target_path_id).or_insert(0) += demand;
 
                     // Update flow last migrated timestamp
@@ -620,7 +633,8 @@ impl CostGradientLoadBalancer {
                     interface_name: sp.interface_name.clone(),
                     capacity_bps: sp.capacity_bps,
                     allocated_load_bps: load,
-                    saturation_ratio: (load as f64 / sp.capacity_bps.max(1_000_000) as f64).clamp(0.0, 1.0),
+                    saturation_ratio: (load as f64 / sp.capacity_bps.max(1_000_000) as f64)
+                        .clamp(0.0, 1.0),
                     marginal_gradient: grad,
                     total_cost: cost,
                     smoothed_rtt_us: sp.smoothed_rtt_us,
@@ -687,7 +701,12 @@ impl CostGradientLoadBalancer {
             FlowSliceClass::MissionCritical,
             FlowSliceClass::BestEffort,
         ] {
-            let count = self.metrics.migrations_by_slice.get(class).copied().unwrap_or(0);
+            let count = self
+                .metrics
+                .migrations_by_slice
+                .get(class)
+                .copied()
+                .unwrap_or(0);
             out.push_str(&format!(
                 "ifa_multipath_cost_gradient_migrations_by_slice{{slice=\"{}\"}} {}\n",
                 class.as_str(),
@@ -763,12 +782,28 @@ mod tests {
         let embb_profile = FlowQoSProfile::high_throughput(20_000_000); // max_rtt = 150ms
 
         // URLLC should be admissible on sp_fast, but strictly rejected on sp_bulk due to 80ms > 20ms RTT
-        assert!(balancer.evaluate_flow_migration_admissibility(&urllc_profile, &sp_fast, 5_000_000));
-        assert!(!balancer.evaluate_flow_migration_admissibility(&urllc_profile, &sp_bulk, 5_000_000));
+        assert!(balancer.evaluate_flow_migration_admissibility(
+            &urllc_profile,
+            &sp_fast,
+            5_000_000
+        ));
+        assert!(!balancer.evaluate_flow_migration_admissibility(
+            &urllc_profile,
+            &sp_bulk,
+            5_000_000
+        ));
 
         // eMBB should be admissible on both
-        assert!(balancer.evaluate_flow_migration_admissibility(&embb_profile, &sp_fast, 20_000_000));
-        assert!(balancer.evaluate_flow_migration_admissibility(&embb_profile, &sp_bulk, 20_000_000));
+        assert!(balancer.evaluate_flow_migration_admissibility(
+            &embb_profile,
+            &sp_fast,
+            20_000_000
+        ));
+        assert!(balancer.evaluate_flow_migration_admissibility(
+            &embb_profile,
+            &sp_bulk,
+            20_000_000
+        ));
     }
 
     #[test]
@@ -809,8 +844,17 @@ mod tests {
         assert!(plan.gradient_variance_after < plan.gradient_variance_before);
 
         // Verify negotiator state updated
-        assert_eq!(negotiator.get_assignment(&s_embb).unwrap().assigned_path_id, 2);
-        assert_eq!(negotiator.get_assignment(&s_urllc).unwrap().assigned_path_id, 1);
+        assert_eq!(
+            negotiator.get_assignment(&s_embb).unwrap().assigned_path_id,
+            2
+        );
+        assert_eq!(
+            negotiator
+                .get_assignment(&s_urllc)
+                .unwrap()
+                .assigned_path_id,
+            1
+        );
     }
 
     #[test]
