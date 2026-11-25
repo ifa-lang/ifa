@@ -8202,10 +8202,11 @@ mod tests {
         assert_eq!(initial_actions.len(), 0);
 
         // Induce severe reverse bufferbloat on Path 10
-        let s_p10_bloat = router
-            .slice_resilience
-            .diagnose_subpath_asymmetry(10);
-        assert_eq!(s_p10_bloat, crate::slice_resilience::AsymmetricDegradationKind::None);
+        let s_p10_bloat = router.slice_resilience.diagnose_subpath_asymmetry(10);
+        assert_eq!(
+            s_p10_bloat,
+            crate::slice_resilience::AsymmetricDegradationKind::None
+        );
 
         let s_p10_degraded = crate::slice_resilience::DirectionalTelemetrySample {
             path_id: 10,
@@ -8234,7 +8235,9 @@ mod tests {
         assert_eq!(actions[0].to_path_id, 20);
         assert_eq!(router.get_session_path(&s1), Some(20));
         assert_eq!(
-            router.slice_resilience_metrics().asymmetric_reroutes_executed,
+            router
+                .slice_resilience_metrics()
+                .asymmetric_reroutes_executed,
             1
         );
     }

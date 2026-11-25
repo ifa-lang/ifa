@@ -3394,9 +3394,7 @@ pub fn run_mesh_lsa_synchronization_benchmark(
 }
 
 /// Comprehensive benchmark report evaluating dynamic traffic slicing performance under heterogeneous load (URLLC vs eMBB).
-pub use crate::slice_resilience::{
-    run_slice_resilience_benchmark, SliceResilienceBenchmarkReport,
-};
+pub use crate::slice_resilience::{run_slice_resilience_benchmark, SliceResilienceBenchmarkReport};
 
 #[derive(Debug, Clone)]
 pub struct TrafficSlicingBenchmarkReport {
@@ -4336,6 +4334,9 @@ mod tests {
 
         let json = report.to_json();
         assert!(json.contains("\"total_flows\":60") || json.contains("\"total_flows\": 60"));
-        assert!(json.contains("\"verification_passed\":true") || json.contains("\"verification_passed\": true"));
+        assert!(
+            json.contains("\"verification_passed\":true")
+                || json.contains("\"verification_passed\": true")
+        );
     }
 }

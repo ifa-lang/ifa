@@ -137,9 +137,7 @@ impl DirectionalTelemetrySample {
     /// Convert to a standard `SubpathQoSCapability` representation.
     pub fn to_qos_capability(&self) -> SubpathQoSCapability {
         let cap = self.forward_capacity_bps.min(self.reverse_capacity_bps);
-        let throughput = self
-            .forward_throughput_bps
-            .max(self.reverse_throughput_bps);
+        let throughput = self.forward_throughput_bps.max(self.reverse_throughput_bps);
         let avail = cap.saturating_sub(throughput);
         let sat = if cap > 0 {
             (throughput as f64) / (cap as f64)
@@ -340,12 +338,7 @@ impl SubpathProbationTracker {
         }
     }
 
-    pub fn check_completion(
-        &mut self,
-        now_ms: u64,
-        duration_ms: u64,
-        min_samples: usize,
-    ) -> bool {
+    pub fn check_completion(&mut self, now_ms: u64, duration_ms: u64, min_samples: usize) -> bool {
         if self.is_completed {
             return true;
         }
@@ -684,17 +677,16 @@ impl SliceResilienceManager {
             .map(|s| s.forward_capacity_bps.min(s.reverse_capacity_bps))
             .sum();
 
-        let elastic_throttle_factor = if is_severely_constrained
-            && surviving_cap_bps > priority_demand_bps
-        {
-            let remaining_elastic_cap = surviving_cap_bps.saturating_sub(priority_demand_bps);
-            let elastic_demand = total_demand_bps.saturating_sub(priority_demand_bps).max(1);
-            ((remaining_elastic_cap as f64) / (elastic_demand as f64)).clamp(0.1, 1.0)
-        } else if is_severely_constrained {
-            0.1 // Minimum floor under catastrophic constraint
-        } else {
-            1.0 // Unconstrained
-        };
+        let elastic_throttle_factor =
+            if is_severely_constrained && surviving_cap_bps > priority_demand_bps {
+                let remaining_elastic_cap = surviving_cap_bps.saturating_sub(priority_demand_bps);
+                let elastic_demand = total_demand_bps.saturating_sub(priority_demand_bps).max(1);
+                ((remaining_elastic_cap as f64) / (elastic_demand as f64)).clamp(0.1, 1.0)
+            } else if is_severely_constrained {
+                0.1 // Minimum floor under catastrophic constraint
+            } else {
+                1.0 // Unconstrained
+            };
 
         // 5. Audit all current flow assignments for partition severances, asymmetric degradation, or healing restoration
         let current_assignments: Vec<(SessionId, u32, FlowSliceClass)> = negotiator
@@ -717,7 +709,9 @@ impl SliceResilienceManager {
             }
 
             let current_sample = self.subpaths.get(&current_path_id);
-            let is_path_severed = current_sample.map(|s| !s.is_bidirectionally_up()).unwrap_or(true);
+            let is_path_severed = current_sample
+                .map(|s| !s.is_bidirectionally_up())
+                .unwrap_or(true);
             let asymmetry_kind = self.diagnose_subpath_asymmetry(current_path_id);
 
             // Check if current assignment suffers from asymmetric impairment for this slice
@@ -752,7 +746,11 @@ impl SliceResilienceManager {
                     if let Some((score, _, deg_kind)) =
                         self.evaluate_resilient_subpath_fitness(&profile, candidate)
                     {
-                        if best_target.as_ref().map(|(_, best, _)| score > *best).unwrap_or(true) {
+                        if best_target
+                            .as_ref()
+                            .map(|(_, best, _)| score > *best)
+                            .unwrap_or(true)
+                        {
                             best_target = Some((candidate.path_id, score, deg_kind));
                         }
                     }
@@ -1134,7 +1132,8 @@ pub fn run_slice_resilience_benchmark(
     // --- Scenario 1: Abrupt Network Partition (Sever Primary Path 201) ---
     manager.mark_subpath_severed(201, current_time_ms);
     let start_failover = Instant::now();
-    let failover_actions = manager.evaluate_and_enforce_resilience(&mut negotiator, current_time_ms);
+    let failover_actions =
+        manager.evaluate_and_enforce_resilience(&mut negotiator, current_time_ms);
     let failover_duration_us = (start_failover.elapsed().as_nanos() as f64) / 1000.0;
     total_eval_count += 1;
 
@@ -1183,7 +1182,8 @@ pub fn run_slice_resilience_benchmark(
 
     // --- Scenario 4: Catastrophic Partition with Graceful Elastic Throttling ---
     current_time_ms += 500;
-    let throttle_actions = manager.evaluate_and_enforce_resilience(&mut negotiator, current_time_ms);
+    let throttle_actions =
+        manager.evaluate_and_enforce_resilience(&mut negotiator, current_time_ms);
     total_eval_count += 1;
     for a in &throttle_actions {
         migration_timestamps
