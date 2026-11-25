@@ -922,7 +922,7 @@ impl SliceResilienceBenchmarkReport {
             "| **Partition Healing & Probation** | **0 Flap Violations** | Flapping | **100.0%** | {:.2} µs reconvergence |\n",
             self.probation_healing_reconvergence_us,
         ));
-        table.push_str("\n");
+        table.push('\n');
         table.push_str(&format!(
             "**Throughput**: {:.2} evaluations/sec | **Result**: {}\n",
             self.throughput_evaluations_per_sec,
@@ -1235,21 +1235,19 @@ pub fn run_slice_resilience_benchmark(
     for (sid, prof) in &flows {
         if let Some(assign) = negotiator.get_assignment(sid) {
             if let Some(sample) = manager.subpaths.get(&assign.assigned_path_id) {
-                if sample.is_bidirectionally_up() {
-                    if prof.slice_class == FlowSliceClass::UltraLowLatency {
-                        if sample.total_rtt_us() <= prof.max_rtt_us
-                            && sample.total_queuing_delay_us() <= prof.max_queuing_delay_us
-                            && sample.worst_loss_ppm() <= prof.max_loss_ppm
-                        {
-                            urllc_slo_met += 1;
-                        }
-                    } else if prof.slice_class == FlowSliceClass::MissionCritical {
-                        if sample.total_rtt_us() <= prof.max_rtt_us
-                            && sample.worst_loss_ppm() <= prof.max_loss_ppm
-                        {
-                            mc_slo_met += 1;
-                        }
-                    }
+                if sample.is_bidirectionally_up()
+                    && prof.slice_class == FlowSliceClass::UltraLowLatency
+                    && sample.total_rtt_us() <= prof.max_rtt_us
+                    && sample.total_queuing_delay_us() <= prof.max_queuing_delay_us
+                    && sample.worst_loss_ppm() <= prof.max_loss_ppm
+                {
+                    urllc_slo_met += 1;
+                } else if sample.is_bidirectionally_up()
+                    && prof.slice_class == FlowSliceClass::MissionCritical
+                    && sample.total_rtt_us() <= prof.max_rtt_us
+                    && sample.worst_loss_ppm() <= prof.max_loss_ppm
+                {
+                    mc_slo_met += 1;
                 }
             }
         }
