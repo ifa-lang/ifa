@@ -106,12 +106,19 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 Some(p) if p.exists() => match SessionRegistry::load_from_file(p) {
                     Ok(reg) => reg,
                     Err(e) => {
-                        eprintln!("error: failed to load ISSP state file `{}`: {}", p.display(), e);
+                        eprintln!(
+                            "error: failed to load ISSP state file `{}`: {}",
+                            p.display(),
+                            e
+                        );
                         return ExitCode::FAILURE;
                     }
                 },
                 Some(p) => {
-                    eprintln!("error: specified state file `{}` does not exist", p.display());
+                    eprintln!(
+                        "error: specified state file `{}` does not exist",
+                        p.display()
+                    );
                     return ExitCode::FAILURE;
                 }
                 None => {
@@ -216,12 +223,19 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 Some(p) if p.exists() => match SessionRegistry::load_from_file(p) {
                     Ok(reg) => reg,
                     Err(e) => {
-                        eprintln!("error: failed to load ISSP state file `{}`: {}", p.display(), e);
+                        eprintln!(
+                            "error: failed to load ISSP state file `{}`: {}",
+                            p.display(),
+                            e
+                        );
                         return ExitCode::FAILURE;
                     }
                 },
                 Some(p) => {
-                    eprintln!("error: specified state file `{}` does not exist", p.display());
+                    eprintln!(
+                        "error: specified state file `{}` does not exist",
+                        p.display()
+                    );
                     return ExitCode::FAILURE;
                 }
                 None => SessionRegistry::new(1),
@@ -285,7 +299,10 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                     "Standby (Replicated Shadow)"
                 }
             );
-            println!("Migration Epoch:    {} (fencing token)", snap.migration_epoch);
+            println!(
+                "Migration Epoch:    {} (fencing token)",
+                snap.migration_epoch
+            );
             println!(
                 "Age:                {}s (captured at unix timestamp {})",
                 age_secs, snap.captured_unix_secs
@@ -294,7 +311,10 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
             println!("Flow & Routing:");
             println!("  Flow Hash:        {:#018x}", snap.id.flow_hash);
             println!("  Origin Node:      {}", snap.id.origin_node);
-            println!("  Session Nonce:    {} ({:#010x})", snap.id.nonce, snap.id.nonce);
+            println!(
+                "  Session Nonce:    {} ({:#010x})",
+                snap.id.nonce, snap.id.nonce
+            );
             println!();
             println!("Sequence & Sliding Window:");
             println!("  TX Sequence:      {}", snap.tx_seq);
@@ -350,7 +370,11 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
             let registry = match SessionRegistry::load_from_file(&state_path) {
                 Ok(reg) => reg,
                 Err(e) => {
-                    eprintln!("error: failed to load ISSP state file `{}`: {}", state_path.display(), e);
+                    eprintln!(
+                        "error: failed to load ISSP state file `{}`: {}",
+                        state_path.display(),
+                        e
+                    );
                     return ExitCode::FAILURE;
                 }
             };
@@ -398,7 +422,11 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
 
             // Save updated state file
             if let Err(e) = registry.save_to_file(&state_path) {
-                eprintln!("error: failed to persist state dump to `{}`: {}", state_path.display(), e);
+                eprintln!(
+                    "error: failed to persist state dump to `{}`: {}",
+                    state_path.display(),
+                    e
+                );
                 return ExitCode::FAILURE;
             }
 
@@ -417,7 +445,11 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 };
                 let bytes = capsule.to_bytes();
                 if let Err(e) = fs::write(&capsule_path, &bytes) {
-                    eprintln!("error: failed to write capsule to `{}`: {}", capsule_path.display(), e);
+                    eprintln!(
+                        "error: failed to write capsule to `{}`: {}",
+                        capsule_path.display(),
+                        e
+                    );
                     return ExitCode::FAILURE;
                 }
                 Some((capsule_path, bytes.len()))
@@ -433,10 +465,7 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
                 "  Target Node:     {}",
                 target_node.unwrap_or(registry.node_id)
             );
-            println!(
-                "  Previous Epoch:  {}",
-                prev_epoch
-            );
+            println!("  Previous Epoch:  {}", prev_epoch);
             println!(
                 "  New Epoch:       {} (fencing guard incremented)",
                 updated_snap.migration_epoch

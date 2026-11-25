@@ -111,7 +111,10 @@ impl SessionId {
 
     /// Format as canonical string "01a2b3c4d5e6f708:0001:0042".
     pub fn to_canonical_string(&self) -> String {
-        format!("{:016x}:{:04x}:{:04x}", self.flow_hash, self.origin_node, self.nonce)
+        format!(
+            "{:016x}:{:04x}:{:04x}",
+            self.flow_hash, self.origin_node, self.nonce
+        )
     }
 
     /// Parse from canonical format ("flow_hash:origin_node:nonce") or hex flow hash.
@@ -140,14 +143,21 @@ impl SessionId {
                 .map_err(|e| format!("invalid flow hash identifier '{}': {}", s, e))?;
             Ok(Self::new(flow_hash, 0, 0))
         } else {
-            Err(format!("invalid session format '{}' (expected <flow_hash>:<node>:<nonce>)", s))
+            Err(format!(
+                "invalid session format '{}' (expected <flow_hash>:<node>:<nonce>)",
+                s
+            ))
         }
     }
 }
 
 impl std::fmt::Display for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:016x}:{:04x}:{:04x}", self.flow_hash, self.origin_node, self.nonce)
+        write!(
+            f,
+            "{:016x}:{:04x}:{:04x}",
+            self.flow_hash, self.origin_node, self.nonce
+        )
     }
 }
 
@@ -1425,7 +1435,10 @@ impl SessionRegistry {
             gossip_auth_failed_count: AtomicU64::new(0),
             gossip_replay_failed_count: AtomicU64::new(0),
         });
-        let mut reg_guard = registry.sessions.lock().map_err(|_| SyncError::LockPoisoned)?;
+        let mut reg_guard = registry
+            .sessions
+            .lock()
+            .map_err(|_| SyncError::LockPoisoned)?;
 
         let mut offset = ISSP_DUMP_HEADER_SIZE;
         for _ in 0..count {
