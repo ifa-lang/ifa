@@ -16,6 +16,7 @@ pub mod session_sync;
 pub mod simd_classifier;
 pub mod string;
 pub mod telemetry;
+pub mod telemetry_queue;
 pub mod wasi;
 pub mod zstd_archive;
 
@@ -123,6 +124,10 @@ pub use telemetry::{
     OtelMultipathBalancingGrpcExporter, OtelProtobufMultipathExporter, OtlpGrpcError,
     OtlpGrpcExportResult, PrometheusMultipathBalancingExporter, ProtobufWriter, ResourceAuditScope,
     ResourceUsage, DEFAULT_LATENCY_BUCKETS_SECONDS,
+};
+pub use telemetry_queue::{
+    PriorityTelemetryRing, TelemetryEvent, TelemetryPriority, TierStats, CRITICAL_RING_CAPACITY,
+    DEBUG_RING_CAPACITY, HIGH_RING_CAPACITY, NORMAL_RING_CAPACITY,
 };
 pub use wasi::*;
 pub use zstd_archive::{
