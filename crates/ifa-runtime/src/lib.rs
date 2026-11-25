@@ -11,6 +11,7 @@ pub mod io;
 pub mod panic;
 pub mod reactor;
 pub mod session_sync;
+pub mod simd_classifier;
 pub mod string;
 pub mod telemetry;
 pub mod wasi;
@@ -25,9 +26,10 @@ pub use allocator::{
 pub use benchmarks::{
     create_saturated_multipath_snapshot, profile_allocator_engine, run_allocator_multithread_suite,
     run_generational_benchmark_suite, run_issp_failover_benchmark_suite, run_issp_scenario,
-    run_telemetry_streaming_vs_polling_benchmark, AllocatorEngine, AllocatorThroughputResult,
-    BenchmarkReport, BenchmarkResult, IsspBenchmarkScenarioResult,
-    IsspFailoverBenchmarkSuiteReport, IsspNetworkProfile, MultithreadBenchmarkSuiteReport,
+    run_simd_capsule_and_classification_benchmark, run_telemetry_streaming_vs_polling_benchmark,
+    AllocatorEngine, AllocatorThroughputResult, BenchmarkReport, BenchmarkResult,
+    IsspBenchmarkScenarioResult, IsspFailoverBenchmarkSuiteReport, IsspNetworkProfile,
+    MultithreadBenchmarkSuiteReport, SimdClassificationBenchmarkReport, SimdPhaseResult,
     TelemetryComparativeReport, TelemetryLoadResult, TelemetryTransportKind,
 };
 pub use blocking::{
@@ -83,6 +85,12 @@ pub use session_sync::{
     ISSP_PKT_FLAG_FULL_HEADER, ISSP_SESSION_HEADER_UNCOMPRESSED_SIZE, ISSP_SESSION_MAGIC,
     ISSP_SUBPATH_PACKET_MAGIC, ISSP_VERSION_V1, ISSP_VERSION_V2_ENCRYPTED, MAX_PEER_NODES,
     MAX_SESSIONS, SECURE_GOSSIP_FRAME_SIZE, SNAPSHOT_MAX_AGE,
+};
+pub use simd_classifier::{
+    decode_capsule_header_simd, decode_capsule_headers_batch_simd, decode_capsule_view_simd,
+    IsspCapsuleHeader, IsspCapsuleView, IsspClassifiedBatch, IsspPacketPriority,
+    IsspSimdPacketClassifier, IsspTelemetryPacketClass, ISSP_FAMILY_PREFIX, ISSP_MESH_LSA_MAGIC,
+    ISSP_MIGRATION_MAGIC, ISSP_TELEMETRY_MAGIC, ISSP_TRACE_MAGIC,
 };
 pub use string::IfaString;
 pub use telemetry::{

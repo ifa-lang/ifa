@@ -1488,3 +1488,39 @@ fn test_cli_net_session_telemetry_serve_e2e() {
     let _stderr_logs = stderr_drain.join().unwrap();
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_net_session_simd_bench_cli() {
+    let ifa_bin = get_ifa_binary();
+
+    let out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("simd-bench")
+        .arg("--packets")
+        .arg("500")
+        .output()
+        .expect("exec simd-bench");
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ISSP SIMD Capsule Header Decoding & Telemetry Classification Benchmark"));
+    assert!(stdout.contains("SIMD / SWAR Vector"));
+    assert!(stdout.contains("SIMD 4-Lane Batch"));
+
+    let json_out = Command::new(&ifa_bin)
+        .arg("net")
+        .arg("session")
+        .arg("simd-bench")
+        .arg("--packets")
+        .arg("500")
+        .arg("--json")
+        .output()
+        .expect("exec simd-bench json");
+
+    assert!(json_out.status.success());
+    let json_str = String::from_utf8_lossy(&json_out.stdout);
+    assert!(json_str.contains("packet_count"));
+    assert!(json_str.contains("capsule_decode_speedup"));
+    assert!(json_str.contains("classification_speedup"));
+}

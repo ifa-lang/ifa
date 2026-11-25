@@ -799,23 +799,41 @@ impl IsspCapsule {
         buf
     }
 
-    /// Decode from raw RFC 9297 capsule payload bytes.
+    /// Decode from raw RFC 9297 capsule payload bytes using SIMD-accelerated header parser.
     pub fn from_bytes(slice: &[u8]) -> Result<Self, SyncError> {
-        if slice.len() < ISSP_CAPSULE_HEADER_SIZE {
-            return Err(SyncError::InvalidCapsuleLength(slice.len()));
-        }
-        let magic = u32::from_be_bytes(slice[0..4].try_into().unwrap());
-        if magic != ISSP_CAPSULE_MAGIC {
-            return Err(SyncError::BadCapsuleMagic);
-        }
-        let version = u32::from_le_bytes(slice[4..8].try_into().unwrap());
-        let origin_node_id = u32::from_le_bytes(slice[8..12].try_into().unwrap());
+        let header = crate::simd_classifier::decode_capsule_header_simd(slice)?;
         let payload = slice[ISSP_CAPSULE_HEADER_SIZE..].to_vec();
         Ok(Self {
-            version,
-            origin_node_id,
+            version: header.version,
+            origin_node_id: header.origin_node_id,
             payload,
         })
+    }
+
+    /// Decode from raw bytes using SIMD-accelerated header parser.
+    #[inline]
+    pub fn from_bytes_simd(slice: &[u8]) -> Result<Self, SyncError> {
+        Self::from_bytes(slice)
+    }
+
+    /// Extract decoded header metadata without allocating payload.
+    #[inline]
+    pub fn header(&self) -> crate::simd_classifier::IsspCapsuleHeader {
+        crate::simd_classifier::IsspCapsuleHeader {
+            magic: ISSP_CAPSULE_MAGIC,
+            version: self.version,
+            origin_node_id: self.origin_node_id,
+            payload_len: self.payload.len(),
+        }
+    }
+
+    /// Return zero-copy borrowed view of this capsule.
+    #[inline]
+    pub fn view(&self) -> crate::simd_classifier::IsspCapsuleView<'_> {
+        crate::simd_classifier::IsspCapsuleView {
+            header: self.header(),
+            payload: &self.payload,
+        }
     }
 }
 

@@ -1596,6 +1596,330 @@ pub fn run_telemetry_streaming_vs_polling_benchmark(
     }
 }
 
+// ---------------------------------------------------------------------------
+// SIMD Capsule Header Decoding & Telemetry Classification Benchmark
+// ---------------------------------------------------------------------------
+
+/// Result of an individual phase in the SIMD throughput benchmark suite.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimdPhaseResult {
+    /// Descriptive name of the execution phase.
+    pub name: String,
+    /// Total count of operations / packets processed.
+    pub operations: usize,
+    /// Elapsed wall-clock execution time in nanoseconds.
+    pub elapsed_ns: u64,
+    /// Throughput in millions of operations per second (Mops/s).
+    pub throughput_mops: f64,
+    /// Average duration per operation in nanoseconds.
+    pub ns_per_op: f64,
+}
+
+/// Comprehensive benchmark report comparing scalar vs SIMD capsule decoding & telemetry classification.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimdClassificationBenchmarkReport {
+    /// Total number of packets processed per phase.
+    pub packet_count: usize,
+    /// Scalar capsule header decoding result.
+    pub scalar_capsule_decode: SimdPhaseResult,
+    /// SIMD / SWAR capsule header decoding result.
+    pub simd_capsule_decode: SimdPhaseResult,
+    /// Relative speedup factor of SIMD capsule decoding over scalar.
+    pub capsule_decode_speedup: f64,
+    /// Scalar packet classification result.
+    pub scalar_classification: SimdPhaseResult,
+    /// SIMD vectorized batch classification result.
+    pub simd_batch_classification: SimdPhaseResult,
+    /// Relative speedup factor of SIMD batch classification over scalar.
+    pub classification_speedup: f64,
+    /// Vectorized heartbeat probe filter result.
+    pub probe_filter_simd: SimdPhaseResult,
+    /// Vectorized telemetry metrics filter result.
+    pub telemetry_filter_simd: SimdPhaseResult,
+}
+
+impl SimdClassificationBenchmarkReport {
+    /// Format benchmark report as a Markdown table.
+    pub fn to_markdown_table(&self) -> String {
+        let mut s = String::new();
+        s.push_str("### ISSP SIMD Capsule Header Decoding & Telemetry Classification Benchmark\n\n");
+        s.push_str(&format!("**Dataset Size:** {} wire packets per phase\n\n", self.packet_count));
+        s.push_str("| Benchmark Phase | Engine / Mode | Elapsed (ms) | Throughput (Mops/s) | Latency (ns/op) | Speedup |\n");
+        s.push_str("|---|---|---|---|---|---|\n");
+        s.push_str(&format!(
+            "| Capsule Header Decode | Scalar Fallback | {:.3} | {:.2} | {:.1} | 1.00x |\n",
+            self.scalar_capsule_decode.elapsed_ns as f64 / 1_000_000.0,
+            self.scalar_capsule_decode.throughput_mops,
+            self.scalar_capsule_decode.ns_per_op,
+        ));
+        s.push_str(&format!(
+            "| Capsule Header Decode | **SIMD / SWAR Vector** | {:.3} | **{:.2}** | **{:.1}** | **{:.2}x** |\n",
+            self.simd_capsule_decode.elapsed_ns as f64 / 1_000_000.0,
+            self.simd_capsule_decode.throughput_mops,
+            self.simd_capsule_decode.ns_per_op,
+            self.capsule_decode_speedup,
+        ));
+        s.push_str(&format!(
+            "| Telemetry Classification | Scalar Branching | {:.3} | {:.2} | {:.1} | 1.00x |\n",
+            self.scalar_classification.elapsed_ns as f64 / 1_000_000.0,
+            self.scalar_classification.throughput_mops,
+            self.scalar_classification.ns_per_op,
+        ));
+        s.push_str(&format!(
+            "| Telemetry Classification | **SIMD 4-Lane Batch** | {:.3} | **{:.2}** | **{:.1}** | **{:.2}x** |\n",
+            self.simd_batch_classification.elapsed_ns as f64 / 1_000_000.0,
+            self.simd_batch_classification.throughput_mops,
+            self.simd_batch_classification.ns_per_op,
+            self.classification_speedup,
+        ));
+        s.push_str(&format!(
+            "| Heartbeat Probe Filter | Vectorized Magic Match | {:.3} | {:.2} | {:.1} | - |\n",
+            self.probe_filter_simd.elapsed_ns as f64 / 1_000_000.0,
+            self.probe_filter_simd.throughput_mops,
+            self.probe_filter_simd.ns_per_op,
+        ));
+        s.push_str(&format!(
+            "| Telemetry Metrics Filter | Vectorized Magic Match | {:.3} | {:.2} | {:.1} | - |\n",
+            self.telemetry_filter_simd.elapsed_ns as f64 / 1_000_000.0,
+            self.telemetry_filter_simd.throughput_mops,
+            self.telemetry_filter_simd.ns_per_op,
+        ));
+        s
+    }
+
+    /// Serialize benchmark metrics into JSON.
+    pub fn to_json(&self) -> String {
+        format!(
+            r#"{{"packet_count":{},"capsule_decode_speedup":{:.2},"classification_speedup":{:.2},"simd_capsule_mops":{:.2},"simd_classification_mops":{:.2}}}"#,
+            self.packet_count,
+            self.capsule_decode_speedup,
+            self.classification_speedup,
+            self.simd_capsule_decode.throughput_mops,
+            self.simd_batch_classification.throughput_mops
+        )
+    }
+}
+
+/// Execute comprehensive benchmark evaluating SIMD capsule header decoding and telemetry classification.
+pub fn run_simd_capsule_and_classification_benchmark(
+    packet_count: usize,
+) -> SimdClassificationBenchmarkReport {
+    let count = packet_count.max(100);
+
+    // ── Generate representative wire packet buffers ─────────────────────────
+    let mut capsule_buffers: Vec<Vec<u8>> = Vec::with_capacity(count);
+    let mut mixed_packets: Vec<Vec<u8>> = Vec::with_capacity(count);
+
+    for i in 0..count {
+        // Capsule packet (alternating V1 and V2)
+        let mut cap = Vec::with_capacity(32);
+        cap.extend_from_slice(&crate::session_sync::ISSP_CAPSULE_MAGIC.to_be_bytes());
+        let version = if i % 2 == 0 { 1u32 } else { 2u32 };
+        cap.extend_from_slice(&version.to_le_bytes());
+        cap.extend_from_slice(&((i as u32 % 64) + 1).to_le_bytes());
+        cap.extend_from_slice(b"issp-session-gossip-payload-wire");
+        capsule_buffers.push(cap);
+
+        // Mixed telemetry & network packets
+        match i % 6 {
+            0 => {
+                // Heartbeat probe
+                let mut hb = [0u8; 40];
+                hb[0..4].copy_from_slice(&crate::session_sync::ISSP_HEARTBEAT_MAGIC.to_be_bytes());
+                hb[4..8].copy_from_slice(&((i as u32 % 32) + 1).to_le_bytes());
+                hb[8..12].copy_from_slice(&((i as u32 % 4) + 1).to_le_bytes());
+                hb[12..20].copy_from_slice(&(i as u64 * 10).to_le_bytes());
+                mixed_packets.push(hb.to_vec());
+            }
+            1 => {
+                // Telemetry metrics report
+                let mut telem = Vec::new();
+                telem.extend_from_slice(&crate::simd_classifier::ISSP_TELEMETRY_MAGIC.to_be_bytes());
+                telem.extend_from_slice(&((i as u32 % 16) + 1).to_le_bytes());
+                telem.extend_from_slice(&1u16.to_le_bytes());
+                telem.extend_from_slice(b"otlp-telemetry-metrics-buffer");
+                mixed_packets.push(telem);
+            }
+            2 => {
+                // Distributed trace context
+                let mut tr = Vec::new();
+                tr.extend_from_slice(&crate::simd_classifier::ISSP_TRACE_MAGIC.to_be_bytes());
+                tr.extend_from_slice(&[0x11; 16]);
+                tr.extend_from_slice(&[0x22; 8]);
+                mixed_packets.push(tr);
+            }
+            3 => {
+                // Capsule gossip
+                let mut cap_pkt = Vec::new();
+                cap_pkt.extend_from_slice(&crate::session_sync::ISSP_CAPSULE_MAGIC.to_be_bytes());
+                cap_pkt.extend_from_slice(&1u32.to_le_bytes());
+                cap_pkt.extend_from_slice(&((i as u32 % 8) + 1).to_le_bytes());
+                cap_pkt.extend_from_slice(b"session-snapshot-frame");
+                mixed_packets.push(cap_pkt);
+            }
+            4 => {
+                // Mesh LSA
+                let mut lsa = Vec::new();
+                lsa.extend_from_slice(&crate::simd_classifier::ISSP_MESH_LSA_MAGIC.to_be_bytes());
+                lsa.extend_from_slice(&((i as u32 % 12) + 1).to_le_bytes());
+                lsa.extend_from_slice(&(i as u64).to_le_bytes());
+                lsa.extend_from_slice(&4u32.to_le_bytes());
+                mixed_packets.push(lsa);
+            }
+            _ => {
+                // Subpath data
+                let mut sp = Vec::new();
+                sp.extend_from_slice(&crate::session_sync::ISSP_SUBPATH_PACKET_MAGIC.to_be_bytes());
+                sp.extend_from_slice(&0u16.to_le_bytes());
+                sp.extend_from_slice(&1u32.to_le_bytes());
+                sp.extend_from_slice(&(i as u64).to_le_bytes());
+                sp.extend_from_slice(b"subpath-packet-content");
+                mixed_packets.push(sp);
+            }
+        }
+    }
+
+    let capsule_slices: Vec<&[u8]> = capsule_buffers.iter().map(|b| b.as_slice()).collect();
+    let mixed_slices: Vec<&[u8]> = mixed_packets.iter().map(|b| b.as_slice()).collect();
+
+    // ── Phase 1: Scalar Capsule Header Decoding ─────────────────────────────
+    let t_start = Instant::now();
+    let mut scalar_valid = 0;
+    for slice in &capsule_slices {
+        if slice.len() >= crate::session_sync::ISSP_CAPSULE_HEADER_SIZE {
+            let magic = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
+            if magic == crate::session_sync::ISSP_CAPSULE_MAGIC {
+                let v = u32::from_le_bytes([slice[4], slice[5], slice[6], slice[7]]);
+                let origin = u32::from_le_bytes([slice[8], slice[9], slice[10], slice[11]]);
+                black_box((magic, v, origin));
+                scalar_valid += 1;
+            }
+        }
+    }
+    let scalar_capsule_elapsed = t_start.elapsed().as_nanos() as u64;
+    let scalar_capsule_ns = (scalar_capsule_elapsed as f64) / (count as f64);
+    let scalar_capsule_mops = (count as f64) / (scalar_capsule_elapsed.max(1) as f64 / 1_000.0);
+
+    let scalar_capsule_result = SimdPhaseResult {
+        name: "Scalar Capsule Header Decode".to_string(),
+        operations: count,
+        elapsed_ns: scalar_capsule_elapsed,
+        throughput_mops: scalar_capsule_mops,
+        ns_per_op: scalar_capsule_ns,
+    };
+
+    // ── Phase 2: SIMD / SWAR Capsule Header Decoding ────────────────────────
+    let t_start = Instant::now();
+    let simd_headers = crate::simd_classifier::decode_capsule_headers_batch_simd(&capsule_slices);
+    black_box(&simd_headers);
+    let simd_capsule_elapsed = t_start.elapsed().as_nanos() as u64;
+    let simd_capsule_ns = (simd_capsule_elapsed as f64) / (count as f64);
+    let simd_capsule_mops = (count as f64) / (simd_capsule_elapsed.max(1) as f64 / 1_000.0);
+
+    let simd_capsule_result = SimdPhaseResult {
+        name: "SIMD Capsule Header Decode".to_string(),
+        operations: count,
+        elapsed_ns: simd_capsule_elapsed,
+        throughput_mops: simd_capsule_mops,
+        ns_per_op: simd_capsule_ns,
+    };
+
+    let capsule_decode_speedup = if simd_capsule_elapsed > 0 {
+        (scalar_capsule_elapsed as f64) / (simd_capsule_elapsed as f64)
+    } else {
+        1.0
+    };
+
+    // ── Phase 3: Scalar Classification ──────────────────────────────────────
+    let t_start = Instant::now();
+    for slice in &mixed_slices {
+        let class = crate::simd_classifier::IsspSimdPacketClassifier::classify_packet(slice);
+        black_box(class);
+    }
+    let scalar_class_elapsed = t_start.elapsed().as_nanos() as u64;
+    let scalar_class_ns = (scalar_class_elapsed as f64) / (count as f64);
+    let scalar_class_mops = (count as f64) / (scalar_class_elapsed.max(1) as f64 / 1_000.0);
+
+    let scalar_classification_result = SimdPhaseResult {
+        name: "Scalar Packet Classification".to_string(),
+        operations: count,
+        elapsed_ns: scalar_class_elapsed,
+        throughput_mops: scalar_class_mops,
+        ns_per_op: scalar_class_ns,
+    };
+
+    // ── Phase 4: SIMD 4-Lane Batch Classification ───────────────────────────
+    let t_start = Instant::now();
+    let batch_classes =
+        crate::simd_classifier::IsspSimdPacketClassifier::classify_batch_simd(&mixed_slices);
+    black_box(&batch_classes);
+    let simd_class_elapsed = t_start.elapsed().as_nanos() as u64;
+    let simd_class_ns = (simd_class_elapsed as f64) / (count as f64);
+    let simd_class_mops = (count as f64) / (simd_class_elapsed.max(1) as f64 / 1_000.0);
+
+    let simd_classification_result = SimdPhaseResult {
+        name: "SIMD Batch Packet Classification".to_string(),
+        operations: count,
+        elapsed_ns: simd_class_elapsed,
+        throughput_mops: simd_class_mops,
+        ns_per_op: simd_class_ns,
+    };
+
+    let classification_speedup = if simd_class_elapsed > 0 {
+        (scalar_class_elapsed as f64) / (simd_class_elapsed as f64)
+    } else {
+        1.0
+    };
+
+    // ── Phase 5: Vectorized Probe Filter ────────────────────────────────────
+    let t_start = Instant::now();
+    let probes =
+        crate::simd_classifier::IsspSimdPacketClassifier::filter_heartbeat_probes_simd(&mixed_slices);
+    black_box(&probes);
+    let probe_elapsed = t_start.elapsed().as_nanos() as u64;
+    let probe_ns = (probe_elapsed as f64) / (count as f64);
+    let probe_mops = (count as f64) / (probe_elapsed.max(1) as f64 / 1_000.0);
+
+    let probe_filter_result = SimdPhaseResult {
+        name: "Vectorized Heartbeat Probe Filter".to_string(),
+        operations: count,
+        elapsed_ns: probe_elapsed,
+        throughput_mops: probe_mops,
+        ns_per_op: probe_ns,
+    };
+
+    // ── Phase 6: Vectorized Telemetry Filter ────────────────────────────────
+    let t_start = Instant::now();
+    let telem_indices =
+        crate::simd_classifier::IsspSimdPacketClassifier::filter_telemetry_metrics_simd(&mixed_slices);
+    black_box(&telem_indices);
+    let telem_elapsed = t_start.elapsed().as_nanos() as u64;
+    let telem_ns = (telem_elapsed as f64) / (count as f64);
+    let telem_mops = (count as f64) / (telem_elapsed.max(1) as f64 / 1_000.0);
+
+    let telemetry_filter_result = SimdPhaseResult {
+        name: "Vectorized Telemetry Filter".to_string(),
+        operations: count,
+        elapsed_ns: telem_elapsed,
+        throughput_mops: telem_mops,
+        ns_per_op: telem_ns,
+    };
+
+    black_box(scalar_valid);
+
+    SimdClassificationBenchmarkReport {
+        packet_count: count,
+        scalar_capsule_decode: scalar_capsule_result,
+        simd_capsule_decode: simd_capsule_result,
+        capsule_decode_speedup,
+        scalar_classification: scalar_classification_result,
+        simd_batch_classification: simd_classification_result,
+        classification_speedup,
+        probe_filter_simd: probe_filter_result,
+        telemetry_filter_simd: telemetry_filter_result,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1761,5 +2085,35 @@ mod tests {
         assert!(snap.interface_latency_histograms.contains_key("wwan0-5g"));
         assert!(snap.interface_latency_histograms.contains_key("tun0-vpn"));
         assert!(snap.interface_latency_histograms.contains_key("wlan0-mesh"));
+    }
+
+    #[test]
+    fn test_simd_capsule_and_classification_benchmark_runs() {
+        let report = run_simd_capsule_and_classification_benchmark(200);
+        assert_eq!(report.packet_count, 200);
+
+        // Verify throughput metrics are positive
+        assert!(report.scalar_capsule_decode.throughput_mops > 0.0);
+        assert!(report.simd_capsule_decode.throughput_mops > 0.0);
+        assert!(report.scalar_classification.throughput_mops > 0.0);
+        assert!(report.simd_batch_classification.throughput_mops > 0.0);
+        assert!(report.probe_filter_simd.throughput_mops > 0.0);
+        assert!(report.telemetry_filter_simd.throughput_mops > 0.0);
+
+        // Verify speedups are calculated
+        assert!(report.capsule_decode_speedup > 0.0);
+        assert!(report.classification_speedup > 0.0);
+
+        // Verify Markdown rendering
+        let md = report.to_markdown_table();
+        assert!(md.contains("ISSP SIMD Capsule Header Decoding & Telemetry Classification Benchmark"));
+        assert!(md.contains("SIMD / SWAR Vector"));
+        assert!(md.contains("SIMD 4-Lane Batch"));
+
+        // Verify JSON serialization
+        let json = report.to_json();
+        assert!(json.contains("\"packet_count\": 200") || json.contains("\"packet_count\":200"));
+        assert!(json.contains("capsule_decode_speedup"));
+        assert!(json.contains("classification_speedup"));
     }
 }

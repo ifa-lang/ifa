@@ -3,6 +3,7 @@
 use clap::Subcommand;
 use ifa_runtime::{
     run_issp_failover_benchmark_suite, run_issp_scenario,
+    run_simd_capsule_and_classification_benchmark,
     run_telemetry_streaming_vs_polling_benchmark, IsspBandwidthEstimate, IsspCapsule,
     IsspClusterQuorumConfig, IsspCongestionPhase, IsspFailoverBenchmarkSuiteReport,
     IsspFlapDampingConfig, IsspHeartbeatProbe, IsspMultipathRoute, IsspNetworkProfile,
@@ -192,6 +193,15 @@ pub enum SessionCommand {
         /// Number of benchmark sample iterations per transport protocol
         #[arg(short, long, default_value = "1000")]
         iterations: usize,
+        /// Output formatted as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Benchmark SIMD capsule header decoding and telemetry packet classification throughput
+    SimdBench {
+        /// Number of wire packets to decode and classify in benchmark (default: 50000)
+        #[arg(short, long, default_value = "50000")]
+        packets: usize,
         /// Output formatted as JSON
         #[arg(long)]
         json: bool,
@@ -1714,6 +1724,15 @@ fn execute_session_command(cmd: SessionCommand) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        SessionCommand::SimdBench { packets, json } => {
+            let report = run_simd_capsule_and_classification_benchmark(packets);
+            if json {
+                println!("{}", report.to_json());
+            } else {
+                println!("{}", report.to_markdown_table());
+            }
+            ExitCode::SUCCESS
+        }
         SessionCommand::Failovers { file, json } => {
             let registry = match resolve_state_file(file.as_ref()) {
                 Some(p) if p.exists() => match SessionRegistry::load_from_file(&p) {
@@ -2095,6 +2114,23 @@ mod tests {
 
         let cmd_json = SessionCommand::Failovers {
             file: None,
+            json: true,
+        };
+        let code_json = execute_session_command(cmd_json);
+        assert_eq!(code_json, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_session_command_simd_bench_execution() {
+        let cmd = SessionCommand::SimdBench {
+            packets: 200,
+            json: false,
+        };
+        let code = execute_session_command(cmd);
+        assert_eq!(code, ExitCode::SUCCESS);
+
+        let cmd_json = SessionCommand::SimdBench {
+            packets: 200,
             json: true,
         };
         let code_json = execute_session_command(cmd_json);
