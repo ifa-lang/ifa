@@ -1888,7 +1888,10 @@ mod tests {
                 }
             }
         }
-        assert!(served, "did not serve the WebSocket /ws/metrics request in time");
+        assert!(
+            served,
+            "did not serve the WebSocket /ws/metrics request in time"
+        );
 
         let (resp_str, frame_payload) = handle.join().unwrap();
         assert!(resp_str.contains("101 Switching Protocols"));
