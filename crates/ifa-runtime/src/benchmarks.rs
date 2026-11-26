@@ -3449,6 +3449,7 @@ pub use crate::multipath_fec::{
 pub use crate::multipath_retransmit::{
     run_subpath_retransmit_benchmark, SubpathRetransmitBenchmarkReport,
 };
+pub use crate::multipath_router::{run_multipath_router_benchmark, MultipathRouterBenchmarkReport};
 pub use crate::reorder_engine::{
     run_multipath_reordering_benchmark, MultipathReorderingBenchmarkReport,
 };
@@ -4608,5 +4609,20 @@ mod tests {
 
         let prom = report.telemetry_summary.export_prometheus_metrics();
         assert!(prom.contains("ifa_subpath_current_pmtu_bytes"));
+    }
+
+    #[test]
+    fn test_multipath_router_benchmark_suite_runs() {
+        let report = run_multipath_router_benchmark(40);
+        assert_eq!(report.total_frames_routed, 40);
+        assert!(report.total_bytes_routed > 0);
+        assert_eq!(report.total_failovers_executed, 1);
+        assert!(report.total_migrated_frames > 0);
+        assert!(report.refragmented_on_failover > 0);
+        assert!(report.zero_loss_verified);
+
+        let md = report.to_markdown_table();
+        assert!(md.contains("Dynamic PMTU/BDP Multipath Router & Lossless Failover Report"));
+        assert!(md.contains("PASSED"));
     }
 }

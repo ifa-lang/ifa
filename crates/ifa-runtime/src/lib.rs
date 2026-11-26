@@ -21,6 +21,7 @@ pub mod multi_node_sla;
 pub mod multipath_congestion;
 pub mod multipath_fec;
 pub mod multipath_retransmit;
+pub mod multipath_router;
 pub mod panic;
 pub mod reactor;
 pub mod reorder_engine;
@@ -148,6 +149,11 @@ pub use multipath_retransmit::{
     ReceiverNackGenerator, RetransmitSlicePolicy, RetransmittedPacket, SelectiveAckRange,
     SenderRetransmitBuffer, SubpathNackPacket, SubpathRetransmitBenchmarkReport,
     SubpathRetransmitManager, SubpathRetransmitTelemetrySummary, SubpathSackPacket,
+};
+pub use multipath_router::{
+    run_multipath_router_benchmark, DispatchedFrameResult, FailoverEvent, InflightFrameRecord,
+    MultipathRouter, MultipathRouterBenchmarkReport, RouterError, SubpathHealth, SubpathRoute,
+    SubpathSelection,
 };
 pub use panic::{
     catch_panic, clear_last_panic, dispatch_panic, get_last_panic, get_last_panic_raw_ptr,
