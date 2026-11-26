@@ -209,8 +209,8 @@ pub use string::IfaString;
 pub use subpath_pmtud::{
     calculate_crc32, run_subpath_pmtud_and_fragmentation_benchmark, AdaptiveFragmenter,
     AdaptiveReassembler, FrameFragment, PmtuProbeAck, PmtuProbePacket, PmtudState,
-    PmtudTelemetrySummary, ReassembledFrame, SubpathPmtudBenchmarkReport, SubpathPmtuConfig,
-    SubpathPmtuManager, SubpathPmtuMetrics, SubpathPmtuTracker, UnfragmentedFrame,
+    PmtudTelemetrySummary, ReassembledFrame, SubpathPmtuConfig, SubpathPmtuManager,
+    SubpathPmtuMetrics, SubpathPmtuTracker, SubpathPmtudBenchmarkReport, UnfragmentedFrame,
     DEFAULT_MTU_LADDER, ENCAPSULATED_TUNNEL_MTU, ETHERNET_STANDARD_MTU, FLAG_LAST_FRAGMENT,
     FLAG_RETRANSMITTED, FLAG_URLLC_PRIORITIZED, FRAGMENT_HEADER_SIZE, IFA_FRAGMENT_MAGIC,
     IFA_PMTU_ACK_MAGIC, IFA_PMTU_PROBE_MAGIC, IPV6_MIN_MTU, JUMBO_FRAME_MTU,
