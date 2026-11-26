@@ -17,6 +17,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::*;
+
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::*;
+
 use crate::reorder_engine::MultipathPacket;
 use crate::traffic_slicing::FlowSliceClass;
 
@@ -117,54 +123,340 @@ pub fn build_cauchy_matrix(m: usize, k: usize) -> Vec<Vec<u8>> {
     g
 }
 
-/// Solve an N x N linear system over GF(2^8) using Gaussian elimination with partial pivoting.
-/// Returns the solution vector x such that Mat * x = rhs.
+/// Constant-time bitwise Galois Field GF(2^8) multiplication used for compile-time lookup table generation.
+pub const fn const_gf_mul(mut a: u8, mut b: u8) -> u8 {
+    let mut p = 0u8;
+    let mut i = 0;
+    while i < 8 {
+        if (b & 1) != 0 {
+            p ^= a;
+        }
+        let carry = (a & 0x80) != 0;
+        a <<= 1;
+        if carry {
+            a ^= 0x1d;
+        }
+        b >>= 1;
+        i += 1;
+    }
+    p
+}
+
+/// Precomputed 4-bit low nibble multiplication table for GF(2^8) SIMD vectorization.
+static GF_MUL_TABLE_LO: [[u8; 16]; 256] = {
+    let mut table = [[0u8; 16]; 256];
+    let mut c = 0;
+    while c < 256 {
+        let mut nibble = 0;
+        while nibble < 16 {
+            table[c][nibble] = const_gf_mul(c as u8, nibble as u8);
+            nibble += 1;
+        }
+        c += 1;
+    }
+    table
+};
+
+/// Precomputed 4-bit high nibble multiplication table for GF(2^8) SIMD vectorization.
+static GF_MUL_TABLE_HI: [[u8; 16]; 256] = {
+    let mut table = [[0u8; 16]; 256];
+    let mut c = 0;
+    while c < 256 {
+        let mut nibble = 0;
+        while nibble < 16 {
+            table[c][nibble] = const_gf_mul(c as u8, (nibble as u8) << 4);
+            nibble += 1;
+        }
+        c += 1;
+    }
+    table
+};
+
+/// Invert an N x N matrix over GF(2^8) using Gauss-Jordan elimination.
+/// Returns Some(inverse) if the matrix is non-singular, or None if singular.
 #[allow(clippy::needless_range_loop)]
-pub fn solve_gf_linear_system(mat: &[Vec<u8>], rhs: &[u8]) -> Option<Vec<u8>> {
+pub fn invert_gf_matrix(mat: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
     let n = mat.len();
-    if n == 0 || rhs.len() != n {
+    if n == 0 {
         return None;
     }
-    let mut a: Vec<Vec<u8>> = Vec::with_capacity(n);
-    for (i, row) in mat.iter().enumerate() {
+    for row in mat {
         if row.len() != n {
             return None;
         }
-        let mut aug = row.clone();
-        aug.push(rhs[i]);
-        a.push(aug);
+    }
+
+    // Augmented matrix [A | I] of dimension n x (2 * n)
+    let mut aug = vec![vec![0u8; 2 * n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            aug[i][j] = mat[i][j];
+        }
+        aug[i][n + i] = 1;
     }
 
     for i in 0..n {
         let mut pivot_row = i;
-        while pivot_row < n && a[pivot_row][i] == 0 {
+        while pivot_row < n && aug[pivot_row][i] == 0 {
             pivot_row += 1;
         }
         if pivot_row == n {
             return None; // Singular matrix
         }
         if pivot_row != i {
-            a.swap(i, pivot_row);
+            aug.swap(i, pivot_row);
         }
-        let inv = gf_inv(a[i][i]);
-        for j in i..=n {
-            a[i][j] = gf_mul(a[i][j], inv);
+
+        let inv = gf_inv(aug[i][i]);
+        // Normalize pivot row
+        for j in i..(2 * n) {
+            aug[i][j] = gf_mul(aug[i][j], inv);
         }
+
+        // Eliminate column i in all other rows
         for r in 0..n {
-            if r != i && a[r][i] != 0 {
-                let factor = a[r][i];
-                for c in i..=n {
-                    a[r][c] ^= gf_mul(factor, a[i][c]);
+            if r != i && aug[r][i] != 0 {
+                let factor = aug[r][i];
+                for c in i..(2 * n) {
+                    aug[r][c] ^= gf_mul(factor, aug[i][c]);
                 }
             }
         }
     }
 
-    let mut res = Vec::with_capacity(n);
-    for row in a.iter().take(n) {
-        res.push(row[n]);
+    // Extract inverse matrix from the right half
+    let mut inv_mat = vec![vec![0u8; n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            inv_mat[i][j] = aug[i][n + j];
+        }
     }
-    Some(res)
+    Some(inv_mat)
+}
+
+/// Solve an N x N linear system over GF(2^8) using matrix inversion.
+/// Returns the solution vector x such that Mat * x = rhs.
+pub fn solve_gf_linear_system(mat: &[Vec<u8>], rhs: &[u8]) -> Option<Vec<u8>> {
+    let n = mat.len();
+    if n != rhs.len() {
+        return None;
+    }
+    let inv_mat = invert_gf_matrix(mat)?;
+    let mut solution = vec![0u8; n];
+    for i in 0..n {
+        let mut sum = 0u8;
+        for j in 0..n {
+            sum ^= gf_mul(inv_mat[i][j], rhs[j]);
+        }
+        solution[i] = sum;
+    }
+    Some(solution)
+}
+
+// ---------------------------------------------------------------------------
+// Hardware Accelerated SIMD Routines (AVX2 / NEON) & Fast Fallback
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn xor_slice_avx2(dst: &mut [u8], src: &[u8]) {
+    let len = dst.len().min(src.len());
+    let mut i = 0;
+    while i + 32 <= len {
+        let d = _mm256_loadu_si256(dst.as_ptr().add(i) as *const __m256i);
+        let s = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
+        let r = _mm256_xor_si256(d, s);
+        _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, r);
+        i += 32;
+    }
+    while i < len {
+        dst[i] ^= src[i];
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn gf_mul_add_slice_avx2(dst: &mut [u8], src: &[u8], coeff: u8) {
+    let len = dst.len().min(src.len());
+    let lo_table = &GF_MUL_TABLE_LO[coeff as usize];
+    let hi_table = &GF_MUL_TABLE_HI[coeff as usize];
+
+    let t_lo_128 = _mm_loadu_si128(lo_table.as_ptr() as *const __m128i);
+    let t_hi_128 = _mm_loadu_si128(hi_table.as_ptr() as *const __m128i);
+    let t_lo = _mm256_broadcastsi128_si256(t_lo_128);
+    let t_hi = _mm256_broadcastsi128_si256(t_hi_128);
+
+    let mask_0f = _mm256_set1_epi8(0x0f);
+
+    let mut i = 0;
+    while i + 32 <= len {
+        let s = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
+        let lo_idx = _mm256_and_si256(s, mask_0f);
+        let hi_idx = _mm256_and_si256(_mm256_srli_epi16(s, 4), mask_0f);
+
+        let p_lo = _mm256_shuffle_epi8(t_lo, lo_idx);
+        let p_hi = _mm256_shuffle_epi8(t_hi, hi_idx);
+        let prod = _mm256_xor_si256(p_lo, p_hi);
+
+        let d = _mm256_loadu_si256(dst.as_ptr().add(i) as *const __m256i);
+        let res = _mm256_xor_si256(d, prod);
+        _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, res);
+        i += 32;
+    }
+    while i < len {
+        dst[i] ^= gf_mul(coeff, src[i]);
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn xor_slice_neon(dst: &mut [u8], src: &[u8]) {
+    let len = dst.len().min(src.len());
+    let mut i = 0;
+    while i + 16 <= len {
+        let d = vld1q_u8(dst.as_ptr().add(i));
+        let s = vld1q_u8(src.as_ptr().add(i));
+        let r = veorq_u8(d, s);
+        vst1q_u8(dst.as_mut_ptr().add(i), r);
+        i += 16;
+    }
+    while i < len {
+        dst[i] ^= src[i];
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn gf_mul_add_slice_neon(dst: &mut [u8], src: &[u8], coeff: u8) {
+    let len = dst.len().min(src.len());
+    let lo_table = &GF_MUL_TABLE_LO[coeff as usize];
+    let hi_table = &GF_MUL_TABLE_HI[coeff as usize];
+
+    let t_lo = vld1q_u8(lo_table.as_ptr());
+    let t_hi = vld1q_u8(hi_table.as_ptr());
+    let mask_0f = vdupq_n_u8(0x0f);
+
+    let mut i = 0;
+    while i + 16 <= len {
+        let s = vld1q_u8(src.as_ptr().add(i));
+        let lo_idx = vandq_u8(s, mask_0f);
+        let hi_idx = vshrq_n_u8(s, 4);
+
+        let p_lo = vqtbl1q_u8(t_lo, lo_idx);
+        let p_hi = vqtbl1q_u8(t_hi, hi_idx);
+        let prod = veorq_u8(p_lo, p_hi);
+
+        let d = vld1q_u8(dst.as_ptr().add(i));
+        let res = veorq_u8(d, prod);
+        vst1q_u8(dst.as_mut_ptr().add(i), res);
+        i += 16;
+    }
+    while i < len {
+        dst[i] ^= gf_mul(coeff, src[i]);
+        i += 1;
+    }
+}
+
+/// Returns the active SIMD acceleration backend for GF arithmetic and syndrome processing.
+pub fn get_simd_fec_backend() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            return "AVX2 (256-bit SIMD)";
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return "NEON (128-bit SIMD)";
+        }
+    }
+    "Scalar/SWAR (64-bit chunking)"
+}
+
+/// Bitwise XOR accumulation: dst[..] ^= src[..] using optimal hardware SIMD vectorization.
+pub fn xor_slice(dst: &mut [u8], src: &[u8]) {
+    let len = dst.len().min(src.len());
+    if len == 0 {
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe {
+                xor_slice_avx2(dst, src);
+            }
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            unsafe {
+                xor_slice_neon(dst, src);
+            }
+            return;
+        }
+    }
+
+    // 64-bit word-level SWAR fallback
+    let mut i = 0;
+    while i + 8 <= len {
+        let d = u64::from_ne_bytes(dst[i..i + 8].try_into().unwrap());
+        let s = u64::from_ne_bytes(src[i..i + 8].try_into().unwrap());
+        dst[i..i + 8].copy_from_slice(&(d ^ s).to_ne_bytes());
+        i += 8;
+    }
+    while i < len {
+        dst[i] ^= src[i];
+        i += 1;
+    }
+}
+
+/// Galois Field AXPY: dst[..] ^= coeff * src[..] over GF(2^8) using AVX2, NEON or nibble table.
+pub fn gf_mul_add_slice(dst: &mut [u8], src: &[u8], coeff: u8) {
+    let len = dst.len().min(src.len());
+    if len == 0 || coeff == 0 {
+        return;
+    }
+    if coeff == 1 {
+        xor_slice(dst, src);
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe {
+                gf_mul_add_slice_avx2(dst, src, coeff);
+            }
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            unsafe {
+                gf_mul_add_slice_neon(dst, src, coeff);
+            }
+            return;
+        }
+    }
+
+    // Scalar fallback using fast nibble lookup
+    let lo_table = &GF_MUL_TABLE_LO[coeff as usize];
+    let hi_table = &GF_MUL_TABLE_HI[coeff as usize];
+    for i in 0..len {
+        let b = src[i];
+        let prod = lo_table[(b & 0x0f) as usize] ^ hi_table[((b >> 4) & 0x0f) as usize];
+        dst[i] ^= prod;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -480,8 +772,8 @@ impl MultipathFecEncoder {
         Some(parity_packets)
     }
 
-    /// Internal block encoder: applies fast XOR for M=1, or Cauchy Reed-Solomon for M >= 2.
-    fn encode_block(
+    /// Block encoder: applies fast XOR for M=1, or Cauchy Reed-Solomon for M >= 2 using SIMD AVX2/NEON.
+    pub fn encode_block(
         flow_id: u32,
         block_index: u64,
         source_packets: &[FecDataPacket],
@@ -509,15 +801,13 @@ impl MultipathFecEncoder {
         let mut parity_packets = Vec::with_capacity(m);
 
         if m == 1 {
-            // Fast bitwise XOR parity with 2-byte length prefix
+            // Fast bitwise XOR parity with 2-byte length prefix using hardware SIMD vectorization
             let mut parity_buf = vec![0u8; max_len];
             for p in source_packets {
                 let len = p.payload.len();
                 parity_buf[0] ^= (len >> 8) as u8;
                 parity_buf[1] ^= (len & 0xFF) as u8;
-                for (i, byte) in p.payload.iter().enumerate() {
-                    parity_buf[2 + i] ^= byte;
-                }
+                xor_slice(&mut parity_buf[2..2 + len], &p.payload);
             }
 
             // Assign alternate subpath for diversity
@@ -540,7 +830,7 @@ impl MultipathFecEncoder {
                 send_timestamp_ns: now_ns,
             });
         } else {
-            // Cauchy Reed-Solomon over GF(2^8) with 2-byte length prefix
+            // Cauchy Reed-Solomon over GF(2^8) with 2-byte length prefix using SIMD AVX2/NEON AXPY
             let g = build_cauchy_matrix(m, k);
             for i in 0..m {
                 let mut parity_buf = vec![0u8; max_len];
@@ -549,9 +839,7 @@ impl MultipathFecEncoder {
                     let len = p.payload.len();
                     parity_buf[0] ^= gf_mul(coeff, (len >> 8) as u8);
                     parity_buf[1] ^= gf_mul(coeff, (len & 0xFF) as u8);
-                    for (b, byte) in p.payload.iter().enumerate() {
-                        parity_buf[2 + b] ^= gf_mul(coeff, *byte);
-                    }
+                    gf_mul_add_slice(&mut parity_buf[2..2 + len], &p.payload, coeff);
                 }
 
                 // Disjoint subpath selection with round-robin diversity
@@ -667,7 +955,7 @@ impl DecoderBlockState {
         let mut recovered_packets = Vec::with_capacity(erasures_count);
 
         if erasures_count == 1 && self.m_parity_count == 1 {
-            // Fast XOR single erasure reconstruction with length restoration
+            // Fast XOR single erasure reconstruction with length restoration using SIMD
             let missing_seq = missing_seqs[0];
             let parity = self.received_parity.values().next().unwrap();
             let mut recovered_symbol = parity.parity_payload.clone();
@@ -678,11 +966,8 @@ impl DecoderBlockState {
                     recovered_symbol[0] ^= (len >> 8) as u8;
                     recovered_symbol[1] ^= (len & 0xFF) as u8;
                 }
-                for (i, byte) in p.payload.iter().enumerate() {
-                    if 2 + i < recovered_symbol.len() {
-                        recovered_symbol[2 + i] ^= byte;
-                    }
-                }
+                let copy_len = len.min(recovered_symbol.len().saturating_sub(2));
+                xor_slice(&mut recovered_symbol[2..2 + copy_len], &p.payload[..copy_len]);
             }
 
             let actual_len = if recovered_symbol.len() >= 2 {
@@ -708,7 +993,7 @@ impl DecoderBlockState {
             };
             recovered_packets.push(recovered);
         } else {
-            // General Cauchy Reed-Solomon decoding for E erasures
+            // General Cauchy Reed-Solomon decoding for E erasures using matrix inversion and SIMD syndrome processing
             let g = build_cauchy_matrix(self.m_parity_count, k);
 
             // Map missing sequence numbers to column indices in G (0..k-1)
@@ -735,15 +1020,14 @@ impl DecoderBlockState {
                 }
             }
 
+            // Invert the E x E submatrix ONCE for the entire FEC block
+            let inv_mat = invert_gf_matrix(&sub_mat)?;
+
             let max_len = selected_parities
                 .iter()
                 .map(|p| p.parity_payload.len())
                 .max()
                 .unwrap_or(0);
-
-            // Reconstruct byte-by-byte across max_len
-            let mut recovered_bytes: Vec<Vec<u8>> =
-                vec![Vec::with_capacity(max_len); erasures_count];
 
             // Pre-collect known data columns
             let known_data: Vec<(usize, &FecDataPacket)> = self
@@ -759,30 +1043,33 @@ impl DecoderBlockState {
                 })
                 .collect();
 
-            for b in 0..max_len {
-                let mut rhs = Vec::with_capacity(erasures_count);
-                for parity in &selected_parities {
-                    let mut val = if b < parity.parity_payload.len() {
-                        parity.parity_payload[b]
-                    } else {
-                        0
-                    };
-                    let p_idx = parity.parity_index as usize;
-                    for &(col, pkt) in &known_data {
-                        let known_byte = match b {
-                            0 => (pkt.payload.len() >> 8) as u8,
-                            1 => (pkt.payload.len() & 0xFF) as u8,
-                            offset if offset - 2 < pkt.payload.len() => pkt.payload[offset - 2],
-                            _ => 0,
-                        };
-                        val ^= gf_mul(g[p_idx][col], known_byte);
-                    }
-                    rhs.push(val);
-                }
+            // Compute partial syndrome buffers S_i for each parity equation
+            let mut syndromes = Vec::with_capacity(erasures_count);
+            for parity in &selected_parities {
+                let mut s_i = vec![0u8; max_len];
+                let copy_len = parity.parity_payload.len().min(max_len);
+                s_i[..copy_len].copy_from_slice(&parity.parity_payload[..copy_len]);
 
-                let solution = solve_gf_linear_system(&sub_mat, &rhs)?;
-                for (e_idx, &byte) in solution.iter().enumerate() {
-                    recovered_bytes[e_idx].push(byte);
+                let p_idx = parity.parity_index as usize;
+                for &(col, pkt) in &known_data {
+                    let coeff = g[p_idx][col];
+                    let len = pkt.payload.len();
+                    if max_len >= 2 {
+                        s_i[0] ^= gf_mul(coeff, (len >> 8) as u8);
+                        s_i[1] ^= gf_mul(coeff, (len & 0xFF) as u8);
+                    }
+                    let payload_len = len.min(max_len.saturating_sub(2));
+                    gf_mul_add_slice(&mut s_i[2..2 + payload_len], &pkt.payload[..payload_len], coeff);
+                }
+                syndromes.push(s_i);
+            }
+
+            // Reconstruct erased packets by multiplying inverted matrix by syndrome vectors via SIMD AXPY
+            let mut recovered_symbols = vec![vec![0u8; max_len]; erasures_count];
+            for (e_idx, rec_buf) in recovered_symbols.iter_mut().enumerate() {
+                for (i, s_i) in syndromes.iter().enumerate() {
+                    let coeff = inv_mat[e_idx][i];
+                    gf_mul_add_slice(rec_buf, s_i, coeff);
                 }
             }
 
@@ -790,7 +1077,7 @@ impl DecoderBlockState {
             let subpath = selected_parities[0].subpath_id;
 
             for (e_idx, &seq) in missing_seqs.iter().enumerate() {
-                let raw = &recovered_bytes[e_idx];
+                let raw = &recovered_symbols[e_idx];
                 let actual_len = if raw.len() >= 2 {
                     ((raw[0] as usize) << 8) | (raw[1] as usize)
                 } else {
@@ -992,6 +1279,8 @@ pub struct MultipathFecTelemetrySummary {
     pub total_unrecoverable_blocks: u64,
     pub recovery_success_ratio: f64,
     pub redundancy_overhead_ratio: f64,
+    pub simd_backend: &'static str,
+    pub simd_acceleration_active: bool,
 }
 
 /// Multipath Forward Error Correction & Cross-Subpath Erasure Engine.
@@ -1024,6 +1313,9 @@ impl MultipathFecEngine {
             0.0
         };
 
+        let backend = get_simd_fec_backend();
+        let simd_active = backend.starts_with("AVX2") || backend.starts_with("NEON");
+
         MultipathFecTelemetrySummary {
             total_source_packets_encoded: self.encoder.total_source_packets_encoded,
             total_parity_packets_generated: self.encoder.total_parity_packets_generated,
@@ -1034,6 +1326,8 @@ impl MultipathFecEngine {
             total_unrecoverable_blocks: self.decoder.total_unrecoverable_blocks,
             recovery_success_ratio: recovery_ratio,
             redundancy_overhead_ratio: overhead_ratio,
+            simd_backend: backend,
+            simd_acceleration_active: simd_active,
         }
     }
 
@@ -1089,6 +1383,14 @@ impl MultipathFecEngine {
         out.push_str(&format!(
             "ifa_issp_fec_redundancy_overhead_ratio {:.4}\n",
             summary.redundancy_overhead_ratio
+        ));
+
+        out.push_str("# HELP ifa_issp_fec_simd_active Whether hardware SIMD vectorization (AVX2/NEON) is active.\n");
+        out.push_str("# TYPE ifa_issp_fec_simd_active gauge\n");
+        out.push_str(&format!(
+            "ifa_issp_fec_simd_active{{backend=\"{}\"}} {}\n",
+            summary.simd_backend,
+            if summary.simd_acceleration_active { 1 } else { 0 }
         ));
 
         out
@@ -1350,6 +1652,203 @@ pub fn run_multipath_fec_benchmark() -> MultipathFecBenchmarkReport {
     }
 }
 
+/// Report on SIMD AVX2/NEON syndrome evaluation and matrix inversion performance for large FEC blocks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimdFecBenchmarkReport {
+    /// Active hardware SIMD backend name.
+    pub simd_backend: &'static str,
+    /// Whether hardware SIMD vectorization is active.
+    pub simd_active: bool,
+    /// Number of source packets in large block (K).
+    pub k_source_count: usize,
+    /// Number of parity packets in large block (M).
+    pub m_parity_count: usize,
+    /// Packet payload size in bytes (MTU size, e.g. 1400 bytes).
+    pub packet_payload_bytes: usize,
+    /// Number of erased packets recovered simultaneously.
+    pub erasures_recovered_count: usize,
+    /// Encoding duration in nanoseconds.
+    pub encode_duration_ns: u64,
+    /// Decoding / reconstruction duration in nanoseconds.
+    pub decode_duration_ns: u64,
+    /// Effective decoding throughput in Megabytes per second (MB/s).
+    pub decode_throughput_mb_s: f64,
+    /// Whether all recovered packets matched original payloads bit-for-bit.
+    pub bit_exact_recovery_passed: bool,
+    /// Overall benchmark verification passed.
+    pub verification_passed: bool,
+}
+
+impl SimdFecBenchmarkReport {
+    pub fn to_markdown_table(&self) -> String {
+        let mut out = String::with_capacity(1024);
+        out.push_str("| Metric | Value | Status |\n");
+        out.push_str("| :--- | :--- | :--- |\n");
+        out.push_str(&format!(
+            "| SIMD Acceleration Backend | `{}` | {} |\n",
+            self.simd_backend,
+            if self.simd_active { "ACTIVE" } else { "FALLBACK" }
+        ));
+        out.push_str(&format!(
+            "| Large Block Topology | K={}, M={} ({} bytes/pkt) | CONFIGURED |\n",
+            self.k_source_count, self.m_parity_count, self.packet_payload_bytes
+        ));
+        out.push_str(&format!(
+            "| Erasures Recovered | {} / {} simultaneously | VERIFIED |\n",
+            self.erasures_recovered_count, self.m_parity_count
+        ));
+        out.push_str(&format!(
+            "| Encode Duration | {:.3} ms | MEASURED |\n",
+            self.encode_duration_ns as f64 / 1_000_000.0
+        ));
+        out.push_str(&format!(
+            "| Decode Duration | {:.3} ms | MEASURED |\n",
+            self.decode_duration_ns as f64 / 1_000_000.0
+        ));
+        out.push_str(&format!(
+            "| Effective Decode Throughput | {:.2} MB/s | {} |\n",
+            self.decode_throughput_mb_s,
+            if self.decode_throughput_mb_s > 50.0 { "HIGH SPEED" } else { "NOMINAL" }
+        ));
+        out.push_str(&format!(
+            "| Payload Bit-Exact Integrity | 100% Identity Match | {} |\n",
+            if self.bit_exact_recovery_passed { "PASSED" } else { "FAILED" }
+        ));
+        out.push_str(&format!(
+            "| SIMD FEC Evaluation Status | **{}** | **{}** |\n",
+            if self.verification_passed { "PASSED" } else { "FAILED" },
+            if self.verification_passed { "COMPLIANT" } else { "NON-COMPLIANT" }
+        ));
+        out
+    }
+
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"simd_backend\":\"{}\",\"simd_active\":{},\"k_source_count\":{},\"m_parity_count\":{},\"packet_payload_bytes\":{},\"erasures_recovered_count\":{},\"encode_duration_ns\":{},\"decode_duration_ns\":{},\"decode_throughput_mb_s\":{:.2},\"bit_exact_recovery_passed\":{},\"verification_passed\":{}}}",
+            self.simd_backend,
+            self.simd_active,
+            self.k_source_count,
+            self.m_parity_count,
+            self.packet_payload_bytes,
+            self.erasures_recovered_count,
+            self.encode_duration_ns,
+            self.decode_duration_ns,
+            self.decode_throughput_mb_s,
+            self.bit_exact_recovery_passed,
+            self.verification_passed
+        )
+    }
+}
+
+/// Execute end-to-end benchmark verifying SIMD AVX2/NEON syndrome calculation and matrix inversion.
+pub fn run_simd_fec_benchmark() -> SimdFecBenchmarkReport {
+    let mut engine = MultipathFecEngine::new();
+    let flow_id = 999u32;
+    let k = 8;
+    let m = 4;
+    let payload_size = 1400; // Standard MTU payload
+    let now_ns = 10_000_000_000u64;
+
+    // Generate K distinct source packets
+    let mut source_packets = Vec::with_capacity(k);
+    for seq in 0..k {
+        // Deterministic pseudo-random pattern across 1400 bytes
+        let mut payload = vec![0u8; payload_size];
+        for (idx, b) in payload.iter_mut().enumerate() {
+            *b = ((seq * 37 + idx * 73 + 17) & 0xFF) as u8;
+        }
+        source_packets.push(FecDataPacket::new(
+            flow_id,
+            seq as u64,
+            1,
+            FlowSliceClass::MissionCritical,
+            payload,
+            now_ns,
+        ));
+    }
+
+    // Measure encoding of K packets into M parity packets
+    let alternate_subpaths = [101, 102, 103, 104];
+    let t_enc_start = std::time::Instant::now();
+    let parity_packets = MultipathFecEncoder::encode_block(
+        flow_id,
+        0,
+        &source_packets,
+        m,
+        &alternate_subpaths,
+        now_ns,
+    );
+    let encode_duration_ns = t_enc_start.elapsed().as_nanos() as u64;
+
+    assert_eq!(parity_packets.len(), m);
+
+    // Simulate 4 erasures: Drop packets at indices 1, 3, 5, 7
+    let erased_indices = [1, 3, 5, 7];
+    for (i, packet) in source_packets.iter().enumerate().take(k) {
+        if !erased_indices.contains(&i) {
+            let _ = engine.decoder.ingest_data_packet(
+                packet.clone(),
+                0,
+                now_ns + 10_000,
+            );
+        }
+    }
+
+    // Ingest all M parity packets
+    for (idx, p) in parity_packets.iter().enumerate() {
+        if idx < m - 1 {
+            let _ = engine.decoder.ingest_parity_packet(
+                p.clone(),
+                FlowSliceClass::MissionCritical,
+                now_ns + 20_000 + (idx as u64) * 1_000,
+            );
+        }
+    }
+
+    // Trigger decoding with the final parity packet and measure duration
+    let t_dec_start = std::time::Instant::now();
+    let recovered = engine.decoder.ingest_parity_packet(
+        parity_packets[m - 1].clone(),
+        FlowSliceClass::MissionCritical,
+        now_ns + 20_000 + (m as u64) * 1_000,
+    ).expect("Reconstruction of 4 erasures succeeded");
+    let decode_duration_ns = t_dec_start.elapsed().as_nanos() as u64;
+
+    assert_eq!(recovered.len(), erased_indices.len());
+
+    // Verify bit-exact payload match
+    let mut bit_exact = true;
+    for (i, &erased_idx) in erased_indices.iter().enumerate() {
+        if recovered[i].sequence_number != erased_idx as u64 {
+            bit_exact = false;
+        }
+        if recovered[i].payload != source_packets[erased_idx].payload {
+            bit_exact = false;
+        }
+    }
+
+    let total_reconstructed_bytes = (erased_indices.len() * payload_size) as f64;
+    let decode_secs = (decode_duration_ns.max(1) as f64) / 1_000_000_000.0;
+    let decode_throughput_mb_s = (total_reconstructed_bytes / decode_secs) / (1024.0 * 1024.0);
+
+    let backend = get_simd_fec_backend();
+    let is_simd = backend.starts_with("AVX2") || backend.starts_with("NEON");
+
+    SimdFecBenchmarkReport {
+        simd_backend: backend,
+        simd_active: is_simd,
+        k_source_count: k,
+        m_parity_count: m,
+        packet_payload_bytes: payload_size,
+        erasures_recovered_count: recovered.len(),
+        encode_duration_ns,
+        decode_duration_ns,
+        decode_throughput_mb_s,
+        bit_exact_recovery_passed: bit_exact,
+        verification_passed: bit_exact && recovered.len() == 4,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit Tests
 // ---------------------------------------------------------------------------
@@ -1379,6 +1878,110 @@ mod tests {
         let b = 43u8;
         let q = gf_div(a, b);
         assert_eq!(gf_mul(q, b), a);
+    }
+
+    #[test]
+    fn test_const_gf_mul_and_nibble_table_identities() {
+        // Validate const_gf_mul matches runtime gf_mul across all 256x256 combinations
+        for a in 0..=255u8 {
+            for b in 0..=255u8 {
+                let const_prod = const_gf_mul(a, b);
+                let runtime_prod = gf_mul(a, b);
+                assert_eq!(
+                    const_prod, runtime_prod,
+                    "Mismatch for gf_mul({}, {})",
+                    a, b
+                );
+
+                // Verify nibble decomposition identity: a * b == LO[a][b & 0xf] ^ HI[a][b >> 4]
+                let lo = (b & 0x0f) as usize;
+                let hi = ((b >> 4) & 0x0f) as usize;
+                let decomposed = GF_MUL_TABLE_LO[a as usize][lo] ^ GF_MUL_TABLE_HI[a as usize][hi];
+                assert_eq!(
+                    decomposed, runtime_prod,
+                    "Nibble mismatch for a={}, b={}",
+                    a, b
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_matrix_inversion_and_identity() {
+        // 1x1 matrix
+        let m1 = vec![vec![42u8]];
+        let inv1 = invert_gf_matrix(&m1).expect("1x1 inverted");
+        assert_eq!(inv1, vec![vec![gf_inv(42)]]);
+
+        // 3x3 Cauchy submatrix
+        let g = build_cauchy_matrix(4, 4);
+        let m3 = vec![
+            vec![g[0][0], g[0][1], g[0][2]],
+            vec![g[1][0], g[1][1], g[1][2]],
+            vec![g[2][0], g[2][1], g[2][2]],
+        ];
+        let inv3 = invert_gf_matrix(&m3).expect("3x3 Cauchy inverted");
+
+        // Verify M * M^-1 == Identity
+        for i in 0..3 {
+            for j in 0..3 {
+                let mut sum = 0u8;
+                for k in 0..3 {
+                    sum ^= gf_mul(m3[i][k], inv3[k][j]);
+                }
+                let expected = if i == j { 1 } else { 0 };
+                assert_eq!(sum, expected, "Identity check failed at ({}, {})", i, j);
+            }
+        }
+    }
+
+    #[test]
+    fn test_simd_gf_mul_add_slice_matches_scalar() {
+        let test_sizes = [1, 7, 15, 16, 17, 31, 32, 33, 64, 127, 256, 1400];
+        let coeffs = [0, 1, 2, 0x57, 0x83, 255];
+
+        for &len in &test_sizes {
+            for &c in &coeffs {
+                let mut src = vec![0u8; len];
+                for (i, b) in src.iter_mut().enumerate() {
+                    *b = ((i * 31 + 17) & 0xFF) as u8;
+                }
+                let mut dst_simd = vec![0xAAu8; len];
+                let mut dst_scalar = vec![0xAAu8; len];
+
+                // Scalar reference
+                for i in 0..len {
+                    dst_scalar[i] ^= gf_mul(c, src[i]);
+                }
+
+                // Hardware-accelerated SIMD
+                gf_mul_add_slice(&mut dst_simd, &src, c);
+
+                assert_eq!(
+                    dst_simd, dst_scalar,
+                    "Mismatch for len={}, coeff={}",
+                    len, c
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_xor_slice_exactness() {
+        let test_sizes = [1, 5, 8, 15, 16, 23, 32, 63, 64, 128, 1400];
+        for &len in &test_sizes {
+            let mut src = vec![0u8; len];
+            let mut dst = vec![0u8; len];
+            let mut expected = vec![0u8; len];
+            for i in 0..len {
+                src[i] = (i & 0xFF) as u8;
+                dst[i] = ((i * 3 + 7) & 0xFF) as u8;
+                expected[i] = dst[i] ^ src[i];
+            }
+
+            xor_slice(&mut dst, &src);
+            assert_eq!(dst, expected, "xor_slice failed for len={}", len);
+        }
     }
 
     #[test]
@@ -1476,6 +2079,7 @@ mod tests {
         assert!(metrics.contains("ifa_issp_fec_parity_packets_generated_total 1"));
         assert!(metrics.contains("ifa_issp_fec_packets_recovered_total 1"));
         assert!(metrics.contains("ifa_issp_fec_recovery_success_ratio 1.0000"));
+        assert!(metrics.contains("ifa_issp_fec_simd_active"));
     }
 
     #[test]
@@ -1490,6 +2094,25 @@ mod tests {
         let md = report.to_markdown_table();
         assert!(md.contains("URLLC 0-RTT Recovery"));
         assert!(md.contains("Mission-Critical Double Erasure"));
+        assert!(md.contains("PASSED"));
+
+        let json = report.to_json();
+        assert!(json.contains("\"verification_passed\":true"));
+    }
+
+    #[test]
+    fn test_simd_fec_benchmark_suite() {
+        let report = run_simd_fec_benchmark();
+        assert!(report.verification_passed);
+        assert!(report.bit_exact_recovery_passed);
+        assert_eq!(report.k_source_count, 8);
+        assert_eq!(report.m_parity_count, 4);
+        assert_eq!(report.erasures_recovered_count, 4);
+        assert_eq!(report.packet_payload_bytes, 1400);
+
+        let md = report.to_markdown_table();
+        assert!(md.contains("SIMD Acceleration Backend"));
+        assert!(md.contains("Large Block Topology"));
         assert!(md.contains("PASSED"));
 
         let json = report.to_json();

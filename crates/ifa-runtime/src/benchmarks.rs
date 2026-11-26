@@ -3434,7 +3434,10 @@ pub use crate::multi_node_sla::{run_multi_node_sla_benchmark, MultiNodeSlaReport
 pub use crate::multipath_congestion::{
     run_multipath_congestion_benchmark, MultipathCongestionBenchmarkReport,
 };
-pub use crate::multipath_fec::{run_multipath_fec_benchmark, MultipathFecBenchmarkReport};
+pub use crate::multipath_fec::{
+    run_multipath_fec_benchmark, run_simd_fec_benchmark, MultipathFecBenchmarkReport,
+    SimdFecBenchmarkReport,
+};
 pub use crate::multipath_retransmit::{
     run_subpath_retransmit_benchmark, SubpathRetransmitBenchmarkReport,
 };
@@ -4509,5 +4512,23 @@ mod tests {
         assert_eq!(report.saturated_urllc_admitted_packets, 100);
         assert_eq!(report.saturated_best_effort_preempted_packets, 100);
         assert!(report.restored_best_effort_admitted_packets > 0);
+    }
+
+    #[test]
+    fn test_simd_fec_benchmark_suite_runs() {
+        let report = run_simd_fec_benchmark();
+        assert!(report.verification_passed);
+        assert!(report.bit_exact_recovery_passed);
+        assert_eq!(report.k_source_count, 8);
+        assert_eq!(report.m_parity_count, 4);
+        assert_eq!(report.erasures_recovered_count, 4);
+        assert_eq!(report.packet_payload_bytes, 1400);
+
+        let md = report.to_markdown_table();
+        assert!(md.contains("SIMD Acceleration Backend"));
+        assert!(md.contains("PASSED"));
+
+        let json = report.to_json();
+        assert!(json.contains("\"verification_passed\":true"));
     }
 }

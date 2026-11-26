@@ -122,10 +122,11 @@ pub use multipath_congestion::{
     LEDBAT_DEFAULT_TARGET_DELAY_US, MIN_CWND_BYTES, TCP_MSS_BYTES,
 };
 pub use multipath_fec::{
-    build_cauchy_matrix, gf_add, gf_div, gf_inv, gf_mul, gf_sub, run_multipath_fec_benchmark,
-    solve_gf_linear_system, FecDataPacket, FecParityPacket, FecProfile, FecUnrecoverableGapEvent,
-    MultipathFecBenchmarkReport, MultipathFecDecoder, MultipathFecEncoder, MultipathFecEngine,
-    MultipathFecTelemetrySummary,
+    build_cauchy_matrix, const_gf_mul, get_simd_fec_backend, gf_add, gf_div, gf_inv, gf_mul,
+    gf_mul_add_slice, gf_sub, invert_gf_matrix, run_multipath_fec_benchmark,
+    run_simd_fec_benchmark, solve_gf_linear_system, xor_slice, FecDataPacket, FecParityPacket,
+    FecProfile, FecUnrecoverableGapEvent, MultipathFecBenchmarkReport, MultipathFecDecoder,
+    MultipathFecEncoder, MultipathFecEngine, MultipathFecTelemetrySummary, SimdFecBenchmarkReport,
 };
 pub use multipath_retransmit::{
     run_subpath_retransmit_benchmark, select_priority_fallback_subpath, InflightPacketRecord,
