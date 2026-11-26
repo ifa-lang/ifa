@@ -28,6 +28,7 @@ pub mod session_sync;
 pub mod simd_classifier;
 pub mod slice_resilience;
 pub mod string;
+pub mod subpath_pmtud;
 pub mod subpath_scheduler;
 pub mod telemetry;
 pub mod telemetry_queue;
@@ -205,6 +206,16 @@ pub use slice_resilience::{
     SliceResilienceMetrics, SubpathProbationTracker,
 };
 pub use string::IfaString;
+pub use subpath_pmtud::{
+    calculate_crc32, run_subpath_pmtud_and_fragmentation_benchmark, AdaptiveFragmenter,
+    AdaptiveReassembler, FrameFragment, PmtuProbeAck, PmtuProbePacket, PmtudState,
+    PmtudTelemetrySummary, ReassembledFrame, SubpathPmtudBenchmarkReport, SubpathPmtuConfig,
+    SubpathPmtuManager, SubpathPmtuMetrics, SubpathPmtuTracker, UnfragmentedFrame,
+    DEFAULT_MTU_LADDER, ENCAPSULATED_TUNNEL_MTU, ETHERNET_STANDARD_MTU, FLAG_LAST_FRAGMENT,
+    FLAG_RETRANSMITTED, FLAG_URLLC_PRIORITIZED, FRAGMENT_HEADER_SIZE, IFA_FRAGMENT_MAGIC,
+    IFA_PMTU_ACK_MAGIC, IFA_PMTU_PROBE_MAGIC, IPV6_MIN_MTU, JUMBO_FRAME_MTU,
+    MAX_UNFRAGMENTED_FRAME_SIZE,
+};
 pub use subpath_scheduler::{
     run_subpath_scheduler_benchmark, EnqueueVerdict, ScheduledPacket, SubpathDeficitScheduler,
     SubpathQueuedPacket, SubpathSchedulerBenchmarkReport, SubpathSchedulerGroup, SubpathSliceQueue,

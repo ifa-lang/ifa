@@ -3453,6 +3453,9 @@ pub use crate::reorder_engine::{
     run_multipath_reordering_benchmark, MultipathReorderingBenchmarkReport,
 };
 pub use crate::slice_resilience::{run_slice_resilience_benchmark, SliceResilienceBenchmarkReport};
+pub use crate::subpath_pmtud::{
+    run_subpath_pmtud_and_fragmentation_benchmark, SubpathPmtudBenchmarkReport,
+};
 pub use crate::subpath_scheduler::{
     run_subpath_scheduler_benchmark, SubpathSchedulerBenchmarkReport,
 };
@@ -4580,5 +4583,30 @@ mod tests {
         let json = report.to_json();
         assert!(json.contains("\"total_packets\": 50"));
         assert!(json.contains("\"zero_loss_achieved\": true"));
+    }
+
+    #[test]
+    fn test_subpath_pmtud_and_adaptive_fragmentation_benchmark_suite_runs() {
+        let report = run_subpath_pmtud_and_fragmentation_benchmark(50);
+        assert_eq!(report.total_frames, 50);
+        assert!(report.total_fragments >= 50);
+        assert_eq!(report.jumbo_subpath_converged_pmtu, 9000);
+        assert_eq!(report.standard_subpath_converged_pmtu, 1500);
+        assert_eq!(report.tunnel_subpath_converged_pmtu, 1420);
+        assert_eq!(report.satellite_subpath_converged_pmtu, 1280);
+        assert!(report.black_hole_detected_and_recovered);
+        assert!(report.zero_truncation_verified);
+        assert_eq!(report.bit_exact_integrity_ratio, 1.0);
+        assert!(report.fragmentation_throughput_mb_sec > 0.0);
+
+        let md = report.telemetry_summary.to_markdown_table();
+        assert!(md.contains("Dynamic Subpath PMTUD & Adaptive Fragmentation Audit Report"));
+        assert!(md.contains("PASSED"));
+
+        let json = report.telemetry_summary.to_json();
+        assert!(json.contains("\"zero_truncation_ratio\": 1.000000"));
+
+        let prom = report.telemetry_summary.export_prometheus_metrics();
+        assert!(prom.contains("ifa_subpath_current_pmtu_bytes"));
     }
 }
