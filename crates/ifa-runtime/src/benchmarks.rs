@@ -4625,4 +4625,21 @@ mod tests {
         assert!(md.contains("Dynamic PMTU/BDP Multipath Router & Lossless Failover Report"));
         assert!(md.contains("PASSED"));
     }
+
+    #[test]
+    fn test_connection_migration_benchmark_suite_runs() {
+        let report = crate::connection_migration::run_connection_migration_benchmark(10);
+        assert_eq!(report.total_migrations_executed, 10);
+        assert!(report.total_packets_reordered >= 20);
+        assert!(report.zero_loss_achieved);
+        assert!(report.sequence_continuity_preserved);
+        assert!(report.anti_amplification_verified);
+
+        let md = report.to_markdown_table();
+        assert!(md.contains("MP-QUIC Connection Migration & Dynamic Rebinding Benchmark Report"));
+        assert!(md.contains("PASSED"));
+
+        let json = report.to_json();
+        assert!(json.contains("\"migrations_completed\": 10"));
+    }
 }

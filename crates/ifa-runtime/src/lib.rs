@@ -5,6 +5,7 @@ pub mod benchmarks;
 pub mod blocking;
 pub mod burst_loss_eval;
 pub mod collections;
+pub mod connection_migration;
 pub mod cost_gradient;
 pub mod crypto_overhead_rekey;
 pub mod ffi;
@@ -65,6 +66,12 @@ pub use blocking::{
     GLOBAL_BLOCKING_POOL,
 };
 pub use collections::{IfaList, IfaMap};
+pub use connection_migration::{
+    run_connection_migration_benchmark, AntiAmplificationTracker, ConnectionId,
+    ConnectionMigrationBenchmarkReport, ConnectionMigrationEngine, ConnectionMigrationRecord,
+    MigrationCompletion, MigrationError, MigrationTrigger, PathChallenge, PathResponse,
+    PathValidationStatus, SocketAddress,
+};
 pub use cost_gradient::{
     CostGradientConfig, CostGradientLoadBalancer, CostGradientMetrics, CostGradientRebalanceAction,
     CostGradientRebalancePlan, CostGradientWeights, SubpathCostGradient,
