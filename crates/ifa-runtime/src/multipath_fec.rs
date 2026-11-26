@@ -1939,6 +1939,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn test_matrix_inversion_and_identity() {
         // 1x1 matrix
         let m1 = vec![vec![42u8]];
