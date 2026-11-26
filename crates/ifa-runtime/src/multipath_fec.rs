@@ -967,7 +967,10 @@ impl DecoderBlockState {
                     recovered_symbol[1] ^= (len & 0xFF) as u8;
                 }
                 let copy_len = len.min(recovered_symbol.len().saturating_sub(2));
-                xor_slice(&mut recovered_symbol[2..2 + copy_len], &p.payload[..copy_len]);
+                xor_slice(
+                    &mut recovered_symbol[2..2 + copy_len],
+                    &p.payload[..copy_len],
+                );
             }
 
             let actual_len = if recovered_symbol.len() >= 2 {
@@ -1059,7 +1062,11 @@ impl DecoderBlockState {
                         s_i[1] ^= gf_mul(coeff, (len & 0xFF) as u8);
                     }
                     let payload_len = len.min(max_len.saturating_sub(2));
-                    gf_mul_add_slice(&mut s_i[2..2 + payload_len], &pkt.payload[..payload_len], coeff);
+                    gf_mul_add_slice(
+                        &mut s_i[2..2 + payload_len],
+                        &pkt.payload[..payload_len],
+                        coeff,
+                    );
                 }
                 syndromes.push(s_i);
             }
@@ -1390,7 +1397,11 @@ impl MultipathFecEngine {
         out.push_str(&format!(
             "ifa_issp_fec_simd_active{{backend=\"{}\"}} {}\n",
             summary.simd_backend,
-            if summary.simd_acceleration_active { 1 } else { 0 }
+            if summary.simd_acceleration_active {
+                1
+            } else {
+                0
+            }
         ));
 
         out
@@ -1687,7 +1698,11 @@ impl SimdFecBenchmarkReport {
         out.push_str(&format!(
             "| SIMD Acceleration Backend | `{}` | {} |\n",
             self.simd_backend,
-            if self.simd_active { "ACTIVE" } else { "FALLBACK" }
+            if self.simd_active {
+                "ACTIVE"
+            } else {
+                "FALLBACK"
+            }
         ));
         out.push_str(&format!(
             "| Large Block Topology | K={}, M={} ({} bytes/pkt) | CONFIGURED |\n",
@@ -1708,16 +1723,32 @@ impl SimdFecBenchmarkReport {
         out.push_str(&format!(
             "| Effective Decode Throughput | {:.2} MB/s | {} |\n",
             self.decode_throughput_mb_s,
-            if self.decode_throughput_mb_s > 50.0 { "HIGH SPEED" } else { "NOMINAL" }
+            if self.decode_throughput_mb_s > 50.0 {
+                "HIGH SPEED"
+            } else {
+                "NOMINAL"
+            }
         ));
         out.push_str(&format!(
             "| Payload Bit-Exact Integrity | 100% Identity Match | {} |\n",
-            if self.bit_exact_recovery_passed { "PASSED" } else { "FAILED" }
+            if self.bit_exact_recovery_passed {
+                "PASSED"
+            } else {
+                "FAILED"
+            }
         ));
         out.push_str(&format!(
             "| SIMD FEC Evaluation Status | **{}** | **{}** |\n",
-            if self.verification_passed { "PASSED" } else { "FAILED" },
-            if self.verification_passed { "COMPLIANT" } else { "NON-COMPLIANT" }
+            if self.verification_passed {
+                "PASSED"
+            } else {
+                "FAILED"
+            },
+            if self.verification_passed {
+                "COMPLIANT"
+            } else {
+                "NON-COMPLIANT"
+            }
         ));
         out
     }
@@ -1786,11 +1817,9 @@ pub fn run_simd_fec_benchmark() -> SimdFecBenchmarkReport {
     let erased_indices = [1, 3, 5, 7];
     for (i, packet) in source_packets.iter().enumerate().take(k) {
         if !erased_indices.contains(&i) {
-            let _ = engine.decoder.ingest_data_packet(
-                packet.clone(),
-                0,
-                now_ns + 10_000,
-            );
+            let _ = engine
+                .decoder
+                .ingest_data_packet(packet.clone(), 0, now_ns + 10_000);
         }
     }
 
@@ -1807,11 +1836,14 @@ pub fn run_simd_fec_benchmark() -> SimdFecBenchmarkReport {
 
     // Trigger decoding with the final parity packet and measure duration
     let t_dec_start = std::time::Instant::now();
-    let recovered = engine.decoder.ingest_parity_packet(
-        parity_packets[m - 1].clone(),
-        FlowSliceClass::MissionCritical,
-        now_ns + 20_000 + (m as u64) * 1_000,
-    ).expect("Reconstruction of 4 erasures succeeded");
+    let recovered = engine
+        .decoder
+        .ingest_parity_packet(
+            parity_packets[m - 1].clone(),
+            FlowSliceClass::MissionCritical,
+            now_ns + 20_000 + (m as u64) * 1_000,
+        )
+        .expect("Reconstruction of 4 erasures succeeded");
     let decode_duration_ns = t_dec_start.elapsed().as_nanos() as u64;
 
     assert_eq!(recovered.len(), erased_indices.len());
