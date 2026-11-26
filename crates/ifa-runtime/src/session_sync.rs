@@ -3520,6 +3520,43 @@ impl IsspDynamicMultipathRouter {
         self.ingress_gatekeeper.apply_backpressure(signal, now_ns)
     }
 
+    /// Couple active multi-node telemetry synthesis with the ingress admission gatekeeper,
+    /// triggering automated preemption of non-priority flows when global saturation is detected.
+    pub fn synchronize_active_telemetry_preemption(
+        &mut self,
+        tick: u64,
+        now_ns: u64,
+    ) -> crate::multi_node_sla::ClosedLoopAdaptationResult {
+        let adaptation = self.multi_node_sla.evaluate_and_adapt(tick);
+
+        for action in &adaptation.actions_triggered {
+            match action {
+                crate::multi_node_sla::ClosedLoopControlAction::GlobalSaturationPreemption {
+                    ..
+                } => {
+                    self.ingress_gatekeeper
+                        .apply_preemption_action(action, now_ns);
+                }
+                crate::multi_node_sla::ClosedLoopControlAction::UpstreamBackpressureSignal {
+                    ..
+                } => {
+                    self.apply_closed_loop_backpressure(action, now_ns);
+                }
+                crate::multi_node_sla::ClosedLoopControlAction::AggressiveRateThrottling {
+                    ..
+                } => {}
+                crate::multi_node_sla::ClosedLoopControlAction::DedicatedSubpathIsolation {
+                    ..
+                } => {}
+                crate::multi_node_sla::ClosedLoopControlAction::CapacityHeadroomReservation {
+                    ..
+                } => {}
+            }
+        }
+
+        adaptation
+    }
+
     /// Process packet admission at the ingress gatekeeper before scheduling.
     pub fn admit_ingress_packet(
         &mut self,
@@ -8873,5 +8910,88 @@ mod tests {
         assert_eq!(summary.total_retransmissions_dispatched, 1);
         assert_eq!(summary.total_fallback_switches, 1);
         assert_eq!(summary.active_inflight_packets, 0);
+    }
+
+    #[test]
+    fn test_router_active_telemetry_preemption_coupling() {
+        use crate::multi_node_sla::MultiNodeSliceTelemetryRecord;
+        use crate::traffic_slicing::FlowSliceClass;
+
+        let mut router =
+            IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::BandwidthAggregation);
+        let now_ns = 1_000_000_000;
+
+        // Ingest severely congested multi-node telemetry on subpath 10 causing critical URLLC violation
+        router
+            .multi_node_sla_mut()
+            .ingest_telemetry(MultiNodeSliceTelemetryRecord {
+                node_id: 1,
+                timestamp_ns: now_ns,
+                subpath_id: 10,
+                slice_class: FlowSliceClass::UltraLowLatency,
+                packets_transmitted: 1000,
+                packets_lost: 25,
+                bytes_transmitted: 150_000,
+                avg_rtt_ns: 12_000_000, // Violates 5ms SLA
+                p99_rtt_ns: 20_000_000,
+                jitter_ns: 4_000_000,
+                queuing_delay_ns: 6_000_000, // High queuing delay
+                active_flows: 5,
+                allocated_bandwidth_bps: 5_000_000,
+            });
+
+        router
+            .multi_node_sla_mut()
+            .ingest_telemetry(MultiNodeSliceTelemetryRecord {
+                node_id: 1,
+                timestamp_ns: now_ns,
+                subpath_id: 10,
+                slice_class: FlowSliceClass::BestEffort,
+                packets_transmitted: 50_000,
+                packets_lost: 100,
+                bytes_transmitted: 60_000_000,
+                avg_rtt_ns: 50_000_000,
+                p99_rtt_ns: 80_000_000,
+                jitter_ns: 15_000_000,
+                queuing_delay_ns: 25_000_000,
+                active_flows: 50,
+                allocated_bandwidth_bps: 95_000_000,
+            });
+
+        // Trigger active coupling cycle
+        let adaptation = router.synchronize_active_telemetry_preemption(1, now_ns);
+        assert!(!adaptation.actions_triggered.is_empty());
+
+        // Verify preemption is active on ingress gatekeeper
+        assert!(router.ingress_gatekeeper().is_preemption_active(now_ns));
+        assert_eq!(
+            router.ingress_gatekeeper().preemption_severity(now_ns),
+            crate::multi_node_sla::SaturationSeverity::Critical
+        );
+
+        // Verify BestEffort packet is immediately preempted/rejected
+        let be_decision = router.admit_ingress_packet(FlowSliceClass::BestEffort, 1200, now_ns);
+        assert_eq!(
+            be_decision,
+            crate::ingress_admission::AdmissionDecision::Rejected {
+                reason:
+                    crate::ingress_admission::IngressRejectionReason::PreemptedForPriorityTraffic
+            }
+        );
+
+        // Verify URLLC packet is admitted without obstacle
+        let urllc_decision =
+            router.admit_ingress_packet(FlowSliceClass::UltraLowLatency, 128, now_ns);
+        assert_eq!(
+            urllc_decision,
+            crate::ingress_admission::AdmissionDecision::Admitted
+        );
+
+        // Verify balancing snapshot exposes preemption state
+        let snap = router.balancing_snapshot(now_ns);
+        assert!(snap.preemption_active);
+        assert_eq!(snap.preemption_severity, 3); // Critical
+        assert_eq!(snap.total_ingress_preempted_packets, 1);
+        assert_eq!(snap.total_ingress_preempted_bytes, 1200);
     }
 }

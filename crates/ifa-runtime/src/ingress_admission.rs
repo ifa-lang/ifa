@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::string::String;
 
-use crate::multi_node_sla::ClosedLoopControlAction;
+use crate::multi_node_sla::{ClosedLoopControlAction, SaturationSeverity};
 use crate::traffic_slicing::FlowSliceClass;
 
 /// Reason an ingress packet or flow was rejected at the gate.
@@ -23,6 +23,8 @@ pub enum IngressRejectionReason {
     StrictBackpressureSaturation,
     /// Slice is administratively suspended or at zero capacity.
     SliceSuspended,
+    /// Non-priority flow preempted to guarantee bandwidth and zero-queuing headroom for priority traffic.
+    PreemptedForPriorityTraffic,
 }
 
 impl IngressRejectionReason {
@@ -31,6 +33,7 @@ impl IngressRejectionReason {
             Self::TokenBucketExhausted => "token_bucket_exhausted",
             Self::StrictBackpressureSaturation => "strict_backpressure_saturation",
             Self::SliceSuspended => "slice_suspended",
+            Self::PreemptedForPriorityTraffic => "preempted_for_priority_traffic",
         }
     }
 }
@@ -60,6 +63,25 @@ pub struct ActiveBackpressure {
 
 impl ActiveBackpressure {
     /// Whether this backpressure record has expired.
+    pub fn is_expired(&self, now_ns: u64) -> bool {
+        now_ns >= self.received_timestamp_ns.saturating_add(self.ttl_ns)
+    }
+}
+
+/// Active global saturation preemption state applied across ingress flows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivePreemptionState {
+    pub initiator_node_id: u32,
+    pub severity: SaturationSeverity,
+    pub preempted_slices: Vec<FlowSliceClass>,
+    pub rate_multiplier_permille: u32,
+    pub received_timestamp_ns: u64,
+    pub ttl_ns: u64,
+    pub guaranteed_priority_headroom_pct: u8,
+}
+
+impl ActivePreemptionState {
+    /// Whether this preemption state has expired.
     pub fn is_expired(&self, now_ns: u64) -> bool {
         now_ns >= self.received_timestamp_ns.saturating_add(self.ttl_ns)
     }
@@ -170,6 +192,7 @@ pub struct IngressAdmissionConfig {
     pub default_rates: BTreeMap<FlowSliceClass, u64>,
     pub burst_depth_ms: u32,
     pub backpressure_ttl_ns: u64,
+    pub preemption_ttl_ns: u64,
     pub priority_protection_enabled: bool,
     pub min_clamped_rate_bps: u64,
 }
@@ -186,6 +209,7 @@ impl Default for IngressAdmissionConfig {
             default_rates,
             burst_depth_ms: 50,                 // 50 ms burst allowance
             backpressure_ttl_ns: 1_000_000_000, // 1 second TTL
+            preemption_ttl_ns: 2_000_000_000,   // 2 seconds preemption TTL
             priority_protection_enabled: true,
             min_clamped_rate_bps: 1_000_000, // 1 Mbps minimum clamp
         }
@@ -200,6 +224,10 @@ pub struct IngressAdmissionMetrics {
     pub total_throttled_packets: u64,
     pub total_throttled_bytes: u64,
     pub total_rejected_packets: u64,
+    pub total_preempted_packets: u64,
+    pub total_preempted_bytes: u64,
+    pub total_preemption_triggers: u64,
+    pub total_preemptions_expired: u64,
     pub total_backpressures_received: u64,
     pub total_backpressures_expired: u64,
     pub total_rate_restorations: u64,
@@ -212,6 +240,7 @@ pub struct IngressAdmissionGatekeeper {
     config: IngressAdmissionConfig,
     token_buckets: BTreeMap<FlowSliceClass, SliceTokenBucket>,
     active_backpressures: BTreeMap<(u32, FlowSliceClass), ActiveBackpressure>,
+    active_preemption: Option<ActivePreemptionState>,
     metrics: IngressAdmissionMetrics,
 }
 
@@ -232,6 +261,7 @@ impl IngressAdmissionGatekeeper {
             config,
             token_buckets,
             active_backpressures: BTreeMap::new(),
+            active_preemption: None,
             metrics: IngressAdmissionMetrics::default(),
         }
     }
@@ -249,6 +279,65 @@ impl IngressAdmissionGatekeeper {
     /// Access reference to metrics.
     pub fn metrics(&self) -> &IngressAdmissionMetrics {
         &self.metrics
+    }
+
+    /// Read active preemption state if currently engaged.
+    pub fn active_preemption(&self) -> Option<&ActivePreemptionState> {
+        self.active_preemption.as_ref()
+    }
+
+    /// Whether global saturation preemption is currently active.
+    pub fn is_preemption_active(&self, now_ns: u64) -> bool {
+        match &self.active_preemption {
+            Some(p) => !p.is_expired(now_ns),
+            None => false,
+        }
+    }
+
+    /// Read active preemption severity level.
+    pub fn preemption_severity(&self, now_ns: u64) -> SaturationSeverity {
+        if self.is_preemption_active(now_ns) {
+            self.active_preemption
+                .as_ref()
+                .map(|p| p.severity)
+                .unwrap_or(SaturationSeverity::Normal)
+        } else {
+            SaturationSeverity::Normal
+        }
+    }
+
+    /// Apply an automated global saturation preemption action from multi-node telemetry.
+    pub fn apply_preemption_action(
+        &mut self,
+        action: &ClosedLoopControlAction,
+        now_ns: u64,
+    ) -> bool {
+        if let ClosedLoopControlAction::GlobalSaturationPreemption {
+            initiator_node_id,
+            severity,
+            preempted_slices,
+            rate_multiplier_permille,
+            guaranteed_priority_headroom_pct,
+        } = action
+        {
+            self.metrics.total_preemption_triggers =
+                self.metrics.total_preemption_triggers.saturating_add(1);
+
+            self.active_preemption = Some(ActivePreemptionState {
+                initiator_node_id: *initiator_node_id,
+                severity: *severity,
+                preempted_slices: preempted_slices.clone(),
+                rate_multiplier_permille: *rate_multiplier_permille,
+                received_timestamp_ns: now_ns,
+                ttl_ns: self.config.preemption_ttl_ns,
+                guaranteed_priority_headroom_pct: *guaranteed_priority_headroom_pct,
+            });
+
+            self.recalculate_effective_rates(now_ns);
+            true
+        } else {
+            false
+        }
     }
 
     /// Ingest and apply an upstream backpressure action received from a downstream node.
@@ -306,8 +395,41 @@ impl IngressAdmissionGatekeeper {
         removed
     }
 
+    /// Prune expired preemption state and smoothly restore ingress rates.
+    pub fn prune_expired_preemption(&mut self, now_ns: u64) -> bool {
+        if let Some(ref preemption) = self.active_preemption {
+            if preemption.is_expired(now_ns) {
+                self.active_preemption = None;
+                self.metrics.total_preemptions_expired =
+                    self.metrics.total_preemptions_expired.saturating_add(1);
+                self.metrics.total_rate_restorations =
+                    self.metrics.total_rate_restorations.saturating_add(1);
+                self.recalculate_effective_rates(now_ns);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Recalculate effective token bucket rate caps across all slices.
     fn recalculate_effective_rates(&mut self, now_ns: u64) {
+        let is_preempted = self
+            .active_preemption
+            .as_ref()
+            .map(|p| !p.is_expired(now_ns))
+            .unwrap_or(false);
+
+        let (preempted_slices, permille, headroom_pct) = if is_preempted {
+            let p = self.active_preemption.as_ref().unwrap();
+            (
+                p.preempted_slices.clone(),
+                p.rate_multiplier_permille,
+                p.guaranteed_priority_headroom_pct,
+            )
+        } else {
+            (Vec::new(), 1000, 0)
+        };
+
         for (&slice, bucket) in &mut self.token_buckets {
             bucket.replenish(now_ns);
 
@@ -322,7 +444,33 @@ impl IngressAdmissionGatekeeper {
                 }
             }
 
-            if let Some(rate_cap) = min_recommended_rate {
+            // Check if slice is directly targeted by active preemption
+            let slice_preempted = is_preempted && preempted_slices.contains(&slice);
+
+            if slice_preempted {
+                if permille == 0 {
+                    // Total preemption: zero rate cap and drain token credit
+                    bucket.effective_rate_bps = 0;
+                    bucket.current_tokens_bytes = 0.0;
+                    bucket.burst_bytes = 1500;
+                } else {
+                    let nominal = bucket.configured_rate_bps;
+                    let preempted_rate = (nominal * permille as u64) / 1000;
+                    let clamped = if let Some(rate_cap) = min_recommended_rate {
+                        rate_cap.min(preempted_rate)
+                    } else {
+                        preempted_rate
+                    }
+                    .max(self.config.min_clamped_rate_bps);
+
+                    bucket.effective_rate_bps = clamped;
+                    let clamped_burst =
+                        ((clamped / 8) * (self.config.burst_depth_ms as u64) / 1000).max(1500);
+                    bucket.burst_bytes = clamped_burst;
+                    bucket.current_tokens_bytes =
+                        bucket.current_tokens_bytes.min(clamped_burst as f64);
+                }
+            } else if let Some(rate_cap) = min_recommended_rate {
                 // Priority slices are protected: cannot be throttled by bulk backpressure
                 if self.config.priority_protection_enabled
                     && matches!(
@@ -331,6 +479,12 @@ impl IngressAdmissionGatekeeper {
                     )
                 {
                     bucket.effective_rate_bps = bucket.configured_rate_bps;
+                    let extra_headroom_factor = 1.0 + (headroom_pct as f64 / 100.0);
+                    let nominal_burst = ((bucket.configured_rate_bps / 8)
+                        * (self.config.burst_depth_ms as u64)
+                        / 1000)
+                        .max(1500);
+                    bucket.burst_bytes = (nominal_burst as f64 * extra_headroom_factor) as u64;
                 } else {
                     let clamped = rate_cap.min(bucket.configured_rate_bps);
                     bucket.effective_rate_bps = clamped;
@@ -342,10 +496,19 @@ impl IngressAdmissionGatekeeper {
                 }
             } else {
                 bucket.effective_rate_bps = bucket.configured_rate_bps;
+                let extra_headroom_factor = if matches!(
+                    slice,
+                    FlowSliceClass::UltraLowLatency | FlowSliceClass::MissionCritical
+                ) && is_preempted
+                {
+                    1.0 + (headroom_pct as f64 / 100.0)
+                } else {
+                    1.0
+                };
                 let nominal_burst =
                     ((bucket.configured_rate_bps / 8) * (self.config.burst_depth_ms as u64) / 1000)
                         .max(1500);
-                bucket.burst_bytes = nominal_burst;
+                bucket.burst_bytes = (nominal_burst as f64 * extra_headroom_factor) as u64;
             }
         }
     }
@@ -359,6 +522,28 @@ impl IngressAdmissionGatekeeper {
     ) -> AdmissionDecision {
         // Auto-prune on packet ingestion if expired entries exist
         self.prune_expired_backpressures(now_ns);
+        self.prune_expired_preemption(now_ns);
+
+        // Check if slice is currently preempted with 0 permille multiplier
+        if self.is_preemption_active(now_ns) {
+            if let Some(ref preemption) = self.active_preemption {
+                if preemption.preempted_slices.contains(&slice)
+                    && preemption.rate_multiplier_permille == 0
+                {
+                    self.metrics.total_preempted_packets =
+                        self.metrics.total_preempted_packets.saturating_add(1);
+                    self.metrics.total_preempted_bytes = self
+                        .metrics
+                        .total_preempted_bytes
+                        .saturating_add(packet_bytes as u64);
+                    self.metrics.total_rejected_packets =
+                        self.metrics.total_rejected_packets.saturating_add(1);
+                    return AdmissionDecision::Rejected {
+                        reason: IngressRejectionReason::PreemptedForPriorityTraffic,
+                    };
+                }
+            }
+        }
 
         let decision = if let Some(bucket) = self.token_buckets.get_mut(&slice) {
             bucket.try_consume(packet_bytes, now_ns)
@@ -500,6 +685,59 @@ impl IngressAdmissionGatekeeper {
 
         let _ = writeln!(
             out,
+            "# HELP ifa_ingress_preempted_packets_total Total non-priority packets preempted for priority traffic"
+        );
+        let _ = writeln!(out, "# TYPE ifa_ingress_preempted_packets_total counter");
+        let _ = writeln!(
+            out,
+            "ifa_ingress_preempted_packets_total{{node=\"{}\"}} {}",
+            self.local_node_id, self.metrics.total_preempted_packets
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP ifa_ingress_preempted_bytes_total Total non-priority bytes preempted for priority traffic"
+        );
+        let _ = writeln!(out, "# TYPE ifa_ingress_preempted_bytes_total counter");
+        let _ = writeln!(
+            out,
+            "ifa_ingress_preempted_bytes_total{{node=\"{}\"}} {}",
+            self.local_node_id, self.metrics.total_preempted_bytes
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP ifa_ingress_preemption_severity Active preemption severity level (0: normal, 1: elevated, 2: severe, 3: critical)"
+        );
+        let _ = writeln!(out, "# TYPE ifa_ingress_preemption_severity gauge");
+        let _ = writeln!(
+            out,
+            "ifa_ingress_preemption_severity{{node=\"{}\"}} {}",
+            self.local_node_id,
+            self.active_preemption
+                .as_ref()
+                .map(|p| p.severity as u8)
+                .unwrap_or(0)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP ifa_ingress_preemption_active Whether global saturation preemption is currently active (1 or 0)"
+        );
+        let _ = writeln!(out, "# TYPE ifa_ingress_preemption_active gauge");
+        let _ = writeln!(
+            out,
+            "ifa_ingress_preemption_active{{node=\"{}\"}} {}",
+            self.local_node_id,
+            if self.active_preemption.is_some() {
+                1
+            } else {
+                0
+            }
+        );
+
+        let _ = writeln!(
+            out,
             "# HELP ifa_ingress_active_backpressures Current count of active downstream backpressures"
         );
         let _ = writeln!(out, "# TYPE ifa_ingress_active_backpressures gauge");
@@ -632,6 +870,111 @@ pub fn run_ingress_admission_benchmark() -> IngressAdmissionBenchmarkReport {
         backpressure_signals_applied: gatekeeper.metrics().total_backpressures_received,
         rate_restorations_completed: gatekeeper.metrics().total_rate_restorations,
         final_effective_embb_rate_bps: restored_rate,
+    }
+}
+
+/// Comprehensive report produced by the automated preemptive ingress admission benchmark.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreemptiveAdmissionBenchmarkReport {
+    pub nominal_urllc_admitted_packets: u64,
+    pub nominal_best_effort_admitted_packets: u64,
+    pub saturated_best_effort_preempted_packets: u64,
+    pub saturated_best_effort_preempted_bytes: u64,
+    pub saturated_urllc_admitted_packets: u64,
+    pub restored_best_effort_admitted_packets: u64,
+    pub preemption_severity_applied: SaturationSeverity,
+    pub preemption_triggers_count: u64,
+    pub rate_restorations_completed: u64,
+    pub priority_preservation_success: bool,
+}
+
+/// Automated benchmark validating active telemetry coupling and preemptive flow shedding during global saturation.
+pub fn run_preemptive_admission_benchmark() -> PreemptiveAdmissionBenchmarkReport {
+    let mut gatekeeper = IngressAdmissionGatekeeper::default_for_node(1);
+    let mut now_ns = 1_000_000_000; // Start at 1.0s
+
+    // Phase 1: Nominal operation (no saturation)
+    let mut nominal_urllc = 0;
+    let mut nominal_be = 0;
+    for _ in 0..100 {
+        if gatekeeper.admit_packet(FlowSliceClass::UltraLowLatency, 128, now_ns)
+            == AdmissionDecision::Admitted
+        {
+            nominal_urllc += 1;
+        }
+        if gatekeeper.admit_packet(FlowSliceClass::BestEffort, 1200, now_ns)
+            == AdmissionDecision::Admitted
+        {
+            nominal_be += 1;
+        }
+        now_ns += 1_000_000; // 1ms advance
+    }
+
+    // Phase 2: Global saturation strikes multi-node mesh (critical severity)
+    // Multi-node telemetry synthesizer generates GlobalSaturationPreemption action
+    let preemption_action = ClosedLoopControlAction::GlobalSaturationPreemption {
+        initiator_node_id: 1,
+        severity: SaturationSeverity::Critical,
+        preempted_slices: vec![FlowSliceClass::BestEffort, FlowSliceClass::HighThroughput],
+        rate_multiplier_permille: 0, // BestEffort totally preempted
+        guaranteed_priority_headroom_pct: 50,
+    };
+    gatekeeper.apply_preemption_action(&preemption_action, now_ns);
+
+    // Phase 3: Traffic under active global saturation
+    let mut saturated_urllc = 0;
+    let mut saturated_be_preempted = 0;
+    let mut saturated_be_preempted_bytes = 0;
+
+    for _ in 0..100 {
+        // URLLC packets must be 100% admitted with protected headroom
+        let urllc_dec = gatekeeper.admit_packet(FlowSliceClass::UltraLowLatency, 128, now_ns);
+        if urllc_dec == AdmissionDecision::Admitted {
+            saturated_urllc += 1;
+        }
+
+        // BestEffort packets must be rejected with PreemptedForPriorityTraffic
+        let be_dec = gatekeeper.admit_packet(FlowSliceClass::BestEffort, 1200, now_ns);
+        if let AdmissionDecision::Rejected { reason } = be_dec {
+            if reason == IngressRejectionReason::PreemptedForPriorityTraffic {
+                saturated_be_preempted += 1;
+                saturated_be_preempted_bytes += 1200;
+            }
+        }
+        now_ns += 1_000_000;
+    }
+
+    // Phase 4: Advance time past preemption TTL (TTL is 2.0s)
+    now_ns += 2_500_000_000; // advance 2.5s
+    gatekeeper.prune_expired_preemption(now_ns);
+
+    // Phase 5: Restored operation
+    let mut restored_be = 0;
+    for _ in 0..50 {
+        if gatekeeper.admit_packet(FlowSliceClass::BestEffort, 1200, now_ns)
+            == AdmissionDecision::Admitted
+        {
+            restored_be += 1;
+        }
+        now_ns += 1_000_000;
+    }
+
+    let priority_preservation_success = nominal_urllc == 100
+        && saturated_urllc == 100
+        && saturated_be_preempted == 100
+        && restored_be > 0;
+
+    PreemptiveAdmissionBenchmarkReport {
+        nominal_urllc_admitted_packets: nominal_urllc,
+        nominal_best_effort_admitted_packets: nominal_be,
+        saturated_best_effort_preempted_packets: saturated_be_preempted,
+        saturated_best_effort_preempted_bytes: saturated_be_preempted_bytes,
+        saturated_urllc_admitted_packets: saturated_urllc,
+        restored_best_effort_admitted_packets: restored_be,
+        preemption_severity_applied: SaturationSeverity::Critical,
+        preemption_triggers_count: gatekeeper.metrics().total_preemption_triggers,
+        rate_restorations_completed: gatekeeper.metrics().total_rate_restorations,
+        priority_preservation_success,
     }
 }
 
@@ -784,5 +1127,75 @@ mod tests {
         let snap = router.balancing_snapshot(100);
         assert_eq!(snap.total_ingress_admitted_packets, 1);
         assert_eq!(snap.total_ingress_backpressures_applied, 1);
+    }
+
+    #[test]
+    fn test_preemption_application_and_shedding() {
+        let mut gatekeeper = IngressAdmissionGatekeeper::default_for_node(1);
+        let now_ns = 500_000;
+
+        assert!(!gatekeeper.is_preemption_active(now_ns));
+        assert_eq!(
+            gatekeeper.preemption_severity(now_ns),
+            SaturationSeverity::Normal
+        );
+
+        let preemption = ClosedLoopControlAction::GlobalSaturationPreemption {
+            initiator_node_id: 1,
+            severity: SaturationSeverity::Critical,
+            preempted_slices: vec![FlowSliceClass::BestEffort],
+            rate_multiplier_permille: 0,
+            guaranteed_priority_headroom_pct: 40,
+        };
+
+        let applied = gatekeeper.apply_preemption_action(&preemption, now_ns);
+        assert!(applied);
+        assert!(gatekeeper.is_preemption_active(now_ns));
+        assert_eq!(
+            gatekeeper.preemption_severity(now_ns),
+            SaturationSeverity::Critical
+        );
+        assert_eq!(gatekeeper.effective_rate_bps(FlowSliceClass::BestEffort), 0);
+
+        // Best effort packet is rejected immediately with PreemptedForPriorityTraffic
+        let dec_be = gatekeeper.admit_packet(FlowSliceClass::BestEffort, 1000, now_ns);
+        assert_eq!(
+            dec_be,
+            AdmissionDecision::Rejected {
+                reason: IngressRejectionReason::PreemptedForPriorityTraffic
+            }
+        );
+
+        // URLLC packet admitted without issue
+        let dec_urllc = gatekeeper.admit_packet(FlowSliceClass::UltraLowLatency, 128, now_ns);
+        assert_eq!(dec_urllc, AdmissionDecision::Admitted);
+
+        assert_eq!(gatekeeper.metrics().total_preempted_packets, 1);
+        assert_eq!(gatekeeper.metrics().total_preempted_bytes, 1000);
+
+        // Advance past TTL (2.0s)
+        let future_ns = now_ns + 3_000_000_000;
+        let expired = gatekeeper.prune_expired_preemption(future_ns);
+        assert!(expired);
+        assert!(!gatekeeper.is_preemption_active(future_ns));
+        assert_eq!(
+            gatekeeper.effective_rate_bps(FlowSliceClass::BestEffort),
+            100_000_000
+        );
+    }
+
+    #[test]
+    fn test_run_preemptive_admission_benchmark_scenario() {
+        let report = run_preemptive_admission_benchmark();
+        assert!(report.priority_preservation_success);
+        assert_eq!(report.nominal_urllc_admitted_packets, 100);
+        assert_eq!(report.saturated_urllc_admitted_packets, 100);
+        assert_eq!(report.saturated_best_effort_preempted_packets, 100);
+        assert_eq!(report.saturated_best_effort_preempted_bytes, 120_000);
+        assert!(report.restored_best_effort_admitted_packets > 0);
+        assert_eq!(
+            report.preemption_severity_applied,
+            SaturationSeverity::Critical
+        );
     }
 }

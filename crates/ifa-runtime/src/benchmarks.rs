@@ -1400,6 +1400,10 @@ pub fn create_saturated_multipath_snapshot(
         last_gradient_variance: 0.0,
         active_flows_by_slice: BTreeMap::new(),
         sla_violations_by_slice: BTreeMap::new(),
+        preemption_active: false,
+        preemption_severity: 0,
+        total_ingress_preempted_packets: 0,
+        total_ingress_preempted_bytes: 0,
     }
 }
 
@@ -3423,7 +3427,8 @@ pub use crate::burst_loss_eval::{
     CombinedBurstLossBenchmarkReport, CombinedFlowEvaluationResult,
 };
 pub use crate::ingress_admission::{
-    run_ingress_admission_benchmark, IngressAdmissionBenchmarkReport,
+    run_ingress_admission_benchmark, run_preemptive_admission_benchmark,
+    IngressAdmissionBenchmarkReport, PreemptiveAdmissionBenchmarkReport,
 };
 pub use crate::multi_node_sla::{run_multi_node_sla_benchmark, MultiNodeSlaReport};
 pub use crate::multipath_congestion::{
@@ -4494,5 +4499,15 @@ mod tests {
         assert!(report.embb_throughput_efficiency_passed);
         assert!(report.total_fec_0rtt_recovered >= 10);
         assert!(report.overall_delivery_success_rate > 0.90);
+    }
+
+    #[test]
+    fn test_preemptive_admission_benchmark_suite_runs() {
+        let report = run_preemptive_admission_benchmark();
+        assert!(report.priority_preservation_success);
+        assert_eq!(report.nominal_urllc_admitted_packets, 100);
+        assert_eq!(report.saturated_urllc_admitted_packets, 100);
+        assert_eq!(report.saturated_best_effort_preempted_packets, 100);
+        assert!(report.restored_best_effort_admitted_packets > 0);
     }
 }

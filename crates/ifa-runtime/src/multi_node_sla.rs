@@ -88,6 +88,43 @@ pub struct InterSliceInterferenceEvent {
     pub aggressor_bandwidth_share_pct: f64,
 }
 
+/// Severity level of global network saturation across multi-node mesh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SaturationSeverity {
+    /// Normal operating conditions; no preemption required.
+    Normal = 0,
+    /// Elevated queuing delay or slight isolation drop; mild rate suppression on lowest priority.
+    Elevated = 1,
+    /// Severe congestion threatening MissionCritical traffic; preemption of BestEffort and heavy throttling.
+    Severe = 2,
+    /// Critical congestion causing direct SLA violations on UltraLowLatency; immediate preemption of non-priority flows.
+    Critical = 3,
+}
+
+impl SaturationSeverity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Elevated => "elevated",
+            Self::Severe => "severe",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+/// Global mesh saturation assessment synthesized from active multi-node telemetry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlobalSaturationAssessment {
+    pub severity: SaturationSeverity,
+    pub global_isolation_score: f64,
+    pub global_compliance_ratio: f64,
+    pub congested_nodes: Vec<u32>,
+    pub congested_subpaths: Vec<(u32, u32)>,
+    pub violating_priority_slices: Vec<FlowSliceClass>,
+    pub average_mesh_queuing_delay_ns: u64,
+    pub recommended_action: Option<ClosedLoopControlAction>,
+}
+
 /// Closed-loop remedial actions executed to enforce isolation and restore SLA compliance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClosedLoopControlAction {
@@ -112,6 +149,13 @@ pub enum ClosedLoopControlAction {
         ingress_node_id: u32,
         throttled_slice: FlowSliceClass,
         recommended_max_rate_bps: u64,
+    },
+    GlobalSaturationPreemption {
+        initiator_node_id: u32,
+        severity: SaturationSeverity,
+        preempted_slices: Vec<FlowSliceClass>,
+        rate_multiplier_permille: u32,
+        guaranteed_priority_headroom_pct: u8,
     },
 }
 
@@ -165,6 +209,7 @@ pub struct MultiNodeSlaMetrics {
     pub total_throttles_enacted: u64,
     pub total_reservations_enacted: u64,
     pub total_backpressure_signals: u64,
+    pub total_preemption_actions: u64,
     pub total_e2e_sla_violations: u64,
 }
 
@@ -538,6 +583,143 @@ impl MultiNodeSlaSynthesizer {
         (compliant_count as f64) / (self.records.len() as f64)
     }
 
+    /// Synthesize global mesh saturation status from active telemetry records.
+    ///
+    /// Evaluates cross-node queuing delay, SLA target violations, and isolation degradation
+    /// to determine whether global network saturation requires automated ingress preemption.
+    pub fn detect_global_saturation(&self) -> GlobalSaturationAssessment {
+        let global_isolation_score = self.compute_global_isolation_score();
+        let global_compliance_ratio = self.compute_global_compliance_ratio();
+
+        if self.records.is_empty() {
+            return GlobalSaturationAssessment {
+                severity: SaturationSeverity::Normal,
+                global_isolation_score: 1.0,
+                global_compliance_ratio: 1.0,
+                congested_nodes: Vec::new(),
+                congested_subpaths: Vec::new(),
+                violating_priority_slices: Vec::new(),
+                average_mesh_queuing_delay_ns: 0,
+                recommended_action: None,
+            };
+        }
+
+        let mut total_queuing_delay: u128 = 0;
+        let mut sample_count: u64 = 0;
+        let mut congested_nodes = Vec::new();
+        let mut congested_subpaths = Vec::new();
+        let mut violating_priority_slices = Vec::new();
+
+        let mut urllc_violation = false;
+        let mut mission_critical_violation = false;
+
+        // Examine recent telemetry window (last 500 samples)
+        for r in self.records.iter().rev().take(500) {
+            total_queuing_delay += r.queuing_delay_ns as u128;
+            sample_count += 1;
+
+            let target = self
+                .sla_targets
+                .get(&r.slice_class)
+                .cloned()
+                .unwrap_or_else(|| SliceSlaTarget::default_for(r.slice_class));
+
+            let sample_loss_ppm = if r.packets_transmitted > 0 {
+                ((r.packets_lost as f64 / r.packets_transmitted as f64) * 1_000_000.0) as u32
+            } else {
+                0
+            };
+
+            let is_sla_violating = r.avg_rtt_ns > target.max_latency_ns
+                || r.jitter_ns > target.max_jitter_ns
+                || sample_loss_ppm > target.max_loss_ppm;
+
+            // Congestion indicator: high queuing delay
+            if r.queuing_delay_ns >= 4_000_000 {
+                if !congested_nodes.contains(&r.node_id) {
+                    congested_nodes.push(r.node_id);
+                }
+                if !congested_subpaths.contains(&(r.node_id, r.subpath_id)) {
+                    congested_subpaths.push((r.node_id, r.subpath_id));
+                }
+            }
+
+            if matches!(r.slice_class, FlowSliceClass::UltraLowLatency)
+                && (is_sla_violating || r.queuing_delay_ns >= 2_000_000)
+            {
+                urllc_violation = true;
+                if !violating_priority_slices.contains(&FlowSliceClass::UltraLowLatency) {
+                    violating_priority_slices.push(FlowSliceClass::UltraLowLatency);
+                }
+            } else if matches!(r.slice_class, FlowSliceClass::MissionCritical)
+                && (is_sla_violating || r.queuing_delay_ns >= 8_000_000)
+            {
+                mission_critical_violation = true;
+                if !violating_priority_slices.contains(&FlowSliceClass::MissionCritical) {
+                    violating_priority_slices.push(FlowSliceClass::MissionCritical);
+                }
+            }
+        }
+
+        let average_mesh_queuing_delay_ns = if sample_count > 0 {
+            (total_queuing_delay / sample_count as u128) as u64
+        } else {
+            0
+        };
+
+        // Determine severity and preemption action
+        let (severity, recommended_action) = if urllc_violation || global_isolation_score < 0.50 {
+            // Critical saturation: preempt BestEffort entirely (0 permille) and throttle HighThroughput heavily
+            let action = ClosedLoopControlAction::GlobalSaturationPreemption {
+                initiator_node_id: self.local_node_id,
+                severity: SaturationSeverity::Critical,
+                preempted_slices: vec![FlowSliceClass::BestEffort, FlowSliceClass::HighThroughput],
+                rate_multiplier_permille: 0,
+                guaranteed_priority_headroom_pct: 50,
+            };
+            (SaturationSeverity::Critical, Some(action))
+        } else if mission_critical_violation
+            || congested_nodes.len() >= 2
+            || global_isolation_score < 0.70
+        {
+            // Severe saturation: preempt BestEffort and throttle HighThroughput
+            let action = ClosedLoopControlAction::GlobalSaturationPreemption {
+                initiator_node_id: self.local_node_id,
+                severity: SaturationSeverity::Severe,
+                preempted_slices: vec![FlowSliceClass::BestEffort, FlowSliceClass::HighThroughput],
+                rate_multiplier_permille: 250,
+                guaranteed_priority_headroom_pct: 35,
+            };
+            (SaturationSeverity::Severe, Some(action))
+        } else if global_isolation_score < 0.85
+            || global_compliance_ratio < 0.90
+            || average_mesh_queuing_delay_ns >= 2_000_000
+        {
+            // Elevated congestion: throttle BestEffort to 50%
+            let action = ClosedLoopControlAction::GlobalSaturationPreemption {
+                initiator_node_id: self.local_node_id,
+                severity: SaturationSeverity::Elevated,
+                preempted_slices: vec![FlowSliceClass::BestEffort],
+                rate_multiplier_permille: 500,
+                guaranteed_priority_headroom_pct: 20,
+            };
+            (SaturationSeverity::Elevated, Some(action))
+        } else {
+            (SaturationSeverity::Normal, None)
+        };
+
+        GlobalSaturationAssessment {
+            severity,
+            global_isolation_score,
+            global_compliance_ratio,
+            congested_nodes,
+            congested_subpaths,
+            violating_priority_slices,
+            average_mesh_queuing_delay_ns,
+            recommended_action,
+        }
+    }
+
     /// Run one closed-loop adaptation cycle: detects interferences, triggers isolation actions,
     /// applies rate throttling, reserves capacity headroom, and emits upstream backpressures.
     pub fn evaluate_and_adapt(&mut self, tick: u64) -> ClosedLoopAdaptationResult {
@@ -606,6 +788,17 @@ impl MultiNodeSlaSynthesizer {
             self.backpressure_queue.push(backpressure_action);
             self.metrics.total_backpressure_signals =
                 self.metrics.total_backpressure_signals.saturating_add(1);
+        }
+
+        // 5. Global saturation preemption evaluation
+        let saturation = self.detect_global_saturation();
+        if saturation.severity >= SaturationSeverity::Elevated {
+            if let Some(preemption_action) = saturation.recommended_action {
+                actions.push(preemption_action.clone());
+                self.backpressure_queue.push(preemption_action);
+                self.metrics.total_preemption_actions =
+                    self.metrics.total_preemption_actions.saturating_add(1);
+            }
         }
 
         self.metrics.total_closed_loop_actions = self
@@ -689,6 +882,17 @@ impl MultiNodeSlaSynthesizer {
             out,
             "ifa_slice_backpressure_signals_total{{node=\"{}\"}} {}",
             self.local_node_id, self.metrics.total_backpressure_signals
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP ifa_slice_preemption_actions_total Total global saturation preemption actions enacted"
+        );
+        let _ = writeln!(out, "# TYPE ifa_slice_preemption_actions_total counter");
+        let _ = writeln!(
+            out,
+            "ifa_slice_preemption_actions_total{{node=\"{}\"}} {}",
+            self.local_node_id, self.metrics.total_preemption_actions
         );
 
         out

@@ -421,6 +421,14 @@ pub struct IsspMultipathBalancingSnapshot {
     pub active_flows_by_slice: BTreeMap<String, usize>,
     /// Accumulated SLA violations partitioned by slice class name.
     pub sla_violations_by_slice: BTreeMap<String, u64>,
+    /// Whether global saturation preemption is currently active on ingress.
+    pub preemption_active: bool,
+    /// Active preemption severity level (0: normal, 1: elevated, 2: severe, 3: critical).
+    pub preemption_severity: u8,
+    /// Total non-priority ingress packets preempted to preserve priority SLA headroom.
+    pub total_ingress_preempted_packets: u64,
+    /// Total non-priority ingress bytes preempted to preserve priority SLA headroom.
+    pub total_ingress_preempted_bytes: u64,
 }
 
 impl IsspMultipathBalancingSnapshot {
@@ -768,6 +776,16 @@ impl IsspMultipathBalancingSnapshot {
                 }
                 m
             },
+            preemption_active: router.ingress_gatekeeper().is_preemption_active(ts),
+            preemption_severity: router.ingress_gatekeeper().preemption_severity(ts) as u8,
+            total_ingress_preempted_packets: router
+                .ingress_gatekeeper()
+                .metrics()
+                .total_preempted_packets,
+            total_ingress_preempted_bytes: router
+                .ingress_gatekeeper()
+                .metrics()
+                .total_preempted_bytes,
         }
     }
 

@@ -76,9 +76,10 @@ pub use header::{
     FLAG_EPOCH_1, FLAG_FREE, FLAG_PINNED, FLAG_QUARANTINED, FLAG_READONLY,
 };
 pub use ingress_admission::{
-    run_ingress_admission_benchmark, ActiveBackpressure, AdmissionDecision,
-    IngressAdmissionBenchmarkReport, IngressAdmissionConfig, IngressAdmissionGatekeeper,
-    IngressAdmissionMetrics, IngressRejectionReason, SliceTokenBucket,
+    run_ingress_admission_benchmark, run_preemptive_admission_benchmark, ActiveBackpressure,
+    ActivePreemptionState, AdmissionDecision, IngressAdmissionBenchmarkReport,
+    IngressAdmissionConfig, IngressAdmissionGatekeeper, IngressAdmissionMetrics,
+    IngressRejectionReason, PreemptiveAdmissionBenchmarkReport, SliceTokenBucket,
 };
 pub use jitter_anomaly::{
     apply_dynamic_thresholds, AnomalySeverity, DynamicCongestionThresholds, JitterAnomalyDetector,
@@ -109,8 +110,9 @@ pub use mtls_attestation::{
 };
 pub use multi_node_sla::{
     run_multi_node_sla_benchmark, ClosedLoopAdaptationResult, ClosedLoopControlAction,
-    EndToEndPathSlaAudit, InterSliceInterferenceEvent, MultiNodeSlaMetrics, MultiNodeSlaReport,
-    MultiNodeSlaSynthesizer, MultiNodeSliceTelemetryRecord, NodeSlaEvaluation, SliceSlaTarget,
+    EndToEndPathSlaAudit, GlobalSaturationAssessment, InterSliceInterferenceEvent,
+    MultiNodeSlaMetrics, MultiNodeSlaReport, MultiNodeSlaSynthesizer,
+    MultiNodeSliceTelemetryRecord, NodeSlaEvaluation, SaturationSeverity, SliceSlaTarget,
 };
 pub use multipath_congestion::{
     run_multipath_congestion_benchmark, Bbrv3Phase, Bbrv3ProbeBwSubPhase, Bbrv3SubpathState,
