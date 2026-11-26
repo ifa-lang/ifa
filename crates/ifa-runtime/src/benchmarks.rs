@@ -3426,6 +3426,10 @@ pub use crate::burst_loss_eval::{
     run_combined_burst_loss_benchmark, BurstLossEmulator, BurstLossModel,
     CombinedBurstLossBenchmarkReport, CombinedFlowEvaluationResult,
 };
+pub use crate::crypto_overhead_rekey::{
+    run_crypto_overhead_and_dynamic_rekey_benchmark, AsymmetricJitterRekeyController,
+    MtlsCryptoBenchmarkReport,
+};
 pub use crate::ingress_admission::{
     run_ingress_admission_benchmark, run_preemptive_admission_benchmark,
     IngressAdmissionBenchmarkReport, PreemptiveAdmissionBenchmarkReport,
@@ -4556,5 +4560,25 @@ mod tests {
 
         let prom = report.export_prometheus_metrics();
         assert!(prom.contains("ifa_mesh_drift_p99_latency_seconds"));
+    }
+
+    #[test]
+    fn test_mtls_crypto_overhead_and_dynamic_rekey_benchmark_suite_runs() {
+        let report = run_crypto_overhead_and_dynamic_rekey_benchmark(50);
+        assert_eq!(report.total_packets, 50);
+        assert!(report.payload_bytes_processed > 0);
+        assert!(report.wire_overhead_bytes > 0);
+        assert!(report.overhead_ratio_percent > 0.0);
+        assert!(report.dynamic_rekey_events > 0);
+        assert!(report.grace_packets_accepted > 0);
+        assert!(report.zero_loss_achieved);
+
+        let md = report.to_markdown_table();
+        assert!(md.contains("mTLS Cryptographic Overhead & Dynamic Rekey Benchmark Report"));
+        assert!(md.contains("PASSED"));
+
+        let json = report.to_json();
+        assert!(json.contains("\"total_packets\": 50"));
+        assert!(json.contains("\"zero_loss_achieved\": true"));
     }
 }

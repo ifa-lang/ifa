@@ -6,6 +6,7 @@ pub mod blocking;
 pub mod burst_loss_eval;
 pub mod collections;
 pub mod cost_gradient;
+pub mod crypto_overhead_rekey;
 pub mod ffi;
 pub mod fiber;
 pub mod header;
@@ -65,6 +66,13 @@ pub use collections::{IfaList, IfaMap};
 pub use cost_gradient::{
     CostGradientConfig, CostGradientLoadBalancer, CostGradientMetrics, CostGradientRebalanceAction,
     CostGradientRebalancePlan, CostGradientWeights, SubpathCostGradient,
+};
+pub use crypto_overhead_rekey::{
+    run_crypto_overhead_and_dynamic_rekey_benchmark, AsymmetricJitterRekeyController,
+    AsymmetricJitterTracker, CryptoOverheadTelemetry, LatencyStats, MtlsCryptoBenchmarkReport,
+    RekeyEventRecord, RekeyTriggerReason, SliceCryptoMetrics, SubpathJitterProfile,
+    DEFAULT_ADAPTIVE_MARGIN_NS, DEFAULT_JITTER_SAFETY_FACTOR, DEFAULT_MIN_GRACE_PERIOD_NS,
+    MTLS_ENVELOPE_WIRE_OVERHEAD_BYTES,
 };
 pub use ffi::*;
 pub use fiber::{
