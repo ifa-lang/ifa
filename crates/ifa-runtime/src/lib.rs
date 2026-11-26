@@ -13,6 +13,7 @@ pub mod ingress_admission;
 pub mod io;
 pub mod jitter_anomaly;
 pub mod latency_drift;
+pub mod mesh_drift_eval;
 pub mod mesh_lsa;
 pub mod mtls_attestation;
 pub mod multi_node_sla;
@@ -90,6 +91,11 @@ pub use latency_drift::{
     DriftSeverity, InterSliceDisparityReport, LatencyDriftConfig, LatencyDriftMetrics,
     LatencyDriftMonitor, LatencyDriftSample, PreemptiveMigrationAction,
     PreemptiveReallocationReason, SliceDriftState, SubpathDriftTracker,
+};
+pub use mesh_drift_eval::{
+    run_mesh_multi_region_drift_benchmark, HighDriftProfile, MeshBenchmarkPacket,
+    MeshDriftBenchmarkReport, MeshMediaKind, MeshRegion, MultiRegionMeshDriftEvaluator,
+    MultiRegionMeshLink, StrategyDriftMetrics, TransportStrategyKind,
 };
 pub use mesh_lsa::{
     lsa_phase_name, IsspLinkStateEntry, IsspLsaError, IsspLsaIngestSummary, IsspLsaLinkRecord,

@@ -3430,6 +3430,10 @@ pub use crate::ingress_admission::{
     run_ingress_admission_benchmark, run_preemptive_admission_benchmark,
     IngressAdmissionBenchmarkReport, PreemptiveAdmissionBenchmarkReport,
 };
+pub use crate::mesh_drift_eval::{
+    run_mesh_multi_region_drift_benchmark, MeshDriftBenchmarkReport, MultiRegionMeshDriftEvaluator,
+    StrategyDriftMetrics, TransportStrategyKind,
+};
 pub use crate::multi_node_sla::{run_multi_node_sla_benchmark, MultiNodeSlaReport};
 pub use crate::multipath_congestion::{
     run_multipath_congestion_benchmark, MultipathCongestionBenchmarkReport,
@@ -4530,5 +4534,27 @@ mod tests {
 
         let json = report.to_json();
         assert!(json.contains("\"verification_passed\":true"));
+    }
+
+    #[test]
+    fn test_mesh_multi_region_drift_benchmark_suite_runs() {
+        let report = run_mesh_multi_region_drift_benchmark();
+        assert!(report.verification_passed);
+        assert_eq!(report.total_links_evaluated, 4);
+        assert_eq!(report.evaluated_regions.len(), 4);
+        assert!(report.latency_p99_reduction_ratio < 0.75);
+        assert!(report.urllc_sla_gain_factor >= 1.0);
+        assert!(report.resilience_gain_factor >= 1.0);
+
+        let md = report.to_markdown_table();
+        assert!(md.contains("Multi-Region Mesh Latency & Resilience"));
+        assert!(md.contains("IFA Resilient Multipath"));
+        assert!(md.contains("PASSED"));
+
+        let json = report.to_json();
+        assert!(json.contains("\"verification_passed\":true"));
+
+        let prom = report.export_prometheus_metrics();
+        assert!(prom.contains("ifa_mesh_drift_p99_latency_seconds"));
     }
 }
