@@ -3,6 +3,7 @@
 pub mod allocator;
 pub mod benchmarks;
 pub mod blocking;
+pub mod burst_loss_eval;
 pub mod collections;
 pub mod cost_gradient;
 pub mod ffi;

@@ -3418,6 +3418,10 @@ pub fn run_mesh_lsa_synchronization_benchmark(
 }
 
 /// Comprehensive benchmark report evaluating dynamic traffic slicing performance under heterogeneous load (URLLC vs eMBB).
+pub use crate::burst_loss_eval::{
+    run_combined_burst_loss_benchmark, BurstLossEmulator, BurstLossModel,
+    CombinedBurstLossBenchmarkReport, CombinedFlowEvaluationResult,
+};
 pub use crate::ingress_admission::{
     run_ingress_admission_benchmark, IngressAdmissionBenchmarkReport,
 };
@@ -4479,5 +4483,16 @@ mod tests {
         assert_eq!(report.retransmissions_dispatched, 6);
         assert_eq!(report.fallback_subpaths_utilized, 6);
         assert!(report.retransmission_success_rate > 0.99);
+    }
+
+    #[test]
+    fn test_combined_burst_loss_benchmark_suite_runs() {
+        let report = run_combined_burst_loss_benchmark();
+        assert!(report.verification_passed);
+        assert!(report.urllc_zero_rtt_passed);
+        assert!(report.mission_critical_zero_loss_passed);
+        assert!(report.embb_throughput_efficiency_passed);
+        assert!(report.total_fec_0rtt_recovered >= 10);
+        assert!(report.overall_delivery_success_rate > 0.90);
     }
 }
