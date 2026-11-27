@@ -2519,8 +2519,7 @@ mod tests {
         };
         let resp_packet = MultipathMuxPacket::Migration(response.clone());
         let resp_encoded = resp_packet.encode();
-        let resp_decoded =
-            MultipathMuxPacket::decode(&resp_encoded).expect("decode path response");
+        let resp_decoded = MultipathMuxPacket::decode(&resp_encoded).expect("decode path response");
         assert_eq!(resp_decoded, resp_packet);
 
         let new_cid = MigrationFrame::NewConnectionId {
@@ -2535,9 +2534,7 @@ mod tests {
             MultipathMuxPacket::decode(&cid_encoded).expect("decode new connection id");
         assert_eq!(cid_decoded, cid_packet);
 
-        let ret_cid = MigrationFrame::RetireConnectionId {
-            sequence_number: 2,
-        };
+        let ret_cid = MigrationFrame::RetireConnectionId { sequence_number: 2 };
         let ret_packet = MultipathMuxPacket::Migration(ret_cid.clone());
         let ret_encoded = ret_packet.encode();
         let ret_decoded =

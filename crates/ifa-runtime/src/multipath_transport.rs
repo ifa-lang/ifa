@@ -379,9 +379,9 @@ impl AsyncMultipathTransport {
 
                             if let Ok(packet) = MultipathMuxPacket::decode(&buf[..n]) {
                                 match packet {
-                                    MultipathMuxPacket::Migration(MigrationFrame::PathChallenge {
-                                        nonce,
-                                    }) => {
+                                    MultipathMuxPacket::Migration(
+                                        MigrationFrame::PathChallenge { nonce },
+                                    ) => {
                                         // RFC 9000 §8.2.2: Echo matching PATH_RESPONSE to from_addr
                                         let resp = MultipathMuxPacket::Migration(
                                             MigrationFrame::PathResponse { nonce },
@@ -408,9 +408,9 @@ impl AsyncMultipathTransport {
                                         }
                                         ingested_count += 1;
                                     }
-                                    MultipathMuxPacket::Migration(MigrationFrame::PathResponse {
-                                        nonce,
-                                    }) => {
+                                    MultipathMuxPacket::Migration(
+                                        MigrationFrame::PathResponse { nonce },
+                                    ) => {
                                         // Path validation response received
                                         let now_ns = now_ms.saturating_mul(1_000_000);
                                         if let Ok(mut engine) = self.migration_engine.lock() {

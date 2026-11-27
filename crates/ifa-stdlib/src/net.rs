@@ -13,11 +13,11 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
-use ifa_runtime::fiber::GLOBAL_SCHEDULER;
 pub use ifa_runtime::connection_migration::{
     ConnectionId, ConnectionMigrationEngine, MigrationError, MigrationTrigger, PathChallenge,
     PathResponse, SocketAddress,
 };
+use ifa_runtime::fiber::GLOBAL_SCHEDULER;
 pub use ifa_runtime::multipath_stream_mux::{
     FlowControlAutotuneConfig, FlowControlFrame, IngestStreamOutcome, MigrationFrame,
     MultipathMuxPacket, MultipathStreamMux, StreamFrame, StreamId, StreamMuxBenchmarkReport,
@@ -29951,7 +29951,8 @@ mod tests {
 
         let s_client = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("client bind"));
         let s_server_wan = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("server bind wan"));
-        let s_server_cell = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("server bind cell"));
+        let s_server_cell =
+            Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("server bind cell"));
 
         let client_addr = s_client.local_addr().expect("client addr");
         let server_wan_addr = s_server_wan.local_addr().expect("server wan addr");
@@ -30013,7 +30014,9 @@ mod tests {
         client
             .write_stream(stream_id, chunk1, false, Some(1))
             .expect("write chunk 1");
-        client.poll_and_transmit_pending().expect("transmit chunk 1");
+        client
+            .poll_and_transmit_pending()
+            .expect("transmit chunk 1");
         server.poll_incoming_and_ingest(10).expect("ingest chunk 1");
         assert_eq!(server.read_stream(stream_id, 100).unwrap(), chunk1);
 
@@ -30030,9 +30033,13 @@ mod tests {
             .expect("initiate migration");
 
         // Server receives PATH_CHALLENGE on cellular socket and echoes PATH_RESPONSE
-        server.poll_incoming_and_ingest(20).expect("server ingest challenge");
+        server
+            .poll_incoming_and_ingest(20)
+            .expect("server ingest challenge");
         // Client receives PATH_RESPONSE and rebinds subpath 1 peer address
-        client.poll_incoming_and_ingest(30).expect("client ingest response");
+        client
+            .poll_incoming_and_ingest(30)
+            .expect("client ingest response");
 
         assert_eq!(client.subpath_peer_addr(1), Some(server_cell_addr));
 
@@ -30041,7 +30048,9 @@ mod tests {
         client
             .write_stream(stream_id, chunk2, true, Some(1))
             .expect("write chunk 2");
-        client.poll_and_transmit_pending().expect("transmit chunk 2");
+        client
+            .poll_and_transmit_pending()
+            .expect("transmit chunk 2");
         server.poll_incoming_and_ingest(40).expect("ingest chunk 2");
 
         assert_eq!(server.read_stream(stream_id, 100).unwrap(), chunk2);
