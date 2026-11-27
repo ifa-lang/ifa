@@ -681,6 +681,75 @@ impl ConnectionMigrationEngine {
         })
     }
 
+    /// Verifies an incoming `PathResponse`, validating the path and rebinding the subpath address
+    /// in standalone mode (without direct router reference).
+    pub fn verify_path_response_standalone(
+        &mut self,
+        response: PathResponse,
+        timestamp_ns: u64,
+    ) -> Result<MigrationCompletion, MigrationError> {
+        let entry = match self.pending_challenges.remove(&response.nonce) {
+            Some(entry) => entry,
+            None => return Err(MigrationError::ChallengeNotFound(response.nonce)),
+        };
+
+        let measured_rtt_ns = timestamp_ns.saturating_sub(entry.challenge.sent_timestamp_ns);
+        self.responses_verified_total += 1;
+
+        // Mark target address as validated in anti-amplification tracker
+        if let Some(tracker) = self
+            .anti_amplification_trackers
+            .get_mut(&entry.target_address)
+        {
+            tracker.mark_validated();
+        }
+
+        // Rebind subpath address in manager
+        self.subpath_addresses
+            .insert(entry.subpath_id, entry.target_address);
+
+        // Rotate Connection ID: retire old, promote new
+        if let Some(cids) = self.active_cids.get_mut(&entry.flow_id) {
+            if let Some(old) = cids.pop_front() {
+                self.retired_cids
+                    .entry(entry.flow_id)
+                    .or_default()
+                    .push(old);
+            }
+            cids.push_back(entry.new_connection_id);
+        }
+
+        let total_migration_latency_ns =
+            timestamp_ns.saturating_sub(entry.challenge.sent_timestamp_ns);
+        self.migrations_completed_total += 1;
+        self.cumulative_migration_latency_ns += total_migration_latency_ns;
+
+        // Update audit record
+        for record in self.migration_history.iter_mut().rev() {
+            if record.migration_id == entry.migration_id {
+                record.status = PathValidationStatus::Validated {
+                    validated_at_ns: timestamp_ns,
+                    measured_rtt_ns,
+                };
+                record.completed_timestamp_ns = Some(timestamp_ns);
+                break;
+            }
+        }
+
+        Ok(MigrationCompletion {
+            migration_id: entry.migration_id,
+            flow_id: entry.flow_id,
+            subpath_id: entry.subpath_id,
+            old_address: entry.old_address,
+            new_address: entry.target_address,
+            active_connection_id: entry.new_connection_id,
+            measured_rtt_ns,
+            migrated_frames: 0,
+            migrated_bytes: 0,
+            total_migration_latency_ns,
+        })
+    }
+
     /// Internal helper that rebinds router subpath metrics upon validation.
     fn rebind_router_subpath(
         &self,

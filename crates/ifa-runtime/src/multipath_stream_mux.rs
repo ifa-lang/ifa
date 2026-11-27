@@ -258,6 +258,7 @@ impl StreamFrame {
 pub enum MultipathMuxPacket {
     Stream(StreamFrame),
     Control(FlowControlFrame),
+    Migration(MigrationFrame),
 }
 
 impl MultipathMuxPacket {
@@ -265,6 +266,7 @@ impl MultipathMuxPacket {
         match self {
             Self::Stream(f) => f.encode(),
             Self::Control(f) => f.encode(),
+            Self::Migration(f) => f.encode(),
         }
     }
 
@@ -276,6 +278,8 @@ impl MultipathMuxPacket {
         }
         if buf[0] == StreamFrame::FRAME_TYPE {
             StreamFrame::decode(buf).map(Self::Stream)
+        } else if MigrationFrame::is_migration_frame(buf[0]) {
+            MigrationFrame::decode(buf).map(Self::Migration)
         } else {
             FlowControlFrame::decode(buf).map(Self::Control)
         }
@@ -291,6 +295,150 @@ impl From<StreamFrame> for MultipathMuxPacket {
 impl From<FlowControlFrame> for MultipathMuxPacket {
     fn from(frame: FlowControlFrame) -> Self {
         Self::Control(frame)
+    }
+}
+
+impl From<MigrationFrame> for MultipathMuxPacket {
+    fn from(frame: MigrationFrame) -> Self {
+        Self::Migration(frame)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection Migration Frames (RFC 9000 aligned)
+// ---------------------------------------------------------------------------
+
+/// Connection Migration and Path Validation Frames conforming to RFC 9000 specifications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationFrame {
+    /// PATH_CHALLENGE (RFC 9000 Type 0x1a): Carries an 8-byte arbitrary challenge nonce.
+    PathChallenge { nonce: [u8; 8] },
+    /// PATH_RESPONSE (RFC 9000 Type 0x1b): Echoes the 8-byte challenge nonce for path validation.
+    PathResponse { nonce: [u8; 8] },
+    /// NEW_CONNECTION_ID (RFC 9000 Type 0x18): Advertises a new connection ID for migration/privacy.
+    NewConnectionId {
+        sequence_number: u64,
+        retire_prior_to: u64,
+        connection_id: [u8; 16],
+        stateless_reset_token: [u8; 16],
+    },
+    /// RETIRE_CONNECTION_ID (RFC 9000 Type 0x19): Retires a connection ID sequence.
+    RetireConnectionId { sequence_number: u64 },
+}
+
+impl MigrationFrame {
+    pub const TYPE_NEW_CONNECTION_ID: u8 = 0x18;
+    pub const TYPE_RETIRE_CONNECTION_ID: u8 = 0x19;
+    pub const TYPE_PATH_CHALLENGE: u8 = 0x1a;
+    pub const TYPE_PATH_RESPONSE: u8 = 0x1b;
+
+    pub fn is_migration_frame(tag: u8) -> bool {
+        matches!(
+            tag,
+            Self::TYPE_NEW_CONNECTION_ID
+                | Self::TYPE_RETIRE_CONNECTION_ID
+                | Self::TYPE_PATH_CHALLENGE
+                | Self::TYPE_PATH_RESPONSE
+        )
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Self::PathChallenge { nonce } => {
+                let mut buf = Vec::with_capacity(9);
+                buf.push(Self::TYPE_PATH_CHALLENGE);
+                buf.extend_from_slice(nonce);
+                buf
+            }
+            Self::PathResponse { nonce } => {
+                let mut buf = Vec::with_capacity(9);
+                buf.push(Self::TYPE_PATH_RESPONSE);
+                buf.extend_from_slice(nonce);
+                buf
+            }
+            Self::NewConnectionId {
+                sequence_number,
+                retire_prior_to,
+                connection_id,
+                stateless_reset_token,
+            } => {
+                let mut buf = Vec::with_capacity(49);
+                buf.push(Self::TYPE_NEW_CONNECTION_ID);
+                buf.extend_from_slice(&sequence_number.to_be_bytes());
+                buf.extend_from_slice(&retire_prior_to.to_be_bytes());
+                buf.extend_from_slice(connection_id);
+                buf.extend_from_slice(stateless_reset_token);
+                buf
+            }
+            Self::RetireConnectionId { sequence_number } => {
+                let mut buf = Vec::with_capacity(9);
+                buf.push(Self::TYPE_RETIRE_CONNECTION_ID);
+                buf.extend_from_slice(&sequence_number.to_be_bytes());
+                buf
+            }
+        }
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, StreamMuxError> {
+        if buf.is_empty() {
+            return Err(StreamMuxError::InvalidControlFrame(
+                "Empty buffer".to_string(),
+            ));
+        }
+        match buf[0] {
+            Self::TYPE_PATH_CHALLENGE => {
+                if buf.len() < 9 {
+                    return Err(StreamMuxError::InvalidControlFrame(
+                        "Buffer too short for PATH_CHALLENGE (expected 9 bytes)".to_string(),
+                    ));
+                }
+                let mut nonce = [0u8; 8];
+                nonce.copy_from_slice(&buf[1..9]);
+                Ok(Self::PathChallenge { nonce })
+            }
+            Self::TYPE_PATH_RESPONSE => {
+                if buf.len() < 9 {
+                    return Err(StreamMuxError::InvalidControlFrame(
+                        "Buffer too short for PATH_RESPONSE (expected 9 bytes)".to_string(),
+                    ));
+                }
+                let mut nonce = [0u8; 8];
+                nonce.copy_from_slice(&buf[1..9]);
+                Ok(Self::PathResponse { nonce })
+            }
+            Self::TYPE_NEW_CONNECTION_ID => {
+                if buf.len() < 49 {
+                    return Err(StreamMuxError::InvalidControlFrame(
+                        "Buffer too short for NEW_CONNECTION_ID (expected 49 bytes)".to_string(),
+                    ));
+                }
+                let sequence_number = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+                let retire_prior_to = u64::from_be_bytes(buf[9..17].try_into().unwrap());
+                let mut connection_id = [0u8; 16];
+                connection_id.copy_from_slice(&buf[17..33]);
+                let mut stateless_reset_token = [0u8; 16];
+                stateless_reset_token.copy_from_slice(&buf[33..49]);
+                Ok(Self::NewConnectionId {
+                    sequence_number,
+                    retire_prior_to,
+                    connection_id,
+                    stateless_reset_token,
+                })
+            }
+            Self::TYPE_RETIRE_CONNECTION_ID => {
+                if buf.len() < 9 {
+                    return Err(StreamMuxError::InvalidControlFrame(
+                        "Buffer too short for RETIRE_CONNECTION_ID (expected 9 bytes)".to_string(),
+                    ));
+                }
+                let sequence_number = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+                Ok(Self::RetireConnectionId { sequence_number })
+            }
+            tag => Err(StreamMuxError::InvalidControlFrame(format!(
+                "Unknown migration frame tag: 0x{:02x}",
+                tag
+            ))),
+        }
     }
 }
 
@@ -2355,5 +2503,45 @@ mod tests {
         let cp_encoded = ctrl_packet.encode();
         let cp_decoded = MultipathMuxPacket::decode(&cp_encoded).expect("decode control packet");
         assert_eq!(cp_decoded, ctrl_packet);
+
+        // Migration frames envelope tests
+        let challenge = MigrationFrame::PathChallenge {
+            nonce: [1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let chal_packet = MultipathMuxPacket::Migration(challenge.clone());
+        let chal_encoded = chal_packet.encode();
+        let chal_decoded =
+            MultipathMuxPacket::decode(&chal_encoded).expect("decode path challenge");
+        assert_eq!(chal_decoded, chal_packet);
+
+        let response = MigrationFrame::PathResponse {
+            nonce: [1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let resp_packet = MultipathMuxPacket::Migration(response.clone());
+        let resp_encoded = resp_packet.encode();
+        let resp_decoded =
+            MultipathMuxPacket::decode(&resp_encoded).expect("decode path response");
+        assert_eq!(resp_decoded, resp_packet);
+
+        let new_cid = MigrationFrame::NewConnectionId {
+            sequence_number: 5,
+            retire_prior_to: 2,
+            connection_id: [0xAA; 16],
+            stateless_reset_token: [0xBB; 16],
+        };
+        let cid_packet = MultipathMuxPacket::Migration(new_cid.clone());
+        let cid_encoded = cid_packet.encode();
+        let cid_decoded =
+            MultipathMuxPacket::decode(&cid_encoded).expect("decode new connection id");
+        assert_eq!(cid_decoded, cid_packet);
+
+        let ret_cid = MigrationFrame::RetireConnectionId {
+            sequence_number: 2,
+        };
+        let ret_packet = MultipathMuxPacket::Migration(ret_cid.clone());
+        let ret_encoded = ret_packet.encode();
+        let ret_decoded =
+            MultipathMuxPacket::decode(&ret_encoded).expect("decode retire connection id");
+        assert_eq!(ret_decoded, ret_packet);
     }
 }

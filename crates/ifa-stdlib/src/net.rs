@@ -14,10 +14,14 @@ use std::time::Duration;
 use std::os::unix::io::AsRawFd;
 
 use ifa_runtime::fiber::GLOBAL_SCHEDULER;
+pub use ifa_runtime::connection_migration::{
+    ConnectionId, ConnectionMigrationEngine, MigrationError, MigrationTrigger, PathChallenge,
+    PathResponse, SocketAddress,
+};
 pub use ifa_runtime::multipath_stream_mux::{
-    FlowControlAutotuneConfig, FlowControlFrame, IngestStreamOutcome, MultipathMuxPacket,
-    MultipathStreamMux, StreamFrame, StreamId, StreamMuxBenchmarkReport, StreamMuxError,
-    StreamMuxTelemetry, StreamPriority, StreamReassemblyBuffer, StreamState,
+    FlowControlAutotuneConfig, FlowControlFrame, IngestStreamOutcome, MigrationFrame,
+    MultipathMuxPacket, MultipathStreamMux, StreamFrame, StreamId, StreamMuxBenchmarkReport,
+    StreamMuxError, StreamMuxTelemetry, StreamPriority, StreamReassemblyBuffer, StreamState,
 };
 pub use ifa_runtime::multipath_transport::{
     AsyncMultipathSubpath, AsyncMultipathTransport, SubpathTransportTelemetry,
@@ -29932,6 +29936,115 @@ mod tests {
 
         let read_back = server.read_stream(stream_id, 1024).expect("read stream");
         assert_eq!(read_back, msg);
+        assert!(server.is_stream_complete(stream_id));
+    }
+
+    #[test]
+    fn test_async_multipath_transport_connection_migration() {
+        use super::{
+            AsyncMultipathSubpath, AsyncMultipathTransport, AsyncUdpSocket, FlowSliceClass,
+            MigrationTrigger, StreamId, StreamPriority,
+        };
+
+        let client = AsyncMultipathTransport::new();
+        let server = AsyncMultipathTransport::new();
+
+        let s_client = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("client bind"));
+        let s_server_wan = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("server bind wan"));
+        let s_server_cell = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("server bind cell"));
+
+        let client_addr = s_client.local_addr().expect("client addr");
+        let server_wan_addr = s_server_wan.local_addr().expect("server wan addr");
+        let server_cell_addr = s_server_cell.local_addr().expect("server cell addr");
+
+        client
+            .add_subpath(AsyncMultipathSubpath::new(
+                1,
+                "wan",
+                Arc::clone(&s_client),
+                server_wan_addr,
+                10,
+                100_000_000,
+            ))
+            .expect("add client subpath");
+
+        server
+            .add_subpath(AsyncMultipathSubpath::new(
+                1,
+                "wan",
+                Arc::clone(&s_server_wan),
+                client_addr,
+                10,
+                100_000_000,
+            ))
+            .expect("add server wan subpath");
+
+        server
+            .add_subpath(AsyncMultipathSubpath::new(
+                2,
+                "cellular",
+                Arc::clone(&s_server_cell),
+                client_addr,
+                25,
+                50_000_000,
+            ))
+            .expect("add server cellular subpath");
+
+        let stream_id = StreamId::client_bidi(3);
+        client
+            .open_stream(
+                stream_id,
+                StreamPriority::HighInteractive,
+                FlowSliceClass::UltraLowLatency,
+                Some(65536),
+            )
+            .expect("open client stream");
+        server
+            .open_stream(
+                stream_id,
+                StreamPriority::HighInteractive,
+                FlowSliceClass::UltraLowLatency,
+                Some(65536),
+            )
+            .expect("open server stream");
+
+        // 1. Initial write before migration
+        let chunk1 = b"LIVE_STREAM_CHUNK_1_";
+        client
+            .write_stream(stream_id, chunk1, false, Some(1))
+            .expect("write chunk 1");
+        client.poll_and_transmit_pending().expect("transmit chunk 1");
+        server.poll_incoming_and_ingest(10).expect("ingest chunk 1");
+        assert_eq!(server.read_stream(stream_id, 100).unwrap(), chunk1);
+
+        // 2. Client initiates path migration of subpath 1 to cellular address
+        client
+            .initiate_subpath_migration(
+                1,
+                server_cell_addr,
+                MigrationTrigger::PlannedHandover {
+                    reason: "wan_to_cellular".to_string(),
+                },
+                500_000,
+            )
+            .expect("initiate migration");
+
+        // Server receives PATH_CHALLENGE on cellular socket and echoes PATH_RESPONSE
+        server.poll_incoming_and_ingest(20).expect("server ingest challenge");
+        // Client receives PATH_RESPONSE and rebinds subpath 1 peer address
+        client.poll_incoming_and_ingest(30).expect("client ingest response");
+
+        assert_eq!(client.subpath_peer_addr(1), Some(server_cell_addr));
+
+        // 3. Post-migration write on subpath 1 (seamless 0-RTT delivery over cellular)
+        let chunk2 = b"LIVE_STREAM_CHUNK_2_COMPLETED";
+        client
+            .write_stream(stream_id, chunk2, true, Some(1))
+            .expect("write chunk 2");
+        client.poll_and_transmit_pending().expect("transmit chunk 2");
+        server.poll_incoming_and_ingest(40).expect("ingest chunk 2");
+
+        assert_eq!(server.read_stream(stream_id, 100).unwrap(), chunk2);
         assert!(server.is_stream_complete(stream_id));
     }
 

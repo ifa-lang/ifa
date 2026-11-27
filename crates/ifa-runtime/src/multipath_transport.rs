@@ -21,8 +21,13 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::connection_migration::{
+    ConnectionId, ConnectionMigrationEngine, MigrationError, MigrationTrigger, PathChallenge,
+    PathResponse, SocketAddress,
+};
 use crate::multipath_stream_mux::{
-    MultipathMuxPacket, MultipathStreamMux, StreamId, StreamMuxError, StreamPriority,
+    MigrationFrame, MultipathMuxPacket, MultipathStreamMux, StreamId, StreamMuxError,
+    StreamPriority,
 };
 use crate::reactor::AsyncUdpSocket;
 use crate::traffic_slicing::FlowSliceClass;
@@ -105,11 +110,13 @@ impl AsyncMultipathSubpath {
     }
 }
 
-/// Asynchronous Multipath Transport Connection coordinating multiple UDP subpaths and a stream multiplexer.
+/// Asynchronous Multipath Transport Connection coordinating multiple UDP subpaths, a stream multiplexer,
+/// and RFC 9000 connection migration.
 pub struct AsyncMultipathTransport {
     mux: Arc<Mutex<MultipathStreamMux>>,
     subpaths: Arc<RwLock<HashMap<u8, AsyncMultipathSubpath>>>,
     default_subpath_id: Arc<RwLock<Option<u8>>>,
+    migration_engine: Arc<Mutex<ConnectionMigrationEngine>>,
 }
 
 impl AsyncMultipathTransport {
@@ -119,6 +126,7 @@ impl AsyncMultipathTransport {
             mux: Arc::new(Mutex::new(MultipathStreamMux::new())),
             subpaths: Arc::new(RwLock::new(HashMap::new())),
             default_subpath_id: Arc::new(RwLock::new(None)),
+            migration_engine: Arc::new(Mutex::new(ConnectionMigrationEngine::new())),
         }
     }
 
@@ -128,6 +136,7 @@ impl AsyncMultipathTransport {
             mux: Arc::new(Mutex::new(mux)),
             subpaths: Arc::new(RwLock::new(HashMap::new())),
             default_subpath_id: Arc::new(RwLock::new(None)),
+            migration_engine: Arc::new(Mutex::new(ConnectionMigrationEngine::new())),
         }
     }
 
@@ -139,6 +148,13 @@ impl AsyncMultipathTransport {
         // Update multiplexer BDP autotuning
         if let Ok(mut mux) = self.mux.lock() {
             mux.update_subpath_bdp(sid, bdp);
+        }
+
+        // Register initial subpath address in connection migration engine
+        if let Ok(mut engine) = self.migration_engine.lock() {
+            let socket_addr = SocketAddress::from_std_socket_addr(subpath.peer_addr);
+            let cid = ConnectionId::generate_deterministic(1, sid as u64);
+            engine.register_subpath(sid as u32, sid as u32, socket_addr, cid, true);
         }
 
         let mut subpaths = self
@@ -339,48 +355,126 @@ impl AsyncMultipathTransport {
     /// Non-blocking poll and ingestion of incoming packets from all registered UDP subpath sockets.
     ///
     /// Returns the number of successfully ingested packets.
-    pub fn poll_incoming_and_ingest(&self, _now_ms: u64) -> Result<usize, io::Error> {
-        let subpaths = self
-            .subpaths
-            .read()
-            .map_err(|_| io::Error::other("Subpaths lock poisoned"))?;
-
+    pub fn poll_incoming_and_ingest(&self, now_ms: u64) -> Result<usize, io::Error> {
+        let mut completed_migrations = Vec::new();
         let mut ingested_count = 0;
         let mut buf = [0u8; 65536];
 
-        for sp in subpaths.values() {
-            if !sp.active {
-                continue;
-            }
+        {
+            let subpaths = self
+                .subpaths
+                .read()
+                .map_err(|_| io::Error::other("Subpaths lock poisoned"))?;
 
-            loop {
-                match sp.socket.try_recv_from(&mut buf) {
-                    Ok(Some((n, _from_addr))) => {
-                        sp.packets_received.fetch_add(1, Ordering::Relaxed);
-                        sp.bytes_received.fetch_add(n as u64, Ordering::Relaxed);
+            for sp in subpaths.values() {
+                if !sp.active {
+                    continue;
+                }
 
-                        if let Ok(packet) = MultipathMuxPacket::decode(&buf[..n]) {
-                            let mut mux = self
-                                .mux
-                                .lock()
-                                .map_err(|_| io::Error::other("Mux lock poisoned"))?;
+                loop {
+                    match sp.socket.try_recv_from(&mut buf) {
+                        Ok(Some((n, from_addr))) => {
+                            sp.packets_received.fetch_add(1, Ordering::Relaxed);
+                            sp.bytes_received.fetch_add(n as u64, Ordering::Relaxed);
 
-                            match packet {
-                                MultipathMuxPacket::Control(ctrl) => {
-                                    let _ = mux.ingest_control_frame(ctrl);
-                                    ingested_count += 1;
-                                }
-                                MultipathMuxPacket::Stream(stream_frame) => {
-                                    if mux.ingest_incoming_frame(stream_frame).is_ok() {
+                            if let Ok(packet) = MultipathMuxPacket::decode(&buf[..n]) {
+                                match packet {
+                                    MultipathMuxPacket::Migration(MigrationFrame::PathChallenge {
+                                        nonce,
+                                    }) => {
+                                        // RFC 9000 §8.2.2: Echo matching PATH_RESPONSE to from_addr
+                                        let resp = MultipathMuxPacket::Migration(
+                                            MigrationFrame::PathResponse { nonce },
+                                        );
+                                        let resp_bytes = resp.encode();
+                                        let _ = sp.socket.send_to(&resp_bytes, from_addr);
+                                        sp.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                        sp.bytes_sent
+                                            .fetch_add(resp_bytes.len() as u64, Ordering::Relaxed);
+
+                                        if let Ok(mut engine) = self.migration_engine.lock() {
+                                            let sender_addr =
+                                                SocketAddress::from_std_socket_addr(from_addr);
+                                            let chal = PathChallenge::new(
+                                                nonce,
+                                                now_ms.saturating_mul(1_000_000),
+                                            );
+                                            let _ = engine.handle_path_challenge(
+                                                sp.subpath_id as u32,
+                                                chal,
+                                                sender_addr,
+                                                now_ms.saturating_mul(1_000_000),
+                                            );
+                                        }
                                         ingested_count += 1;
+                                    }
+                                    MultipathMuxPacket::Migration(MigrationFrame::PathResponse {
+                                        nonce,
+                                    }) => {
+                                        // Path validation response received
+                                        let now_ns = now_ms.saturating_mul(1_000_000);
+                                        if let Ok(mut engine) = self.migration_engine.lock() {
+                                            let resp = PathResponse::new(nonce, now_ns);
+                                            if let Ok(completion) =
+                                                engine.verify_path_response_standalone(resp, now_ns)
+                                            {
+                                                completed_migrations.push(completion);
+                                            }
+                                        }
+                                        ingested_count += 1;
+                                    }
+                                    MultipathMuxPacket::Migration(
+                                        MigrationFrame::NewConnectionId { .. },
+                                    )
+                                    | MultipathMuxPacket::Migration(
+                                        MigrationFrame::RetireConnectionId { .. },
+                                    ) => {
+                                        ingested_count += 1;
+                                    }
+                                    MultipathMuxPacket::Control(ctrl) => {
+                                        let mut mux = self
+                                            .mux
+                                            .lock()
+                                            .map_err(|_| io::Error::other("Mux lock poisoned"))?;
+                                        let _ = mux.ingest_control_frame(ctrl);
+                                        ingested_count += 1;
+                                    }
+                                    MultipathMuxPacket::Stream(stream_frame) => {
+                                        let mut mux = self
+                                            .mux
+                                            .lock()
+                                            .map_err(|_| io::Error::other("Mux lock poisoned"))?;
+                                        if mux.ingest_incoming_frame(stream_frame).is_ok() {
+                                            ingested_count += 1;
+                                        }
                                     }
                                 }
                             }
                         }
+                        Ok(None) => break, // Socket buffer drained
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e),
                     }
-                    Ok(None) => break, // Socket buffer drained
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        // Apply completed migrations: seamlessly update subpath peer addresses
+        if !completed_migrations.is_empty() {
+            let mut subpaths_mut = self
+                .subpaths
+                .write()
+                .map_err(|_| io::Error::other("Subpaths lock poisoned"))?;
+            for completion in completed_migrations {
+                let sid = completion.subpath_id as u8;
+                if let Some(target_sp) = subpaths_mut.get_mut(&sid) {
+                    target_sp.peer_addr = completion.new_address.to_std_socket_addr();
+                    if completion.measured_rtt_ns > 0 {
+                        target_sp.rtt_ms = (completion.measured_rtt_ns / 1_000_000).max(1);
+                        if let Ok(mut mux) = self.mux.lock() {
+                            mux.update_subpath_bdp(target_sp.subpath_id, target_sp.bdp_bytes());
+                        }
+                    }
                 }
             }
         }
@@ -391,6 +485,150 @@ impl AsyncMultipathTransport {
         }
 
         Ok(ingested_count)
+    }
+
+    /// Initiates an RFC 9000 connection migration for a subpath to a new candidate peer address.
+    ///
+    /// Dispatches a PATH_CHALLENGE probe to the candidate address while enforcing anti-amplification controls.
+    pub fn initiate_subpath_migration(
+        &self,
+        subpath_id: u8,
+        new_peer_addr: SocketAddr,
+        trigger: MigrationTrigger,
+        now_ns: u64,
+    ) -> Result<PathChallenge, MigrationError> {
+        let (socket, wire_bytes, challenge) = {
+            let subpaths = self
+                .subpaths
+                .read()
+                .map_err(|_| MigrationError::SubpathNotFound(subpath_id as u32))?;
+            let sp = subpaths
+                .get(&subpath_id)
+                .ok_or(MigrationError::SubpathNotFound(subpath_id as u32))?;
+
+            let mut engine = self
+                .migration_engine
+                .lock()
+                .map_err(|_| MigrationError::SubpathNotFound(subpath_id as u32))?;
+
+            let target_addr = SocketAddress::from_std_socket_addr(new_peer_addr);
+            let challenge = engine.initiate_migration(
+                subpath_id as u32,
+                subpath_id as u32,
+                target_addr,
+                trigger,
+                now_ns,
+            )?;
+
+            let probe = MultipathMuxPacket::Migration(MigrationFrame::PathChallenge {
+                nonce: challenge.nonce,
+            });
+            let wire_bytes = probe.encode();
+
+            if let Some(tracker) = engine.anti_amplification_trackers.get_mut(&target_addr) {
+                tracker.record_sent(wire_bytes.len());
+            }
+
+            sp.packets_sent.fetch_add(1, Ordering::Relaxed);
+            sp.bytes_sent
+                .fetch_add(wire_bytes.len() as u64, Ordering::Relaxed);
+
+            (Arc::clone(&sp.socket), wire_bytes, challenge)
+        };
+
+        let _ = socket.send_to(&wire_bytes, new_peer_addr);
+        Ok(challenge)
+    }
+
+    /// Handles unsolicited NAT rebinding when an incoming packet arrives from a changed 4-tuple address.
+    pub fn handle_unsolicited_nat_rebinding(
+        &self,
+        subpath_id: u8,
+        new_peer_addr: SocketAddr,
+        now_ns: u64,
+    ) -> Result<Option<PathChallenge>, MigrationError> {
+        let (socket, wire_bytes_opt, challenge_opt) = {
+            let subpaths = self
+                .subpaths
+                .read()
+                .map_err(|_| MigrationError::SubpathNotFound(subpath_id as u32))?;
+            let sp = subpaths
+                .get(&subpath_id)
+                .ok_or(MigrationError::SubpathNotFound(subpath_id as u32))?;
+
+            let mut engine = self
+                .migration_engine
+                .lock()
+                .map_err(|_| MigrationError::SubpathNotFound(subpath_id as u32))?;
+
+            let new_sock_addr = SocketAddress::from_std_socket_addr(new_peer_addr);
+            if let Some(challenge) = engine.handle_unsolicited_nat_rebinding(
+                subpath_id as u32,
+                subpath_id as u32,
+                new_sock_addr,
+                1400,
+                now_ns,
+            ) {
+                let probe = MultipathMuxPacket::Migration(MigrationFrame::PathChallenge {
+                    nonce: challenge.nonce,
+                });
+                let wire_bytes = probe.encode();
+                sp.packets_sent.fetch_add(1, Ordering::Relaxed);
+                sp.bytes_sent
+                    .fetch_add(wire_bytes.len() as u64, Ordering::Relaxed);
+                (Arc::clone(&sp.socket), Some(wire_bytes), Some(challenge))
+            } else {
+                (Arc::clone(&sp.socket), None, None)
+            }
+        };
+
+        if let (Some(bytes), Some(challenge)) = (wire_bytes_opt, challenge_opt) {
+            let _ = socket.send_to(&bytes, new_peer_addr);
+            Ok(Some(challenge))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Returns the currently active remote peer address for a subpath.
+    pub fn subpath_peer_addr(&self, subpath_id: u8) -> Option<SocketAddr> {
+        self.subpaths
+            .read()
+            .ok()?
+            .get(&subpath_id)
+            .map(|sp| sp.peer_addr)
+    }
+
+    /// Directly rebinds a subpath to a new peer address (e.g. for immediate handover).
+    pub fn rebind_subpath_peer_addr(
+        &self,
+        subpath_id: u8,
+        new_peer_addr: SocketAddr,
+    ) -> Result<(), io::Error> {
+        let mut subpaths = self
+            .subpaths
+            .write()
+            .map_err(|_| io::Error::other("Subpaths lock poisoned"))?;
+        if let Some(sp) = subpaths.get_mut(&subpath_id) {
+            sp.peer_addr = new_peer_addr;
+            if let Ok(mut engine) = self.migration_engine.lock() {
+                let socket_addr = SocketAddress::from_std_socket_addr(new_peer_addr);
+                engine
+                    .subpath_addresses
+                    .insert(subpath_id as u32, socket_addr);
+            }
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Subpath {} not found", subpath_id),
+            ))
+        }
+    }
+
+    /// Access the underlying connection migration engine for telemetry and validation status.
+    pub fn migration_engine(&self) -> Arc<Mutex<ConnectionMigrationEngine>> {
+        Arc::clone(&self.migration_engine)
     }
 
     /// Read contiguous, in-order assembled payload bytes from a logical stream.
@@ -494,6 +732,51 @@ impl AsyncMultipathTransport {
                 out,
                 "ifa_transport_subpath_rtt_ms{{subpath_id=\"{}\",name=\"{}\"}} {}",
                 sp.subpath_id, sp.name, sp.rtt_ms
+            );
+        }
+
+        // Connection migration metrics
+        if let Ok(engine) = self.migration_engine.lock() {
+            let _ = writeln!(
+                out,
+                "# HELP ifa_transport_migrations_initiated_total Total RFC 9000 connection migrations initiated."
+            );
+            let _ = writeln!(
+                out,
+                "# TYPE ifa_transport_migrations_initiated_total counter"
+            );
+            let _ = writeln!(
+                out,
+                "ifa_transport_migrations_initiated_total {}",
+                engine.migrations_initiated_total
+            );
+
+            let _ = writeln!(
+                out,
+                "# HELP ifa_transport_migrations_completed_total Total connection migrations successfully validated."
+            );
+            let _ = writeln!(
+                out,
+                "# TYPE ifa_transport_migrations_completed_total counter"
+            );
+            let _ = writeln!(
+                out,
+                "ifa_transport_migrations_completed_total {}",
+                engine.migrations_completed_total
+            );
+
+            let _ = writeln!(
+                out,
+                "# HELP ifa_transport_nat_rebindings_detected_total Total unsolicited NAT 4-tuple rebindings detected."
+            );
+            let _ = writeln!(
+                out,
+                "# TYPE ifa_transport_nat_rebindings_detected_total counter"
+            );
+            let _ = writeln!(
+                out,
+                "ifa_transport_nat_rebindings_detected_total {}",
+                engine.nat_rebindings_detected_total
             );
         }
 
@@ -874,5 +1157,153 @@ mod tests {
         assert!(metrics.contains("ifa_transport_subpath_rtt_ms"));
         assert!(metrics.contains("subpath_id=\"1\""));
         assert!(metrics.contains("name=\"eth0-wan\""));
+        assert!(metrics.contains("ifa_transport_migrations_initiated_total"));
+        assert!(metrics.contains("ifa_transport_migrations_completed_total"));
+    }
+
+    #[test]
+    fn test_multipath_transport_connection_migration_zero_loss_handover() {
+        let client = AsyncMultipathTransport::new();
+        let server = AsyncMultipathTransport::new();
+
+        let client_sock = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("client bind"));
+        let server_sock_1 = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("server bind 1"));
+        let server_sock_2 = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("server bind 2"));
+
+        let client_addr = client_sock.local_addr().expect("client addr");
+        let server_addr_1 = server_sock_1.local_addr().expect("server addr 1");
+        let server_addr_2 = server_sock_2.local_addr().expect("server addr 2");
+
+        // Client registers subpath 1 pointing to server primary address 1
+        client
+            .add_subpath(AsyncMultipathSubpath::new(
+                1,
+                "wan1",
+                Arc::clone(&client_sock),
+                server_addr_1,
+                10,
+                100_000_000,
+            ))
+            .expect("add subpath client 1");
+
+        // Server registers both interfaces
+        server
+            .add_subpath(AsyncMultipathSubpath::new(
+                1,
+                "wan1",
+                Arc::clone(&server_sock_1),
+                client_addr,
+                10,
+                100_000_000,
+            ))
+            .expect("add subpath server 1");
+        server
+            .add_subpath(AsyncMultipathSubpath::new(
+                2,
+                "wan2",
+                Arc::clone(&server_sock_2),
+                client_addr,
+                15,
+                100_000_000,
+            ))
+            .expect("add subpath server 2");
+
+        let stream_id = StreamId::client_bidi(7);
+        client
+            .open_stream(
+                stream_id,
+                StreamPriority::Normal,
+                FlowSliceClass::HighThroughput,
+                Some(65536),
+            )
+            .expect("open stream client");
+        server
+            .open_stream(
+                stream_id,
+                StreamPriority::Normal,
+                FlowSliceClass::HighThroughput,
+                Some(65536),
+            )
+            .expect("open stream server");
+
+        // Phase 1: Send initial payload segment on WAN 1
+        let seg1 = b"SEGMENT_1_PRE_MIGRATION_";
+        client
+            .write_stream(stream_id, seg1, false, Some(1))
+            .expect("write seg1");
+        let sent_1 = client.poll_and_transmit_pending().expect("transmit seg1");
+        assert_eq!(sent_1, 1);
+
+        let rec_1 = server.poll_incoming_and_ingest(10).expect("ingest seg1");
+        assert_eq!(rec_1, 1);
+        let delivered_1 = server
+            .read_stream(stream_id, 100)
+            .expect("read delivered 1");
+        assert_eq!(delivered_1, seg1);
+
+        // Verify pre-migration peer address
+        assert_eq!(client.subpath_peer_addr(1), Some(server_addr_1));
+
+        // Phase 2: Initiate RFC 9000 Connection Migration of Subpath 1 to server_addr_2 (WAN 2)
+        let _challenge = client
+            .initiate_subpath_migration(
+                1,
+                server_addr_2,
+                MigrationTrigger::PlannedHandover {
+                    reason: "wan1_to_wan2".to_string(),
+                },
+                1_000_000,
+            )
+            .expect("initiate migration");
+
+        // Server receives PATH_CHALLENGE on socket 2 and responds with PATH_RESPONSE
+        let s_ingest = server
+            .poll_incoming_and_ingest(20)
+            .expect("server ingest challenge");
+        assert_eq!(s_ingest, 1);
+
+        // Client receives PATH_RESPONSE, concluding path validation and rebinding subpath 1
+        let c_ingest = client
+            .poll_incoming_and_ingest(30)
+            .expect("client ingest response");
+        assert_eq!(c_ingest, 1);
+
+        // Subpath 1 peer address must now be rebound to server_addr_2!
+        assert_eq!(
+            client.subpath_peer_addr(1),
+            Some(server_addr_2),
+            "Subpath 1 peer address should be rebound to server_addr_2"
+        );
+
+        // Phase 3: Transmit second segment on Subpath 1 (now seamlessly routed to server_addr_2)
+        let seg2 = b"SEGMENT_2_POST_MIGRATION_ZERO_LOSS";
+        client
+            .write_stream(stream_id, seg2, true, Some(1))
+            .expect("write seg2");
+        let sent_2 = client.poll_and_transmit_pending().expect("transmit seg2");
+        assert!(sent_2 >= 1);
+
+        // Server receives second segment on socket 2
+        let rec_2 = server.poll_incoming_and_ingest(40).expect("ingest seg2");
+        assert!(rec_2 >= 1);
+
+        let delivered_2 = server
+            .read_stream(stream_id, 100)
+            .expect("read delivered 2");
+        assert_eq!(delivered_2, seg2);
+        assert!(server.is_stream_complete(stream_id));
+
+        // Verify telemetry and metrics
+        let client_metrics = client.export_prometheus_metrics();
+        assert!(client_metrics.contains("ifa_transport_migrations_initiated_total 1"));
+        assert!(client_metrics.contains("ifa_transport_migrations_completed_total 1"));
+
+        // Test Unsolicited NAT Rebinding detection
+        let nat_challenge = client
+            .handle_unsolicited_nat_rebinding(1, server_addr_1, 2_000_000)
+            .expect("handle nat rebinding");
+        assert!(nat_challenge.is_some());
+        let updated_metrics = client.export_prometheus_metrics();
+        assert!(updated_metrics.contains("ifa_transport_nat_rebindings_detected_total 1"));
     }
 }

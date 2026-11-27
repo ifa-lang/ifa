@@ -166,8 +166,8 @@ pub use multipath_router::{
 };
 pub use multipath_stream_mux::{
     run_multipath_stream_mux_benchmark, FlowControlAutotuneConfig, FlowControlFrame,
-    IngestStreamOutcome, MultipathMuxPacket, MultipathStreamMux, StreamFrame, StreamId,
-    StreamMuxBenchmarkReport, StreamMuxError, StreamMuxTelemetry, StreamPriority,
+    IngestStreamOutcome, MigrationFrame, MultipathMuxPacket, MultipathStreamMux, StreamFrame,
+    StreamId, StreamMuxBenchmarkReport, StreamMuxError, StreamMuxTelemetry, StreamPriority,
     StreamReassemblyBuffer, StreamState,
 };
 pub use multipath_transport::{
