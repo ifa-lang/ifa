@@ -24,6 +24,7 @@ pub mod multipath_fec;
 pub mod multipath_retransmit;
 pub mod multipath_router;
 pub mod multipath_stream_mux;
+pub mod multipath_transport;
 pub mod panic;
 pub mod reactor;
 pub mod reorder_engine;
@@ -165,8 +166,12 @@ pub use multipath_router::{
 };
 pub use multipath_stream_mux::{
     run_multipath_stream_mux_benchmark, FlowControlAutotuneConfig, FlowControlFrame,
-    IngestStreamOutcome, MultipathStreamMux, StreamFrame, StreamId, StreamMuxBenchmarkReport,
-    StreamMuxError, StreamMuxTelemetry, StreamPriority, StreamReassemblyBuffer, StreamState,
+    IngestStreamOutcome, MultipathMuxPacket, MultipathStreamMux, StreamFrame, StreamId,
+    StreamMuxBenchmarkReport, StreamMuxError, StreamMuxTelemetry, StreamPriority,
+    StreamReassemblyBuffer, StreamState,
+};
+pub use multipath_transport::{
+    AsyncMultipathSubpath, AsyncMultipathTransport, SubpathTransportTelemetry,
 };
 pub use panic::{
     catch_panic, clear_last_panic, dispatch_panic, get_last_panic, get_last_panic_raw_ptr,

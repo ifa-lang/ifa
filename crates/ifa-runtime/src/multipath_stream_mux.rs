@@ -108,6 +108,25 @@ impl StreamPriority {
             Self::Background => 8_192,
         }
     }
+
+    pub fn to_u8(&self) -> u8 {
+        match self {
+            Self::CriticalControl => 0,
+            Self::HighInteractive => 1,
+            Self::Normal => 2,
+            Self::Background => 3,
+        }
+    }
+
+    pub fn from_u8(val: u8) -> Option<Self> {
+        match val {
+            0 => Some(Self::CriticalControl),
+            1 => Some(Self::HighInteractive),
+            2 => Some(Self::Normal),
+            3 => Some(Self::Background),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +148,9 @@ pub struct StreamFrame {
 }
 
 impl StreamFrame {
+    pub const FRAME_TYPE: u8 = 0x01;
+    pub const HEADER_LEN: usize = 33;
+
     pub fn len(&self) -> usize {
         self.payload.len()
     }
@@ -139,6 +161,136 @@ impl StreamFrame {
 
     pub fn end_offset(&self) -> u64 {
         self.offset.saturating_add(self.payload.len() as u64)
+    }
+
+    /// Serializes the stream data frame into a compact binary representation.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::HEADER_LEN + self.payload.len());
+        buf.push(Self::FRAME_TYPE);
+        let mut flags = 0u8;
+        if self.fin {
+            flags |= 0x01;
+        }
+        if self.is_bicast {
+            flags |= 0x02;
+        }
+        buf.push(flags);
+        buf.extend_from_slice(&self.stream_id.0.to_be_bytes());
+        buf.extend_from_slice(&self.offset.to_be_bytes());
+        let slice_byte = match self.slice_class {
+            FlowSliceClass::UltraLowLatency => 0,
+            FlowSliceClass::HighThroughput => 1,
+            FlowSliceClass::MissionCritical => 2,
+            FlowSliceClass::BestEffort => 3,
+        };
+        buf.push(slice_byte);
+        buf.push(self.priority.to_u8());
+        buf.push(self.subpath_id);
+        buf.extend_from_slice(&self.seq_num.to_be_bytes());
+        buf.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&self.payload);
+        buf
+    }
+
+    /// Deserializes a stream data frame from binary wire representation.
+    pub fn decode(buf: &[u8]) -> Result<Self, StreamMuxError> {
+        if buf.len() < Self::HEADER_LEN {
+            return Err(StreamMuxError::InvalidStreamFrame(format!(
+                "Buffer too short for StreamFrame (expected at least {} bytes, got {})",
+                Self::HEADER_LEN,
+                buf.len()
+            )));
+        }
+        if buf[0] != Self::FRAME_TYPE {
+            return Err(StreamMuxError::InvalidStreamFrame(format!(
+                "Invalid StreamFrame type tag: {:#x}",
+                buf[0]
+            )));
+        }
+        let flags = buf[1];
+        let fin = (flags & 0x01) != 0;
+        let is_bicast = (flags & 0x02) != 0;
+        let stream_id = StreamId(u64::from_be_bytes(buf[2..10].try_into().unwrap()));
+        let offset = u64::from_be_bytes(buf[10..18].try_into().unwrap());
+        let slice_class = match buf[18] {
+            0 => FlowSliceClass::UltraLowLatency,
+            1 => FlowSliceClass::HighThroughput,
+            2 => FlowSliceClass::MissionCritical,
+            3 => FlowSliceClass::BestEffort,
+            other => {
+                return Err(StreamMuxError::InvalidStreamFrame(format!(
+                    "Unknown slice class tag: {}",
+                    other
+                )))
+            }
+        };
+        let priority = StreamPriority::from_u8(buf[19]).ok_or_else(|| {
+            StreamMuxError::InvalidStreamFrame(format!("Unknown priority tag: {}", buf[19]))
+        })?;
+        let subpath_id = buf[20];
+        let seq_num = u64::from_be_bytes(buf[21..29].try_into().unwrap());
+        let payload_len = u32::from_be_bytes(buf[29..33].try_into().unwrap()) as usize;
+        if buf.len() < Self::HEADER_LEN + payload_len {
+            return Err(StreamMuxError::InvalidStreamFrame(format!(
+                "Incomplete payload: expected {} bytes, got {}",
+                payload_len,
+                buf.len() - Self::HEADER_LEN
+            )));
+        }
+        let payload = buf[Self::HEADER_LEN..Self::HEADER_LEN + payload_len].to_vec();
+
+        Ok(Self {
+            stream_id,
+            offset,
+            payload,
+            fin,
+            slice_class,
+            priority,
+            subpath_id,
+            seq_num,
+            is_bicast,
+        })
+    }
+}
+
+/// Unified packet envelope for multipath transport multiplexing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultipathMuxPacket {
+    Stream(StreamFrame),
+    Control(FlowControlFrame),
+}
+
+impl MultipathMuxPacket {
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Self::Stream(f) => f.encode(),
+            Self::Control(f) => f.encode(),
+        }
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, StreamMuxError> {
+        if buf.is_empty() {
+            return Err(StreamMuxError::InvalidControlFrame(
+                "Empty buffer".to_string(),
+            ));
+        }
+        if buf[0] == StreamFrame::FRAME_TYPE {
+            StreamFrame::decode(buf).map(Self::Stream)
+        } else {
+            FlowControlFrame::decode(buf).map(Self::Control)
+        }
+    }
+}
+
+impl From<StreamFrame> for MultipathMuxPacket {
+    fn from(frame: StreamFrame) -> Self {
+        Self::Stream(frame)
+    }
+}
+
+impl From<FlowControlFrame> for MultipathMuxPacket {
+    fn from(frame: FlowControlFrame) -> Self {
+        Self::Control(frame)
     }
 }
 
@@ -528,6 +680,7 @@ pub enum StreamMuxError {
         offset: u64,
     },
     InvalidControlFrame(String),
+    InvalidStreamFrame(String),
 }
 
 impl std::fmt::Display for StreamMuxError {
@@ -561,6 +714,7 @@ impl std::fmt::Display for StreamMuxError {
                 write!(f, "Invalid offset {} for stream {:?}", offset, stream_id)
             }
             Self::InvalidControlFrame(msg) => write!(f, "Invalid control frame: {}", msg),
+            Self::InvalidStreamFrame(msg) => write!(f, "Invalid stream frame: {}", msg),
         }
     }
 }
@@ -2166,5 +2320,40 @@ mod tests {
         assert!(prom.contains("ifa_multipath_hol_blocking_prevented_total"));
         assert!(prom.contains("ifa_multipath_control_frames_total"));
         assert!(prom.contains("ifa_multipath_autotune_window_updates_total"));
+    }
+
+    #[test]
+    fn test_stream_frame_and_mux_packet_wire_codec() {
+        let frame = StreamFrame {
+            stream_id: StreamId(42),
+            offset: 1024,
+            payload: b"HELLO_MULTIPATH_WIRE".to_vec(),
+            fin: true,
+            slice_class: FlowSliceClass::UltraLowLatency,
+            priority: StreamPriority::CriticalControl,
+            subpath_id: 3,
+            seq_num: 777,
+            is_bicast: true,
+        };
+
+        let encoded = frame.encode();
+        assert_eq!(encoded.len(), StreamFrame::HEADER_LEN + frame.payload.len());
+        let decoded = StreamFrame::decode(&encoded).expect("decode StreamFrame");
+        assert_eq!(decoded, frame);
+
+        // Packet envelope test
+        let packet = MultipathMuxPacket::Stream(frame.clone());
+        let p_encoded = packet.encode();
+        let p_decoded = MultipathMuxPacket::decode(&p_encoded).expect("decode MultipathMuxPacket");
+        assert_eq!(p_decoded, packet);
+
+        let ctrl_frame = FlowControlFrame::MaxStreamData {
+            stream_id: StreamId(42),
+            maximum_stream_data: 65536,
+        };
+        let ctrl_packet = MultipathMuxPacket::Control(ctrl_frame);
+        let cp_encoded = ctrl_packet.encode();
+        let cp_decoded = MultipathMuxPacket::decode(&cp_encoded).expect("decode control packet");
+        assert_eq!(cp_decoded, ctrl_packet);
     }
 }

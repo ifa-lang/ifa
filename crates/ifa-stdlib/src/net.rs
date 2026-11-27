@@ -14,10 +14,19 @@ use std::time::Duration;
 use std::os::unix::io::AsRawFd;
 
 use ifa_runtime::fiber::GLOBAL_SCHEDULER;
+pub use ifa_runtime::multipath_stream_mux::{
+    FlowControlAutotuneConfig, FlowControlFrame, IngestStreamOutcome, MultipathMuxPacket,
+    MultipathStreamMux, StreamFrame, StreamId, StreamMuxBenchmarkReport, StreamMuxError,
+    StreamMuxTelemetry, StreamPriority, StreamReassemblyBuffer, StreamState,
+};
+pub use ifa_runtime::multipath_transport::{
+    AsyncMultipathSubpath, AsyncMultipathTransport, SubpathTransportTelemetry,
+};
 pub use ifa_runtime::reactor::{
     AsyncTcpListener, AsyncTcpReadHalf, AsyncTcpStream, AsyncTcpWriteHalf, AsyncTimer,
     AsyncUdpSocket,
 };
+pub use ifa_runtime::FlowSliceClass;
 
 pub mod http;
 
@@ -29851,6 +29860,79 @@ mod tests {
 
         // Timer
         AsyncTimer::sleep(Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_async_multipath_transport_integration() {
+        use super::{
+            AsyncMultipathSubpath, AsyncMultipathTransport, AsyncUdpSocket, FlowSliceClass,
+            StreamId, StreamPriority,
+        };
+
+        let client = AsyncMultipathTransport::new();
+        let server = AsyncMultipathTransport::new();
+
+        let s_client = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("bind client udp"));
+        let s_server = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("bind server udp"));
+
+        let client_addr = s_client.local_addr().expect("client addr");
+        let server_addr = s_server.local_addr().expect("server addr");
+
+        client
+            .add_subpath(AsyncMultipathSubpath::new(
+                1,
+                "loopback-wan",
+                s_client,
+                server_addr,
+                5,
+                100_000_000,
+            ))
+            .expect("add subpath client");
+        server
+            .add_subpath(AsyncMultipathSubpath::new(
+                1,
+                "loopback-wan",
+                s_server,
+                client_addr,
+                5,
+                100_000_000,
+            ))
+            .expect("add subpath server");
+
+        let stream_id = StreamId::client_bidi(1);
+        client
+            .open_stream(
+                stream_id,
+                StreamPriority::Normal,
+                FlowSliceClass::HighThroughput,
+                Some(32768),
+            )
+            .expect("open client stream");
+        server
+            .open_stream(
+                stream_id,
+                StreamPriority::Normal,
+                FlowSliceClass::HighThroughput,
+                Some(32768),
+            )
+            .expect("open server stream");
+
+        let msg = b"IFA_STDLIB_ASYNC_MULTIPATH_TRANSPORT_PAYLOAD";
+        client
+            .write_stream(stream_id, msg, true, Some(1))
+            .expect("write stream");
+
+        let sent = client.poll_and_transmit_pending().expect("transmit");
+        assert!(sent >= 1);
+
+        let received = server
+            .poll_incoming_and_ingest(10)
+            .expect("receive and ingest");
+        assert!(received >= 1);
+
+        let read_back = server.read_stream(stream_id, 1024).expect("read stream");
+        assert_eq!(read_back, msg);
+        assert!(server.is_stream_complete(stream_id));
     }
 
     #[test]
