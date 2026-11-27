@@ -11,6 +11,7 @@ pub mod crypto_overhead_rekey;
 pub mod ffi;
 pub mod fiber;
 pub mod header;
+pub mod hybrid_fec_arbiter;
 pub mod ingress_admission;
 pub mod io;
 pub mod jitter_anomaly;
@@ -102,6 +103,11 @@ pub use fiber::{
 pub use header::{
     EpochTransition, GenHeader, GenRef, ARENA_THREAD_LOCAL_CALL, FLAG_ACTIVE, FLAG_ARENA_SCOPED,
     FLAG_EPOCH_1, FLAG_FREE, FLAG_PINNED, FLAG_QUARANTINED, FLAG_READONLY,
+};
+pub use hybrid_fec_arbiter::{
+    run_hybrid_fec_arbiter_benchmark, ArbiterDecision, HybridFecArbiter, HybridFecBenchmarkReport,
+    HybridFecConfig, HybridFecTelemetrySummary, HybridSchedulingMode, PacketLossArbitrationAction,
+    SubpathNetworkProfile,
 };
 pub use ingress_admission::{
     run_ingress_admission_benchmark, run_preemptive_admission_benchmark, ActiveBackpressure,

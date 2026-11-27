@@ -2322,6 +2322,7 @@ pub struct IsspDynamicMultipathRouter {
     pub fec_engine: crate::multipath_fec::MultipathFecEngine,
     pub congestion_manager: crate::multipath_congestion::MultipathCongestionManager,
     pub retransmit_manager: crate::multipath_retransmit::SubpathRetransmitManager,
+    pub hybrid_fec_arbiter: crate::hybrid_fec_arbiter::HybridFecArbiter,
 }
 
 impl IsspDynamicMultipathRouter {
@@ -2364,6 +2365,7 @@ impl IsspDynamicMultipathRouter {
             fec_engine: crate::multipath_fec::MultipathFecEngine::new(),
             congestion_manager: crate::multipath_congestion::MultipathCongestionManager::new(),
             retransmit_manager: crate::multipath_retransmit::SubpathRetransmitManager::new(),
+            hybrid_fec_arbiter: crate::hybrid_fec_arbiter::HybridFecArbiter::default(),
         }
     }
 
@@ -3818,6 +3820,60 @@ impl IsspDynamicMultipathRouter {
             suggested_fallback,
             now_ns,
         )
+    }
+
+    /// Read access to the hybrid FEC and selective retransmission arbiter.
+    pub fn hybrid_fec_arbiter(&self) -> &crate::hybrid_fec_arbiter::HybridFecArbiter {
+        &self.hybrid_fec_arbiter
+    }
+
+    /// Mutable access to the hybrid FEC and selective retransmission arbiter.
+    pub fn hybrid_fec_arbiter_mut(
+        &mut self,
+    ) -> &mut crate::hybrid_fec_arbiter::HybridFecArbiter {
+        &mut self.hybrid_fec_arbiter
+    }
+
+    /// Synchronize all real-time path telemetry into the hybrid arbiter.
+    pub fn sync_paths_to_hybrid_arbiter(&mut self, now_ns: u64) {
+        for path in self.paths.values() {
+            let rtt_ns = path.metrics.smoothed_rtt_us * 1_000;
+            let jitter_ns = path.metrics.jitter_us * 1_000;
+            let loss_ratio = (path.metrics.loss_rate_ppm as f64) / 1_000_000.0;
+            let mut profile = crate::hybrid_fec_arbiter::SubpathNetworkProfile::new(
+                path.path_id,
+                rtt_ns,
+                jitter_ns,
+                loss_ratio,
+                now_ns,
+            );
+            profile.available_bandwidth_bps = (path.weight as u64) * 10_000_000; // e.g. weight 100 = 1 Gbps
+            let bdp_bytes = (path.metrics.smoothed_rtt_us * path.congestion.bbr.estimated_bandwidth_bps)
+                / (8 * 1_000_000);
+            profile.congestion_headroom_bytes = bdp_bytes.saturating_sub(path.congestion.bytes_in_flight).max(8192);
+            self.hybrid_fec_arbiter.update_subpath_profile(profile);
+        }
+    }
+
+    /// Orchestrate joint hybrid FEC / ARQ parameters for a flow and apply directly to FEC encoder and retransmit buffers.
+    pub fn orchestrate_hybrid_loss_recovery(
+        &mut self,
+        flow_id: u32,
+        subpath_id: u32,
+        slice: crate::traffic_slicing::FlowSliceClass,
+        now_ns: u64,
+    ) -> crate::hybrid_fec_arbiter::ArbiterDecision {
+        self.sync_paths_to_hybrid_arbiter(now_ns);
+        let decision = self
+            .hybrid_fec_arbiter
+            .evaluate_slice_subpath(subpath_id, slice, now_ns);
+
+        self.hybrid_fec_arbiter
+            .apply_to_fec_engine(flow_id, subpath_id, slice, &mut self.fec_engine);
+        self.hybrid_fec_arbiter
+            .apply_to_retransmit_manager(flow_id, subpath_id, slice, &mut self.retransmit_manager);
+
+        decision
     }
 
     /// Return an iterator over all registered routes.
@@ -8993,5 +9049,40 @@ mod tests {
         assert_eq!(snap.preemption_severity, 3); // Critical
         assert_eq!(snap.total_ingress_preempted_packets, 1);
         assert_eq!(snap.total_ingress_preempted_bytes, 1200);
+    }
+
+    #[test]
+    fn test_dynamic_router_orchestrate_hybrid_loss_recovery() {
+        use crate::traffic_slicing::FlowSliceClass;
+
+        let mut router = IsspDynamicMultipathRouter::new(1, IsspRoutingPolicy::ActiveStandby);
+        let now_ns = 1_000_000_000u64;
+
+        // Register two real routes
+        let mut r1 = IsspMultipathRoute::new(101, 2, "wwan0-5g", 1, 100);
+        r1.metrics.smoothed_rtt_us = 2_000; // 2 ms
+        r1.metrics.jitter_us = 300;         // 300 µs
+        r1.metrics.loss_rate_ppm = 1_000;    // 0.1% loss
+        router.add_route(r1);
+
+        let mut r2 = IsspMultipathRoute::new(102, 2, "sat0", 2, 50);
+        r2.metrics.smoothed_rtt_us = 40_000; // 40 ms
+        r2.metrics.jitter_us = 5_000;        // 5 ms
+        r2.metrics.loss_rate_ppm = 50_000;   // 5% loss
+        router.add_route(r2);
+
+        // 1. Evaluate clean 5G subpath for eMBB -> PureArq with 0% parity overhead
+        let dec1 = router.orchestrate_hybrid_loss_recovery(42, 101, FlowSliceClass::HighThroughput, now_ns);
+        assert_eq!(dec1.mode, crate::hybrid_fec_arbiter::HybridSchedulingMode::PureArq);
+        assert_eq!(dec1.recommended_m, 0);
+
+        // 2. Evaluate degraded satellite for MissionCritical -> ReinforcedFecWithFallbackArq
+        let dec2 = router.orchestrate_hybrid_loss_recovery(43, 102, FlowSliceClass::MissionCritical, now_ns);
+        assert_eq!(dec2.mode, crate::hybrid_fec_arbiter::HybridSchedulingMode::ReinforcedFecWithFallbackArq);
+        assert_eq!(dec2.recommended_m, 2);
+
+        // Verify retransmit manager has active buffer for flow 43
+        let sender = router.retransmit_manager.ensure_sender_buffer(43, FlowSliceClass::MissionCritical);
+        assert_eq!(sender.policy.max_retransmission_attempts, 3);
     }
 }
