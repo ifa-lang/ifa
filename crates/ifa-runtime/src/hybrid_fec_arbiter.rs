@@ -70,15 +70,15 @@ pub struct HybridFecConfig {
 impl Default for HybridFecConfig {
     fn default() -> Self {
         Self {
-            ull_sla_latency_ns: 5_000_000,       // 5 ms
-            mc_sla_latency_ns: 25_000_000,      // 25 ms
-            embb_sla_latency_ns: 80_000_000,    // 80 ms
-            be_sla_latency_ns: 200_000_000,     // 200 ms
+            ull_sla_latency_ns: 5_000_000,   // 5 ms
+            mc_sla_latency_ns: 25_000_000,   // 25 ms
+            embb_sla_latency_ns: 80_000_000, // 80 ms
+            be_sla_latency_ns: 200_000_000,  // 200 ms
             jitter_safety_factor: 1.5,
-            pure_arq_loss_threshold: 0.005,     // 0.5%
+            pure_arq_loss_threshold: 0.005,      // 0.5%
             reinforced_fec_loss_threshold: 0.04, // 4.0%
             high_jitter_threshold_ns: 4_000_000, // 4 ms
-            evaluation_cooldown_ns: 50_000_000, // 50 ms
+            evaluation_cooldown_ns: 50_000_000,  // 50 ms
         }
     }
 }
@@ -108,7 +108,13 @@ pub struct SubpathNetworkProfile {
 }
 
 impl SubpathNetworkProfile {
-    pub fn new(subpath_id: u32, rtt_ns: u64, jitter_ns: u64, loss_ratio: f64, updated_at_ns: u64) -> Self {
+    pub fn new(
+        subpath_id: u32,
+        rtt_ns: u64,
+        jitter_ns: u64,
+        loss_ratio: f64,
+        updated_at_ns: u64,
+    ) -> Self {
         Self {
             subpath_id,
             smoothed_rtt_ns: rtt_ns,
@@ -206,9 +212,7 @@ pub enum PacketLossArbitrationAction {
         deadline_ns: u64,
     },
     /// Packet is proactively dropped because residual SLA deadline is already expired.
-    EarlyDropSlaExpired {
-        time_overdue_ns: u64,
-    },
+    EarlyDropSlaExpired { time_overdue_ns: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -308,9 +312,13 @@ impl HybridFecArbiter {
             }
         }
 
-        let profile = self.subpath_profiles.get(&subpath_id).cloned().unwrap_or_else(|| {
-            SubpathNetworkProfile::new(subpath_id, 10_000_000, 1_000_000, 0.01, now_ns)
-        });
+        let profile = self
+            .subpath_profiles
+            .get(&subpath_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                SubpathNetworkProfile::new(subpath_id, 10_000_000, 1_000_000, 0.01, now_ns)
+            });
 
         let sla_total_ns = self.sla_budget_ns(slice);
         let transit_latency_ns = profile.one_way_transit_latency_ns();
@@ -429,7 +437,8 @@ impl HybridFecArbiter {
                     0,
                     true,
                     1,
-                    "BestEffort: Scavenger retransmission with FEC parity disabled (M=0)".to_string(),
+                    "BestEffort: Scavenger retransmission with FEC parity disabled (M=0)"
+                        .to_string(),
                 )
             }
         };
@@ -439,7 +448,9 @@ impl HybridFecArbiter {
             HybridSchedulingMode::PureFec => self.telemetry.pure_fec_decisions += 1,
             HybridSchedulingMode::PureArq => self.telemetry.pure_arq_decisions += 1,
             HybridSchedulingMode::JointHybrid => self.telemetry.joint_hybrid_decisions += 1,
-            HybridSchedulingMode::ReinforcedFecWithFallbackArq => self.telemetry.reinforced_decisions += 1,
+            HybridSchedulingMode::ReinforcedFecWithFallbackArq => {
+                self.telemetry.reinforced_decisions += 1
+            }
             HybridSchedulingMode::BestEffortScavenger => self.telemetry.best_effort_decisions += 1,
         }
 
@@ -471,7 +482,8 @@ impl HybridFecArbiter {
             reason: reason.clone(),
         };
 
-        self.active_decisions.insert((subpath_id, slice), decision.clone());
+        self.active_decisions
+            .insert((subpath_id, slice), decision.clone());
         self.log_audit_entry(&decision);
         self.update_telemetry_averages();
 
@@ -516,9 +528,13 @@ impl HybridFecArbiter {
 
         // Check if target candidate subpath can deliver the retransmitted packet within remaining budget
         let target_subpath = fallback_subpath_id.unwrap_or(original_subpath_id);
-        let target_profile = self.subpath_profiles.get(&target_subpath).cloned().unwrap_or_else(|| {
-            SubpathNetworkProfile::new(target_subpath, 10_000_000, 1_000_000, 0.01, now_ns)
-        });
+        let target_profile = self
+            .subpath_profiles
+            .get(&target_subpath)
+            .cloned()
+            .unwrap_or_else(|| {
+                SubpathNetworkProfile::new(target_subpath, 10_000_000, 1_000_000, 0.01, now_ns)
+            });
 
         let transit_delivery_ns = target_profile.one_way_transit_latency_ns()
             + (target_profile.rfc3550_jitter_ns as f64 * self.config.jitter_safety_factor) as u64;
@@ -603,31 +619,71 @@ impl HybridFecArbiter {
 
         out.push_str("# HELP ifa_hybrid_arbiter_evaluations_total Total evaluations performed by joint arbiter.\n");
         out.push_str("# TYPE ifa_hybrid_arbiter_evaluations_total counter\n");
-        let _ = writeln!(out, "ifa_hybrid_arbiter_evaluations_total {}", self.telemetry.total_evaluations);
+        let _ = writeln!(
+            out,
+            "ifa_hybrid_arbiter_evaluations_total {}",
+            self.telemetry.total_evaluations
+        );
 
         out.push_str("# HELP ifa_hybrid_arbiter_decisions_by_mode Total scheduling decisions categorized by mode.\n");
         out.push_str("# TYPE ifa_hybrid_arbiter_decisions_by_mode counter\n");
-        let _ = writeln!(out, "ifa_hybrid_arbiter_decisions_by_mode{{mode=\"pure_fec\"}} {}", self.telemetry.pure_fec_decisions);
-        let _ = writeln!(out, "ifa_hybrid_arbiter_decisions_by_mode{{mode=\"pure_arq\"}} {}", self.telemetry.pure_arq_decisions);
-        let _ = writeln!(out, "ifa_hybrid_arbiter_decisions_by_mode{{mode=\"joint_hybrid\"}} {}", self.telemetry.joint_hybrid_decisions);
-        let _ = writeln!(out, "ifa_hybrid_arbiter_decisions_by_mode{{mode=\"reinforced_fec\"}} {}", self.telemetry.reinforced_decisions);
-        let _ = writeln!(out, "ifa_hybrid_arbiter_decisions_by_mode{{mode=\"best_effort\"}} {}", self.telemetry.best_effort_decisions);
+        let _ = writeln!(
+            out,
+            "ifa_hybrid_arbiter_decisions_by_mode{{mode=\"pure_fec\"}} {}",
+            self.telemetry.pure_fec_decisions
+        );
+        let _ = writeln!(
+            out,
+            "ifa_hybrid_arbiter_decisions_by_mode{{mode=\"pure_arq\"}} {}",
+            self.telemetry.pure_arq_decisions
+        );
+        let _ = writeln!(
+            out,
+            "ifa_hybrid_arbiter_decisions_by_mode{{mode=\"joint_hybrid\"}} {}",
+            self.telemetry.joint_hybrid_decisions
+        );
+        let _ = writeln!(
+            out,
+            "ifa_hybrid_arbiter_decisions_by_mode{{mode=\"reinforced_fec\"}} {}",
+            self.telemetry.reinforced_decisions
+        );
+        let _ = writeln!(
+            out,
+            "ifa_hybrid_arbiter_decisions_by_mode{{mode=\"best_effort\"}} {}",
+            self.telemetry.best_effort_decisions
+        );
 
         out.push_str("# HELP ifa_hybrid_arbiter_bandwidth_overhead_saved_bytes_total Total parity bandwidth saved via pure ARQ.\n");
         out.push_str("# TYPE ifa_hybrid_arbiter_bandwidth_overhead_saved_bytes_total counter\n");
-        let _ = writeln!(out, "ifa_hybrid_arbiter_bandwidth_overhead_saved_bytes_total {}", self.telemetry.bandwidth_overhead_saved_bytes);
+        let _ = writeln!(
+            out,
+            "ifa_hybrid_arbiter_bandwidth_overhead_saved_bytes_total {}",
+            self.telemetry.bandwidth_overhead_saved_bytes
+        );
 
         out.push_str("# HELP ifa_hybrid_arbiter_early_dropped_sla_expired_total Expired zombie packets dropped early to protect bandwidth.\n");
         out.push_str("# TYPE ifa_hybrid_arbiter_early_dropped_sla_expired_total counter\n");
-        let _ = writeln!(out, "ifa_hybrid_arbiter_early_dropped_sla_expired_total {}", self.telemetry.early_dropped_sla_expired);
+        let _ = writeln!(
+            out,
+            "ifa_hybrid_arbiter_early_dropped_sla_expired_total {}",
+            self.telemetry.early_dropped_sla_expired
+        );
 
         out.push_str("# HELP ifa_hybrid_arbiter_sla_violations_prevented_total Total packets rescued in-time before SLA deadline.\n");
         out.push_str("# TYPE ifa_hybrid_arbiter_sla_violations_prevented_total counter\n");
-        let _ = writeln!(out, "ifa_hybrid_arbiter_sla_violations_prevented_total {}", self.telemetry.sla_violations_prevented);
+        let _ = writeln!(
+            out,
+            "ifa_hybrid_arbiter_sla_violations_prevented_total {}",
+            self.telemetry.sla_violations_prevented
+        );
 
         out.push_str("# HELP ifa_hybrid_arbiter_average_parity_overhead_ratio Mean parity redundancy overhead ratio.\n");
         out.push_str("# TYPE ifa_hybrid_arbiter_average_parity_overhead_ratio gauge\n");
-        let _ = writeln!(out, "ifa_hybrid_arbiter_average_parity_overhead_ratio {:.4}", self.telemetry.average_parity_overhead_ratio);
+        let _ = writeln!(
+            out,
+            "ifa_hybrid_arbiter_average_parity_overhead_ratio {:.4}",
+            self.telemetry.average_parity_overhead_ratio
+        );
 
         out
     }
@@ -705,10 +761,34 @@ pub fn run_hybrid_fec_arbiter_benchmark(iterations: usize) -> HybridFecBenchmark
     let base_time_ns = 1_700_000_000_000_000_000u64;
 
     // Register 4 distinct realistic subpaths
-    arbiter.update_subpath_profile(SubpathNetworkProfile::new(101, 1_500_000, 200_000, 0.001, base_time_ns)); // Pristine 5G URLLC
-    arbiter.update_subpath_profile(SubpathNetworkProfile::new(102, 12_000_000, 1_500_000, 0.015, base_time_ns)); // Nominal Fiber
-    arbiter.update_subpath_profile(SubpathNetworkProfile::new(103, 35_000_000, 4_500_000, 0.060, base_time_ns)); // Degraded Satellite
-    arbiter.update_subpath_profile(SubpathNetworkProfile::new(104, 8_000_000, 800_000, 0.002, base_time_ns)); // Backup Terrestrial
+    arbiter.update_subpath_profile(SubpathNetworkProfile::new(
+        101,
+        1_500_000,
+        200_000,
+        0.001,
+        base_time_ns,
+    )); // Pristine 5G URLLC
+    arbiter.update_subpath_profile(SubpathNetworkProfile::new(
+        102,
+        12_000_000,
+        1_500_000,
+        0.015,
+        base_time_ns,
+    )); // Nominal Fiber
+    arbiter.update_subpath_profile(SubpathNetworkProfile::new(
+        103,
+        35_000_000,
+        4_500_000,
+        0.060,
+        base_time_ns,
+    )); // Degraded Satellite
+    arbiter.update_subpath_profile(SubpathNetworkProfile::new(
+        104,
+        8_000_000,
+        800_000,
+        0.002,
+        base_time_ns,
+    )); // Backup Terrestrial
 
     let start_instant = std::time::Instant::now();
     let mut cur_time = base_time_ns;
@@ -820,7 +900,10 @@ mod tests {
         arbiter.update_subpath_profile(profile);
 
         let decision = arbiter.evaluate_slice_subpath(30, FlowSliceClass::MissionCritical, now);
-        assert_eq!(decision.mode, HybridSchedulingMode::ReinforcedFecWithFallbackArq);
+        assert_eq!(
+            decision.mode,
+            HybridSchedulingMode::ReinforcedFecWithFallbackArq
+        );
         assert_eq!(decision.recommended_k, 4);
         assert_eq!(decision.recommended_m, 2); // Cauchy RS K=4, M=2
         assert_eq!(decision.parity_overhead_ratio, 2.0 / 6.0);
@@ -920,7 +1003,9 @@ mod tests {
         let mut arbiter = HybridFecArbiter::new(HybridFecConfig::default());
         let now = 1_000_000_000u64;
 
-        arbiter.update_subpath_profile(SubpathNetworkProfile::new(10, 2_000_000, 200_000, 0.001, now));
+        arbiter.update_subpath_profile(SubpathNetworkProfile::new(
+            10, 2_000_000, 200_000, 0.001, now,
+        ));
         let _ = arbiter.evaluate_slice_subpath(10, FlowSliceClass::UltraLowLatency, now);
 
         let prom = arbiter.export_prometheus_metrics();
