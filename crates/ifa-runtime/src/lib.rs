@@ -27,6 +27,7 @@ pub mod multipath_router;
 pub mod multipath_stream_mux;
 pub mod multipath_transport;
 pub mod panic;
+pub mod predictive_path_selector;
 pub mod reactor;
 pub mod reorder_engine;
 pub mod session_sync;
@@ -172,8 +173,8 @@ pub use multipath_retransmit::{
 };
 pub use multipath_router::{
     run_multipath_router_benchmark, DispatchedFrameResult, FailoverEvent, InflightFrameRecord,
-    MultipathRouter, MultipathRouterBenchmarkReport, RouterError, SubpathHealth, SubpathRoute,
-    SubpathSelection,
+    MultipathRouter, MultipathRouterBenchmarkReport, PreventiveMigrationResult, RouterError,
+    SubpathHealth, SubpathRoute, SubpathSelection,
 };
 pub use multipath_stream_mux::{
     run_multipath_stream_mux_benchmark, FlowControlAutotuneConfig, FlowControlFrame,
@@ -188,6 +189,11 @@ pub use panic::{
     catch_panic, clear_last_panic, dispatch_panic, get_last_panic, get_last_panic_raw_ptr,
     reset_panic_handler, set_panic_handler, IfaBareMetalStackTrace, IfaPanicKind, IfaPanicRecord,
     PanicHandlerFn, MAX_BARE_METAL_FRAMES, MAX_PANIC_MSG_LEN,
+};
+pub use predictive_path_selector::{
+    run_predictive_selector_benchmark, PredictiveMigrationPlan, PredictiveMigrationReason,
+    PredictiveMigrationRecord, PredictivePathConfig, PredictivePathSelector,
+    PredictiveSelectorBenchmarkReport, SlaRiskAssessment, SlaRiskLevel,
 };
 pub use reactor::{
     ifa_rt_async_close, ifa_rt_async_io_uring_supported, ifa_rt_async_iocp_supported,

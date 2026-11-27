@@ -223,6 +223,19 @@ pub struct FailoverEvent {
     pub target_subpath_distribution: HashMap<u32, usize>,
 }
 
+/// Telemetry record emitted during preventive/proactive subpath migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreventiveMigrationResult {
+    pub source_subpath_id: u32,
+    pub target_subpath_id: u32,
+    pub slice_class: Option<FlowSliceClass>,
+    pub flow_id: Option<u32>,
+    pub migrated_frames_count: usize,
+    pub migrated_bytes: u64,
+    pub refragmented_frames_count: usize,
+    pub timestamp_ns: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Multipath Router Engine
 // ---------------------------------------------------------------------------
@@ -250,6 +263,10 @@ pub struct MultipathRouter {
     pub fragmentation_evaded_frames: u64,
     pub bicast_frames_total: u64,
     pub state_transitions_total: u64,
+    pub preferred_path_overrides: HashMap<(FlowSliceClass, Option<u32>), u32>,
+    pub preventive_migrations_total: u64,
+    pub preventive_migrated_frames_total: u64,
+    pub preventive_migrated_bytes_total: u64,
 
     // Policy parameters
     pub bicast_mission_critical: bool,
@@ -281,6 +298,10 @@ impl MultipathRouter {
             fragmentation_evaded_frames: 0,
             bicast_frames_total: 0,
             state_transitions_total: 0,
+            preferred_path_overrides: HashMap::new(),
+            preventive_migrations_total: 0,
+            preventive_migrated_frames_total: 0,
+            preventive_migrated_bytes_total: 0,
             bicast_mission_critical: true,
             max_failover_history: 128,
         }
@@ -358,11 +379,53 @@ impl MultipathRouter {
         Ok(())
     }
 
-    /// Select optimal subpath(s) for a frame based on slice constraints and path capabilities.
-    pub fn select_subpath_for_frame(
+    /// Register a preferred subpath override for a traffic slice class and optional flow.
+    pub fn set_preferred_subpath(
+        &mut self,
+        slice_class: FlowSliceClass,
+        flow_id: Option<u32>,
+        subpath_id: u32,
+    ) {
+        self.preferred_path_overrides
+            .insert((slice_class, flow_id), subpath_id);
+    }
+
+    /// Remove a preferred subpath override.
+    pub fn clear_preferred_subpath(
+        &mut self,
+        slice_class: FlowSliceClass,
+        flow_id: Option<u32>,
+    ) -> Option<u32> {
+        self.preferred_path_overrides
+            .remove(&(slice_class, flow_id))
+    }
+
+    /// Retrieve active preferred subpath override if configured and operational.
+    pub fn get_preferred_subpath(
+        &self,
+        slice_class: FlowSliceClass,
+        flow_id: Option<u32>,
+    ) -> Option<u32> {
+        self.preferred_path_overrides
+            .get(&(slice_class, flow_id))
+            .copied()
+            .or_else(|| {
+                if flow_id.is_some() {
+                    self.preferred_path_overrides
+                        .get(&(slice_class, None))
+                        .copied()
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Select optimal subpath(s) for a frame based on slice constraints, path capabilities, and optional flow overrides.
+    pub fn select_subpath_for_flow_frame(
         &self,
         slice_class: FlowSliceClass,
         payload_len: usize,
+        flow_id: Option<u32>,
     ) -> Result<SubpathSelection, RouterError> {
         if payload_len == 0 {
             return Err(RouterError::InvalidFrameSize(0));
@@ -377,6 +440,36 @@ impl MultipathRouter {
 
         if candidates.is_empty() {
             return Err(RouterError::NoOperationalSubpaths);
+        }
+
+        // Check for proactive preferred path override
+        if let Some(preferred_id) = self.get_preferred_subpath(slice_class, flow_id) {
+            if let Some(route) = self.subpaths.get(&preferred_id) {
+                if route.health.is_available_for_new_traffic() {
+                    let needs_frag = payload_len > route.max_fragment_payload();
+                    let secondary_bicast = if self.bicast_mission_critical
+                        && slice_class == FlowSliceClass::MissionCritical
+                    {
+                        candidates
+                            .iter()
+                            .find(|r| r.subpath_id != route.subpath_id)
+                            .map(|r| r.subpath_id)
+                    } else {
+                        None
+                    };
+                    return Ok(SubpathSelection {
+                        primary_subpath_id: route.subpath_id,
+                        secondary_bicast_subpath_id: secondary_bicast,
+                        effective_pmtu: route.effective_pmtu,
+                        requires_fragmentation: needs_frag,
+                        estimated_rtt_ns: route.srtt_ns,
+                        justification: format!(
+                            "Predictive preferred path {} for {:?} (sRTT={}ns, pmtu={})",
+                            route.subpath_id, slice_class, route.srtt_ns, route.effective_pmtu
+                        ),
+                    });
+                }
+            }
         }
 
         match slice_class {
@@ -521,6 +614,15 @@ impl MultipathRouter {
         }
     }
 
+    /// Select optimal subpath(s) for a frame based on slice constraints and path capabilities.
+    pub fn select_subpath_for_frame(
+        &self,
+        slice_class: FlowSliceClass,
+        payload_len: usize,
+    ) -> Result<SubpathSelection, RouterError> {
+        self.select_subpath_for_flow_frame(slice_class, payload_len, None)
+    }
+
     /// Route and dispatch a frame onto the optimal subpath, adaptively fragmenting if needed.
     pub fn route_and_dispatch_frame(
         &mut self,
@@ -528,7 +630,11 @@ impl MultipathRouter {
         now_ns: u64,
     ) -> Result<DispatchedFrameResult, RouterError> {
         let payload_len = frame.len();
-        let selection = self.select_subpath_for_frame(frame.slice_class, payload_len)?;
+        let selection = self.select_subpath_for_flow_frame(
+            frame.slice_class,
+            payload_len,
+            Some(frame.flow_id),
+        )?;
 
         // Fragment frame adaptively against selected subpath PMTU
         let fragments = self.fragmenter.fragment(&frame, selection.effective_pmtu);
@@ -732,6 +838,106 @@ impl MultipathRouter {
         self.failover_history.push_back(event.clone());
 
         Ok(event)
+    }
+
+    /// Preventively migrate inflight frames from a degraded or SLA-threatened subpath
+    /// to a healthy target subpath without loss or frame drops.
+    pub fn migrate_inflight_preventively(
+        &mut self,
+        source_subpath_id: u32,
+        target_subpath_id: u32,
+        slice_class_filter: Option<FlowSliceClass>,
+        flow_id_filter: Option<u32>,
+        now_ns: u64,
+    ) -> Result<PreventiveMigrationResult, RouterError> {
+        if !self.subpaths.contains_key(&source_subpath_id) {
+            return Err(RouterError::SubpathNotFound(source_subpath_id));
+        }
+        let target_pmtu = {
+            let target = self
+                .subpaths
+                .get(&target_subpath_id)
+                .ok_or(RouterError::SubpathNotFound(target_subpath_id))?;
+            if !target.health.is_available_for_new_traffic() {
+                return Err(RouterError::NoOperationalSubpaths);
+            }
+            target.effective_pmtu
+        };
+
+        let affected_frame_ids: Vec<u64> = self
+            .inflight_frames
+            .iter()
+            .filter(|(_, rec)| {
+                rec.primary_subpath_id == source_subpath_id
+                    && slice_class_filter.is_none_or(|sc| rec.slice_class == sc)
+                    && flow_id_filter.is_none_or(|fid| rec.flow_id == fid)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+
+        let mut migrated_frames_count = 0;
+        let mut migrated_bytes = 0u64;
+        let mut refragmented_frames_count = 0;
+
+        for frame_id in affected_frame_ids {
+            if let Some(mut record) = self.inflight_frames.remove(&frame_id) {
+                let payload_len = record.payload.len();
+
+                // Deduct inflight bytes from source subpath (zero drop penalty)
+                if let Some(src_route) = self.subpaths.get_mut(&source_subpath_id) {
+                    src_route.inflight_bytes =
+                        src_route.inflight_bytes.saturating_sub(payload_len as u64);
+                }
+
+                // Adaptively refragment if target PMTU requires it
+                let unfragmented = UnfragmentedFrame::new(
+                    record.flow_id,
+                    record.frame_id,
+                    record.slice_class,
+                    record.payload.clone(),
+                );
+                let new_fragments = self.fragmenter.fragment(&unfragmented, target_pmtu);
+                let refragmented = new_fragments.len() > record.fragments.len();
+                if refragmented {
+                    refragmented_frames_count += 1;
+                }
+
+                // Credit target subpath inflight & stats
+                if let Some(target_route) = self.subpaths.get_mut(&target_subpath_id) {
+                    target_route.inflight_bytes += payload_len as u64;
+                    target_route.total_routed_frames += 1;
+                    target_route.total_routed_bytes += payload_len as u64;
+                }
+
+                record.primary_subpath_id = target_subpath_id;
+                record.was_fragmented = new_fragments.len() > 1;
+                record.fragments = new_fragments;
+
+                self.inflight_frames.insert(frame_id, record);
+                migrated_frames_count += 1;
+                migrated_bytes += payload_len as u64;
+            }
+        }
+
+        self.preventive_migrations_total += 1;
+        self.preventive_migrated_frames_total += migrated_frames_count as u64;
+        self.preventive_migrated_bytes_total += migrated_bytes;
+
+        if let Some(slice) = slice_class_filter {
+            self.preferred_path_overrides
+                .insert((slice, flow_id_filter), target_subpath_id);
+        }
+
+        Ok(PreventiveMigrationResult {
+            source_subpath_id,
+            target_subpath_id,
+            slice_class: slice_class_filter,
+            flow_id: flow_id_filter,
+            migrated_frames_count,
+            migrated_bytes,
+            refragmented_frames_count,
+            timestamp_ns: now_ns,
+        })
     }
 
     /// Apply adaptive steering feedback derived from `SubpathJitterDriftTracker` alert events.
