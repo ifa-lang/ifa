@@ -30,6 +30,10 @@ pub use ifa_runtime::reactor::{
     AsyncTcpListener, AsyncTcpReadHalf, AsyncTcpStream, AsyncTcpWriteHalf, AsyncTimer,
     AsyncUdpSocket,
 };
+pub use ifa_runtime::subpath_health::{
+    SubpathAlertSink, SubpathDegradedAlertEvent, SubpathHealthConfig, SubpathHealthMonitor,
+    SubpathHealthState, SubpathHealthTracker,
+};
 pub use ifa_runtime::subpath_shaper::{
     SliceRateLimiter, SliceShaperTelemetry, SubpathAdmissionVerdict, SubpathShaperTelemetry,
     SubpathSliceShaper,

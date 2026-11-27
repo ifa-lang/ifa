@@ -30,6 +30,9 @@ use crate::multipath_stream_mux::{
     StreamPriority,
 };
 use crate::reactor::AsyncUdpSocket;
+use crate::subpath_health::{
+    SubpathAlertSink, SubpathHealthConfig, SubpathHealthMonitor, SubpathHealthState,
+};
 use crate::subpath_shaper::{SubpathAdmissionVerdict, SubpathShaperTelemetry, SubpathSliceShaper};
 use crate::traffic_slicing::FlowSliceClass;
 
@@ -47,6 +50,8 @@ pub struct SubpathTransportTelemetry {
     pub packets_received: u64,
     pub bytes_received: u64,
     pub shaper: SubpathShaperTelemetry,
+    pub health_score: u8,
+    pub health_state: SubpathHealthState,
 }
 
 /// An individual asynchronous subpath binding an `AsyncUdpSocket` to a remote peer.
@@ -142,6 +147,14 @@ impl AsyncMultipathSubpath {
     }
 
     pub fn snapshot(&self) -> SubpathTransportTelemetry {
+        self.snapshot_with_health(100, SubpathHealthState::Healthy)
+    }
+
+    pub fn snapshot_with_health(
+        &self,
+        health_score: u8,
+        health_state: SubpathHealthState,
+    ) -> SubpathTransportTelemetry {
         let shaper_snap = self
             .shaper
             .lock()
@@ -161,6 +174,8 @@ impl AsyncMultipathSubpath {
             packets_received: self.packets_received.load(Ordering::Relaxed),
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
             shaper: shaper_snap,
+            health_score,
+            health_state,
         }
     }
 }
@@ -172,6 +187,7 @@ pub struct AsyncMultipathTransport {
     subpaths: Arc<RwLock<HashMap<u8, AsyncMultipathSubpath>>>,
     default_subpath_id: Arc<RwLock<Option<u8>>>,
     migration_engine: Arc<Mutex<ConnectionMigrationEngine>>,
+    health_monitor: Arc<RwLock<SubpathHealthMonitor>>,
 }
 
 impl AsyncMultipathTransport {
@@ -182,6 +198,7 @@ impl AsyncMultipathTransport {
             subpaths: Arc::new(RwLock::new(HashMap::new())),
             default_subpath_id: Arc::new(RwLock::new(None)),
             migration_engine: Arc::new(Mutex::new(ConnectionMigrationEngine::new())),
+            health_monitor: Arc::new(RwLock::new(SubpathHealthMonitor::new())),
         }
     }
 
@@ -192,6 +209,18 @@ impl AsyncMultipathTransport {
             subpaths: Arc::new(RwLock::new(HashMap::new())),
             default_subpath_id: Arc::new(RwLock::new(None)),
             migration_engine: Arc::new(Mutex::new(ConnectionMigrationEngine::new())),
+            health_monitor: Arc::new(RwLock::new(SubpathHealthMonitor::new())),
+        }
+    }
+
+    /// Creates a transport instance with a custom subpath health monitor configuration.
+    pub fn with_health_config(config: SubpathHealthConfig) -> Self {
+        Self {
+            mux: Arc::new(Mutex::new(MultipathStreamMux::new())),
+            subpaths: Arc::new(RwLock::new(HashMap::new())),
+            default_subpath_id: Arc::new(RwLock::new(None)),
+            migration_engine: Arc::new(Mutex::new(ConnectionMigrationEngine::new())),
+            health_monitor: Arc::new(RwLock::new(SubpathHealthMonitor::with_config(config))),
         }
     }
 
@@ -210,6 +239,15 @@ impl AsyncMultipathTransport {
             let socket_addr = SocketAddress::from_std_socket_addr(subpath.peer_addr);
             let cid = ConnectionId::generate_deterministic(1, sid as u64);
             engine.register_subpath(sid as u32, sid as u32, socket_addr, cid, true);
+        }
+
+        // Register subpath in health monitor
+        if let Ok(mut monitor) = self.health_monitor.write() {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            monitor.register_subpath(sid, subpath.name.clone(), subpath.rtt_ms, now_ns);
         }
 
         let mut subpaths = self
@@ -236,6 +274,10 @@ impl AsyncMultipathTransport {
     ) -> Result<Option<AsyncMultipathSubpath>, io::Error> {
         if let Ok(mut mux) = self.mux.lock() {
             mux.remove_subpath_bdp(subpath_id);
+        }
+
+        if let Ok(mut monitor) = self.health_monitor.write() {
+            monitor.unregister_subpath(subpath_id);
         }
 
         let mut subpaths = self
@@ -377,9 +419,48 @@ impl AsyncMultipathTransport {
                         .unwrap_or_default()
                         .as_nanos() as u64;
 
+                    let is_critical_slice = matches!(
+                        frame.slice_class,
+                        FlowSliceClass::UltraLowLatency | FlowSliceClass::MissionCritical
+                    );
+
+                    // Candidate list for health evaluation and failover
+                    let candidates: Vec<(u8, String, u64, u64, bool)> = subpaths
+                        .values()
+                        .map(|s| (s.subpath_id, s.name.clone(), s.rtt_ms, s.bandwidth_bps, s.active))
+                        .collect();
+
+                    // Proactive failover if the requested primary subpath is degraded/critical/down
+                    let target_subpath_id = if is_critical_slice {
+                        let primary_unhealthy = if let Ok(hm) = self.health_monitor.read() {
+                            hm.tracker(frame.subpath_id)
+                                .map(|t| !t.state.is_viable())
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        };
+
+                        if primary_unhealthy {
+                            if let Ok(mut hm) = self.health_monitor.write() {
+                                hm.select_best_fallback_subpath(
+                                    frame.subpath_id,
+                                    frame.slice_class,
+                                    &candidates,
+                                )
+                                .unwrap_or(frame.subpath_id)
+                            } else {
+                                frame.subpath_id
+                            }
+                        } else {
+                            frame.subpath_id
+                        }
+                    } else {
+                        frame.subpath_id
+                    };
+
                     // Primary transmission with adaptive slice shaping
                     let primary_target = subpaths
-                        .get(&frame.subpath_id)
+                        .get(&target_subpath_id)
                         .filter(|s| s.active)
                         .or(lowest_rtt_subpath);
 
@@ -401,6 +482,9 @@ impl AsyncMultipathTransport {
                                         (sp.rtt_ms * 500_000).max(10_000),
                                     );
                                 }
+                                if let Ok(mut hm) = self.health_monitor.write() {
+                                    hm.record_admission_success(sp.subpath_id, now_ns);
+                                }
                                 sent_count += 1;
                             }
                             SubpathAdmissionVerdict::Delayed { delay_ns } => {
@@ -411,10 +495,53 @@ impl AsyncMultipathTransport {
                                     let transit_ns = (sp.rtt_ms * 500_000).saturating_add(delay_ns);
                                     shaper.record_transit_latency(frame.slice_class, transit_ns);
                                 }
+                                if let Ok(mut hm) = self.health_monitor.write() {
+                                    hm.record_admission_success(sp.subpath_id, now_ns);
+                                }
                                 sent_count += 1;
                             }
                             SubpathAdmissionVerdict::Throttled { .. } => {
-                                // Frame dropped / throttled by shaper policing
+                                // Record admission failure on primary subpath
+                                if let Ok(mut hm) = self.health_monitor.write() {
+                                    hm.record_admission_failure(sp.subpath_id, now_ns);
+                                }
+
+                                // Transparent failover for critical slices upon throttling
+                                if is_critical_slice {
+                                    let fallback_id = if let Ok(mut hm) = self.health_monitor.write() {
+                                        hm.select_best_fallback_subpath(
+                                            sp.subpath_id,
+                                            frame.slice_class,
+                                            &candidates,
+                                        )
+                                    } else {
+                                        None
+                                    };
+
+                                    if let Some(fb_id) = fallback_id {
+                                        if let Some(sp_fb) = subpaths.get(&fb_id).filter(|s| s.active) {
+                                            let fb_verdict = if let Ok(mut shaper) = sp_fb.shaper.lock() {
+                                                shaper.try_admit(frame.slice_class, wire_bytes.len(), now_ns)
+                                            } else {
+                                                SubpathAdmissionVerdict::Admitted
+                                            };
+
+                                            match fb_verdict {
+                                                SubpathAdmissionVerdict::Admitted
+                                                | SubpathAdmissionVerdict::Delayed { .. } => {
+                                                    let n = sp_fb.socket.send_to(&wire_bytes, sp_fb.peer_addr)?;
+                                                    sp_fb.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                                    sp_fb.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                                                    if let Ok(mut hm) = self.health_monitor.write() {
+                                                        hm.record_admission_success(fb_id, now_ns);
+                                                    }
+                                                    sent_count += 1;
+                                                }
+                                                SubpathAdmissionVerdict::Throttled { .. } => {}
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -422,7 +549,7 @@ impl AsyncMultipathTransport {
                     // Bicast secondary transmission for mission-critical slice
                     if frame.is_bicast {
                         if let Some(sec_id) = secondary_subpath_id {
-                            if sec_id != frame.subpath_id {
+                            if sec_id != target_subpath_id {
                                 if let Some(sp_sec) = subpaths.get(&sec_id).filter(|s| s.active) {
                                     let verdict = if let Ok(mut shaper) = sp_sec.shaper.lock() {
                                         shaper.try_admit(
@@ -450,9 +577,16 @@ impl AsyncMultipathTransport {
                                                     (sp_sec.rtt_ms * 500_000).max(10_000),
                                                 );
                                             }
+                                            if let Ok(mut hm) = self.health_monitor.write() {
+                                                hm.record_admission_success(sp_sec.subpath_id, now_ns);
+                                            }
                                             sent_count += 1;
                                         }
-                                        SubpathAdmissionVerdict::Throttled { .. } => {}
+                                        SubpathAdmissionVerdict::Throttled { .. } => {
+                                            if let Ok(mut hm) = self.health_monitor.write() {
+                                                hm.record_admission_failure(sp_sec.subpath_id, now_ns);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -871,13 +1005,97 @@ impl AsyncMultipathTransport {
         }
     }
 
+    /// Returns the subpath health monitor instance.
+    pub fn health_monitor(&self) -> Arc<RwLock<SubpathHealthMonitor>> {
+        self.health_monitor.clone()
+    }
+
+    /// Registers a health degradation alert sink.
+    pub fn register_health_alert_sink(
+        &self,
+        sink: Arc<dyn SubpathAlertSink>,
+    ) -> Result<(), io::Error> {
+        let mut hm = self
+            .health_monitor
+            .write()
+            .map_err(|_| io::Error::other("Health monitor lock poisoned"))?;
+        hm.register_alert_sink(sink);
+        Ok(())
+    }
+
+    /// Updates RTT measurement for a subpath and recalculates health score.
+    pub fn record_subpath_rtt(&self, subpath_id: u8, rtt_ms: u64) -> Result<(), io::Error> {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        if let Ok(mut subpaths) = self.subpaths.write() {
+            if let Some(sp) = subpaths.get_mut(&subpath_id) {
+                sp.rtt_ms = rtt_ms;
+            }
+        }
+
+        let mut hm = self
+            .health_monitor
+            .write()
+            .map_err(|_| io::Error::other("Health monitor lock poisoned"))?;
+        hm.record_rtt_measurement(subpath_id, rtt_ms, now_ns);
+        Ok(())
+    }
+
+    /// Records a PMTU probe timeout/loss on a subpath, triggering degradation evaluation.
+    pub fn record_subpath_pmtu_loss(&self, subpath_id: u8) -> Result<(), io::Error> {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        let mut hm = self
+            .health_monitor
+            .write()
+            .map_err(|_| io::Error::other("Health monitor lock poisoned"))?;
+        hm.record_probe_loss(subpath_id, now_ns);
+        Ok(())
+    }
+
+    /// Records a PMTU probe acknowledgment on a subpath.
+    pub fn record_subpath_pmtu_ack(&self, subpath_id: u8) -> Result<(), io::Error> {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        let mut hm = self
+            .health_monitor
+            .write()
+            .map_err(|_| io::Error::other("Health monitor lock poisoned"))?;
+        hm.record_probe_success(subpath_id, now_ns);
+        Ok(())
+    }
+
     /// Returns a telemetry snapshot for all registered subpaths.
     pub fn subpaths_snapshot(&self) -> Vec<SubpathTransportTelemetry> {
         let subpaths = match self.subpaths.read() {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        let mut list: Vec<_> = subpaths.values().map(|s| s.snapshot()).collect();
+        let monitor = self.health_monitor.read().ok();
+        let mut list: Vec<_> = subpaths
+            .values()
+            .map(|s| {
+                let (score, state) = if let Some(ref m) = monitor {
+                    if let Some(t) = m.tracker(s.subpath_id) {
+                        (t.health_score, t.state)
+                    } else {
+                        (100, SubpathHealthState::Healthy)
+                    }
+                } else {
+                    (100, SubpathHealthState::Healthy)
+                };
+                s.snapshot_with_health(score, state)
+            })
+            .collect();
         list.sort_by_key(|s| s.subpath_id);
         list
     }
@@ -1102,6 +1320,11 @@ impl AsyncMultipathTransport {
                 "ifa_transport_nat_rebindings_detected_total {}",
                 engine.nat_rebindings_detected_total
             );
+        }
+
+        // Subpath health monitoring and failover metrics
+        if let Ok(hm) = self.health_monitor.read() {
+            out.push_str(&hm.export_prometheus_metrics());
         }
 
         out
@@ -1730,5 +1953,103 @@ mod tests {
         assert!(prom.contains("ifa_multipath_shaper_effective_rate_bps{subpath_id=\"1\",name=\"eth0-wan\",slice=\"high_throughput\"} 17500000"));
         assert!(prom.contains("ifa_multipath_shaper_tokens_available_bytes{subpath_id=\"1\",name=\"eth0-wan\",slice=\"mission_critical\"}"));
         assert!(prom.contains("ifa_multipath_shaper_transit_latency_seconds{subpath_id=\"1\",name=\"eth0-wan\",slice=\"ultra_low_latency\"}"));
+    }
+
+    use crate::subpath_health::SubpathDegradedAlertEvent;
+
+    struct HealthAlertRecorder {
+        alert_count: Arc<AtomicU64>,
+    }
+
+    impl SubpathAlertSink for HealthAlertRecorder {
+        fn on_alert(&self, _alert: &SubpathDegradedAlertEvent) {
+            self.alert_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn test_subpath_health_monitor_integration_and_transparent_failover() {
+        let r1_sock = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("bind r1"));
+        let r1_addr = r1_sock.local_addr().expect("r1 local_addr");
+        let s1_sock = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("bind s1"));
+
+        let r2_sock = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("bind r2"));
+        let r2_addr = r2_sock.local_addr().expect("r2 local_addr");
+        let s2_sock = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("bind s2"));
+
+        let transport = AsyncMultipathTransport::new();
+        let alerts_fired = Arc::new(AtomicU64::new(0));
+        transport
+            .register_health_alert_sink(Arc::new(HealthAlertRecorder {
+                alert_count: alerts_fired.clone(),
+            }))
+            .expect("register alert sink");
+
+        let sp1 = AsyncMultipathSubpath::new(1, "eth0-wan", s1_sock, r1_addr, 10, 10_000_000);
+        let sp2 = AsyncMultipathSubpath::new(2, "wwan-5g", s2_sock, r2_addr, 40, 50_000_000);
+
+        transport.add_subpath(sp1).expect("add sp1");
+        transport.add_subpath(sp2).expect("add sp2");
+
+        let snap = transport.subpaths_snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].health_score, 100);
+        assert_eq!(snap[0].health_state, SubpathHealthState::Healthy);
+        assert_eq!(snap[1].health_score, 100);
+        assert_eq!(snap[1].health_state, SubpathHealthState::Healthy);
+
+        // Open UltraLowLatency critical stream
+        transport
+            .open_stream(
+                StreamId(10),
+                StreamPriority::CriticalControl,
+                FlowSliceClass::UltraLowLatency,
+                None,
+            )
+            .expect("open stream");
+
+        // Write first message, should go to primary subpath 1
+        transport
+            .write_stream(StreamId(10), b"Initial critical packet", false, Some(1))
+            .expect("write stream");
+        let sent = transport.poll_and_transmit_pending().expect("transmit");
+        assert_eq!(sent, 1);
+
+        // Verify subpath 1 socket received the frame
+        let mut buf = [0u8; 2048];
+        let (n1, _) = r1_sock.try_recv_from(&mut buf).expect("recv r1").expect("got packet on r1");
+        assert!(n1 > 0);
+
+        // Degrade subpath 1 via consecutive PMTU probe losses
+        transport.record_subpath_pmtu_loss(1).expect("probe loss 1");
+        transport.record_subpath_pmtu_loss(1).expect("probe loss 2");
+        transport.record_subpath_pmtu_loss(1).expect("probe loss 3");
+
+        assert!(alerts_fired.load(Ordering::Relaxed) >= 1);
+
+        // Verify subpath 1 state is now Down in snapshot
+        let snap_degraded = transport.subpaths_snapshot();
+        assert_eq!(snap_degraded[0].health_state, SubpathHealthState::Down);
+        assert_eq!(snap_degraded[0].health_score, 0);
+
+        // Write another message on critical stream targeted at subpath 1
+        // Transparent failover must automatically reroute to surviving healthy subpath 2!
+        transport
+            .write_stream(StreamId(10), b"Failover critical packet", true, Some(1))
+            .expect("write stream failover");
+        let sent_failover = transport.poll_and_transmit_pending().expect("transmit failover");
+        assert_eq!(sent_failover, 1);
+
+        // Verify subpath 2 socket received the failover frame
+        let (n2, _) = r2_sock.try_recv_from(&mut buf).expect("recv r2").expect("got packet on r2");
+        assert!(n2 > 0);
+
+        // Prometheus metrics check
+        let prom = transport.export_prometheus_metrics();
+        assert!(prom.contains("ifa_transport_subpath_health_score{subpath=\"1\",name=\"eth0-wan\"} 0"));
+        assert!(prom.contains("ifa_transport_subpath_health_score{subpath=\"2\",name=\"wwan-5g\"} 100"));
+        assert!(prom.contains("ifa_transport_subpath_failover_events_total{subpath=\"1\",name=\"eth0-wan\"} 1"));
+        assert!(prom.contains("ifa_transport_subpath_state{subpath=\"1\",state=\"down\"} 1"));
+        assert!(prom.contains("ifa_transport_subpath_state{subpath=\"2\",state=\"healthy\"} 1"));
     }
 }

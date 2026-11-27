@@ -32,6 +32,7 @@ pub mod session_sync;
 pub mod simd_classifier;
 pub mod slice_resilience;
 pub mod string;
+pub mod subpath_health;
 pub mod subpath_pmtud;
 pub mod subpath_scheduler;
 pub mod subpath_shaper;
@@ -244,6 +245,10 @@ pub use subpath_pmtud::{
 pub use subpath_scheduler::{
     run_subpath_scheduler_benchmark, EnqueueVerdict, ScheduledPacket, SubpathDeficitScheduler,
     SubpathQueuedPacket, SubpathSchedulerBenchmarkReport, SubpathSchedulerGroup, SubpathSliceQueue,
+};
+pub use subpath_health::{
+    SubpathAlertSink, SubpathDegradedAlertEvent, SubpathHealthConfig, SubpathHealthMonitor,
+    SubpathHealthState, SubpathHealthTracker,
 };
 pub use subpath_shaper::{
     SliceRateLimiter, SliceShaperTelemetry, SubpathAdmissionVerdict, SubpathShaperTelemetry,
