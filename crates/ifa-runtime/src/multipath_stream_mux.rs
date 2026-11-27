@@ -150,18 +150,14 @@ impl StreamFrame {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlowControlFrame {
     /// MAX_DATA (RFC 9000 Type 0x10): Informs the peer of the connection-wide cumulative byte limit.
-    MaxData {
-        maximum_data: u64,
-    },
+    MaxData { maximum_data: u64 },
     /// MAX_STREAM_DATA (RFC 9000 Type 0x11): Informs the peer of the maximum stream offset it can send.
     MaxStreamData {
         stream_id: StreamId,
         maximum_stream_data: u64,
     },
     /// DATA_BLOCKED (RFC 9000 Type 0x14): Informs the peer that the sender is connection flow-control blocked.
-    DataBlocked {
-        data_limit: u64,
-    },
+    DataBlocked { data_limit: u64 },
     /// STREAM_DATA_BLOCKED (RFC 9000 Type 0x15): Informs the peer that the sender is stream flow-control blocked.
     StreamDataBlocked {
         stream_id: StreamId,
@@ -216,7 +212,9 @@ impl FlowControlFrame {
     /// Deserializes a control frame from binary wire representation.
     pub fn decode(buf: &[u8]) -> Result<Self, StreamMuxError> {
         if buf.is_empty() {
-            return Err(StreamMuxError::InvalidControlFrame("Empty buffer".to_string()));
+            return Err(StreamMuxError::InvalidControlFrame(
+                "Empty buffer".to_string(),
+            ));
         }
         match buf[0] {
             Self::TYPE_MAX_DATA => {
@@ -766,7 +764,10 @@ impl StreamMuxTelemetry {
             out,
             "# HELP ifa_multipath_autotune_window_updates_total Number of dynamic window autotuning updates."
         );
-        let _ = writeln!(out, "# TYPE ifa_multipath_autotune_window_updates_total counter");
+        let _ = writeln!(
+            out,
+            "# TYPE ifa_multipath_autotune_window_updates_total counter"
+        );
         let _ = writeln!(
             out,
             "ifa_multipath_autotune_window_updates_total {}",
@@ -967,9 +968,10 @@ impl MultipathStreamMux {
             .saturating_sub(self.connection_bytes_sent);
         if (requested as u64) > conn_credit {
             self.telemetry.connection_flow_control_blocked_total += 1;
-            self.control_tx_queue.push_back(FlowControlFrame::DataBlocked {
-                data_limit: self.max_connection_data_out,
-            });
+            self.control_tx_queue
+                .push_back(FlowControlFrame::DataBlocked {
+                    data_limit: self.max_connection_data_out,
+                });
             self.telemetry.data_blocked_sent_total += 1;
             return Err(StreamMuxError::ConnectionFlowControlBlocked {
                 available: conn_credit,
@@ -1280,10 +1282,9 @@ impl MultipathStreamMux {
                     self.max_connection_data_in = new_conn_max;
                     self.last_advertised_max_conn_data_in = new_conn_max;
                     self.current_connection_window = target_conn;
-                    self.control_tx_queue
-                        .push_back(FlowControlFrame::MaxData {
-                            maximum_data: new_conn_max,
-                        });
+                    self.control_tx_queue.push_back(FlowControlFrame::MaxData {
+                        maximum_data: new_conn_max,
+                    });
                     self.telemetry.max_data_sent_total += 1;
                     self.telemetry.autotune_window_updates_total += 1;
                 }
@@ -1313,13 +1314,19 @@ impl MultipathStreamMux {
             let threshold = (state.current_stream_window as f64
                 * self.autotune_config.update_threshold_ratio) as u64;
 
-            let consumed_since_last = state
-                .bytes_consumed
-                .saturating_sub(state.last_advertised_max_data_in.saturating_sub(state.current_stream_window));
+            let consumed_since_last = state.bytes_consumed.saturating_sub(
+                state
+                    .last_advertised_max_data_in
+                    .saturating_sub(state.current_stream_window),
+            );
 
-            let remaining_credit = state.max_stream_data_in.saturating_sub(state.bytes_received);
+            let remaining_credit = state
+                .max_stream_data_in
+                .saturating_sub(state.bytes_received);
 
-            if consumed_since_last >= threshold || remaining_credit <= (state.current_stream_window / 2) {
+            if consumed_since_last >= threshold
+                || remaining_credit <= (state.current_stream_window / 2)
+            {
                 let new_max_stream_data = state.bytes_consumed + state.current_stream_window;
                 if new_max_stream_data > state.max_stream_data_in {
                     state.max_stream_data_in = new_max_stream_data;
@@ -1343,15 +1350,18 @@ impl MultipathStreamMux {
         let conn_threshold = (self.current_connection_window as f64
             * self.autotune_config.update_threshold_ratio) as u64;
 
-        let conn_consumed_since_last = self
-            .connection_bytes_consumed
-            .saturating_sub(self.last_advertised_max_conn_data_in.saturating_sub(self.current_connection_window));
+        let conn_consumed_since_last = self.connection_bytes_consumed.saturating_sub(
+            self.last_advertised_max_conn_data_in
+                .saturating_sub(self.current_connection_window),
+        );
 
         let conn_remaining = self
             .max_connection_data_in
             .saturating_sub(self.telemetry.bytes_received_total);
 
-        if conn_consumed_since_last >= conn_threshold || conn_remaining <= (self.current_connection_window / 2) {
+        if conn_consumed_since_last >= conn_threshold
+            || conn_remaining <= (self.current_connection_window / 2)
+        {
             let new_max_conn = self.connection_bytes_consumed + self.current_connection_window;
             if new_max_conn > self.max_connection_data_in {
                 self.max_connection_data_in = new_max_conn;
@@ -1943,11 +1953,14 @@ mod tests {
 
         // Sender side backpressure:
         // Sender writes 8,000 bytes successfully using up credit
-        mux.write_stream(s1, &vec![0x77; 8_000], false, 1024).unwrap();
+        mux.write_stream(s1, &vec![0x77; 8_000], false, 1024)
+            .unwrap();
 
         // Sender tries to send another 5 KB on s1. Since only 10 KB was granted and 8 KB was used,
         // attempting 5 KB exceeds available credit (2 KB) and must trigger StreamFlowControlBlocked!
-        let err = mux.write_stream(s1, &vec![0x77; 5_000], false, 1024).unwrap_err();
+        let err = mux
+            .write_stream(s1, &vec![0x77; 5_000], false, 1024)
+            .unwrap_err();
         match err {
             StreamMuxError::StreamFlowControlBlocked {
                 stream_id,
@@ -1982,21 +1995,38 @@ mod tests {
 
         // Sender opens stream with 200 bytes limit
         sender
-            .open_stream(s_id, StreamPriority::Normal, FlowSliceClass::HighThroughput, Some(200))
+            .open_stream(
+                s_id,
+                StreamPriority::Normal,
+                FlowSliceClass::HighThroughput,
+                Some(200),
+            )
             .unwrap();
 
         // Receiver opens stream with 200 bytes limit
         receiver
-            .open_stream(s_id, StreamPriority::Normal, FlowSliceClass::HighThroughput, Some(200))
+            .open_stream(
+                s_id,
+                StreamPriority::Normal,
+                FlowSliceClass::HighThroughput,
+                Some(200),
+            )
             .unwrap();
 
         // 1. Sender writes 200 bytes -> success
-        let w1 = sender.write_stream(s_id, &vec![0x11; 200], false, 200).unwrap();
+        let w1 = sender
+            .write_stream(s_id, &vec![0x11; 200], false, 200)
+            .unwrap();
         assert_eq!(w1, 200);
 
         // 2. Sender attempts 100 more bytes -> blocked!
-        let err = sender.write_stream(s_id, &vec![0x22; 100], true, 100).unwrap_err();
-        assert!(matches!(err, StreamMuxError::StreamFlowControlBlocked { .. }));
+        let err = sender
+            .write_stream(s_id, &vec![0x22; 100], true, 100)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StreamMuxError::StreamFlowControlBlocked { .. }
+        ));
 
         let blocked_frame = sender.poll_outgoing_control_frame().unwrap();
         assert_eq!(
@@ -2017,22 +2047,31 @@ mod tests {
         assert_eq!(read.len(), 200);
 
         // 5. Receiver autotunes and emits MAX_STREAM_DATA
-        let max_stream_frame = receiver.poll_outgoing_control_frame().expect("Receiver must emit MAX_STREAM_DATA");
+        let max_stream_frame = receiver
+            .poll_outgoing_control_frame()
+            .expect("Receiver must emit MAX_STREAM_DATA");
         let (rx_stream_id, new_limit) = match max_stream_frame {
-            FlowControlFrame::MaxStreamData { stream_id, maximum_stream_data } => (stream_id, maximum_stream_data),
+            FlowControlFrame::MaxStreamData {
+                stream_id,
+                maximum_stream_data,
+            } => (stream_id, maximum_stream_data),
             other => panic!("Expected MaxStreamData, got {:?}", other),
         };
         assert_eq!(rx_stream_id, s_id);
         assert!(new_limit > 200);
 
         // 6. Sender ingests MAX_STREAM_DATA
-        sender.ingest_control_frame(FlowControlFrame::MaxStreamData {
-            stream_id: rx_stream_id,
-            maximum_stream_data: new_limit,
-        }).unwrap();
+        sender
+            .ingest_control_frame(FlowControlFrame::MaxStreamData {
+                stream_id: rx_stream_id,
+                maximum_stream_data: new_limit,
+            })
+            .unwrap();
 
         // 7. Sender is now unblocked and successfully sends remaining 100 bytes!
-        let w2 = sender.write_stream(s_id, &vec![0x22; 100], true, 100).unwrap();
+        let w2 = sender
+            .write_stream(s_id, &vec![0x22; 100], true, 100)
+            .unwrap();
         assert_eq!(w2, 100);
     }
 
@@ -2048,8 +2087,20 @@ mod tests {
 
         let s1 = StreamId::client_bidi(10);
         let s2 = StreamId::client_bidi(12);
-        mux.open_stream(s1, StreamPriority::Normal, FlowSliceClass::HighThroughput, Some(500_000)).unwrap();
-        mux.open_stream(s2, StreamPriority::Normal, FlowSliceClass::HighThroughput, Some(500_000)).unwrap();
+        mux.open_stream(
+            s1,
+            StreamPriority::Normal,
+            FlowSliceClass::HighThroughput,
+            Some(500_000),
+        )
+        .unwrap();
+        mux.open_stream(
+            s2,
+            StreamPriority::Normal,
+            FlowSliceClass::HighThroughput,
+            Some(500_000),
+        )
+        .unwrap();
 
         // Ingest data for s1 and s2
         mux.ingest_incoming_frame(StreamFrame {
@@ -2062,7 +2113,8 @@ mod tests {
             subpath_id: 1,
             seq_num: 1,
             is_bicast: false,
-        }).unwrap();
+        })
+        .unwrap();
 
         mux.ingest_incoming_frame(StreamFrame {
             stream_id: s2,
@@ -2074,7 +2126,8 @@ mod tests {
             subpath_id: 2,
             seq_num: 2,
             is_bicast: false,
-        }).unwrap();
+        })
+        .unwrap();
 
         // Read both streams
         let r1 = mux.read_stream(s1, 150_000).unwrap();
