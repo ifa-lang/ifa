@@ -164,9 +164,9 @@ pub use multipath_router::{
     SubpathSelection,
 };
 pub use multipath_stream_mux::{
-    run_multipath_stream_mux_benchmark, IngestStreamOutcome, MultipathStreamMux, StreamFrame,
-    StreamId, StreamMuxBenchmarkReport, StreamMuxError, StreamMuxTelemetry, StreamPriority,
-    StreamReassemblyBuffer, StreamState,
+    run_multipath_stream_mux_benchmark, FlowControlAutotuneConfig, FlowControlFrame,
+    IngestStreamOutcome, MultipathStreamMux, StreamFrame, StreamId, StreamMuxBenchmarkReport,
+    StreamMuxError, StreamMuxTelemetry, StreamPriority, StreamReassemblyBuffer, StreamState,
 };
 pub use panic::{
     catch_panic, clear_last_panic, dispatch_panic, get_last_panic, get_last_panic_raw_ptr,
