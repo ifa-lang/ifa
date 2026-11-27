@@ -1,6 +1,7 @@
 //! IFA Runtime: Deterministic zero-GC generational memory allocator, fiber scheduler, and standard library runtime.
 
 pub mod allocator;
+pub mod async_multipath_egress_gateway;
 pub mod benchmarks;
 pub mod blocking;
 pub mod burst_loss_eval;
@@ -58,6 +59,13 @@ pub use allocator::{
     call_arena_stats, CallArenaGuard, CallArenaStats, EpochGuard, EpochManager, EpochStats,
     GenArena, GlobalGenAllocator, SizeClassPool, SlabPage, SlabPoolSaturationStats, SlabStatus,
     ThreadLocalCallArena, CALL_ARENA_INITIAL_CAPACITY, DEFAULT_PAGE_CAPACITY, GLOBAL_ALLOCATOR,
+};
+pub use async_multipath_egress_gateway::{
+    run_async_multipath_egress_gateway_benchmark, AsyncMultipathEgressGateway,
+    AsyncMultipathEgressGatewayConfig, AsyncMultipathEgressGatewayTelemetry, BackpressuredPacket,
+    EgressCycleReport, EgressGatewayBenchmarkReport, EgressGatewayError, EgressWireEnvelope,
+    EgressWireHeader, PhysicalEgressInterface, EGRESS_HEADER_SIZE, FLAG_BICAST_COPY, FLAG_ECN_CE,
+    FLAG_EGRESS_LAST_FRAGMENT, FLAG_ENCRYPTED, FLAG_URGENT, IFA_EGRESS_MAGIC, IFA_EGRESS_VERSION,
 };
 pub use benchmarks::{
     create_saturated_multipath_snapshot, profile_allocator_engine, run_allocator_multithread_suite,
