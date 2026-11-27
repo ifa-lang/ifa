@@ -232,6 +232,10 @@ pub use slice_resilience::{
     SliceResilienceMetrics, SubpathProbationTracker,
 };
 pub use string::IfaString;
+pub use subpath_health::{
+    SubpathAlertSink, SubpathDegradedAlertEvent, SubpathHealthConfig, SubpathHealthMonitor,
+    SubpathHealthState, SubpathHealthTracker,
+};
 pub use subpath_pmtud::{
     calculate_crc32, run_subpath_pmtud_and_fragmentation_benchmark, AdaptiveFragmenter,
     AdaptiveReassembler, FrameFragment, PmtuProbeAck, PmtuProbePacket, PmtudState,
@@ -245,10 +249,6 @@ pub use subpath_pmtud::{
 pub use subpath_scheduler::{
     run_subpath_scheduler_benchmark, EnqueueVerdict, ScheduledPacket, SubpathDeficitScheduler,
     SubpathQueuedPacket, SubpathSchedulerBenchmarkReport, SubpathSchedulerGroup, SubpathSliceQueue,
-};
-pub use subpath_health::{
-    SubpathAlertSink, SubpathDegradedAlertEvent, SubpathHealthConfig, SubpathHealthMonitor,
-    SubpathHealthState, SubpathHealthTracker,
 };
 pub use subpath_shaper::{
     SliceRateLimiter, SliceShaperTelemetry, SubpathAdmissionVerdict, SubpathShaperTelemetry,

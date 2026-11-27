@@ -427,7 +427,15 @@ impl AsyncMultipathTransport {
                     // Candidate list for health evaluation and failover
                     let candidates: Vec<(u8, String, u64, u64, bool)> = subpaths
                         .values()
-                        .map(|s| (s.subpath_id, s.name.clone(), s.rtt_ms, s.bandwidth_bps, s.active))
+                        .map(|s| {
+                            (
+                                s.subpath_id,
+                                s.name.clone(),
+                                s.rtt_ms,
+                                s.bandwidth_bps,
+                                s.active,
+                            )
+                        })
                         .collect();
 
                     // Proactive failover if the requested primary subpath is degraded/critical/down
@@ -508,31 +516,46 @@ impl AsyncMultipathTransport {
 
                                 // Transparent failover for critical slices upon throttling
                                 if is_critical_slice {
-                                    let fallback_id = if let Ok(mut hm) = self.health_monitor.write() {
-                                        hm.select_best_fallback_subpath(
-                                            sp.subpath_id,
-                                            frame.slice_class,
-                                            &candidates,
-                                        )
-                                    } else {
-                                        None
-                                    };
+                                    let fallback_id =
+                                        if let Ok(mut hm) = self.health_monitor.write() {
+                                            hm.select_best_fallback_subpath(
+                                                sp.subpath_id,
+                                                frame.slice_class,
+                                                &candidates,
+                                            )
+                                        } else {
+                                            None
+                                        };
 
                                     if let Some(fb_id) = fallback_id {
-                                        if let Some(sp_fb) = subpaths.get(&fb_id).filter(|s| s.active) {
-                                            let fb_verdict = if let Ok(mut shaper) = sp_fb.shaper.lock() {
-                                                shaper.try_admit(frame.slice_class, wire_bytes.len(), now_ns)
-                                            } else {
-                                                SubpathAdmissionVerdict::Admitted
-                                            };
+                                        if let Some(sp_fb) =
+                                            subpaths.get(&fb_id).filter(|s| s.active)
+                                        {
+                                            let fb_verdict =
+                                                if let Ok(mut shaper) = sp_fb.shaper.lock() {
+                                                    shaper.try_admit(
+                                                        frame.slice_class,
+                                                        wire_bytes.len(),
+                                                        now_ns,
+                                                    )
+                                                } else {
+                                                    SubpathAdmissionVerdict::Admitted
+                                                };
 
                                             match fb_verdict {
                                                 SubpathAdmissionVerdict::Admitted
                                                 | SubpathAdmissionVerdict::Delayed { .. } => {
-                                                    let n = sp_fb.socket.send_to(&wire_bytes, sp_fb.peer_addr)?;
-                                                    sp_fb.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                                    sp_fb.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
-                                                    if let Ok(mut hm) = self.health_monitor.write() {
+                                                    let n = sp_fb
+                                                        .socket
+                                                        .send_to(&wire_bytes, sp_fb.peer_addr)?;
+                                                    sp_fb
+                                                        .packets_sent
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                    sp_fb
+                                                        .bytes_sent
+                                                        .fetch_add(n as u64, Ordering::Relaxed);
+                                                    if let Ok(mut hm) = self.health_monitor.write()
+                                                    {
                                                         hm.record_admission_success(fb_id, now_ns);
                                                     }
                                                     sent_count += 1;
@@ -578,13 +601,19 @@ impl AsyncMultipathTransport {
                                                 );
                                             }
                                             if let Ok(mut hm) = self.health_monitor.write() {
-                                                hm.record_admission_success(sp_sec.subpath_id, now_ns);
+                                                hm.record_admission_success(
+                                                    sp_sec.subpath_id,
+                                                    now_ns,
+                                                );
                                             }
                                             sent_count += 1;
                                         }
                                         SubpathAdmissionVerdict::Throttled { .. } => {
                                             if let Ok(mut hm) = self.health_monitor.write() {
-                                                hm.record_admission_failure(sp_sec.subpath_id, now_ns);
+                                                hm.record_admission_failure(
+                                                    sp_sec.subpath_id,
+                                                    now_ns,
+                                                );
                                             }
                                         }
                                     }
@@ -2017,7 +2046,10 @@ mod tests {
 
         // Verify subpath 1 socket received the frame
         let mut buf = [0u8; 2048];
-        let (n1, _) = r1_sock.try_recv_from(&mut buf).expect("recv r1").expect("got packet on r1");
+        let (n1, _) = r1_sock
+            .try_recv_from(&mut buf)
+            .expect("recv r1")
+            .expect("got packet on r1");
         assert!(n1 > 0);
 
         // Degrade subpath 1 via consecutive PMTU probe losses
@@ -2037,18 +2069,29 @@ mod tests {
         transport
             .write_stream(StreamId(10), b"Failover critical packet", true, Some(1))
             .expect("write stream failover");
-        let sent_failover = transport.poll_and_transmit_pending().expect("transmit failover");
+        let sent_failover = transport
+            .poll_and_transmit_pending()
+            .expect("transmit failover");
         assert_eq!(sent_failover, 1);
 
         // Verify subpath 2 socket received the failover frame
-        let (n2, _) = r2_sock.try_recv_from(&mut buf).expect("recv r2").expect("got packet on r2");
+        let (n2, _) = r2_sock
+            .try_recv_from(&mut buf)
+            .expect("recv r2")
+            .expect("got packet on r2");
         assert!(n2 > 0);
 
         // Prometheus metrics check
         let prom = transport.export_prometheus_metrics();
-        assert!(prom.contains("ifa_transport_subpath_health_score{subpath=\"1\",name=\"eth0-wan\"} 0"));
-        assert!(prom.contains("ifa_transport_subpath_health_score{subpath=\"2\",name=\"wwan-5g\"} 100"));
-        assert!(prom.contains("ifa_transport_subpath_failover_events_total{subpath=\"1\",name=\"eth0-wan\"} 1"));
+        assert!(
+            prom.contains("ifa_transport_subpath_health_score{subpath=\"1\",name=\"eth0-wan\"} 0")
+        );
+        assert!(
+            prom.contains("ifa_transport_subpath_health_score{subpath=\"2\",name=\"wwan-5g\"} 100")
+        );
+        assert!(prom.contains(
+            "ifa_transport_subpath_failover_events_total{subpath=\"1\",name=\"eth0-wan\"} 1"
+        ));
         assert!(prom.contains("ifa_transport_subpath_state{subpath=\"1\",state=\"down\"} 1"));
         assert!(prom.contains("ifa_transport_subpath_state{subpath=\"2\",state=\"healthy\"} 1"));
     }

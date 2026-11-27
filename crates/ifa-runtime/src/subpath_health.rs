@@ -31,7 +31,10 @@ pub enum SubpathHealthState {
 impl SubpathHealthState {
     /// Returns true if the subpath can carry traffic without imminent risk of complete drop.
     pub fn is_viable(&self) -> bool {
-        matches!(self, SubpathHealthState::Healthy | SubpathHealthState::Degraded)
+        matches!(
+            self,
+            SubpathHealthState::Healthy | SubpathHealthState::Degraded
+        )
     }
 
     /// Label string representation for metric exposition and log formatting.
@@ -160,7 +163,9 @@ impl SubpathHealthTracker {
 
         // 2. Jitter penalty
         if self.rtt_jitter_ms > config.jitter_threshold_ms {
-            let excess = self.rtt_jitter_ms.saturating_sub(config.jitter_threshold_ms);
+            let excess = self
+                .rtt_jitter_ms
+                .saturating_sub(config.jitter_threshold_ms);
             let jitter_penalty = ((excess as f64 * 0.75).min(30.0)) as i32;
             score -= jitter_penalty;
         }
@@ -177,17 +182,18 @@ impl SubpathHealthTracker {
         let new_score = score.clamp(0, 100) as u8;
 
         // Determine target health state and final health score
-        let (target_state, final_score) = if self.consecutive_probe_losses >= config.max_consecutive_probe_losses {
-            (SubpathHealthState::Down, 0)
-        } else if new_score < config.critical_score_threshold
-            || self.consecutive_admission_failures >= config.max_consecutive_admission_failures
-        {
-            (SubpathHealthState::Critical, new_score)
-        } else if new_score < config.degraded_score_threshold {
-            (SubpathHealthState::Degraded, new_score)
-        } else {
-            (SubpathHealthState::Healthy, new_score)
-        };
+        let (target_state, final_score) =
+            if self.consecutive_probe_losses >= config.max_consecutive_probe_losses {
+                (SubpathHealthState::Down, 0)
+            } else if new_score < config.critical_score_threshold
+                || self.consecutive_admission_failures >= config.max_consecutive_admission_failures
+            {
+                (SubpathHealthState::Critical, new_score)
+            } else if new_score < config.degraded_score_threshold {
+                (SubpathHealthState::Degraded, new_score)
+            } else {
+                (SubpathHealthState::Healthy, new_score)
+            };
 
         self.health_score = final_score;
 
@@ -304,7 +310,8 @@ impl SubpathHealthMonitor {
 
             // EWMA for jitter: beta = 0.25
             let beta = 0.25;
-            tracker.rtt_jitter_ms = ((1.0 - beta) * (tracker.rtt_jitter_ms as f64) + beta * diff) as u64;
+            tracker.rtt_jitter_ms =
+                ((1.0 - beta) * (tracker.rtt_jitter_ms as f64) + beta * diff) as u64;
 
             if let Some(alert) = tracker.recalculate_health(&self.config, now_ns) {
                 self.dispatch_alert(alert);
@@ -434,10 +441,7 @@ impl SubpathHealthMonitor {
             out,
             "# HELP ifa_transport_subpath_health_score Dynamic composite health score (0-100)"
         );
-        let _ = writeln!(
-            out,
-            "# TYPE ifa_transport_subpath_health_score gauge"
-        );
+        let _ = writeln!(out, "# TYPE ifa_transport_subpath_health_score gauge");
         for t in self.trackers.values() {
             let _ = writeln!(
                 out,
@@ -514,10 +518,7 @@ impl SubpathHealthMonitor {
             out,
             "# HELP ifa_transport_subpath_rtt_jitter_ms Subpath RTT jitter variance in milliseconds"
         );
-        let _ = writeln!(
-            out,
-            "# TYPE ifa_transport_subpath_rtt_jitter_ms gauge"
-        );
+        let _ = writeln!(out, "# TYPE ifa_transport_subpath_rtt_jitter_ms gauge");
         for t in self.trackers.values() {
             let _ = writeln!(
                 out,
@@ -530,10 +531,7 @@ impl SubpathHealthMonitor {
             out,
             "# HELP ifa_transport_subpath_state Operational health state indicator (1 for active state, 0 otherwise)"
         );
-        let _ = writeln!(
-            out,
-            "# TYPE ifa_transport_subpath_state gauge"
-        );
+        let _ = writeln!(out, "# TYPE ifa_transport_subpath_state gauge");
         for t in self.trackers.values() {
             for state in [
                 SubpathHealthState::Healthy,
@@ -595,7 +593,10 @@ mod tests {
         monitor.register_alert_sink(sink.clone());
 
         monitor.register_subpath(1, "lte-wan", 30, 1000);
-        assert_eq!(monitor.tracker(1).unwrap().state, SubpathHealthState::Healthy);
+        assert_eq!(
+            monitor.tracker(1).unwrap().state,
+            SubpathHealthState::Healthy
+        );
 
         // Record 3 admission failures
         for _ in 0..3 {
@@ -660,18 +661,18 @@ mod tests {
         for _ in 0..5 {
             monitor.record_admission_failure(1, 2000);
         }
-        assert_eq!(monitor.tracker(1).unwrap().state, SubpathHealthState::Critical);
+        assert_eq!(
+            monitor.tracker(1).unwrap().state,
+            SubpathHealthState::Critical
+        );
 
         let subpaths = vec![
             (1, "eth0-wan".to_string(), 10, 100_000_000, true),
             (2, "wwan-5g".to_string(), 40, 50_000_000, true),
         ];
 
-        let fallback = monitor.select_best_fallback_subpath(
-            1,
-            FlowSliceClass::UltraLowLatency,
-            &subpaths,
-        );
+        let fallback =
+            monitor.select_best_fallback_subpath(1, FlowSliceClass::UltraLowLatency, &subpaths);
         assert_eq!(fallback, Some(2));
         assert_eq!(monitor.tracker(1).unwrap().failover_events_total, 1);
     }
@@ -684,7 +685,8 @@ mod tests {
 
         let prom = monitor.export_prometheus_metrics();
         assert!(prom.contains("ifa_transport_subpath_health_score{subpath=\"1\",name=\"eth0\"}"));
-        assert!(prom.contains("ifa_transport_subpath_degraded_events_total{subpath=\"1\",name=\"eth0\"}"));
+        assert!(prom
+            .contains("ifa_transport_subpath_degraded_events_total{subpath=\"1\",name=\"eth0\"}"));
         assert!(prom.contains("ifa_transport_subpath_state{subpath=\"1\",state=\""));
     }
 }
