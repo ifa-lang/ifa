@@ -18,6 +18,10 @@ pub use ifa_runtime::connection_migration::{
     PathResponse, SocketAddress,
 };
 use ifa_runtime::fiber::GLOBAL_SCHEDULER;
+pub use ifa_runtime::multipath_pacing::{
+    MultipathPacingEngine, PacedQueuedPacket, PacedScheduledPacket, PacingPollResult, SubpathPacer,
+    SubpathPacerConfig, SubpathPacingTelemetry, SubpathPacingVerdict,
+};
 pub use ifa_runtime::multipath_stream_mux::{
     FlowControlAutotuneConfig, FlowControlFrame, IngestStreamOutcome, MigrationFrame,
     MultipathMuxPacket, MultipathStreamMux, StreamFrame, StreamId, StreamMuxBenchmarkReport,

@@ -25,6 +25,9 @@ use crate::connection_migration::{
     ConnectionId, ConnectionMigrationEngine, MigrationError, MigrationTrigger, PathChallenge,
     PathResponse, SocketAddress,
 };
+use crate::multipath_pacing::{
+    MultipathPacingEngine, SubpathPacer, SubpathPacingTelemetry, SubpathPacingVerdict,
+};
 use crate::multipath_stream_mux::{
     MigrationFrame, MultipathMuxPacket, MultipathStreamMux, StreamId, StreamMuxError,
     StreamPriority,
@@ -50,6 +53,7 @@ pub struct SubpathTransportTelemetry {
     pub packets_received: u64,
     pub bytes_received: u64,
     pub shaper: SubpathShaperTelemetry,
+    pub pacer: SubpathPacingTelemetry,
     pub health_score: u8,
     pub health_state: SubpathHealthState,
 }
@@ -69,6 +73,7 @@ pub struct AsyncMultipathSubpath {
     pub packets_received: Arc<AtomicU64>,
     pub bytes_received: Arc<AtomicU64>,
     pub shaper: Arc<Mutex<SubpathSliceShaper>>,
+    pub pacer: Arc<Mutex<SubpathPacer>>,
 }
 
 impl AsyncMultipathSubpath {
@@ -89,6 +94,12 @@ impl AsyncMultipathSubpath {
             bandwidth_bps,
             now_ns,
         )));
+        let pacer = Arc::new(Mutex::new(SubpathPacer::new(
+            subpath_id,
+            bandwidth_bps,
+            rtt_ms,
+            now_ns,
+        )));
         Self {
             subpath_id,
             name: name.into(),
@@ -102,6 +113,7 @@ impl AsyncMultipathSubpath {
             packets_received: Arc::new(AtomicU64::new(0)),
             bytes_received: Arc::new(AtomicU64::new(0)),
             shaper,
+            pacer,
         }
     }
 
@@ -115,6 +127,16 @@ impl AsyncMultipathSubpath {
         bandwidth_bps: u64,
         shaper: SubpathSliceShaper,
     ) -> Self {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let pacer = Arc::new(Mutex::new(SubpathPacer::new(
+            subpath_id,
+            bandwidth_bps,
+            rtt_ms,
+            now_ns,
+        )));
         Self {
             subpath_id,
             name: name.into(),
@@ -128,6 +150,7 @@ impl AsyncMultipathSubpath {
             packets_received: Arc::new(AtomicU64::new(0)),
             bytes_received: Arc::new(AtomicU64::new(0)),
             shaper: Arc::new(Mutex::new(shaper)),
+            pacer,
         }
     }
 
@@ -136,6 +159,9 @@ impl AsyncMultipathSubpath {
         self.bandwidth_bps = new_bandwidth_bps;
         if let Ok(mut shaper) = self.shaper.lock() {
             shaper.rebalance(new_bandwidth_bps, now_ns);
+        }
+        if let Ok(mut pacer) = self.pacer.lock() {
+            pacer.update_link(new_bandwidth_bps, self.rtt_ms, now_ns);
         }
     }
 
@@ -162,6 +188,9 @@ impl AsyncMultipathSubpath {
             .unwrap_or_else(|_| {
                 SubpathSliceShaper::new(self.subpath_id, self.bandwidth_bps, 0).snapshot()
             });
+        let pacer_snap = self.pacer.lock().map(|p| p.snapshot()).unwrap_or_else(|_| {
+            SubpathPacer::new(self.subpath_id, self.bandwidth_bps, self.rtt_ms, 0).snapshot()
+        });
         SubpathTransportTelemetry {
             subpath_id: self.subpath_id,
             name: self.name.clone(),
@@ -174,6 +203,7 @@ impl AsyncMultipathSubpath {
             packets_received: self.packets_received.load(Ordering::Relaxed),
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
             shaper: shaper_snap,
+            pacer: pacer_snap,
             health_score,
             health_state,
         }
@@ -188,6 +218,7 @@ pub struct AsyncMultipathTransport {
     default_subpath_id: Arc<RwLock<Option<u8>>>,
     migration_engine: Arc<Mutex<ConnectionMigrationEngine>>,
     health_monitor: Arc<RwLock<SubpathHealthMonitor>>,
+    pacing_engine: Arc<RwLock<MultipathPacingEngine>>,
 }
 
 impl AsyncMultipathTransport {
@@ -199,6 +230,7 @@ impl AsyncMultipathTransport {
             default_subpath_id: Arc::new(RwLock::new(None)),
             migration_engine: Arc::new(Mutex::new(ConnectionMigrationEngine::new())),
             health_monitor: Arc::new(RwLock::new(SubpathHealthMonitor::new())),
+            pacing_engine: Arc::new(RwLock::new(MultipathPacingEngine::new())),
         }
     }
 
@@ -210,6 +242,7 @@ impl AsyncMultipathTransport {
             default_subpath_id: Arc::new(RwLock::new(None)),
             migration_engine: Arc::new(Mutex::new(ConnectionMigrationEngine::new())),
             health_monitor: Arc::new(RwLock::new(SubpathHealthMonitor::new())),
+            pacing_engine: Arc::new(RwLock::new(MultipathPacingEngine::new())),
         }
     }
 
@@ -221,6 +254,7 @@ impl AsyncMultipathTransport {
             default_subpath_id: Arc::new(RwLock::new(None)),
             migration_engine: Arc::new(Mutex::new(ConnectionMigrationEngine::new())),
             health_monitor: Arc::new(RwLock::new(SubpathHealthMonitor::with_config(config))),
+            pacing_engine: Arc::new(RwLock::new(MultipathPacingEngine::new())),
         }
     }
 
@@ -241,13 +275,19 @@ impl AsyncMultipathTransport {
             engine.register_subpath(sid as u32, sid as u32, socket_addr, cid, true);
         }
 
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
         // Register subpath in health monitor
         if let Ok(mut monitor) = self.health_monitor.write() {
-            let now_ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
             monitor.register_subpath(sid, subpath.name.clone(), subpath.rtt_ms, now_ns);
+        }
+
+        // Register subpath in pacing engine
+        if let Ok(mut pe) = self.pacing_engine.write() {
+            pe.register_subpath(sid, subpath.bandwidth_bps, subpath.rtt_ms, now_ns);
         }
 
         let mut subpaths = self
@@ -278,6 +318,10 @@ impl AsyncMultipathTransport {
 
         if let Ok(mut monitor) = self.health_monitor.write() {
             monitor.unregister_subpath(subpath_id);
+        }
+
+        if let Ok(mut pe) = self.pacing_engine.write() {
+            pe.unregister_subpath(subpath_id);
         }
 
         let mut subpaths = self
@@ -466,13 +510,31 @@ impl AsyncMultipathTransport {
                         frame.subpath_id
                     };
 
-                    // Primary transmission with adaptive slice shaping
+                    // Primary transmission with adaptive slice shaping and inter-packet pacing
                     let primary_target = subpaths
                         .get(&target_subpath_id)
                         .filter(|s| s.active)
                         .or(lowest_rtt_subpath);
 
                     if let Some(sp) = primary_target {
+                        let (_pacing_verdict, pacing_delay) = if let Ok(mut pacer) = sp.pacer.lock()
+                        {
+                            let v = pacer.evaluate_tx(frame.slice_class, wire_bytes.len(), now_ns);
+                            let d = pacer.charge_tx(frame.slice_class, wire_bytes.len(), now_ns);
+                            (v, d)
+                        } else {
+                            (SubpathPacingVerdict::Immediate, 0)
+                        };
+
+                        if let Ok(mut pe) = self.pacing_engine.write() {
+                            pe.charge_tx(
+                                sp.subpath_id,
+                                frame.slice_class,
+                                wire_bytes.len(),
+                                now_ns,
+                            );
+                        }
+
                         let verdict = if let Ok(mut shaper) = sp.shaper.lock() {
                             shaper.try_admit(frame.slice_class, wire_bytes.len(), now_ns)
                         } else {
@@ -487,7 +549,9 @@ impl AsyncMultipathTransport {
                                 if let Ok(mut shaper) = sp.shaper.lock() {
                                     shaper.record_transit_latency(
                                         frame.slice_class,
-                                        (sp.rtt_ms * 500_000).max(10_000),
+                                        (sp.rtt_ms * 500_000)
+                                            .saturating_add(pacing_delay)
+                                            .max(10_000),
                                     );
                                 }
                                 if let Ok(mut hm) = self.health_monitor.write() {
@@ -500,7 +564,8 @@ impl AsyncMultipathTransport {
                                 sp.packets_sent.fetch_add(1, Ordering::Relaxed);
                                 sp.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
                                 if let Ok(mut shaper) = sp.shaper.lock() {
-                                    let transit_ns = (sp.rtt_ms * 500_000).saturating_add(delay_ns);
+                                    let transit_ns = (sp.rtt_ms * 500_000)
+                                        .saturating_add(delay_ns.max(pacing_delay));
                                     shaper.record_transit_latency(frame.slice_class, transit_ns);
                                 }
                                 if let Ok(mut hm) = self.health_monitor.write() {
@@ -531,6 +596,13 @@ impl AsyncMultipathTransport {
                                         if let Some(sp_fb) =
                                             subpaths.get(&fb_id).filter(|s| s.active)
                                         {
+                                            if let Ok(mut pacer) = sp_fb.pacer.lock() {
+                                                pacer.charge_tx(
+                                                    frame.slice_class,
+                                                    wire_bytes.len(),
+                                                    now_ns,
+                                                );
+                                            }
                                             let fb_verdict =
                                                 if let Ok(mut shaper) = sp_fb.shaper.lock() {
                                                     shaper.try_admit(
@@ -574,6 +646,13 @@ impl AsyncMultipathTransport {
                         if let Some(sec_id) = secondary_subpath_id {
                             if sec_id != target_subpath_id {
                                 if let Some(sp_sec) = subpaths.get(&sec_id).filter(|s| s.active) {
+                                    if let Ok(mut pacer) = sp_sec.pacer.lock() {
+                                        pacer.charge_tx(
+                                            frame.slice_class,
+                                            wire_bytes.len(),
+                                            now_ns,
+                                        );
+                                    }
                                     let verdict = if let Ok(mut shaper) = sp_sec.shaper.lock() {
                                         shaper.try_admit(
                                             frame.slice_class,
@@ -965,6 +1044,9 @@ impl AsyncMultipathTransport {
             if let Ok(mut mux) = self.mux.lock() {
                 mux.update_subpath_bdp(subpath_id, bdp);
             }
+            if let Ok(mut pe) = self.pacing_engine.write() {
+                pe.update_subpath_link(subpath_id, new_bandwidth_bps, sp.rtt_ms, now_ns);
+            }
             Ok(())
         } else {
             Err(io::Error::new(
@@ -1039,6 +1121,11 @@ impl AsyncMultipathTransport {
         self.health_monitor.clone()
     }
 
+    /// Returns the multipath pacing engine instance.
+    pub fn pacing_engine(&self) -> Arc<RwLock<MultipathPacingEngine>> {
+        self.pacing_engine.clone()
+    }
+
     /// Registers a health degradation alert sink.
     pub fn register_health_alert_sink(
         &self,
@@ -1062,6 +1149,15 @@ impl AsyncMultipathTransport {
         if let Ok(mut subpaths) = self.subpaths.write() {
             if let Some(sp) = subpaths.get_mut(&subpath_id) {
                 sp.rtt_ms = rtt_ms;
+                if let Ok(mut pacer) = sp.pacer.lock() {
+                    pacer.update_link(sp.bandwidth_bps, rtt_ms, now_ns);
+                }
+            }
+        }
+
+        if let Ok(mut pe) = self.pacing_engine.write() {
+            if let Some(pacer) = pe.pacers.get_mut(&subpath_id) {
+                pacer.update_link(pacer.bandwidth_bps, rtt_ms, now_ns);
             }
         }
 
@@ -1354,6 +1450,11 @@ impl AsyncMultipathTransport {
         // Subpath health monitoring and failover metrics
         if let Ok(hm) = self.health_monitor.read() {
             out.push_str(&hm.export_prometheus_metrics());
+        }
+
+        // Subpath pacing engine metrics
+        if let Ok(pe) = self.pacing_engine.read() {
+            out.push_str(&pe.export_prometheus_metrics());
         }
 
         out
@@ -2094,5 +2195,65 @@ mod tests {
         ));
         assert!(prom.contains("ifa_transport_subpath_state{subpath=\"1\",state=\"down\"} 1"));
         assert!(prom.contains("ifa_transport_subpath_state{subpath=\"2\",state=\"healthy\"} 1"));
+    }
+
+    #[test]
+    fn test_multipath_transport_pacing_engine_inter_packet_burst_smoothing_and_urllc_preemption() {
+        let transport = AsyncMultipathTransport::new();
+
+        let s1 = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("bind s1"));
+        let r1 = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("bind r1"));
+        let r1_addr = r1.local_addr().expect("r1 addr");
+
+        // Register subpath: 50 Mbps, 20 ms RTT -> BDP = 125,000 bytes
+        let subpath = AsyncMultipathSubpath::new(1, "eth0-wan", s1, r1_addr, 20, 50_000_000);
+        transport.add_subpath(subpath).expect("add subpath");
+
+        // 1. Open URLLC stream and bulk HighThroughput stream
+        transport
+            .open_stream(
+                StreamId(1),
+                StreamPriority::CriticalControl,
+                FlowSliceClass::UltraLowLatency,
+                None,
+            )
+            .expect("open urllc");
+        transport
+            .open_stream(
+                StreamId(2),
+                StreamPriority::Normal,
+                FlowSliceClass::HighThroughput,
+                None,
+            )
+            .expect("open bulk");
+
+        // 2. Write URLLC frame and bulk frame
+        transport
+            .write_stream(StreamId(1), b"URLLC telemetry probe", false, Some(1))
+            .expect("write urllc");
+        transport
+            .write_stream(StreamId(2), b"Bulk data block 1", false, Some(1))
+            .expect("write bulk");
+
+        let sent = transport.poll_and_transmit_pending().expect("transmit");
+        assert!(sent >= 2);
+
+        // Verify subpath snapshot contains valid pacing telemetry
+        let snaps = transport.subpaths_snapshot();
+        assert_eq!(snaps.len(), 1);
+        let pacer_snap = &snaps[0].pacer;
+        assert_eq!(pacer_snap.subpath_id, 1);
+        assert_eq!(pacer_snap.bandwidth_bps, 50_000_000);
+        assert_eq!(pacer_snap.bdp_bytes, 125_000);
+        assert!(pacer_snap.total_paced_packets >= 2);
+        assert!(pacer_snap.total_urllc_bypass_packets >= 1);
+
+        // Verify Prometheus metrics export contains pacing telemetry
+        let prom = transport.export_prometheus_metrics();
+        assert!(prom.contains("ifa_transport_subpath_pacing_rate_bps{subpath_id=\"1\"} 50000000"));
+        assert!(prom.contains("ifa_transport_subpath_bdp_bytes{subpath_id=\"1\"} 125000"));
+        assert!(prom.contains(
+            "ifa_transport_subpath_urllc_guaranteed_injections_total{subpath_id=\"1\"} 1"
+        ));
     }
 }
