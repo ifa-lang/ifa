@@ -850,8 +850,10 @@ mod tests {
         let bdp = SubpathPacer::calculate_bdp_bytes(100_000_000, 20);
         assert_eq!(bdp, 250_000);
 
-        let mut config = SubpathPacerConfig::default();
-        config.bdp_burst_fraction = 0.125; // 1/8th -> ~31,250 bytes
+        let config = SubpathPacerConfig {
+            bdp_burst_fraction: 0.125, // 1/8th -> ~31,250 bytes
+            ..Default::default()
+        };
         let quantum = SubpathPacer::calculate_burst_quantum(bdp, &config);
         assert_eq!(quantum, 31_250);
     }
@@ -974,9 +976,11 @@ mod tests {
 
     #[test]
     fn test_burst_allowance_and_spill_to_pacing() {
-        let mut config = SubpathPacerConfig::default();
-        config.min_burst_bytes = 2000;
-        config.max_burst_bytes = 2000;
+        let config = SubpathPacerConfig {
+            min_burst_bytes: 2000,
+            max_burst_bytes: 2000,
+            ..Default::default()
+        };
         let mut pacer = SubpathPacer::with_config(1, 80_000_000, 10, config, 1_000_000);
 
         // Pacer has 2000 bytes burst allowance initially
