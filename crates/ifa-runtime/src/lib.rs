@@ -38,6 +38,7 @@ pub mod subpath_health;
 pub mod subpath_pmtud;
 pub mod subpath_scheduler;
 pub mod subpath_shaper;
+pub mod subpath_traffic_pipeline;
 pub mod telemetry;
 pub mod telemetry_queue;
 pub mod topology_cspf;
@@ -263,6 +264,10 @@ pub use subpath_scheduler::{
 pub use subpath_shaper::{
     SliceRateLimiter, SliceShaperTelemetry, SubpathAdmissionVerdict, SubpathShaperTelemetry,
     SubpathSliceShaper,
+};
+pub use subpath_traffic_pipeline::{
+    FeedbackActionResult, PipelineError, PipelineIngressVerdict, PipelinePollResult,
+    SubpathChannelState, SubpathPipelineConfig, SubpathPipelineTelemetry, SubpathTrafficPipeline,
 };
 pub use telemetry::{
     snapshot_to_compact_json, supervise_command, ws_build_close_frame, ws_build_text_frame,
