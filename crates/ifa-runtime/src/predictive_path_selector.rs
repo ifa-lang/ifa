@@ -1061,11 +1061,11 @@ mod tests {
             let send_ns = base_send + i * 1_000_000;
             let recv_ns = send_ns + 3_500_000 + i * 300_000; // Strong positive slope
             let p = MultipathPacket::new(
-                i as u64,
+                i,
                 1,
                 1,
                 FlowSliceClass::UltraLowLatency,
-                i as u64,
+                i,
                 64,
                 send_ns,
                 recv_ns,
