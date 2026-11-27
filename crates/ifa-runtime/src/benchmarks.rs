@@ -4642,4 +4642,21 @@ mod tests {
         let json = report.to_json();
         assert!(json.contains("\"migrations_completed\": 10"));
     }
+
+    #[test]
+    fn test_multipath_stream_mux_benchmark_suite_runs() {
+        let report = crate::multipath_stream_mux::run_multipath_stream_mux_benchmark(12);
+        assert_eq!(report.total_streams_tested, 12);
+        assert!(report.total_bytes_transmitted > 0);
+        assert_eq!(report.bit_exact_reassembly_ratio, 1.0);
+        assert!(report.hol_blocking_prevented_events > 0);
+        assert!(report.zero_head_of_line_blocking_achieved);
+
+        let md = report.to_markdown_table();
+        assert!(md.contains("Multipath Stream Multiplexer & HoL Elimination Report"));
+        assert!(md.contains("PASSED"));
+
+        let json = report.to_json();
+        assert!(json.contains("\"zero_hol_achieved\":true"));
+    }
 }
