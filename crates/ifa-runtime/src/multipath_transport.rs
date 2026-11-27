@@ -33,10 +33,15 @@ use crate::multipath_stream_mux::{
     StreamPriority,
 };
 use crate::reactor::AsyncUdpSocket;
+use crate::subpath_bbr::DeliveryAckSample;
 use crate::subpath_health::{
     SubpathAlertSink, SubpathHealthConfig, SubpathHealthMonitor, SubpathHealthState,
 };
 use crate::subpath_shaper::{SubpathAdmissionVerdict, SubpathShaperTelemetry, SubpathSliceShaper};
+use crate::subpath_starvation_guard::StarvationRemediationVerdict;
+use crate::subpath_traffic_pipeline::{
+    FeedbackActionResult, SubpathPipelineTelemetry, SubpathTrafficPipeline,
+};
 use crate::traffic_slicing::FlowSliceClass;
 
 /// Snapshot telemetry of an individual transport subpath.
@@ -56,6 +61,7 @@ pub struct SubpathTransportTelemetry {
     pub pacer: SubpathPacingTelemetry,
     pub health_score: u8,
     pub health_state: SubpathHealthState,
+    pub pipeline: Option<SubpathPipelineTelemetry>,
 }
 
 /// An individual asynchronous subpath binding an `AsyncUdpSocket` to a remote peer.
@@ -181,6 +187,15 @@ impl AsyncMultipathSubpath {
         health_score: u8,
         health_state: SubpathHealthState,
     ) -> SubpathTransportTelemetry {
+        self.snapshot_with_health_and_pipeline(health_score, health_state, None)
+    }
+
+    pub fn snapshot_with_health_and_pipeline(
+        &self,
+        health_score: u8,
+        health_state: SubpathHealthState,
+        pipeline: Option<SubpathPipelineTelemetry>,
+    ) -> SubpathTransportTelemetry {
         let shaper_snap = self
             .shaper
             .lock()
@@ -206,6 +221,7 @@ impl AsyncMultipathSubpath {
             pacer: pacer_snap,
             health_score,
             health_state,
+            pipeline,
         }
     }
 }
@@ -219,6 +235,7 @@ pub struct AsyncMultipathTransport {
     migration_engine: Arc<Mutex<ConnectionMigrationEngine>>,
     health_monitor: Arc<RwLock<SubpathHealthMonitor>>,
     pacing_engine: Arc<RwLock<MultipathPacingEngine>>,
+    traffic_pipeline: Arc<RwLock<SubpathTrafficPipeline>>,
 }
 
 impl AsyncMultipathTransport {
@@ -231,6 +248,7 @@ impl AsyncMultipathTransport {
             migration_engine: Arc::new(Mutex::new(ConnectionMigrationEngine::new())),
             health_monitor: Arc::new(RwLock::new(SubpathHealthMonitor::new())),
             pacing_engine: Arc::new(RwLock::new(MultipathPacingEngine::new())),
+            traffic_pipeline: Arc::new(RwLock::new(SubpathTrafficPipeline::new())),
         }
     }
 
@@ -243,6 +261,7 @@ impl AsyncMultipathTransport {
             migration_engine: Arc::new(Mutex::new(ConnectionMigrationEngine::new())),
             health_monitor: Arc::new(RwLock::new(SubpathHealthMonitor::new())),
             pacing_engine: Arc::new(RwLock::new(MultipathPacingEngine::new())),
+            traffic_pipeline: Arc::new(RwLock::new(SubpathTrafficPipeline::new())),
         }
     }
 
@@ -255,6 +274,20 @@ impl AsyncMultipathTransport {
             migration_engine: Arc::new(Mutex::new(ConnectionMigrationEngine::new())),
             health_monitor: Arc::new(RwLock::new(SubpathHealthMonitor::with_config(config))),
             pacing_engine: Arc::new(RwLock::new(MultipathPacingEngine::new())),
+            traffic_pipeline: Arc::new(RwLock::new(SubpathTrafficPipeline::new())),
+        }
+    }
+
+    /// Creates a transport instance with a custom subpath traffic pipeline.
+    pub fn with_traffic_pipeline(pipeline: SubpathTrafficPipeline) -> Self {
+        Self {
+            mux: Arc::new(Mutex::new(MultipathStreamMux::new())),
+            subpaths: Arc::new(RwLock::new(HashMap::new())),
+            default_subpath_id: Arc::new(RwLock::new(None)),
+            migration_engine: Arc::new(Mutex::new(ConnectionMigrationEngine::new())),
+            health_monitor: Arc::new(RwLock::new(SubpathHealthMonitor::new())),
+            pacing_engine: Arc::new(RwLock::new(MultipathPacingEngine::new())),
+            traffic_pipeline: Arc::new(RwLock::new(pipeline)),
         }
     }
 
@@ -290,6 +323,12 @@ impl AsyncMultipathTransport {
             pe.register_subpath(sid, subpath.bandwidth_bps, subpath.rtt_ms, now_ns);
         }
 
+        // Register subpath in unified traffic pipeline
+        if let Ok(mut tp) = self.traffic_pipeline.write() {
+            let rtt_us = subpath.rtt_ms.saturating_mul(1000);
+            let _ = tp.register_subpath(sid, subpath.bandwidth_bps, rtt_us, now_ns);
+        }
+
         let mut subpaths = self
             .subpaths
             .write()
@@ -322,6 +361,10 @@ impl AsyncMultipathTransport {
 
         if let Ok(mut pe) = self.pacing_engine.write() {
             pe.unregister_subpath(subpath_id);
+        }
+
+        if let Ok(mut tp) = self.traffic_pipeline.write() {
+            tp.unregister_subpath(subpath_id);
         }
 
         let mut subpaths = self
@@ -535,11 +578,34 @@ impl AsyncMultipathTransport {
                             );
                         }
 
-                        let verdict = if let Ok(mut shaper) = sp.shaper.lock() {
+                        let mut verdict = if let Ok(mut shaper) = sp.shaper.lock() {
                             shaper.try_admit(frame.slice_class, wire_bytes.len(), now_ns)
                         } else {
                             SubpathAdmissionVerdict::Admitted
                         };
+
+                        // Anti-starvation boost evaluation if throttled
+                        if let SubpathAdmissionVerdict::Throttled { .. } = verdict {
+                            if let Ok(mut tp) = self.traffic_pipeline.write() {
+                                if let Ok(mut shaper) = sp.shaper.lock() {
+                                    if let StarvationRemediationVerdict::TokenBoostApplied {
+                                        ..
+                                    } = tp.starvation_guard.check_admission_starvation(
+                                        sp.subpath_id,
+                                        frame.slice_class,
+                                        wire_bytes.len(),
+                                        &mut shaper,
+                                        now_ns,
+                                    ) {
+                                        verdict = shaper.try_admit(
+                                            frame.slice_class,
+                                            wire_bytes.len(),
+                                            now_ns,
+                                        );
+                                    }
+                                }
+                            }
+                        }
 
                         match verdict {
                             SubpathAdmissionVerdict::Admitted => {
@@ -557,6 +623,20 @@ impl AsyncMultipathTransport {
                                 if let Ok(mut hm) = self.health_monitor.write() {
                                     hm.record_admission_success(sp.subpath_id, now_ns);
                                 }
+                                if let Ok(mut tp) = self.traffic_pipeline.write() {
+                                    tp.bbr_mut().on_packet_sent(sp.subpath_id, wire_bytes.len());
+                                    tp.starvation_guard.record_admission(
+                                        sp.subpath_id,
+                                        frame.slice_class,
+                                        wire_bytes.len(),
+                                        now_ns,
+                                    );
+                                    tp.starvation_guard.record_packet_scheduled(
+                                        sp.subpath_id,
+                                        frame.slice_class,
+                                        now_ns,
+                                    );
+                                }
                                 sent_count += 1;
                             }
                             SubpathAdmissionVerdict::Delayed { delay_ns } => {
@@ -571,12 +651,34 @@ impl AsyncMultipathTransport {
                                 if let Ok(mut hm) = self.health_monitor.write() {
                                     hm.record_admission_success(sp.subpath_id, now_ns);
                                 }
+                                if let Ok(mut tp) = self.traffic_pipeline.write() {
+                                    tp.bbr_mut().on_packet_sent(sp.subpath_id, wire_bytes.len());
+                                    tp.starvation_guard.record_admission(
+                                        sp.subpath_id,
+                                        frame.slice_class,
+                                        wire_bytes.len(),
+                                        now_ns,
+                                    );
+                                    tp.starvation_guard.record_packet_scheduled(
+                                        sp.subpath_id,
+                                        frame.slice_class,
+                                        now_ns,
+                                    );
+                                }
                                 sent_count += 1;
                             }
                             SubpathAdmissionVerdict::Throttled { .. } => {
                                 // Record admission failure on primary subpath
                                 if let Ok(mut hm) = self.health_monitor.write() {
                                     hm.record_admission_failure(sp.subpath_id, now_ns);
+                                }
+                                if let Ok(mut tp) = self.traffic_pipeline.write() {
+                                    tp.starvation_guard.record_throttle(
+                                        sp.subpath_id,
+                                        frame.slice_class,
+                                        wire_bytes.len(),
+                                        now_ns,
+                                    );
                                 }
 
                                 // Transparent failover for critical slices upon throttling
@@ -630,9 +732,40 @@ impl AsyncMultipathTransport {
                                                     {
                                                         hm.record_admission_success(fb_id, now_ns);
                                                     }
+                                                    if let Ok(mut tp) =
+                                                        self.traffic_pipeline.write()
+                                                    {
+                                                        tp.bbr_mut().on_packet_sent(
+                                                            fb_id,
+                                                            wire_bytes.len(),
+                                                        );
+                                                        tp.starvation_guard.record_admission(
+                                                            fb_id,
+                                                            frame.slice_class,
+                                                            wire_bytes.len(),
+                                                            now_ns,
+                                                        );
+                                                        tp.starvation_guard
+                                                            .record_packet_scheduled(
+                                                                fb_id,
+                                                                frame.slice_class,
+                                                                now_ns,
+                                                            );
+                                                    }
                                                     sent_count += 1;
                                                 }
-                                                SubpathAdmissionVerdict::Throttled { .. } => {}
+                                                SubpathAdmissionVerdict::Throttled { .. } => {
+                                                    if let Ok(mut tp) =
+                                                        self.traffic_pipeline.write()
+                                                    {
+                                                        tp.starvation_guard.record_throttle(
+                                                            fb_id,
+                                                            frame.slice_class,
+                                                            wire_bytes.len(),
+                                                            now_ns,
+                                                        );
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -685,12 +818,37 @@ impl AsyncMultipathTransport {
                                                     now_ns,
                                                 );
                                             }
+                                            if let Ok(mut tp) = self.traffic_pipeline.write() {
+                                                tp.bbr_mut().on_packet_sent(
+                                                    sp_sec.subpath_id,
+                                                    wire_bytes.len(),
+                                                );
+                                                tp.starvation_guard.record_admission(
+                                                    sp_sec.subpath_id,
+                                                    frame.slice_class,
+                                                    wire_bytes.len(),
+                                                    now_ns,
+                                                );
+                                                tp.starvation_guard.record_packet_scheduled(
+                                                    sp_sec.subpath_id,
+                                                    frame.slice_class,
+                                                    now_ns,
+                                                );
+                                            }
                                             sent_count += 1;
                                         }
                                         SubpathAdmissionVerdict::Throttled { .. } => {
                                             if let Ok(mut hm) = self.health_monitor.write() {
                                                 hm.record_admission_failure(
                                                     sp_sec.subpath_id,
+                                                    now_ns,
+                                                );
+                                            }
+                                            if let Ok(mut tp) = self.traffic_pipeline.write() {
+                                                tp.starvation_guard.record_throttle(
+                                                    sp_sec.subpath_id,
+                                                    frame.slice_class,
+                                                    wire_bytes.len(),
                                                     now_ns,
                                                 );
                                             }
@@ -1047,6 +1205,14 @@ impl AsyncMultipathTransport {
             if let Ok(mut pe) = self.pacing_engine.write() {
                 pe.update_subpath_link(subpath_id, new_bandwidth_bps, sp.rtt_ms, now_ns);
             }
+            if let Ok(mut tp) = self.traffic_pipeline.write() {
+                let _ = tp.register_subpath(
+                    subpath_id,
+                    new_bandwidth_bps,
+                    sp.rtt_ms.saturating_mul(1000),
+                    now_ns,
+                );
+            }
             Ok(())
         } else {
             Err(io::Error::new(
@@ -1126,6 +1292,72 @@ impl AsyncMultipathTransport {
         self.pacing_engine.clone()
     }
 
+    /// Returns the unified subpath traffic pipeline.
+    pub fn traffic_pipeline(&self) -> Arc<RwLock<SubpathTrafficPipeline>> {
+        self.traffic_pipeline.clone()
+    }
+
+    /// Alias for accessing the unified subpath traffic pipeline.
+    pub fn pipeline(&self) -> Arc<RwLock<SubpathTrafficPipeline>> {
+        self.traffic_pipeline.clone()
+    }
+
+    /// Process an incoming delivery acknowledgment sample and propagate closed-loop adaptation
+    /// through BBR rate estimation, pacing calendar updates, and dynamic QoS slice rebalancing.
+    pub fn record_delivery_ack(
+        &self,
+        subpath_id: u8,
+        sample: DeliveryAckSample,
+        now_ns: u64,
+    ) -> Result<FeedbackActionResult, io::Error> {
+        let res = {
+            let mut tp = self
+                .traffic_pipeline
+                .write()
+                .map_err(|_| io::Error::other("Traffic pipeline lock poisoned"))?;
+            tp.on_delivery_ack(subpath_id, sample, now_ns)
+                .map_err(|e| io::Error::other(format!("Pipeline delivery ack error: {:?}", e)))?
+        };
+
+        if sample.rtt_us > 0 {
+            let sample_rtt_ms = (sample.rtt_us / 1000).max(1);
+            if let Ok(mut subpaths) = self.subpaths.write() {
+                if let Some(sp) = subpaths.get_mut(&subpath_id) {
+                    sp.rtt_ms = sample_rtt_ms;
+                }
+            }
+            if let Ok(mut hm) = self.health_monitor.write() {
+                hm.record_rtt_measurement(subpath_id, sample_rtt_ms, now_ns);
+                if sample.lost_bytes > 0 {
+                    hm.record_probe_loss(subpath_id, now_ns);
+                } else {
+                    hm.record_probe_success(subpath_id, now_ns);
+                }
+            }
+        }
+
+        Ok(res)
+    }
+
+    /// Process a downstream congestion event (confirmed packet losses or ECN markings).
+    pub fn record_congestion_event(
+        &self,
+        subpath_id: u8,
+        lost_bytes: usize,
+        ecn_count: u32,
+        now_ns: u64,
+    ) -> Result<FeedbackActionResult, io::Error> {
+        let sample = DeliveryAckSample {
+            delivered_bytes: 0,
+            interval_ns: 1,
+            rtt_us: 0,
+            inflight_bytes_at_send: 0,
+            ecn_ce_count: ecn_count as u64,
+            lost_bytes: lost_bytes as u64,
+        };
+        self.record_delivery_ack(subpath_id, sample, now_ns)
+    }
+
     /// Registers a health degradation alert sink.
     pub fn register_health_alert_sink(
         &self,
@@ -1146,9 +1378,11 @@ impl AsyncMultipathTransport {
             .unwrap_or_default()
             .as_nanos() as u64;
 
+        let mut bw = 10_000_000;
         if let Ok(mut subpaths) = self.subpaths.write() {
             if let Some(sp) = subpaths.get_mut(&subpath_id) {
                 sp.rtt_ms = rtt_ms;
+                bw = sp.bandwidth_bps;
                 if let Ok(mut pacer) = sp.pacer.lock() {
                     pacer.update_link(sp.bandwidth_bps, rtt_ms, now_ns);
                 }
@@ -1159,6 +1393,10 @@ impl AsyncMultipathTransport {
             if let Some(pacer) = pe.pacers.get_mut(&subpath_id) {
                 pacer.update_link(pacer.bandwidth_bps, rtt_ms, now_ns);
             }
+        }
+
+        if let Ok(mut tp) = self.traffic_pipeline.write() {
+            let _ = tp.register_subpath(subpath_id, bw, rtt_ms.saturating_mul(1000), now_ns);
         }
 
         let mut hm = self
@@ -1206,6 +1444,7 @@ impl AsyncMultipathTransport {
             Err(_) => return Vec::new(),
         };
         let monitor = self.health_monitor.read().ok();
+        let pipeline = self.traffic_pipeline.read().ok();
         let mut list: Vec<_> = subpaths
             .values()
             .map(|s| {
@@ -1218,7 +1457,8 @@ impl AsyncMultipathTransport {
                 } else {
                     (100, SubpathHealthState::Healthy)
                 };
-                s.snapshot_with_health(score, state)
+                let pipe_snap = pipeline.as_ref().and_then(|p| p.snapshot(s.subpath_id));
+                s.snapshot_with_health_and_pipeline(score, state, pipe_snap)
             })
             .collect();
         list.sort_by_key(|s| s.subpath_id);
@@ -1455,6 +1695,11 @@ impl AsyncMultipathTransport {
         // Subpath pacing engine metrics
         if let Ok(pe) = self.pacing_engine.read() {
             out.push_str(&pe.export_prometheus_metrics());
+        }
+
+        // Unified subpath traffic pipeline metrics (BBR, Shaper, Pacer, Starvation Guard)
+        if let Ok(tp) = self.traffic_pipeline.read() {
+            out.push_str(&tp.export_prometheus_metrics());
         }
 
         out
@@ -2255,5 +2500,115 @@ mod tests {
         assert!(prom.contains(
             "ifa_transport_subpath_urllc_guaranteed_injections_total{subpath_id=\"1\"} 1"
         ));
+    }
+
+    #[test]
+    fn test_multipath_transport_traffic_pipeline_coupling_and_starvation_mitigation() {
+        let r1_sock = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("bind r1"));
+        let r1_addr = r1_sock.local_addr().expect("r1 local_addr");
+        let s1_sock = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("bind s1"));
+
+        let transport = AsyncMultipathTransport::new();
+        let sp1 = AsyncMultipathSubpath::new(1, "eth0-wan", s1_sock, r1_addr, 10, 20_000_000);
+        transport.add_subpath(sp1).expect("add subpath 1");
+
+        // Verify pipeline channel registration
+        {
+            let pipe = transport.traffic_pipeline();
+            let p = pipe.read().expect("pipeline lock");
+            assert!(p.channel_state(1).is_some());
+            assert!(p.bbr().subpath_state(1).is_some());
+        }
+
+        // Open streams across distinct QoS slices
+        transport
+            .open_stream(
+                StreamId(10),
+                StreamPriority::CriticalControl,
+                FlowSliceClass::UltraLowLatency,
+                Some(65536),
+            )
+            .expect("open urllc stream");
+        transport
+            .open_stream(
+                StreamId(20),
+                StreamPriority::Normal,
+                FlowSliceClass::HighThroughput,
+                Some(65536),
+            )
+            .expect("open ht stream");
+        transport
+            .open_stream(
+                StreamId(30),
+                StreamPriority::Background,
+                FlowSliceClass::BestEffort,
+                Some(65536),
+            )
+            .expect("open be stream");
+
+        // Write frames
+        transport
+            .write_stream(StreamId(10), b"URLLC control signal", false, Some(1))
+            .expect("write urllc");
+        transport
+            .write_stream(
+                StreamId(20),
+                b"High throughput chunk payload",
+                false,
+                Some(1),
+            )
+            .expect("write ht");
+        transport
+            .write_stream(StreamId(30), b"Best effort background data", false, Some(1))
+            .expect("write be");
+
+        // Transmit pending frames
+        let sent = transport
+            .poll_and_transmit_pending()
+            .expect("transmit frames");
+        assert!(sent >= 3, "All queued QoS frames must be transmitted");
+
+        let now_ns = 1_000_000_000u64;
+
+        // Process delivery ACK feedback sample
+        let sample = DeliveryAckSample {
+            delivered_bytes: 4096,
+            interval_ns: 2_000_000, // 2 ms
+            rtt_us: 8_000,          // 8 ms
+            inflight_bytes_at_send: 4096,
+            ecn_ce_count: 0,
+            lost_bytes: 0,
+        };
+        let feedback = transport
+            .record_delivery_ack(1, sample, now_ns)
+            .expect("record delivery ack");
+        assert_eq!(feedback.subpath_id, 1);
+        assert!(feedback.btl_bw_bps > 0);
+        assert_eq!(feedback.rt_prop_us, 8_000);
+        assert!(!feedback.backpressure_applied);
+
+        // Verify RTT updated in subpath snapshot
+        let snaps = transport.subpaths_snapshot();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].rtt_ms, 8);
+        assert!(snaps[0].pipeline.is_some());
+
+        // Process downstream congestion loss event
+        let cong_feedback = transport
+            .record_congestion_event(1, 1400, 0, now_ns + 10_000_000)
+            .expect("record congestion event");
+        assert!(cong_feedback.backpressure_applied);
+        assert!(cong_feedback.active_backpressure_level_pct < 100);
+
+        // Verify OpenMetrics Prometheus export contains unified pipeline telemetry
+        let prom = transport.export_prometheus_metrics();
+        assert!(prom.contains("ifa_subpath_pipeline_loss_events_total{subpath_id=\"1\"} 1"));
+        assert!(prom.contains("ifa_subpath_pipeline_in_backpressure{subpath_id=\"1\"} 1"));
+        assert!(prom.contains("ifa_multipath_bbr_btl_bw_bps{subpath_id=\"1\"}"));
+        assert!(prom.contains("ifa_multipath_bbr_rt_prop_microseconds{subpath_id=\"1\"} 8000"));
+        assert!(prom.contains(
+            "ifa_transport_subpath_starvation_severity{subpath=\"1\",slice=\"best_effort\"}"
+        ));
+        assert!(prom.contains("ifa_transport_subpath_starvation_severity{subpath=\"1\",slice=\"ultra_low_latency\"} 0"));
     }
 }
