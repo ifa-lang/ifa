@@ -27,9 +27,7 @@ use crate::multipath_pacing::{
 use crate::subpath_bbr::{
     DeliveryAckSample, SubpathBbrConfig, SubpathBbrDriver, SubpathBbrPhase, SubpathBbrTelemetry,
 };
-use crate::subpath_shaper::{
-    SubpathAdmissionVerdict, SubpathShaperTelemetry, SubpathSliceShaper,
-};
+use crate::subpath_shaper::{SubpathAdmissionVerdict, SubpathShaperTelemetry, SubpathSliceShaper};
 use crate::traffic_slicing::FlowSliceClass;
 
 /// Verdict returned upon packet ingress submission to the pipeline.
@@ -47,9 +45,7 @@ pub enum PipelineIngressVerdict {
         pacing_verdict: SubpathPacingVerdict,
     },
     /// Packet dropped at ingress due to token exhaustion on its traffic slice.
-    ThrottledByShaper {
-        dropped_bytes: usize,
-    },
+    ThrottledByShaper { dropped_bytes: usize },
     /// Packet blocked by BBR congestion window saturation.
     BlockedByCwnd {
         inflight_bytes: u64,
@@ -63,10 +59,7 @@ pub enum PipelinePollResult {
     /// A packet is ready for wire departure. Accounting in BBR and Shaper is performed automatically.
     Ready(PacedScheduledPacket),
     /// Subpath is actively pacing; caller should wait `wait_ns` nanoseconds until `next_wake_ns`.
-    WaitPacing {
-        wait_ns: u64,
-        next_wake_ns: u64,
-    },
+    WaitPacing { wait_ns: u64, next_wake_ns: u64 },
     /// No packets queued for transmission on this subpath.
     Empty,
 }
@@ -305,11 +298,12 @@ impl SubpathTrafficPipeline {
         }
 
         // 2. Congestion Window (BBR) Verification
-        let can_send_bbr = if slice_class == FlowSliceClass::UltraLowLatency && config.urllc_bypass_cwnd {
-            true
-        } else {
-            self.bbr.can_send(subpath_id, slice_class, packet_size)
-        };
+        let can_send_bbr =
+            if slice_class == FlowSliceClass::UltraLowLatency && config.urllc_bypass_cwnd {
+                true
+            } else {
+                self.bbr.can_send(subpath_id, slice_class, packet_size)
+            };
 
         if !can_send_bbr {
             let (inflight, cwnd) = self
@@ -333,7 +327,9 @@ impl SubpathTrafficPipeline {
             SubpathPacingVerdict::Immediate
         };
 
-        let packet_id = self.pacing.enqueue(subpath_id, slice_class, payload, now_ns);
+        let packet_id = self
+            .pacing
+            .enqueue(subpath_id, slice_class, payload, now_ns);
 
         {
             let state = self.subpaths.get_mut(&subpath_id).unwrap();
@@ -382,9 +378,13 @@ impl SubpathTrafficPipeline {
                 }
                 Ok(PipelinePollResult::Ready(packet))
             }
-            PacingPollResult::WaitPacing { wait_ns, next_wake_ns } => {
-                Ok(PipelinePollResult::WaitPacing { wait_ns, next_wake_ns })
-            }
+            PacingPollResult::WaitPacing {
+                wait_ns,
+                next_wake_ns,
+            } => Ok(PipelinePollResult::WaitPacing {
+                wait_ns,
+                next_wake_ns,
+            }),
             PacingPollResult::Empty => Ok(PipelinePollResult::Empty),
         }
     }
@@ -791,10 +791,7 @@ impl SubpathTrafficPipeline {
             out,
             "# HELP ifa_subpath_pipeline_in_backpressure Whether subpath is under active backpressure throttling (1/0)."
         );
-        let _ = writeln!(
-            out,
-            "# TYPE ifa_subpath_pipeline_in_backpressure gauge"
-        );
+        let _ = writeln!(out, "# TYPE ifa_subpath_pipeline_in_backpressure gauge");
 
         for &sid in self.subpaths.keys() {
             if let Some(metrics) = self.export_subpath_prometheus_metrics(sid) {
@@ -961,7 +958,10 @@ mod tests {
             }
         }
 
-        assert!(throttled_count > 0, "BestEffort burst should be throttled once bucket is exhausted");
+        assert!(
+            throttled_count > 0,
+            "BestEffort burst should be throttled once bucket is exhausted"
+        );
         let st = pipeline.channel_state(sid).unwrap();
         assert!(st.total_throttled_packets > 0);
         assert!(st.total_throttled_bytes > 0);
@@ -988,7 +988,10 @@ mod tests {
             .unwrap();
 
         match verdict_bulk {
-            PipelineIngressVerdict::BlockedByCwnd { inflight_bytes, cwnd_bytes } => {
+            PipelineIngressVerdict::BlockedByCwnd {
+                inflight_bytes,
+                cwnd_bytes,
+            } => {
                 assert!(inflight_bytes >= cwnd_bytes);
             }
             _ => panic!("Expected BlockedByCwnd for HighThroughput when CWND is saturated"),
@@ -1001,7 +1004,8 @@ mod tests {
             .unwrap();
 
         match verdict_urllc {
-            PipelineIngressVerdict::Admitted { .. } | PipelineIngressVerdict::AdmittedWithDelay { .. } => {}
+            PipelineIngressVerdict::Admitted { .. }
+            | PipelineIngressVerdict::AdmittedWithDelay { .. } => {}
             _ => panic!("Expected URLLC packet to bypass CWND constraint and be admitted"),
         }
     }
