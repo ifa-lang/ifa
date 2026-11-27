@@ -30,10 +30,11 @@ use crate::multipath_stream_mux::{
     StreamPriority,
 };
 use crate::reactor::AsyncUdpSocket;
+use crate::subpath_shaper::{SubpathAdmissionVerdict, SubpathShaperTelemetry, SubpathSliceShaper};
 use crate::traffic_slicing::FlowSliceClass;
 
 /// Snapshot telemetry of an individual transport subpath.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SubpathTransportTelemetry {
     pub subpath_id: u8,
     pub name: String,
@@ -45,6 +46,7 @@ pub struct SubpathTransportTelemetry {
     pub bytes_sent: u64,
     pub packets_received: u64,
     pub bytes_received: u64,
+    pub shaper: SubpathShaperTelemetry,
 }
 
 /// An individual asynchronous subpath binding an `AsyncUdpSocket` to a remote peer.
@@ -61,6 +63,7 @@ pub struct AsyncMultipathSubpath {
     pub bytes_sent: Arc<AtomicU64>,
     pub packets_received: Arc<AtomicU64>,
     pub bytes_received: Arc<AtomicU64>,
+    pub shaper: Arc<Mutex<SubpathSliceShaper>>,
 }
 
 impl AsyncMultipathSubpath {
@@ -71,6 +74,41 @@ impl AsyncMultipathSubpath {
         peer_addr: SocketAddr,
         rtt_ms: u64,
         bandwidth_bps: u64,
+    ) -> Self {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let shaper = Arc::new(Mutex::new(SubpathSliceShaper::new(
+            subpath_id,
+            bandwidth_bps,
+            now_ns,
+        )));
+        Self {
+            subpath_id,
+            name: name.into(),
+            socket,
+            peer_addr,
+            rtt_ms,
+            bandwidth_bps,
+            active: true,
+            packets_sent: Arc::new(AtomicU64::new(0)),
+            bytes_sent: Arc::new(AtomicU64::new(0)),
+            packets_received: Arc::new(AtomicU64::new(0)),
+            bytes_received: Arc::new(AtomicU64::new(0)),
+            shaper,
+        }
+    }
+
+    /// Create an asynchronous subpath with a custom preconfigured multi-slice traffic shaper.
+    pub fn with_shaper(
+        subpath_id: u8,
+        name: impl Into<String>,
+        socket: Arc<AsyncUdpSocket>,
+        peer_addr: SocketAddr,
+        rtt_ms: u64,
+        bandwidth_bps: u64,
+        shaper: SubpathSliceShaper,
     ) -> Self {
         Self {
             subpath_id,
@@ -84,6 +122,15 @@ impl AsyncMultipathSubpath {
             bytes_sent: Arc::new(AtomicU64::new(0)),
             packets_received: Arc::new(AtomicU64::new(0)),
             bytes_received: Arc::new(AtomicU64::new(0)),
+            shaper: Arc::new(Mutex::new(shaper)),
+        }
+    }
+
+    /// Dynamically update bandwidth and rebalance slice allocations.
+    pub fn update_bandwidth(&mut self, new_bandwidth_bps: u64, now_ns: u64) {
+        self.bandwidth_bps = new_bandwidth_bps;
+        if let Ok(mut shaper) = self.shaper.lock() {
+            shaper.rebalance(new_bandwidth_bps, now_ns);
         }
     }
 
@@ -95,6 +142,13 @@ impl AsyncMultipathSubpath {
     }
 
     pub fn snapshot(&self) -> SubpathTransportTelemetry {
+        let shaper_snap = self
+            .shaper
+            .lock()
+            .map(|s| s.snapshot())
+            .unwrap_or_else(|_| {
+                SubpathSliceShaper::new(self.subpath_id, self.bandwidth_bps, 0).snapshot()
+            });
         SubpathTransportTelemetry {
             subpath_id: self.subpath_id,
             name: self.name.clone(),
@@ -106,6 +160,7 @@ impl AsyncMultipathSubpath {
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             packets_received: self.packets_received.load(Ordering::Relaxed),
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
+            shaper: shaper_snap,
         }
     }
 }
@@ -317,18 +372,51 @@ impl AsyncMultipathTransport {
                 Some(frame) => {
                     let packet = MultipathMuxPacket::Stream(frame.clone());
                     let wire_bytes = packet.encode();
+                    let now_ns = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64;
 
-                    // Primary transmission
-                    if let Some(sp) = subpaths.get(&frame.subpath_id).filter(|s| s.active) {
-                        let n = sp.socket.send_to(&wire_bytes, sp.peer_addr)?;
-                        sp.packets_sent.fetch_add(1, Ordering::Relaxed);
-                        sp.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
-                        sent_count += 1;
-                    } else if let Some(fallback) = lowest_rtt_subpath {
-                        let n = fallback.socket.send_to(&wire_bytes, fallback.peer_addr)?;
-                        fallback.packets_sent.fetch_add(1, Ordering::Relaxed);
-                        fallback.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
-                        sent_count += 1;
+                    // Primary transmission with adaptive slice shaping
+                    let primary_target = subpaths
+                        .get(&frame.subpath_id)
+                        .filter(|s| s.active)
+                        .or(lowest_rtt_subpath);
+
+                    if let Some(sp) = primary_target {
+                        let verdict = if let Ok(mut shaper) = sp.shaper.lock() {
+                            shaper.try_admit(frame.slice_class, wire_bytes.len(), now_ns)
+                        } else {
+                            SubpathAdmissionVerdict::Admitted
+                        };
+
+                        match verdict {
+                            SubpathAdmissionVerdict::Admitted => {
+                                let n = sp.socket.send_to(&wire_bytes, sp.peer_addr)?;
+                                sp.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                sp.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                                if let Ok(mut shaper) = sp.shaper.lock() {
+                                    shaper.record_transit_latency(
+                                        frame.slice_class,
+                                        (sp.rtt_ms * 500_000).max(10_000),
+                                    );
+                                }
+                                sent_count += 1;
+                            }
+                            SubpathAdmissionVerdict::Delayed { delay_ns } => {
+                                let n = sp.socket.send_to(&wire_bytes, sp.peer_addr)?;
+                                sp.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                sp.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                                if let Ok(mut shaper) = sp.shaper.lock() {
+                                    let transit_ns = (sp.rtt_ms * 500_000).saturating_add(delay_ns);
+                                    shaper.record_transit_latency(frame.slice_class, transit_ns);
+                                }
+                                sent_count += 1;
+                            }
+                            SubpathAdmissionVerdict::Throttled { .. } => {
+                                // Frame dropped / throttled by shaper policing
+                            }
+                        }
                     }
 
                     // Bicast secondary transmission for mission-critical slice
@@ -336,10 +424,36 @@ impl AsyncMultipathTransport {
                         if let Some(sec_id) = secondary_subpath_id {
                             if sec_id != frame.subpath_id {
                                 if let Some(sp_sec) = subpaths.get(&sec_id).filter(|s| s.active) {
-                                    let n = sp_sec.socket.send_to(&wire_bytes, sp_sec.peer_addr)?;
-                                    sp_sec.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                    sp_sec.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
-                                    sent_count += 1;
+                                    let verdict = if let Ok(mut shaper) = sp_sec.shaper.lock() {
+                                        shaper.try_admit(
+                                            frame.slice_class,
+                                            wire_bytes.len(),
+                                            now_ns,
+                                        )
+                                    } else {
+                                        SubpathAdmissionVerdict::Admitted
+                                    };
+
+                                    match verdict {
+                                        SubpathAdmissionVerdict::Admitted
+                                        | SubpathAdmissionVerdict::Delayed { .. } => {
+                                            let n = sp_sec
+                                                .socket
+                                                .send_to(&wire_bytes, sp_sec.peer_addr)?;
+                                            sp_sec.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                            sp_sec
+                                                .bytes_sent
+                                                .fetch_add(n as u64, Ordering::Relaxed);
+                                            if let Ok(mut shaper) = sp_sec.shaper.lock() {
+                                                shaper.record_transit_latency(
+                                                    frame.slice_class,
+                                                    (sp_sec.rtt_ms * 500_000).max(10_000),
+                                                );
+                                            }
+                                            sent_count += 1;
+                                        }
+                                        SubpathAdmissionVerdict::Throttled { .. } => {}
+                                    }
                                 }
                             }
                         }
@@ -670,6 +784,93 @@ impl AsyncMultipathTransport {
         }
     }
 
+    /// Dynamically update the bandwidth of a specific subpath and proportionally rebalance its slice shaper.
+    pub fn update_subpath_bandwidth(
+        &self,
+        subpath_id: u8,
+        new_bandwidth_bps: u64,
+        now_ns: u64,
+    ) -> Result<(), io::Error> {
+        let mut subpaths = self
+            .subpaths
+            .write()
+            .map_err(|_| io::Error::other("Subpaths lock poisoned"))?;
+
+        if let Some(sp) = subpaths.get_mut(&subpath_id) {
+            sp.update_bandwidth(new_bandwidth_bps, now_ns);
+            let bdp = sp.bdp_bytes();
+            if let Ok(mut mux) = self.mux.lock() {
+                mux.update_subpath_bdp(subpath_id, bdp);
+            }
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Subpath {} not found", subpath_id),
+            ))
+        }
+    }
+
+    /// Access the slice traffic shaper of a specific subpath.
+    pub fn subpath_shaper(&self, subpath_id: u8) -> Option<Arc<Mutex<SubpathSliceShaper>>> {
+        self.subpaths
+            .read()
+            .ok()?
+            .get(&subpath_id)
+            .map(|sp| Arc::clone(&sp.shaper))
+    }
+
+    /// Apply dynamic backpressure reduction to a specific slice on a subpath.
+    pub fn apply_subpath_backpressure(
+        &self,
+        subpath_id: u8,
+        slice: FlowSliceClass,
+        scale_pct: u32,
+        now_ns: u64,
+    ) -> Result<(), io::Error> {
+        let subpaths = self
+            .subpaths
+            .read()
+            .map_err(|_| io::Error::other("Subpaths lock poisoned"))?;
+
+        if let Some(sp) = subpaths.get(&subpath_id) {
+            if let Ok(mut shaper) = sp.shaper.lock() {
+                shaper.apply_backpressure_reduction(slice, scale_pct, now_ns);
+            }
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Subpath {} not found", subpath_id),
+            ))
+        }
+    }
+
+    /// Reset backpressure reduction for a specific slice on a subpath.
+    pub fn reset_subpath_backpressure(
+        &self,
+        subpath_id: u8,
+        slice: FlowSliceClass,
+        now_ns: u64,
+    ) -> Result<(), io::Error> {
+        let subpaths = self
+            .subpaths
+            .read()
+            .map_err(|_| io::Error::other("Subpaths lock poisoned"))?;
+
+        if let Some(sp) = subpaths.get(&subpath_id) {
+            if let Ok(mut shaper) = sp.shaper.lock() {
+                shaper.reset_backpressure_reduction(slice, now_ns);
+            }
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Subpath {} not found", subpath_id),
+            ))
+        }
+    }
+
     /// Returns a telemetry snapshot for all registered subpaths.
     pub fn subpaths_snapshot(&self) -> Vec<SubpathTransportTelemetry> {
         let subpaths = match self.subpaths.read() {
@@ -733,6 +934,129 @@ impl AsyncMultipathTransport {
                 "ifa_transport_subpath_rtt_ms{{subpath_id=\"{}\",name=\"{}\"}} {}",
                 sp.subpath_id, sp.name, sp.rtt_ms
             );
+        }
+
+        // Multi-slice adaptive traffic shaping metrics
+        let _ = writeln!(
+            out,
+            "# HELP ifa_multipath_shaper_admitted_packets_total Total packets admitted by subpath slice shaper."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE ifa_multipath_shaper_admitted_packets_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "# HELP ifa_multipath_shaper_admitted_bytes_total Total bytes admitted by subpath slice shaper."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE ifa_multipath_shaper_admitted_bytes_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "# HELP ifa_multipath_shaper_throttled_packets_total Total packets throttled by subpath slice shaper."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE ifa_multipath_shaper_throttled_packets_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "# HELP ifa_multipath_shaper_throttled_bytes_total Total bytes throttled by subpath slice shaper."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE ifa_multipath_shaper_throttled_bytes_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "# HELP ifa_multipath_shaper_delayed_packets_total Total packets delayed/paced by subpath slice shaper."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE ifa_multipath_shaper_delayed_packets_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "# HELP ifa_multipath_shaper_delayed_bytes_total Total bytes delayed/paced by subpath slice shaper."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE ifa_multipath_shaper_delayed_bytes_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "# HELP ifa_multipath_shaper_effective_rate_bps Effective shaped bandwidth per subpath and slice."
+        );
+        let _ = writeln!(out, "# TYPE ifa_multipath_shaper_effective_rate_bps gauge");
+        let _ = writeln!(
+            out,
+            "# HELP ifa_multipath_shaper_tokens_available_bytes Current available token bucket bytes per subpath and slice."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE ifa_multipath_shaper_tokens_available_bytes gauge"
+        );
+        let _ = writeln!(
+            out,
+            "# HELP ifa_multipath_shaper_transit_latency_seconds Average transit latency through subpath shaping."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE ifa_multipath_shaper_transit_latency_seconds gauge"
+        );
+
+        for sp in self.subpaths_snapshot() {
+            for slice in &sp.shaper.slices {
+                let slice_str = slice.slice_class.as_str();
+                let _ = writeln!(
+                    out,
+                    "ifa_multipath_shaper_admitted_packets_total{{subpath_id=\"{}\",name=\"{}\",slice=\"{}\"}} {}",
+                    sp.subpath_id, sp.name, slice_str, slice.admitted_packets
+                );
+                let _ = writeln!(
+                    out,
+                    "ifa_multipath_shaper_admitted_bytes_total{{subpath_id=\"{}\",name=\"{}\",slice=\"{}\"}} {}",
+                    sp.subpath_id, sp.name, slice_str, slice.admitted_bytes
+                );
+                let _ = writeln!(
+                    out,
+                    "ifa_multipath_shaper_throttled_packets_total{{subpath_id=\"{}\",name=\"{}\",slice=\"{}\"}} {}",
+                    sp.subpath_id, sp.name, slice_str, slice.throttled_packets
+                );
+                let _ = writeln!(
+                    out,
+                    "ifa_multipath_shaper_throttled_bytes_total{{subpath_id=\"{}\",name=\"{}\",slice=\"{}\"}} {}",
+                    sp.subpath_id, sp.name, slice_str, slice.throttled_bytes
+                );
+                let _ = writeln!(
+                    out,
+                    "ifa_multipath_shaper_delayed_packets_total{{subpath_id=\"{}\",name=\"{}\",slice=\"{}\"}} {}",
+                    sp.subpath_id, sp.name, slice_str, slice.delayed_packets
+                );
+                let _ = writeln!(
+                    out,
+                    "ifa_multipath_shaper_delayed_bytes_total{{subpath_id=\"{}\",name=\"{}\",slice=\"{}\"}} {}",
+                    sp.subpath_id, sp.name, slice_str, slice.delayed_bytes
+                );
+                let _ = writeln!(
+                    out,
+                    "ifa_multipath_shaper_effective_rate_bps{{subpath_id=\"{}\",name=\"{}\",slice=\"{}\"}} {}",
+                    sp.subpath_id, sp.name, slice_str, slice.effective_rate_bps
+                );
+                let _ = writeln!(
+                    out,
+                    "ifa_multipath_shaper_tokens_available_bytes{{subpath_id=\"{}\",name=\"{}\",slice=\"{}\"}} {:.2}",
+                    sp.subpath_id, sp.name, slice_str, slice.current_tokens_bytes
+                );
+                let transit_sec = (slice.avg_transit_latency_ns as f64) / 1_000_000_000.0;
+                let _ = writeln!(
+                    out,
+                    "ifa_multipath_shaper_transit_latency_seconds{{subpath_id=\"{}\",name=\"{}\",slice=\"{}\"}} {:.6}",
+                    sp.subpath_id, sp.name, slice_str, transit_sec
+                );
+            }
         }
 
         // Connection migration metrics
@@ -1305,5 +1629,106 @@ mod tests {
         assert!(nat_challenge.is_some());
         let updated_metrics = client.export_prometheus_metrics();
         assert!(updated_metrics.contains("ifa_transport_nat_rebindings_detected_total 1"));
+    }
+
+    #[test]
+    fn test_subpath_slice_shaping_and_dynamic_bandwidth_rebalance() {
+        let transport = AsyncMultipathTransport::new();
+        let sock = Arc::new(AsyncUdpSocket::bind("127.0.0.1:0").expect("bind"));
+        let addr = sock.local_addr().expect("addr");
+
+        let subpath = AsyncMultipathSubpath::new(1, "eth0-wan", sock, addr, 15, 10_000_000); // 10 Mbps
+        transport.add_subpath(subpath).expect("add subpath");
+
+        // Open streams across multiple slices
+        let st_urllc = StreamId::client_bidi(1);
+        let st_embb = StreamId::client_bidi(2);
+
+        transport
+            .open_stream(
+                st_urllc,
+                StreamPriority::CriticalControl,
+                FlowSliceClass::UltraLowLatency,
+                Some(65536),
+            )
+            .expect("open urllc");
+        transport
+            .open_stream(
+                st_embb,
+                StreamPriority::Normal,
+                FlowSliceClass::HighThroughput,
+                Some(65536),
+            )
+            .expect("open embb");
+
+        // Write and transmit packets
+        transport
+            .write_stream(st_urllc, b"URLLC_PRIORITY_DATA", false, Some(1))
+            .expect("write urllc");
+        transport
+            .write_stream(st_embb, b"HIGH_THROUGHPUT_DATA", false, Some(1))
+            .expect("write embb");
+
+        let transmitted = transport.poll_and_transmit_pending().expect("transmit");
+        assert!(transmitted >= 2);
+
+        // Check shaper state
+        let shaper_arc = transport.subpath_shaper(1).expect("subpath shaper");
+        let shaper = shaper_arc.lock().unwrap();
+        let ull_limiter = shaper
+            .limiters
+            .get(&FlowSliceClass::UltraLowLatency)
+            .unwrap();
+        assert!(ull_limiter.admitted_packets >= 1);
+        assert_eq!(ull_limiter.configured_rate_bps, 2_000_000); // 20% of 10M
+        drop(shaper);
+
+        // Dynamically rebalance bandwidth to 50 Mbps
+        transport
+            .update_subpath_bandwidth(1, 50_000_000, 2_000_000_000)
+            .expect("update bw");
+        let shaper = shaper_arc.lock().unwrap();
+        let ull_scaled = shaper
+            .limiters
+            .get(&FlowSliceClass::UltraLowLatency)
+            .unwrap();
+        assert_eq!(ull_scaled.effective_rate_bps, 10_000_000); // 20% of 50M
+        let ht_scaled = shaper
+            .limiters
+            .get(&FlowSliceClass::HighThroughput)
+            .unwrap();
+        assert_eq!(ht_scaled.effective_rate_bps, 17_500_000); // 35% of 50M
+        drop(shaper);
+
+        // Test backpressure reduction on HighThroughput slice
+        transport
+            .apply_subpath_backpressure(1, FlowSliceClass::HighThroughput, 50, 3_000_000_000)
+            .expect("backpressure");
+        let shaper = shaper_arc.lock().unwrap();
+        let ht_throttled = shaper
+            .limiters
+            .get(&FlowSliceClass::HighThroughput)
+            .unwrap();
+        assert_eq!(ht_throttled.effective_rate_bps, 8_750_000); // 50% of 17.5M
+        drop(shaper);
+
+        // Reset backpressure
+        transport
+            .reset_subpath_backpressure(1, FlowSliceClass::HighThroughput, 4_000_000_000)
+            .expect("reset backpressure");
+        let shaper = shaper_arc.lock().unwrap();
+        let ht_restored = shaper
+            .limiters
+            .get(&FlowSliceClass::HighThroughput)
+            .unwrap();
+        assert_eq!(ht_restored.effective_rate_bps, 17_500_000);
+        drop(shaper);
+
+        // Verify OpenMetrics Prometheus telemetry output
+        let prom = transport.export_prometheus_metrics();
+        assert!(prom.contains("ifa_multipath_shaper_admitted_packets_total{subpath_id=\"1\",name=\"eth0-wan\",slice=\"ultra_low_latency\"}"));
+        assert!(prom.contains("ifa_multipath_shaper_effective_rate_bps{subpath_id=\"1\",name=\"eth0-wan\",slice=\"high_throughput\"} 17500000"));
+        assert!(prom.contains("ifa_multipath_shaper_tokens_available_bytes{subpath_id=\"1\",name=\"eth0-wan\",slice=\"mission_critical\"}"));
+        assert!(prom.contains("ifa_multipath_shaper_transit_latency_seconds{subpath_id=\"1\",name=\"eth0-wan\",slice=\"ultra_low_latency\"}"));
     }
 }

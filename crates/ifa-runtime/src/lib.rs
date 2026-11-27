@@ -34,6 +34,7 @@ pub mod slice_resilience;
 pub mod string;
 pub mod subpath_pmtud;
 pub mod subpath_scheduler;
+pub mod subpath_shaper;
 pub mod telemetry;
 pub mod telemetry_queue;
 pub mod topology_cspf;
@@ -243,6 +244,10 @@ pub use subpath_pmtud::{
 pub use subpath_scheduler::{
     run_subpath_scheduler_benchmark, EnqueueVerdict, ScheduledPacket, SubpathDeficitScheduler,
     SubpathQueuedPacket, SubpathSchedulerBenchmarkReport, SubpathSchedulerGroup, SubpathSliceQueue,
+};
+pub use subpath_shaper::{
+    SliceRateLimiter, SliceShaperTelemetry, SubpathAdmissionVerdict, SubpathShaperTelemetry,
+    SubpathSliceShaper,
 };
 pub use telemetry::{
     snapshot_to_compact_json, supervise_command, ws_build_close_frame, ws_build_text_frame,

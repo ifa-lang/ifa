@@ -30,6 +30,10 @@ pub use ifa_runtime::reactor::{
     AsyncTcpListener, AsyncTcpReadHalf, AsyncTcpStream, AsyncTcpWriteHalf, AsyncTimer,
     AsyncUdpSocket,
 };
+pub use ifa_runtime::subpath_shaper::{
+    SliceRateLimiter, SliceShaperTelemetry, SubpathAdmissionVerdict, SubpathShaperTelemetry,
+    SubpathSliceShaper,
+};
 pub use ifa_runtime::FlowSliceClass;
 
 pub mod http;
