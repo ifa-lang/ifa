@@ -38,6 +38,7 @@ pub mod subpath_health;
 pub mod subpath_pmtud;
 pub mod subpath_scheduler;
 pub mod subpath_shaper;
+pub mod subpath_starvation_guard;
 pub mod subpath_traffic_pipeline;
 pub mod telemetry;
 pub mod telemetry_queue;

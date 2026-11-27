@@ -28,6 +28,10 @@ use crate::subpath_bbr::{
     DeliveryAckSample, SubpathBbrConfig, SubpathBbrDriver, SubpathBbrPhase, SubpathBbrTelemetry,
 };
 use crate::subpath_shaper::{SubpathAdmissionVerdict, SubpathShaperTelemetry, SubpathSliceShaper};
+use crate::subpath_starvation_guard::{
+    StarvationGuardConfig, StarvationRemediationVerdict, SubpathStarvationGuard,
+    SubpathStarvationTelemetry,
+};
 use crate::traffic_slicing::FlowSliceClass;
 
 /// Verdict returned upon packet ingress submission to the pipeline.
@@ -103,6 +107,7 @@ pub struct SubpathPipelineConfig {
     pub backpressure_ecn_reduction_pct: u32,
     pub clean_recovery_rounds_threshold: u32,
     pub urllc_bypass_cwnd: bool,
+    pub starvation_config: StarvationGuardConfig,
 }
 
 impl SubpathPipelineConfig {
@@ -120,6 +125,7 @@ impl SubpathPipelineConfig {
             backpressure_ecn_reduction_pct: 85,  // 15% reduction on ECN
             clean_recovery_rounds_threshold: 3,  // 3 consecutive clean rounds to restore
             urllc_bypass_cwnd: true,
+            starvation_config: StarvationGuardConfig::default(),
         }
     }
 }
@@ -154,6 +160,7 @@ pub struct SubpathPipelineTelemetry {
     pub bbr: SubpathBbrTelemetry,
     pub pacing: SubpathPacingTelemetry,
     pub shaper: SubpathShaperTelemetry,
+    pub starvation: Option<SubpathStarvationTelemetry>,
 }
 
 /// Unified Multipath Traffic Pipeline combining Shaper, BBR Driver, and Pacing Engine.
@@ -169,6 +176,8 @@ pub struct SubpathTrafficPipeline {
     bbr: SubpathBbrDriver,
     /// Cross-priority multipath pacing and scheduling engine.
     pacing: MultipathPacingEngine,
+    /// Anti-starvation monitoring and priority inversion guard.
+    pub starvation_guard: SubpathStarvationGuard,
 }
 
 impl SubpathTrafficPipeline {
@@ -180,6 +189,7 @@ impl SubpathTrafficPipeline {
             shapers: BTreeMap::new(),
             bbr: SubpathBbrDriver::new(),
             pacing: MultipathPacingEngine::new(),
+            starvation_guard: SubpathStarvationGuard::new(),
         }
     }
 
@@ -236,7 +246,10 @@ impl SubpathTrafficPipeline {
             }
         }
 
-        // 4. Initialize Channel State
+        // 4. Initialize Starvation Guard
+        self.starvation_guard.register_subpath(sid, now_ns);
+
+        // 5. Initialize Channel State
         let state = SubpathChannelState {
             subpath_id: sid,
             consecutive_clean_rounds: 0,
@@ -257,6 +270,7 @@ impl SubpathTrafficPipeline {
         self.shapers.remove(&subpath_id);
         self.bbr.unregister_subpath(subpath_id);
         self.pacing.unregister_subpath(subpath_id);
+        self.starvation_guard.unregister_subpath(subpath_id);
         removed_channel
     }
 
@@ -285,17 +299,33 @@ impl SubpathTrafficPipeline {
         }
 
         // 1. Shaper Admission Check
-        let admission_verdict = {
+        let mut admission_verdict = {
             let shaper = self.shapers.get_mut(&subpath_id).unwrap();
             shaper.try_admit(slice_class, packet_size, now_ns)
         };
 
+        // If throttled, check if anti-starvation guard authorizes a temporary token boost
+        if let SubpathAdmissionVerdict::Throttled { .. } = admission_verdict {
+            let shaper = self.shapers.get_mut(&subpath_id).unwrap();
+            if let StarvationRemediationVerdict::TokenBoostApplied { .. } = self
+                .starvation_guard
+                .check_admission_starvation(subpath_id, slice_class, packet_size, shaper, now_ns)
+            {
+                admission_verdict = shaper.try_admit(slice_class, packet_size, now_ns);
+            }
+        }
+
         if let SubpathAdmissionVerdict::Throttled { dropped_bytes } = admission_verdict {
+            self.starvation_guard
+                .record_throttle(subpath_id, slice_class, packet_size, now_ns);
             let state = self.subpaths.get_mut(&subpath_id).unwrap();
             state.total_throttled_packets += 1;
             state.total_throttled_bytes += dropped_bytes as u64;
             return Ok(PipelineIngressVerdict::ThrottledByShaper { dropped_bytes });
         }
+
+        self.starvation_guard
+            .record_admission(subpath_id, slice_class, packet_size, now_ns);
 
         // 2. Congestion Window (BBR) Verification
         let can_send_bbr =
@@ -366,7 +396,14 @@ impl SubpathTrafficPipeline {
             return Err(PipelineError::SubpathNotFound { subpath_id });
         }
 
-        match self.pacing.poll_subpath(subpath_id, now_ns) {
+        let poll_res = if let Some(pacer) = self.pacing.pacers.get_mut(&subpath_id) {
+            self.starvation_guard
+                .poll_with_starvation_guard(subpath_id, pacer, now_ns)
+        } else {
+            PacingPollResult::Empty
+        };
+
+        match poll_res {
             PacingPollResult::Ready(packet) => {
                 self.bbr.on_packet_sent(subpath_id, packet.size_bytes);
                 if let Some(shaper) = self.shapers.get_mut(&subpath_id) {
@@ -391,19 +428,13 @@ impl SubpathTrafficPipeline {
 
     /// Polls across all managed subpaths, prioritizing `UltraLowLatency` packets first.
     pub fn poll_next_available(&mut self, now_ns: u64) -> Option<(u8, PacedScheduledPacket)> {
-        if let Some((sid, packet)) = self.pacing.poll_any(now_ns) {
-            self.bbr.on_packet_sent(sid, packet.size_bytes);
-            if let Some(shaper) = self.shapers.get_mut(&sid) {
-                shaper.record_transit_latency(packet.slice_class, packet.pacing_delay_ns);
+        let subpaths: Vec<u8> = self.subpaths.keys().copied().collect();
+        for sid in subpaths {
+            if let Ok(PipelinePollResult::Ready(packet)) = self.poll_egress(sid, now_ns) {
+                return Some((sid, packet));
             }
-            if let Some(state) = self.subpaths.get_mut(&sid) {
-                state.total_egress_packets += 1;
-                state.total_egress_bytes += packet.size_bytes as u64;
-            }
-            Some((sid, packet))
-        } else {
-            None
         }
+        None
     }
 
     /// Processes an incoming delivery feedback sample and executes closed-loop adaptations.
@@ -577,6 +608,7 @@ impl SubpathTrafficPipeline {
         let bbr = self.bbr.subpath_state(subpath_id)?.snapshot();
         let pacing = self.pacing.pacers.get(&subpath_id)?.snapshot();
         let shaper = self.shapers.get(&subpath_id)?.snapshot();
+        let starvation = self.starvation_guard.subpath_telemetry(subpath_id);
 
         Some(SubpathPipelineTelemetry {
             subpath_id,
@@ -584,6 +616,7 @@ impl SubpathTrafficPipeline {
             bbr,
             pacing,
             shaper,
+            starvation,
         })
     }
 
@@ -798,6 +831,8 @@ impl SubpathTrafficPipeline {
                 out.push_str(&metrics);
             }
         }
+
+        out.push_str(&self.starvation_guard.export_prometheus_metrics());
 
         out
     }
@@ -1171,5 +1206,149 @@ mod tests {
         assert!(metrics.contains("ifa_multipath_shaper_admitted_packets_total{subpath_id=\"6\""));
         assert!(metrics.contains("ifa_multipath_pacing_rate_bps{subpath_id=\"6\""));
         assert!(metrics.contains("ifa_multipath_bbr_btl_bw_bps{subpath_id=\"6\""));
+        assert!(metrics.contains("ifa_transport_subpath_starvation_severity{subpath=\"6\""));
+    }
+
+    #[test]
+    fn test_pipeline_anti_starvation_admission_token_boost() {
+        let mut pipeline = SubpathTrafficPipeline::new();
+        let now_ns = 1_000_000_000;
+        let sid = 7;
+
+        pipeline
+            .register_subpath(sid, 10_000_000, 20_000, now_ns)
+            .unwrap();
+
+        // 1. Drain the initial BestEffort burst bucket (8192 bytes) with 5 packets (7500 bytes)
+        for _ in 0..5 {
+            let res =
+                pipeline.submit_packet(sid, FlowSliceClass::BestEffort, vec![0xAA; 1500], now_ns);
+            assert!(matches!(
+                res,
+                Ok(PipelineIngressVerdict::Admitted { .. }
+                    | PipelineIngressVerdict::AdmittedWithDelay { .. })
+            ));
+        }
+
+        // 2. Submit packets when bucket is empty to accumulate consecutive throttles
+        let mut throttled_count = 0;
+        for _ in 0..8 {
+            let res =
+                pipeline.submit_packet(sid, FlowSliceClass::BestEffort, vec![0xBB; 1500], now_ns);
+            if let Ok(PipelineIngressVerdict::ThrottledByShaper { .. }) = res {
+                throttled_count += 1;
+            }
+        }
+        assert_eq!(
+            throttled_count, 8,
+            "Expected exactly 8 throttles to hit streak threshold"
+        );
+
+        // 3. The 9th packet arrives with exhausted bucket:
+        // Starvation guard detects throttle streak >= 8 and injects an emergency token boost!
+        let boost_res = pipeline.submit_packet(
+            sid,
+            FlowSliceClass::BestEffort,
+            vec![0xCC; 1500],
+            now_ns + 1_000, // 1us later, negligible token replenish
+        );
+
+        match boost_res {
+            Ok(PipelineIngressVerdict::Admitted { packet_id, .. }) => {
+                assert!(packet_id > 0);
+            }
+            Ok(PipelineIngressVerdict::AdmittedWithDelay { packet_id, .. }) => {
+                assert!(packet_id > 0);
+            }
+            other => panic!(
+                "Expected Admitted or AdmittedWithDelay via anti-starvation boost, got: {:?}",
+                other
+            ),
+        }
+
+        let snap = pipeline.snapshot(sid).unwrap();
+        let starvation = snap.starvation.unwrap();
+        let be = starvation
+            .slices
+            .iter()
+            .find(|s| s.slice_class == FlowSliceClass::BestEffort)
+            .unwrap();
+        assert!(be.total_token_boost_events >= 1);
+        assert!(be.total_boosted_bytes >= 1500);
+    }
+
+    #[test]
+    fn test_pipeline_scheduling_starvation_promotion_with_urllc_shielding() {
+        let mut pipeline = SubpathTrafficPipeline::new();
+        let now_ns = 1_000_000_000;
+        let sid = 8;
+
+        pipeline
+            .register_subpath(sid, 20_000_000, 10_000, now_ns)
+            .unwrap();
+
+        // Submit 1 BestEffort packet
+        let be_verdict = pipeline
+            .submit_packet(sid, FlowSliceClass::BestEffort, vec![0xBE; 1000], now_ns)
+            .unwrap();
+        let be_id = match be_verdict {
+            PipelineIngressVerdict::Admitted { packet_id, .. } => packet_id,
+            PipelineIngressVerdict::AdmittedWithDelay { packet_id, .. } => packet_id,
+            _ => panic!("Expected BE admitted"),
+        };
+
+        // Submit 10 MissionCritical packets
+        for _ in 0..10 {
+            let _ = pipeline.submit_packet(
+                sid,
+                FlowSliceClass::MissionCritical,
+                vec![0xCC; 500],
+                now_ns,
+            );
+        }
+
+        // Trigger consecutive higher priority serves in starvation guard
+        for _ in 0..70 {
+            pipeline.starvation_guard.record_packet_scheduled(
+                sid,
+                FlowSliceClass::MissionCritical,
+                now_ns,
+            );
+        }
+
+        // Also submit an UltraLowLatency packet
+        let urllc_verdict = pipeline
+            .submit_packet(
+                sid,
+                FlowSliceClass::UltraLowLatency,
+                vec![0x11; 128],
+                now_ns,
+            )
+            .unwrap();
+        let urllc_id = match urllc_verdict {
+            PipelineIngressVerdict::Admitted { packet_id, .. } => packet_id,
+            _ => panic!("Expected URLLC admitted"),
+        };
+
+        // 1st poll: URLLC MUST be scheduled first, preserving URLLC SLA despite BestEffort starvation!
+        let poll1 = pipeline.poll_egress(sid, now_ns).unwrap();
+        match poll1 {
+            PipelinePollResult::Ready(packet) => {
+                assert_eq!(packet.packet_id, urllc_id);
+                assert_eq!(packet.slice_class, FlowSliceClass::UltraLowLatency);
+            }
+            _ => panic!("Expected Ready for URLLC"),
+        }
+
+        // 2nd poll: With URLLC queue now empty, BestEffort starvation promotion activates
+        // and preempts MissionCritical packets!
+        let poll2 = pipeline.poll_egress(sid, now_ns).unwrap();
+        match poll2 {
+            PipelinePollResult::Ready(packet) => {
+                assert_eq!(packet.packet_id, be_id);
+                assert_eq!(packet.slice_class, FlowSliceClass::BestEffort);
+            }
+            _ => panic!("Expected Ready for promoted BestEffort packet"),
+        }
     }
 }

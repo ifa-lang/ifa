@@ -168,6 +168,13 @@ impl SliceRateLimiter {
             .unwrap_or(0)
     }
 
+    /// Boost available tokens by `boost_bytes`, replenishing first and capping at bucket burst limit.
+    pub fn boost_tokens(&mut self, boost_bytes: u64, now_ns: u64) {
+        self.replenish(now_ns);
+        self.current_tokens_bytes =
+            (self.current_tokens_bytes + boost_bytes as f64).min(self.burst_bytes as f64);
+    }
+
     /// Dynamically update configured/effective rates, adjusting burst depth and clamping tokens.
     pub fn update_rate(&mut self, new_rate_bps: u64, burst_bytes: u64, now_ns: u64) {
         self.replenish(now_ns);
@@ -337,6 +344,16 @@ impl SubpathSliceShaper {
             let bytes_per_sec = limiter.effective_rate_bps / 8;
             limiter.burst_bytes =
                 ((bytes_per_sec * self.burst_window_ms as u64) / 1000).max(Self::MIN_BURST_BYTES);
+        }
+    }
+
+    /// Injects a temporary token boost into a specified slice's limiter to mitigate starvation.
+    pub fn boost_tokens(&mut self, slice: FlowSliceClass, boost_bytes: u64, now_ns: u64) -> bool {
+        if let Some(limiter) = self.limiters.get_mut(&slice) {
+            limiter.boost_tokens(boost_bytes, now_ns);
+            true
+        } else {
+            false
         }
     }
 

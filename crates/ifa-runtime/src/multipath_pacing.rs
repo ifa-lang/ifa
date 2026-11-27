@@ -425,6 +425,18 @@ impl SubpathPacer {
 
     /// Poll and schedule the next ready packet respecting cross-priority order and pacing clock.
     pub fn poll_next(&mut self, now_ns: u64) -> PacingPollResult {
+        self.poll_next_with_starvation(now_ns, None)
+    }
+
+    /// Poll and schedule next ready packet with anti-starvation promotion support for a starved slice.
+    ///
+    /// Strictly guarantees UltraLowLatency SLA: if an UltraLowLatency packet is ready for wire
+    /// transmission, it ALWAYS takes absolute precedence over anti-starvation promotions.
+    pub fn poll_next_with_starvation(
+        &mut self,
+        now_ns: u64,
+        starved_slice: Option<FlowSliceClass>,
+    ) -> PacingPollResult {
         self.replenish_burst_allowance(now_ns);
 
         // Tier 1: UltraLowLatency (URLLC) absolute priority with guaranteed injection quantum
@@ -460,6 +472,58 @@ impl SubpathPacer {
                     false
                 }
             };
+
+        // Anti-Starvation Preemption: If a lower-priority slice is starved, promote it ahead
+        // of MissionCritical / HighThroughput, but ONLY while URLLC is not actively transmitting.
+        if let Some(slice) = starved_slice {
+            match slice {
+                FlowSliceClass::BestEffort
+                    if can_transmit_queue(
+                        &self.best_effort_queue,
+                        self.current_burst_allowance_bytes,
+                        self.next_tx_time_ns,
+                    ) =>
+                {
+                    let packet = self.best_effort_queue.pop_front().unwrap();
+                    let size = packet.size_bytes;
+                    let delay = self.charge_tx(FlowSliceClass::BestEffort, size, now_ns);
+                    return PacingPollResult::Ready(PacedScheduledPacket {
+                        packet_id: packet.packet_id,
+                        subpath_id: packet.subpath_id,
+                        slice_class: FlowSliceClass::BestEffort,
+                        payload: packet.payload,
+                        size_bytes: size,
+                        enqueued_timestamp_ns: packet.enqueued_timestamp_ns,
+                        scheduled_timestamp_ns: now_ns,
+                        pacing_delay_ns: delay,
+                        was_urllc_preempted: false,
+                    });
+                }
+                FlowSliceClass::HighThroughput
+                    if can_transmit_queue(
+                        &self.high_throughput_queue,
+                        self.current_burst_allowance_bytes,
+                        self.next_tx_time_ns,
+                    ) =>
+                {
+                    let packet = self.high_throughput_queue.pop_front().unwrap();
+                    let size = packet.size_bytes;
+                    let delay = self.charge_tx(FlowSliceClass::HighThroughput, size, now_ns);
+                    return PacingPollResult::Ready(PacedScheduledPacket {
+                        packet_id: packet.packet_id,
+                        subpath_id: packet.subpath_id,
+                        slice_class: FlowSliceClass::HighThroughput,
+                        payload: packet.payload,
+                        size_bytes: size,
+                        enqueued_timestamp_ns: packet.enqueued_timestamp_ns,
+                        scheduled_timestamp_ns: now_ns,
+                        pacing_delay_ns: delay,
+                        was_urllc_preempted: false,
+                    });
+                }
+                _ => {}
+            }
+        }
 
         // Tier 2: MissionCritical
         if can_transmit_queue(
@@ -710,8 +774,18 @@ impl MultipathPacingEngine {
 
     /// Poll the next ready packet from a specific subpath.
     pub fn poll_subpath(&mut self, subpath_id: u8, now_ns: u64) -> PacingPollResult {
+        self.poll_subpath_with_starvation(subpath_id, now_ns, None)
+    }
+
+    /// Poll the next ready packet from a specific subpath with optional anti-starvation promotion.
+    pub fn poll_subpath_with_starvation(
+        &mut self,
+        subpath_id: u8,
+        now_ns: u64,
+        starved_slice: Option<FlowSliceClass>,
+    ) -> PacingPollResult {
         if let Some(pacer) = self.pacers.get_mut(&subpath_id) {
-            pacer.poll_next(now_ns)
+            pacer.poll_next_with_starvation(now_ns, starved_slice)
         } else {
             PacingPollResult::Empty
         }
