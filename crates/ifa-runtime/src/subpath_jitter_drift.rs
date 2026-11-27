@@ -75,16 +75,16 @@ pub struct SubpathJitterDriftConfig {
 impl Default for SubpathJitterDriftConfig {
     fn default() -> Self {
         Self {
-            jitter_ewma_shift: 4,               // 1/16 gain
-            max_transit_samples: 64,            // 64-sample rolling window
-            jitter_surge_multiplier: 2.5,       // 2.5x baseline
-            jitter_surge_absolute_ns: 15_000_000, // 15 ms
-            excessive_skew_warning_ns: 20_000_000, // 20 ms
-            excessive_skew_critical_ns: 45_000_000, // 45 ms
-            drift_rate_warning_ns_per_sec: 5_000_000.0, // 5 ms/sec
+            jitter_ewma_shift: 4,                         // 1/16 gain
+            max_transit_samples: 64,                      // 64-sample rolling window
+            jitter_surge_multiplier: 2.5,                 // 2.5x baseline
+            jitter_surge_absolute_ns: 15_000_000,         // 15 ms
+            excessive_skew_warning_ns: 20_000_000,        // 20 ms
+            excessive_skew_critical_ns: 45_000_000,       // 45 ms
+            drift_rate_warning_ns_per_sec: 5_000_000.0,   // 5 ms/sec
             drift_rate_critical_ns_per_sec: 20_000_000.0, // 20 ms/sec
             min_samples_for_drift_evaluation: 6,
-            alert_cooldown_ns: 50_000_000,      // 50 ms
+            alert_cooldown_ns: 50_000_000, // 50 ms
             max_alerts_history: 128,
         }
     }
@@ -482,20 +482,19 @@ impl SubpathJitterDriftTracker {
         stats.samples.push_back(sample);
 
         // 2. Compute linear drift rate (slope) over the sliding window
-        let (drift_rate, consecutive_increases) = if stats.samples.len()
-            >= self.config.min_samples_for_drift_evaluation
-        {
-            let slope = Self::compute_linear_drift_rate(&stats.samples);
-            let prev_drift = stats.drift_rate_ns_per_sec;
-            let consec = if slope > prev_drift && slope > 0.0 {
-                stats.consecutive_drift_surges + 1
+        let (drift_rate, consecutive_increases) =
+            if stats.samples.len() >= self.config.min_samples_for_drift_evaluation {
+                let slope = Self::compute_linear_drift_rate(&stats.samples);
+                let prev_drift = stats.drift_rate_ns_per_sec;
+                let consec = if slope > prev_drift && slope > 0.0 {
+                    stats.consecutive_drift_surges + 1
+                } else {
+                    0
+                };
+                (slope, consec)
             } else {
-                0
+                (0.0, 0)
             };
-            (slope, consec)
-        } else {
-            (0.0, 0)
-        };
 
         stats.drift_rate_ns_per_sec = drift_rate;
         stats.consecutive_drift_surges = consecutive_increases;
@@ -532,7 +531,8 @@ impl SubpathJitterDriftTracker {
             let dt_sec = recv_timestamp_ns.saturating_sub(record.last_update_ns) as f64 / 1e9;
             if dt_sec > 1e-6 {
                 let dskew = (record.smoothed_skew_ns - old_smoothed) / dt_sec;
-                record.skew_drift_rate_ns_per_sec = record.skew_drift_rate_ns_per_sec * 0.7 + dskew * 0.3;
+                record.skew_drift_rate_ns_per_sec =
+                    record.skew_drift_rate_ns_per_sec * 0.7 + dskew * 0.3;
             }
             record.last_update_ns = recv_timestamp_ns;
         }
@@ -579,18 +579,14 @@ impl SubpathJitterDriftTracker {
                 self.next_alert_id += 1;
 
                 let action = match severity {
-                    AnomalySeverity::Critical => {
-                        RoutingSteeringAction::EvictSliceFromSubpath {
-                            subpath_id,
-                            slice_class,
-                        }
-                    }
-                    AnomalySeverity::Degraded => {
-                        RoutingSteeringAction::PenalizeRoutingWeight {
-                            subpath_id,
-                            penalty_factor_pct: penalty,
-                        }
-                    }
+                    AnomalySeverity::Critical => RoutingSteeringAction::EvictSliceFromSubpath {
+                        subpath_id,
+                        slice_class,
+                    },
+                    AnomalySeverity::Degraded => RoutingSteeringAction::PenalizeRoutingWeight {
+                        subpath_id,
+                        penalty_factor_pct: penalty,
+                    },
                     AnomalySeverity::Warning => RoutingSteeringAction::IncreaseReorderHoldTimeout {
                         recommended_hold_ns: effective_jitter * 3,
                     },
@@ -720,7 +716,8 @@ impl SubpathJitterDriftTracker {
                     let stats_cur = self.subpaths.get_mut(&subpath_id).unwrap();
                     if severity >= AnomalySeverity::Degraded {
                         stats_cur.is_degraded = true;
-                        stats_cur.routing_penalty_factor_pct = stats_cur.routing_penalty_factor_pct.max(50);
+                        stats_cur.routing_penalty_factor_pct =
+                            stats_cur.routing_penalty_factor_pct.max(50);
                     }
 
                     if recv_timestamp_ns.saturating_sub(stats_cur.last_alert_timestamp_ns)
@@ -848,7 +845,11 @@ impl SubpathJitterDriftTracker {
     }
 
     /// Retrieve pairwise skew between two subpaths.
-    pub fn get_pairwise_skew(&self, subpath_a: u32, subpath_b: u32) -> Option<&InterSubpathSkewRecord> {
+    pub fn get_pairwise_skew(
+        &self,
+        subpath_a: u32,
+        subpath_b: u32,
+    ) -> Option<&InterSubpathSkewRecord> {
         let key = (subpath_a.min(subpath_b), subpath_a.max(subpath_b));
         self.pairwise_skews.get(&key)
     }
@@ -961,7 +962,10 @@ impl SubpathJitterDriftTracker {
         }
 
         let _ = writeln!(out, "# HELP ifa_subpath_differential_skew_nanoseconds Smoothed differential path skew between subpath pairs.");
-        let _ = writeln!(out, "# TYPE ifa_subpath_differential_skew_nanoseconds gauge");
+        let _ = writeln!(
+            out,
+            "# TYPE ifa_subpath_differential_skew_nanoseconds gauge"
+        );
         for ((a, b), rec) in &self.pairwise_skews {
             let _ = writeln!(
                 out,
@@ -970,7 +974,10 @@ impl SubpathJitterDriftTracker {
             );
         }
 
-        let _ = writeln!(out, "# HELP ifa_subpath_routing_penalty_pct Dynamic routing penalty factor percentage.");
+        let _ = writeln!(
+            out,
+            "# HELP ifa_subpath_routing_penalty_pct Dynamic routing penalty factor percentage."
+        );
         let _ = writeln!(out, "# TYPE ifa_subpath_routing_penalty_pct gauge");
         for (&id, stats) in &self.subpaths {
             let _ = writeln!(
@@ -981,7 +988,10 @@ impl SubpathJitterDriftTracker {
         }
 
         let _ = writeln!(out, "# HELP ifa_subpath_jitter_drift_anomalies_total Total jitter and drift anomalies detected.");
-        let _ = writeln!(out, "# TYPE ifa_subpath_jitter_drift_anomalies_total counter");
+        let _ = writeln!(
+            out,
+            "# TYPE ifa_subpath_jitter_drift_anomalies_total counter"
+        );
         let _ = writeln!(
             out,
             "ifa_subpath_jitter_drift_anomalies_total {}",
@@ -1003,8 +1013,16 @@ impl SubpathJitterDriftTracker {
     pub fn generate_audit_report(&self) -> String {
         let mut json = String::with_capacity(2048);
         let _ = writeln!(json, "{{");
-        let _ = writeln!(json, "  \"total_samples\": {},", self.total_samples_recorded);
-        let _ = writeln!(json, "  \"total_anomalies\": {},", self.total_anomalies_detected);
+        let _ = writeln!(
+            json,
+            "  \"total_samples\": {},",
+            self.total_samples_recorded
+        );
+        let _ = writeln!(
+            json,
+            "  \"total_anomalies\": {},",
+            self.total_anomalies_detected
+        );
         let _ = writeln!(json, "  \"total_alerts\": {},", self.total_alerts_emitted);
         let _ = writeln!(json, "  \"subpaths\": [");
         let mut first_sp = true;
@@ -1015,13 +1033,37 @@ impl SubpathJitterDriftTracker {
             first_sp = false;
             let _ = writeln!(json, "    {{");
             let _ = writeln!(json, "      \"subpath_id\": {},", id);
-            let _ = writeln!(json, "      \"last_transit_ns\": {},", stats.last_transit_latency_ns);
-            let _ = writeln!(json, "      \"min_transit_ns\": {},", stats.min_transit_latency_ns);
-            let _ = writeln!(json, "      \"max_transit_ns\": {},", stats.max_transit_latency_ns);
-            let _ = writeln!(json, "      \"rfc3550_jitter_ns\": {},", stats.rfc3550_jitter_ns);
-            let _ = writeln!(json, "      \"drift_rate_ns_per_sec\": {:.2},", stats.drift_rate_ns_per_sec);
+            let _ = writeln!(
+                json,
+                "      \"last_transit_ns\": {},",
+                stats.last_transit_latency_ns
+            );
+            let _ = writeln!(
+                json,
+                "      \"min_transit_ns\": {},",
+                stats.min_transit_latency_ns
+            );
+            let _ = writeln!(
+                json,
+                "      \"max_transit_ns\": {},",
+                stats.max_transit_latency_ns
+            );
+            let _ = writeln!(
+                json,
+                "      \"rfc3550_jitter_ns\": {},",
+                stats.rfc3550_jitter_ns
+            );
+            let _ = writeln!(
+                json,
+                "      \"drift_rate_ns_per_sec\": {:.2},",
+                stats.drift_rate_ns_per_sec
+            );
             let _ = writeln!(json, "      \"is_degraded\": {},", stats.is_degraded);
-            let _ = writeln!(json, "      \"penalty_pct\": {}", stats.routing_penalty_factor_pct);
+            let _ = writeln!(
+                json,
+                "      \"penalty_pct\": {}",
+                stats.routing_penalty_factor_pct
+            );
             let _ = write!(json, "    }}");
         }
         let _ = writeln!(json, "\n  ],");
@@ -1036,7 +1078,11 @@ impl SubpathJitterDriftTracker {
             let _ = writeln!(json, "      \"alert_id\": {},", alt.alert_id);
             let _ = writeln!(json, "      \"timestamp_ns\": {},", alt.timestamp_ns);
             let _ = writeln!(json, "      \"subpath_id\": {},", alt.subpath_id);
-            let _ = writeln!(json, "      \"anomaly_kind\": \"{}\",", alt.anomaly_kind.as_str());
+            let _ = writeln!(
+                json,
+                "      \"anomaly_kind\": \"{}\",",
+                alt.anomaly_kind.as_str()
+            );
             let _ = writeln!(json, "      \"severity\": \"{}\",", alt.severity.as_str());
             let _ = writeln!(json, "      \"action\": \"{}\",", alt.action.as_str());
             let _ = writeln!(json, "      \"message\": \"{}\"", alt.message);
@@ -1066,20 +1112,17 @@ mod tests {
             let transit = 10_000_000 + (seq % 2) * 100_000;
             let recv_ns = send_ns + transit;
 
-            let alerts = tracker.record_transit(
-                1,
-                101,
-                FlowSliceClass::BestEffort,
-                seq,
-                send_ns,
-                recv_ns,
-            );
+            let alerts =
+                tracker.record_transit(1, 101, FlowSliceClass::BestEffort, seq, send_ns, recv_ns);
             assert!(alerts.is_empty(), "Nominal jitter should emit zero alerts");
         }
 
         let stats = tracker.get_subpath_stats(1).unwrap();
         assert_eq!(stats.total_samples, 20);
-        assert!(stats.rfc3550_jitter_ns < 200_000, "Jitter should stay well below 200µs");
+        assert!(
+            stats.rfc3550_jitter_ns < 200_000,
+            "Jitter should stay well below 200µs"
+        );
         assert_eq!(stats.routing_penalty_factor_pct, 0);
         assert!(!stats.is_degraded);
     }
@@ -1089,7 +1132,7 @@ mod tests {
         let mut tracker = SubpathJitterDriftTracker::new(SubpathJitterDriftConfig {
             jitter_surge_multiplier: 2.0,
             jitter_surge_absolute_ns: 5_000_000, // 5ms absolute
-            alert_cooldown_ns: 1_000, // Minimal cooldown for test
+            alert_cooldown_ns: 1_000,            // Minimal cooldown for test
             ..SubpathJitterDriftConfig::default()
         });
 
@@ -1097,16 +1140,33 @@ mod tests {
         for seq in 1..=10 {
             let send_ns = 1_000_000_000 + seq * 20_000_000;
             let transit = 5_000_000 + (seq % 2) * 1_000_000; // 5ms to 6ms
-            tracker.record_transit(1, 101, FlowSliceClass::HighThroughput, seq, send_ns, send_ns + transit);
+            tracker.record_transit(
+                1,
+                101,
+                FlowSliceClass::HighThroughput,
+                seq,
+                send_ns,
+                send_ns + transit,
+            );
         }
 
         // Inject severe jitter surge: transit jumps from 5ms to 35ms (30ms jump)
         let send_surge = 1_000_000_000 + 11 * 20_000_000;
         let recv_surge = send_surge + 35_000_000;
-        let alerts = tracker.record_transit(1, 101, FlowSliceClass::HighThroughput, 11, send_surge, recv_surge);
+        let alerts = tracker.record_transit(
+            1,
+            101,
+            FlowSliceClass::HighThroughput,
+            11,
+            send_surge,
+            recv_surge,
+        );
 
         assert!(!alerts.is_empty(), "Jitter surge should trigger alert");
-        let surge_alert = alerts.iter().find(|a| a.anomaly_kind == JitterDriftAnomalyKind::JitterSurge).unwrap();
+        let surge_alert = alerts
+            .iter()
+            .find(|a| a.anomaly_kind == JitterDriftAnomalyKind::JitterSurge)
+            .unwrap();
         assert_eq!(surge_alert.subpath_id, 1);
         assert!(surge_alert.measured_jitter_ns > 2_000_000);
 
@@ -1130,15 +1190,30 @@ mod tests {
             let send_ns = 1_000_000_000 + (seq - 1) * 100_000_000;
             let transit = 10_000_000 + (seq - 1) * 2_000_000; // 10ms, 12ms, 14ms...
             let recv_ns = send_ns + transit;
-            let alerts = tracker.record_transit(2, 202, FlowSliceClass::MissionCritical, seq, send_ns, recv_ns);
+            let alerts = tracker.record_transit(
+                2,
+                202,
+                FlowSliceClass::MissionCritical,
+                seq,
+                send_ns,
+                recv_ns,
+            );
             total_alerts.extend(alerts);
         }
 
         let stats = tracker.get_subpath_stats(2).unwrap();
-        assert!(stats.drift_rate_ns_per_sec > 15_000_000.0, "Drift slope should reflect ~20ms/sec buildup");
+        assert!(
+            stats.drift_rate_ns_per_sec > 15_000_000.0,
+            "Drift slope should reflect ~20ms/sec buildup"
+        );
 
-        let drift_alert = total_alerts.iter().find(|a| a.anomaly_kind == JitterDriftAnomalyKind::MonotonicDriftDivergence);
-        assert!(drift_alert.is_some(), "Monotonic drift alert must be emitted");
+        let drift_alert = total_alerts
+            .iter()
+            .find(|a| a.anomaly_kind == JitterDriftAnomalyKind::MonotonicDriftDivergence);
+        assert!(
+            drift_alert.is_some(),
+            "Monotonic drift alert must be emitted"
+        );
     }
 
     #[test]
@@ -1152,7 +1227,14 @@ mod tests {
         // Subpath 1: Fast Fiber path (5ms latency)
         for seq in 1..=8 {
             let send_ns = 2_000_000_000 + seq * 10_000_000;
-            tracker.record_transit(1, 303, FlowSliceClass::UltraLowLatency, seq, send_ns, send_ns + 5_000_000);
+            tracker.record_transit(
+                1,
+                303,
+                FlowSliceClass::UltraLowLatency,
+                seq,
+                send_ns,
+                send_ns + 5_000_000,
+            );
         }
 
         // Subpath 2: High-latency Satellite path (50ms latency)
@@ -1160,19 +1242,34 @@ mod tests {
         let mut skew_alerts = Vec::new();
         for seq in 1..=8 {
             let send_ns = 2_000_000_000 + seq * 10_000_000;
-            let alerts = tracker.record_transit(2, 303, FlowSliceClass::UltraLowLatency, seq, send_ns, send_ns + 50_000_000);
+            let alerts = tracker.record_transit(
+                2,
+                303,
+                FlowSliceClass::UltraLowLatency,
+                seq,
+                send_ns,
+                send_ns + 50_000_000,
+            );
             skew_alerts.extend(alerts);
         }
 
-        let skew_alert = skew_alerts.iter().find(|a| a.anomaly_kind == JitterDriftAnomalyKind::ExcessivePathSkew);
-        assert!(skew_alert.is_some(), "Excessive path skew must be detected between Subpath 1 and 2");
+        let skew_alert = skew_alerts
+            .iter()
+            .find(|a| a.anomaly_kind == JitterDriftAnomalyKind::ExcessivePathSkew);
+        assert!(
+            skew_alert.is_some(),
+            "Excessive path skew must be detected between Subpath 1 and 2"
+        );
         let alert = skew_alert.unwrap();
         assert_eq!(alert.subpath_id, 2);
         assert_eq!(alert.paired_subpath_id, Some(1));
 
         // URLLC action must evict the slower subpath (subpath 2)
         match &alert.action {
-            RoutingSteeringAction::EvictSliceFromSubpath { subpath_id, slice_class } => {
+            RoutingSteeringAction::EvictSliceFromSubpath {
+                subpath_id,
+                slice_class,
+            } => {
                 assert_eq!(*subpath_id, 2);
                 assert_eq!(*slice_class, FlowSliceClass::UltraLowLatency);
             }
@@ -1204,7 +1301,8 @@ mod tests {
         assert!(alerts.is_empty());
 
         let prometheus = tracker.export_prometheus_metrics();
-        assert!(prometheus.contains("ifa_subpath_transit_latency_nanoseconds{subpath_id=\"1\"} 12000000"));
+        assert!(prometheus
+            .contains("ifa_subpath_transit_latency_nanoseconds{subpath_id=\"1\"} 12000000"));
         assert!(prometheus.contains("ifa_subpath_jitter_nanoseconds{subpath_id=\"1\"}"));
         assert!(prometheus.contains("ifa_subpath_jitter_drift_anomalies_total"));
 

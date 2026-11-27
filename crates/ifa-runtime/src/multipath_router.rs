@@ -771,7 +771,9 @@ impl MultipathRouter {
                 } => {
                     if let Some(route) = self.subpaths.get_mut(subpath_id) {
                         // Heavily inflate perceived sRTT so slice steering rejects this path
-                        route.srtt_ns = route.srtt_ns.saturating_add(alert.differential_skew_ns.max(10_000_000));
+                        route.srtt_ns = route
+                            .srtt_ns
+                            .saturating_add(alert.differential_skew_ns.max(10_000_000));
                         applied_actions += 1;
                     }
                 }
@@ -824,7 +826,8 @@ impl MultipathRouter {
                         _ => {}
                     }
                 }
-                let (route, _, needs_frag) = best_route.ok_or(RouterError::NoOperationalSubpaths)?;
+                let (route, _, needs_frag) =
+                    best_route.ok_or(RouterError::NoOperationalSubpaths)?;
                 Ok(SubpathSelection {
                     primary_subpath_id: route.subpath_id,
                     secondary_bicast_subpath_id: None,
@@ -1310,9 +1313,7 @@ mod tests {
 
     #[test]
     fn test_jitter_drift_feedback_and_adaptive_steering() {
-        use crate::subpath_jitter_drift::{
-            SubpathJitterDriftConfig, SubpathJitterDriftTracker,
-        };
+        use crate::subpath_jitter_drift::{SubpathJitterDriftConfig, SubpathJitterDriftTracker};
 
         let mut router = MultipathRouter::new();
         // Subpath 1: Nominal fiber (sRTT 5ms, weight 10)
@@ -1328,12 +1329,28 @@ mod tests {
 
         // Feed nominal traffic to both subpaths
         for seq in 1..=10 {
-            tracker.record_transit(1, 10, FlowSliceClass::UltraLowLatency, seq, seq * 10_000_000, seq * 10_000_000 + 5_000_000);
-            tracker.record_transit(2, 10, FlowSliceClass::UltraLowLatency, seq, seq * 10_000_000, seq * 10_000_000 + 6_000_000);
+            tracker.record_transit(
+                1,
+                10,
+                FlowSliceClass::UltraLowLatency,
+                seq,
+                seq * 10_000_000,
+                seq * 10_000_000 + 5_000_000,
+            );
+            tracker.record_transit(
+                2,
+                10,
+                FlowSliceClass::UltraLowLatency,
+                seq,
+                seq * 10_000_000,
+                seq * 10_000_000 + 6_000_000,
+            );
         }
 
         // Initially both are admissible, Subpath 1 is selected for URLLC because sRTT 5ms < 6ms
-        let sel = router.select_subpath_for_frame_with_tracker(FlowSliceClass::UltraLowLatency, 1000, &tracker).unwrap();
+        let sel = router
+            .select_subpath_for_frame_with_tracker(FlowSliceClass::UltraLowLatency, 1000, &tracker)
+            .unwrap();
         assert_eq!(sel.primary_subpath_id, 1);
 
         // Now inject jitter surge on subpath 1
@@ -1352,7 +1369,9 @@ mod tests {
         assert!(applied > 0);
 
         // Subpath 1 is now marked degraded/penalized by tracker, so router steers URLLC frame to Subpath 2!
-        let sel2 = router.select_subpath_for_frame_with_tracker(FlowSliceClass::UltraLowLatency, 1000, &tracker).unwrap();
+        let sel2 = router
+            .select_subpath_for_frame_with_tracker(FlowSliceClass::UltraLowLatency, 1000, &tracker)
+            .unwrap();
         assert_eq!(sel2.primary_subpath_id, 2);
     }
 }
