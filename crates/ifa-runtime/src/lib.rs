@@ -21,6 +21,7 @@ pub mod mesh_lsa;
 pub mod mtls_attestation;
 pub mod multi_node_sla;
 pub mod multipath_congestion;
+pub mod multipath_event_scheduler;
 pub mod multipath_fec;
 pub mod multipath_pacing;
 pub mod multipath_pacing_coordinator;
@@ -160,6 +161,12 @@ pub use multipath_congestion::{
     MultipathCongestionBenchmarkReport, MultipathCongestionManager,
     MultipathCongestionTelemetrySummary, SubpathCongestionController, SubpathSliceWindow,
     LEDBAT_DEFAULT_TARGET_DELAY_US, MIN_CWND_BYTES, TCP_MSS_BYTES,
+};
+pub use multipath_event_scheduler::{
+    run_multipath_event_scheduler_benchmark, EventProcessOutcome, EventSchedulerBenchmarkReport,
+    MultipathEventScheduler, MultipathEventSchedulerConfig, MultipathEventSchedulerTelemetry,
+    MultipathSchedulerEvent, SchedulerDispatchResult, SchedulerInflightRecord,
+    SchedulerStepSummary, SchedulerSubpathInfo,
 };
 pub use multipath_fec::{
     build_cauchy_matrix, const_gf_mul, get_simd_fec_backend, gf_add, gf_div, gf_inv, gf_mul,
