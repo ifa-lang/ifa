@@ -35,6 +35,7 @@ pub mod slice_resilience;
 pub mod string;
 pub mod subpath_bbr;
 pub mod subpath_health;
+pub mod subpath_jitter_drift;
 pub mod subpath_pmtud;
 pub mod subpath_scheduler;
 pub mod subpath_shaper;
@@ -247,6 +248,11 @@ pub use subpath_bbr::{
 pub use subpath_health::{
     SubpathAlertSink, SubpathDegradedAlertEvent, SubpathHealthConfig, SubpathHealthMonitor,
     SubpathHealthState, SubpathHealthTracker,
+};
+pub use subpath_jitter_drift::{
+    AnomalySeverity as JitterDriftSeverity, InterSubpathSkewRecord, JitterDriftAnomalyKind,
+    RoutingSteeringAction, SubpathJitterDriftAlert, SubpathJitterDriftConfig,
+    SubpathJitterDriftTracker, SubpathJitterStats, SubpathTransitSample,
 };
 pub use subpath_pmtud::{
     calculate_crc32, run_subpath_pmtud_and_fragmentation_benchmark, AdaptiveFragmenter,

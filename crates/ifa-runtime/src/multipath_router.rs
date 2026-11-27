@@ -734,6 +734,113 @@ impl MultipathRouter {
         Ok(event)
     }
 
+    /// Apply adaptive steering feedback derived from `SubpathJitterDriftTracker` alert events.
+    pub fn apply_jitter_drift_feedback(
+        &mut self,
+        alerts: &[crate::subpath_jitter_drift::SubpathJitterDriftAlert],
+    ) -> usize {
+        let mut applied_actions = 0;
+        for alert in alerts {
+            match &alert.action {
+                crate::subpath_jitter_drift::RoutingSteeringAction::PenalizeRoutingWeight {
+                    subpath_id,
+                    penalty_factor_pct,
+                } => {
+                    if let Some(route) = self.subpaths.get_mut(subpath_id) {
+                        let original = route.weight;
+                        let reduction = (original * *penalty_factor_pct) / 100;
+                        route.weight = original.saturating_sub(reduction).max(1);
+                        applied_actions += 1;
+                    }
+                }
+                crate::subpath_jitter_drift::RoutingSteeringAction::TriggerSubpathProbation {
+                    subpath_id,
+                    ..
+                } => {
+                    if let Some(route) = self.subpaths.get_mut(subpath_id) {
+                        if route.health == SubpathHealth::Healthy {
+                            route.health = SubpathHealth::Degraded;
+                            self.state_transitions_total += 1;
+                            applied_actions += 1;
+                        }
+                    }
+                }
+                crate::subpath_jitter_drift::RoutingSteeringAction::EvictSliceFromSubpath {
+                    subpath_id,
+                    ..
+                } => {
+                    if let Some(route) = self.subpaths.get_mut(subpath_id) {
+                        // Heavily inflate perceived sRTT so slice steering rejects this path
+                        route.srtt_ns = route.srtt_ns.saturating_add(alert.differential_skew_ns.max(10_000_000));
+                        applied_actions += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        applied_actions
+    }
+
+    /// Select optimal subpath taking into account dynamic jitter drift tracker constraints.
+    pub fn select_subpath_for_frame_with_tracker(
+        &self,
+        slice_class: FlowSliceClass,
+        payload_len: usize,
+        tracker: &crate::subpath_jitter_drift::SubpathJitterDriftTracker,
+    ) -> Result<SubpathSelection, RouterError> {
+        if payload_len == 0 {
+            return Err(RouterError::InvalidFrameSize(0));
+        }
+
+        // Filter candidates that are healthy and admissible per jitter/drift profile
+        let admissible: Vec<&SubpathRoute> = self
+            .subpaths
+            .values()
+            .filter(|r| {
+                r.health.is_available_for_new_traffic()
+                    && tracker.is_subpath_admissible_for_slice(r.subpath_id, slice_class)
+            })
+            .collect();
+
+        if admissible.is_empty() {
+            // Fall back to standard candidate selection if all were filtered
+            return self.select_subpath_for_frame(slice_class, payload_len);
+        }
+
+        // Apply normal slice evaluation across admissible candidates
+        match slice_class {
+            FlowSliceClass::UltraLowLatency => {
+                let mut best_route: Option<(&SubpathRoute, u64, bool)> = None;
+                for route in admissible {
+                    let needs_frag = payload_len > route.max_fragment_payload();
+                    let frag_penalty_ns = if needs_frag { 300_000 } else { 0 };
+                    let queuing_ns = (route.inflight_bytes * 10).min(500_000);
+                    let score = route.srtt_ns + queuing_ns + frag_penalty_ns;
+                    match best_route {
+                        None => best_route = Some((route, score, needs_frag)),
+                        Some((_, best_score, _)) if score < best_score => {
+                            best_route = Some((route, score, needs_frag));
+                        }
+                        _ => {}
+                    }
+                }
+                let (route, _, needs_frag) = best_route.ok_or(RouterError::NoOperationalSubpaths)?;
+                Ok(SubpathSelection {
+                    primary_subpath_id: route.subpath_id,
+                    secondary_bicast_subpath_id: None,
+                    effective_pmtu: route.effective_pmtu,
+                    requires_fragmentation: needs_frag,
+                    estimated_rtt_ns: route.srtt_ns,
+                    justification: format!(
+                        "URLLC min-delay path {} (drift-filtered, sRTT={}ns)",
+                        route.subpath_id, route.srtt_ns
+                    ),
+                })
+            }
+            _ => self.select_subpath_for_frame(slice_class, payload_len),
+        }
+    }
+
     /// Export operational metrics in Prometheus / OpenMetrics format.
     pub fn export_prometheus_metrics(&self) -> String {
         let mut out = String::with_capacity(2048);
@@ -1199,5 +1306,53 @@ mod tests {
         let json = router.to_json_audit();
         assert!(json.contains("\"total_routed_frames\": 1"));
         assert!(json.contains("\"effective_pmtu\": 1500"));
+    }
+
+    #[test]
+    fn test_jitter_drift_feedback_and_adaptive_steering() {
+        use crate::subpath_jitter_drift::{
+            SubpathJitterDriftConfig, SubpathJitterDriftTracker,
+        };
+
+        let mut router = MultipathRouter::new();
+        // Subpath 1: Nominal fiber (sRTT 5ms, weight 10)
+        router.register_subpath(1, 1500, 100_000, 5_000_000, 10);
+        // Subpath 2: Secondary cellular (sRTT 6ms, weight 10)
+        router.register_subpath(2, 1500, 100_000, 6_000_000, 10);
+
+        let mut tracker = SubpathJitterDriftTracker::new(SubpathJitterDriftConfig {
+            jitter_surge_absolute_ns: 2_000_000,
+            alert_cooldown_ns: 100,
+            ..SubpathJitterDriftConfig::default()
+        });
+
+        // Feed nominal traffic to both subpaths
+        for seq in 1..=10 {
+            tracker.record_transit(1, 10, FlowSliceClass::UltraLowLatency, seq, seq * 10_000_000, seq * 10_000_000 + 5_000_000);
+            tracker.record_transit(2, 10, FlowSliceClass::UltraLowLatency, seq, seq * 10_000_000, seq * 10_000_000 + 6_000_000);
+        }
+
+        // Initially both are admissible, Subpath 1 is selected for URLLC because sRTT 5ms < 6ms
+        let sel = router.select_subpath_for_frame_with_tracker(FlowSliceClass::UltraLowLatency, 1000, &tracker).unwrap();
+        assert_eq!(sel.primary_subpath_id, 1);
+
+        // Now inject jitter surge on subpath 1
+        let surge_alerts = tracker.record_transit(
+            1,
+            10,
+            FlowSliceClass::UltraLowLatency,
+            11,
+            200_000_000,
+            200_000_000 + 40_000_000, // 40ms transit!
+        );
+        assert!(!surge_alerts.is_empty());
+
+        // Apply feedback to router
+        let applied = router.apply_jitter_drift_feedback(&surge_alerts);
+        assert!(applied > 0);
+
+        // Subpath 1 is now marked degraded/penalized by tracker, so router steers URLLC frame to Subpath 2!
+        let sel2 = router.select_subpath_for_frame_with_tracker(FlowSliceClass::UltraLowLatency, 1000, &tracker).unwrap();
+        assert_eq!(sel2.primary_subpath_id, 2);
     }
 }

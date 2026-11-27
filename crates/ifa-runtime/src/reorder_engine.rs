@@ -442,6 +442,8 @@ pub struct MultipathReorderEngine {
     pub recent_gap_events: Vec<ReorderGapEvent>,
     /// Maximum recent gap events retained in history.
     pub max_gap_history: usize,
+    /// Real-time jitter and nanosecond temporal drift tracker across heterogeneous subpaths.
+    pub jitter_drift_tracker: crate::subpath_jitter_drift::SubpathJitterDriftTracker,
 }
 
 impl Default for MultipathReorderEngine {
@@ -456,6 +458,7 @@ impl MultipathReorderEngine {
             flows: BTreeMap::new(),
             recent_gap_events: Vec::new(),
             max_gap_history: 128,
+            jitter_drift_tracker: crate::subpath_jitter_drift::SubpathJitterDriftTracker::default(),
         }
     }
 
@@ -476,6 +479,9 @@ impl MultipathReorderEngine {
         &mut self,
         packet: MultipathPacket,
     ) -> (IngestResult, Vec<DeliveredPacket>) {
+        // Track jitter, variance, and inter-subpath temporal drift
+        let _ = self.jitter_drift_tracker.record_packet(&packet);
+
         let flow_id = packet.flow_id;
         let slice = packet.slice_class;
         let arrival_ns = packet.received_timestamp_ns;
@@ -1304,5 +1310,30 @@ mod tests {
 
         let json = report.to_json();
         assert!(json.contains("\"verification_passed\":true"));
+    }
+
+    #[test]
+    fn test_reorder_engine_jitter_drift_integration() {
+        let mut engine = MultipathReorderEngine::new();
+        let now_ns = 5_000_000_000u64;
+
+        for seq in 1..=5 {
+            let p = MultipathPacket::new(
+                seq,
+                10,
+                1,
+                FlowSliceClass::BestEffort,
+                seq,
+                100,
+                now_ns + seq * 10_000_000,
+                now_ns + seq * 10_000_000 + 4_000_000,
+            );
+            engine.ingest_packet(p);
+        }
+
+        assert_eq!(engine.jitter_drift_tracker.total_samples_recorded, 5);
+        let stats = engine.jitter_drift_tracker.get_subpath_stats(1).unwrap();
+        assert_eq!(stats.total_samples, 5);
+        assert_eq!(stats.last_transit_latency_ns, 4_000_000);
     }
 }
