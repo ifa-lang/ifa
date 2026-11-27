@@ -23,6 +23,7 @@ pub mod multi_node_sla;
 pub mod multipath_congestion;
 pub mod multipath_fec;
 pub mod multipath_pacing;
+pub mod multipath_pacing_coordinator;
 pub mod multipath_retransmit;
 pub mod multipath_router;
 pub mod multipath_stream_mux;
@@ -170,6 +171,13 @@ pub use multipath_fec::{
 pub use multipath_pacing::{
     MultipathPacingEngine, PacedQueuedPacket, PacedScheduledPacket, PacingPollResult, SubpathPacer,
     SubpathPacerConfig, SubpathPacingTelemetry, SubpathPacingVerdict,
+};
+pub use multipath_pacing_coordinator::{
+    run_multipath_pacing_coordinator_benchmark, CoordinatorScheduleVerdict,
+    MultipathPacingBenchmarkReport, MultipathPacingCoordinator, OutboundItemKind,
+    OutboundPacketItem, PacingCoordinatorConfig, ScheduledOutboundItem,
+    SubpathCoordinatorTelemetry, SubpathPacerState, DEFAULT_MAX_BURST_BYTES,
+    DEFAULT_MIN_BURST_BYTES,
 };
 pub use multipath_retransmit::{
     run_subpath_retransmit_benchmark, select_priority_fallback_subpath, InflightPacketRecord,
