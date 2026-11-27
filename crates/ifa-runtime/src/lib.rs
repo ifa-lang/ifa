@@ -33,6 +33,7 @@ pub mod session_sync;
 pub mod simd_classifier;
 pub mod slice_resilience;
 pub mod string;
+pub mod subpath_bbr;
 pub mod subpath_health;
 pub mod subpath_pmtud;
 pub mod subpath_scheduler;
@@ -237,6 +238,10 @@ pub use slice_resilience::{
     SliceResilienceMetrics, SubpathProbationTracker,
 };
 pub use string::IfaString;
+pub use subpath_bbr::{
+    DeliveryAckSample, SubpathBbrConfig, SubpathBbrDriver, SubpathBbrPhase,
+    SubpathBbrProbeBwSubPhase, SubpathBbrState, SubpathBbrTelemetry, DEFAULT_MIN_CWND_BYTES,
+};
 pub use subpath_health::{
     SubpathAlertSink, SubpathDegradedAlertEvent, SubpathHealthConfig, SubpathHealthMonitor,
     SubpathHealthState, SubpathHealthTracker,
