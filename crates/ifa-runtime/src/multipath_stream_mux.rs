@@ -1953,13 +1953,12 @@ mod tests {
 
         // Sender side backpressure:
         // Sender writes 8,000 bytes successfully using up credit
-        mux.write_stream(s1, &vec![0x77; 8_000], false, 1024)
-            .unwrap();
+        mux.write_stream(s1, &[0x77; 8_000], false, 1024).unwrap();
 
         // Sender tries to send another 5 KB on s1. Since only 10 KB was granted and 8 KB was used,
         // attempting 5 KB exceeds available credit (2 KB) and must trigger StreamFlowControlBlocked!
         let err = mux
-            .write_stream(s1, &vec![0x77; 5_000], false, 1024)
+            .write_stream(s1, &[0x77; 5_000], false, 1024)
             .unwrap_err();
         match err {
             StreamMuxError::StreamFlowControlBlocked {
@@ -2014,14 +2013,12 @@ mod tests {
             .unwrap();
 
         // 1. Sender writes 200 bytes -> success
-        let w1 = sender
-            .write_stream(s_id, &vec![0x11; 200], false, 200)
-            .unwrap();
+        let w1 = sender.write_stream(s_id, &[0x11; 200], false, 200).unwrap();
         assert_eq!(w1, 200);
 
         // 2. Sender attempts 100 more bytes -> blocked!
         let err = sender
-            .write_stream(s_id, &vec![0x22; 100], true, 100)
+            .write_stream(s_id, &[0x22; 100], true, 100)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -2069,9 +2066,7 @@ mod tests {
             .unwrap();
 
         // 7. Sender is now unblocked and successfully sends remaining 100 bytes!
-        let w2 = sender
-            .write_stream(s_id, &vec![0x22; 100], true, 100)
-            .unwrap();
+        let w2 = sender.write_stream(s_id, &[0x22; 100], true, 100).unwrap();
         assert_eq!(w2, 100);
     }
 
