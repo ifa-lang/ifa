@@ -823,4 +823,77 @@ mod tests {
             res.diagnostics
         );
     }
+
+    // -----------------------------------------------------------------
+    // E0072 — select arms: ref payload must be rejected
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_select_arm_ref_payload_rejected() {
+        let code = r#"
+            fn consume(ch: sync::Channel<ref i32>) {
+                select {
+                    let msg = ch => {
+                        let _ = msg;
+                    }
+                }
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0072")),
+            "Expected E0072 on select arm with ref payload, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_select_arm_struct_with_ref_field_rejected() {
+        let code = r#"
+            struct Packet {
+                data: ref i64,
+                id: i64,
+            }
+            fn consume(ch: sync::Channel<Packet>) {
+                select {
+                    let pkt = ch => {
+                        let _ = pkt;
+                    }
+                }
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0072")),
+            "Expected E0072 on select arm with struct containing ref field, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_select_arm_value_payload_accepted() {
+        let code = r#"
+            fn consume(ch: sync::Channel<i64>) {
+                select {
+                    let msg = ch => {
+                        let _ = msg;
+                    }
+                }
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        let has_e0072 = res
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0072"));
+        assert!(
+            !has_e0072,
+            "E0072 must NOT fire for a pure value payload in select arm, got: {:?}",
+            res.diagnostics
+        );
+    }
 }

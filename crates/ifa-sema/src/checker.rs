@@ -3276,8 +3276,41 @@ impl<'a> SemanticAnalyzer<'a> {
                         if let Some(chan_expr) = &arm.channel {
                             let chan_ty = self.infer_expr(chan_expr);
                             if let Type::Generic { name, args } = &chan_ty {
-                                if INTERNER.resolve(name) == "Channel" && !args.is_empty() {
+                                let ch_name_str = INTERNER.resolve(name);
+                                if matches!(
+                                    ch_name_str.as_str(),
+                                    "Channel"
+                                        | "ReliableChannel"
+                                        | "BestEffortChannel"
+                                        | "RedundantChannel"
+                                        | "Stream"
+                                        | "PacketChannel"
+                                        | "MultipathChannel"
+                                ) && !args.is_empty()
+                                {
                                     elem_ty = args[0].clone();
+                                    // E0072 — deep ref check on select arm channel payload
+                                    let mut visited = std::collections::HashSet::new();
+                                    if type_contains_ref_deep(
+                                        &elem_ty,
+                                        &self.symbols,
+                                        &mut visited,
+                                    ) {
+                                        self.diagnostics.push(
+                                            Diagnostic::error(format!(
+                                                "le type de charge utile '{}' reçu via '{}' dans un bras 'select' ne peut pas contenir de référence locale ('ref') : les références locales ne survivent pas au transfert inter-fibres",
+                                                elem_ty, ch_name_str
+                                            ))
+                                            .with_code("E0072")
+                                            .with_primary_label(
+                                                chan_expr.span,
+                                                "bras select recevant un type contenant une référence locale",
+                                            )
+                                            .with_note(
+                                                "Utilisez la sémantique de valeur pure (sans 'ref') pour les types transmis par canal.",
+                                            ),
+                                        );
+                                    }
                                 }
                             }
                             if let Some(pat) = &arm.pattern {
