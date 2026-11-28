@@ -194,14 +194,46 @@ void ifa_rt_coro_iter_destroy(void* iter) {
 #define IFA_CHAN_STATE_OPEN 0
 #define IFA_CHAN_STATE_CLOSED 1
 
+#if defined(__GNUC__) || defined(__clang__)
+#define IFA_CACHE_ALIGN __attribute__((aligned(64)))
+#elif defined(_MSC_VER)
+#define IFA_CACHE_ALIGN __declspec(align(64))
+#else
+#define IFA_CACHE_ALIGN
+#endif
+
 typedef struct ifa_channel_sync {
     void** buffer;
     size_t capacity;
-    _Atomic size_t head;
-    _Atomic size_t tail;
-    _Atomic size_t count;
-    _Atomic int state;
+    IFA_CACHE_ALIGN _Atomic size_t head;
+    IFA_CACHE_ALIGN _Atomic size_t tail;
+    IFA_CACHE_ALIGN _Atomic size_t count;
+    IFA_CACHE_ALIGN _Atomic int state;
 } ifa_channel_sync_t;
+
+void ifa_rt_atomic_fence(int32_t ordering) {
+    switch (ordering) {
+        case 0: break; // Relaxed
+        case 1: atomic_thread_fence(memory_order_acquire); break;
+        case 2: atomic_thread_fence(memory_order_release); break;
+        case 3: atomic_thread_fence(memory_order_acq_rel); break;
+        default: atomic_thread_fence(memory_order_seq_cst); break;
+    }
+}
+
+void ifa_rt_spin_loop_hint(void) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    #if defined(__GNUC__) || defined(__clang__)
+    __builtin_ia32_pause();
+    #else
+    _mm_pause();
+    #endif
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield" ::: "memory");
+#else
+    // generic fallback
+#endif
+}
 
 void* ifa_rt_channel_create(size_t capacity) {
     ifa_channel_sync_t* c = (ifa_channel_sync_t*)calloc(1, sizeof(ifa_channel_sync_t));
@@ -233,6 +265,7 @@ int32_t ifa_rt_channel_try_send(void* chan, void* val) {
         if (atomic_compare_exchange_weak(&c->count, &cur_cnt, cur_cnt + 1)) {
             size_t tail_idx = atomic_fetch_add(&c->tail, 1) % c->capacity;
             c->buffer[tail_idx] = val;
+            atomic_thread_fence(memory_order_release);
             return 0; // Success
         }
         if (atomic_load(&c->state) == IFA_CHAN_STATE_CLOSED) return -2;
@@ -257,6 +290,7 @@ int32_t ifa_rt_channel_try_recv(void* chan, void** out_val) {
     while (cur_cnt > 0) {
         if (atomic_compare_exchange_weak(&c->count, &cur_cnt, cur_cnt - 1)) {
             size_t head_idx = atomic_fetch_add(&c->head, 1) % c->capacity;
+            atomic_thread_fence(memory_order_acquire);
             *out_val = c->buffer[head_idx];
             return 0; // Success
         }

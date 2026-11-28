@@ -5144,7 +5144,20 @@ pub extern "C" fn ifa_rt_condvar_notify_all(cv: *mut IfaCondVarHandle) -> i32 {
     0
 }
 
-/// Opaque wrapper around an atomic 64-bit integer for C-ABI FFI.
+/// Helper to translate integer ordering flags to Rust atomic memory orderings.
+#[inline]
+pub(crate) fn map_atomic_ordering(ordering: i32) -> std::sync::atomic::Ordering {
+    match ordering {
+        0 => std::sync::atomic::Ordering::Relaxed,
+        1 => std::sync::atomic::Ordering::Acquire,
+        2 => std::sync::atomic::Ordering::Release,
+        3 => std::sync::atomic::Ordering::AcqRel,
+        _ => std::sync::atomic::Ordering::SeqCst,
+    }
+}
+
+/// Opaque wrapper around an atomic 64-bit integer for C-ABI FFI, aligned to 64 bytes to eliminate false sharing.
+#[repr(align(64))]
 pub struct IfaAtomicHandle(pub(crate) std::sync::atomic::AtomicI64);
 
 /// Create a new atomic 64-bit integer initialized to the specified value.
@@ -5227,6 +5240,25 @@ pub extern "C" fn ifa_rt_atomic_cas(a: *mut IfaAtomicHandle, expected: i64, desi
     }
 }
 
+/// Atomically load 64-bit integer value with explicit memory ordering.
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_load_explicit(a: *mut IfaAtomicHandle, ordering: i32) -> i64 {
+    if a.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*a };
+    handle.0.load(map_atomic_ordering(ordering))
+}
+
+/// Atomically store 64-bit integer value with explicit memory ordering.
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_store_explicit(a: *mut IfaAtomicHandle, val: i64, ordering: i32) {
+    if !a.is_null() {
+        let handle = unsafe { &*a };
+        handle.0.store(val, map_atomic_ordering(ordering));
+    }
+}
+
 /// Send a 64-bit integer value over the channel.
 #[no_mangle]
 pub extern "C" fn ifa_rt_channel_send_int(chan: *mut IfaChannelHandle, val: i64) -> i32 {
@@ -5268,7 +5300,8 @@ pub extern "C" fn ifa_rt_channel_try_recv_int(
     res
 }
 
-/// Opaque wrapper around an atomic 64-bit unsigned integer for C-ABI FFI.
+/// Opaque wrapper around an atomic 64-bit unsigned integer for C-ABI FFI, aligned to 64 bytes to eliminate false sharing.
+#[repr(align(64))]
 pub struct IfaAtomicU64Handle(pub(crate) std::sync::atomic::AtomicU64);
 
 /// Create a new atomic 64-bit unsigned integer initialized to the specified value.
@@ -5353,6 +5386,41 @@ pub extern "C" fn ifa_rt_atomic_u64_cas(
         Ok(v) => v,
         Err(v) => v,
     }
+}
+
+/// Atomically load 64-bit unsigned integer value with explicit memory ordering.
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_u64_load_explicit(a: *mut IfaAtomicU64Handle, ordering: i32) -> u64 {
+    if a.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*a };
+    handle.0.load(map_atomic_ordering(ordering))
+}
+
+/// Atomically store 64-bit unsigned integer value with explicit memory ordering.
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_u64_store_explicit(a: *mut IfaAtomicU64Handle, val: u64, ordering: i32) {
+    if !a.is_null() {
+        let handle = unsafe { &*a };
+        handle.0.store(val, map_atomic_ordering(ordering));
+    }
+}
+
+/// Issue an explicit atomic memory barrier/fence with the given ordering.
+/// ordering: 0=Relaxed, 1=Acquire, 2=Release, 3=AcqRel, 4=SeqCst (default).
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_fence(ordering: i32) {
+    let ord = map_atomic_ordering(ordering);
+    if ord != std::sync::atomic::Ordering::Relaxed {
+        std::sync::atomic::fence(ord);
+    }
+}
+
+/// Emit CPU spin loop hint (PAUSE on x86, YIELD on ARM) for lock-free busy waiting loops.
+#[no_mangle]
+pub extern "C" fn ifa_rt_spin_loop_hint() {
+    std::hint::spin_loop();
 }
 
 /// Opaque wrapper around a cooperative fiber WaitGroup for C-ABI FFI.

@@ -975,6 +975,33 @@ struct RingSlot<T> {
     value: UnsafeCell<Option<T>>,
 }
 
+/// Cacheline-aligned wrapper to eliminate false sharing between CPU cores.
+#[repr(align(64))]
+#[derive(Debug, Default)]
+pub struct CachePadded<T>(pub T);
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for CachePadded<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T> CachePadded<T> {
+    /// Wrap value in cacheline-aligned storage.
+    pub const fn new(value: T) -> Self {
+        Self(value)
+    }
+}
+
 /// High-performance lock-free bounded MPMC atomic ring buffer without GC.
 /// Uses atomic sequence counters and cacheline alignment to eliminate false sharing.
 pub struct AtomicRingBuffer<T> {
@@ -982,8 +1009,8 @@ pub struct AtomicRingBuffer<T> {
     mask: usize,
     buffer_capacity: usize,
     capacity: usize,
-    head: AtomicUsize,
-    tail: AtomicUsize,
+    head: CachePadded<AtomicUsize>,
+    tail: CachePadded<AtomicUsize>,
 }
 
 unsafe impl<T: Send> Send for AtomicRingBuffer<T> {}
@@ -1007,8 +1034,8 @@ impl<T> AtomicRingBuffer<T> {
             mask,
             buffer_capacity: cap,
             capacity: user_cap,
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
+            head: CachePadded::new(AtomicUsize::new(0)),
+            tail: CachePadded::new(AtomicUsize::new(0)),
         }
     }
 

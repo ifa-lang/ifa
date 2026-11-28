@@ -8,7 +8,46 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub use ifa_runtime::fiber::{AdaptiveBackoff, FiberId, FiberScheduler, FiberState};
+pub use ifa_runtime::fiber::{AdaptiveBackoff, CachePadded, FiberId, FiberScheduler, FiberState};
+
+pub const ORDERING_RELAXED: i32 = 0;
+pub const ORDERING_ACQUIRE: i32 = 1;
+pub const ORDERING_RELEASE: i32 = 2;
+pub const ORDERING_ACQ_REL: i32 = 3;
+pub const ORDERING_SEQ_CST: i32 = 4;
+
+/// Map integer ordering representation to standard atomic Ordering.
+#[inline]
+pub fn map_ordering(ordering: i32) -> Ordering {
+    match ordering {
+        0 => Ordering::Relaxed,
+        1 => Ordering::Acquire,
+        2 => Ordering::Release,
+        3 => Ordering::AcqRel,
+        _ => Ordering::SeqCst,
+    }
+}
+
+/// Issue an explicit atomic memory fence.
+#[inline]
+pub fn memory_fence(ordering: i32) {
+    let ord = map_ordering(ordering);
+    if ord != Ordering::Relaxed {
+        std::sync::atomic::fence(ord);
+    }
+}
+
+/// Full hardware memory barrier with SeqCst ordering.
+#[inline]
+pub fn memory_barrier() {
+    std::sync::atomic::fence(Ordering::SeqCst);
+}
+
+/// Emit hardware CPU pause/yield hint for lock-free spin loops.
+#[inline]
+pub fn cpu_pause() {
+    std::hint::spin_loop();
+}
 
 /// Error returned when timed receive expires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,6 +376,14 @@ impl AtomicInt {
         self.0
             .compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst)
     }
+
+    pub fn load_explicit(&self, ordering: Ordering) -> i64 {
+        self.0.load(ordering)
+    }
+
+    pub fn store_explicit(&self, val: i64, ordering: Ordering) {
+        self.0.store(val, ordering)
+    }
 }
 
 /// Ergonomic atomic boolean wrapper with explicit memory semantics.
@@ -389,6 +436,14 @@ impl AtomicUint {
     pub fn compare_exchange(&self, current: u64, new: u64) -> Result<u64, u64> {
         self.0
             .compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst)
+    }
+
+    pub fn load_explicit(&self, ordering: Ordering) -> u64 {
+        self.0.load(ordering)
+    }
+
+    pub fn store_explicit(&self, val: u64, ordering: Ordering) {
+        self.0.store(val, ordering)
     }
 }
 
@@ -1261,5 +1316,27 @@ mod tests {
             Some("second".to_string())
         );
         assert!(tq.is_empty());
+    }
+
+    #[test]
+    fn test_lock_free_primitives_and_barriers() {
+        memory_barrier();
+        memory_fence(ORDERING_ACQUIRE);
+        memory_fence(ORDERING_RELEASE);
+        memory_fence(ORDERING_ACQ_REL);
+        cpu_pause();
+
+        let a = AtomicInt::new(42);
+        assert_eq!(a.load_explicit(Ordering::Acquire), 42);
+        a.store_explicit(99, Ordering::Release);
+        assert_eq!(a.load_explicit(Ordering::SeqCst), 99);
+
+        let u = AtomicUint::new(1000);
+        assert_eq!(u.load_explicit(Ordering::Acquire), 1000);
+        u.store_explicit(2000, Ordering::Release);
+        assert_eq!(u.load_explicit(Ordering::SeqCst), 2000);
+
+        let padded_val = CachePadded::new(AtomicUsize::new(777));
+        assert_eq!(padded_val.load(Ordering::Relaxed), 777);
     }
 }

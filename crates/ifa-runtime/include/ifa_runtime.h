@@ -666,6 +666,8 @@ void ifa_rt_atomic_store(ifa_atomic_handle_t* a, int64_t val);
 int64_t ifa_rt_atomic_fetch_add(ifa_atomic_handle_t* a, int64_t delta);
 int64_t ifa_rt_atomic_fetch_sub(ifa_atomic_handle_t* a, int64_t delta);
 int64_t ifa_rt_atomic_cas(ifa_atomic_handle_t* a, int64_t expected, int64_t desired);
+int64_t ifa_rt_atomic_load_explicit(ifa_atomic_handle_t* a, int32_t ordering);
+void ifa_rt_atomic_store_explicit(ifa_atomic_handle_t* a, int64_t val, int32_t ordering);
 
 ifa_atomic_u64_handle_t* ifa_rt_atomic_u64_create(uint64_t initial_val);
 void ifa_rt_atomic_u64_destroy(ifa_atomic_u64_handle_t* a);
@@ -674,6 +676,11 @@ void ifa_rt_atomic_u64_store(ifa_atomic_u64_handle_t* a, uint64_t val);
 uint64_t ifa_rt_atomic_u64_fetch_add(ifa_atomic_u64_handle_t* a, uint64_t delta);
 uint64_t ifa_rt_atomic_u64_fetch_sub(ifa_atomic_u64_handle_t* a, uint64_t delta);
 uint64_t ifa_rt_atomic_u64_cas(ifa_atomic_u64_handle_t* a, uint64_t expected, uint64_t desired);
+uint64_t ifa_rt_atomic_u64_load_explicit(ifa_atomic_u64_handle_t* a, int32_t ordering);
+void ifa_rt_atomic_u64_store_explicit(ifa_atomic_u64_handle_t* a, uint64_t val, int32_t ordering);
+
+void ifa_rt_atomic_fence(int32_t ordering);
+void ifa_rt_spin_loop_hint(void);
 
 ifa_waitgroup_handle_t* ifa_rt_waitgroup_create(void);
 void ifa_rt_waitgroup_destroy(ifa_waitgroup_handle_t* wg);

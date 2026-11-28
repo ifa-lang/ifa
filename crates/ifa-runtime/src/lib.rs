@@ -115,7 +115,7 @@ pub use crypto_overhead_rekey::{
 };
 pub use ffi::*;
 pub use fiber::{
-    AdaptiveBackoff, AtomicRingBuffer, Channel, CoroDestroyFn, CoroResumeFn, CoroStatus, FiberId,
+    AdaptiveBackoff, AtomicRingBuffer, CachePadded, Channel, CoroDestroyFn, CoroResumeFn, CoroStatus, FiberId,
     FiberScheduler, FiberState, FiberStepResult, FiberTask, RecvError, SendError, StacklessCoro,
     TryRecvError, TrySendError, GLOBAL_SCHEDULER,
 };

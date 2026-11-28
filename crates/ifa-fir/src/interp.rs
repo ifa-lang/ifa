@@ -4018,6 +4018,70 @@ impl<'a> FirInterpreter<'a> {
                     } else {
                         Ok(FirValue::Bool(false))
                     }
+                } else if fn_name == "sync::atomic_load_explicit"
+                    || fn_name == "atomic_load_explicit"
+                    || fn_name == "ifa_rt_atomic_load_explicit"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let v = self.sync_atomics.get(&id).copied().unwrap_or(0);
+                    Ok(FirValue::Int(v as i128))
+                } else if fn_name == "sync::atomic_store_explicit"
+                    || fn_name == "atomic_store_explicit"
+                    || fn_name == "ifa_rt_atomic_store_explicit"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let val = match evaluated_args.get(1) {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    self.sync_atomics.insert(id, val);
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::atomic_u64_load_explicit"
+                    || fn_name == "atomic_u64_load_explicit"
+                    || fn_name == "ifa_rt_atomic_u64_load_explicit"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let v = self.sync_atomics_u64.get(&id).copied().unwrap_or(0);
+                    Ok(FirValue::Int(v as i128))
+                } else if fn_name == "sync::atomic_u64_store_explicit"
+                    || fn_name == "atomic_u64_store_explicit"
+                    || fn_name == "ifa_rt_atomic_u64_store_explicit"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let val = match evaluated_args.get(1) {
+                        Some(FirValue::Int(n)) => *n as u64,
+                        _ => 0,
+                    };
+                    self.sync_atomics_u64.insert(id, val);
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::fence"
+                    || fn_name == "fence"
+                    || fn_name == "sync::memory_barrier"
+                    || fn_name == "memory_barrier"
+                    || fn_name == "ifa_rt_atomic_fence"
+                {
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::spin_loop_hint"
+                    || fn_name == "spin_loop_hint"
+                    || fn_name == "sync::cpu_pause"
+                    || fn_name == "cpu_pause"
+                    || fn_name == "ifa_rt_spin_loop_hint"
+                {
+                    std::hint::spin_loop();
+                    Ok(FirValue::Bool(true))
                 } else if fn_name == "sync::waitgroup_create"
                     || fn_name == "waitgroup_create"
                     || fn_name == "ifa_rt_waitgroup_create"

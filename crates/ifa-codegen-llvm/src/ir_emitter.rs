@@ -333,6 +333,12 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("declare i64 @ifa_rt_atomic_u64_fetch_add(ptr, i64)\n");
         out.push_str("declare i64 @ifa_rt_atomic_u64_fetch_sub(ptr, i64)\n");
         out.push_str("declare i64 @ifa_rt_atomic_u64_cas(ptr, i64, i64)\n");
+        out.push_str("declare i64 @ifa_rt_atomic_load_explicit(ptr, i32)\n");
+        out.push_str("declare void @ifa_rt_atomic_store_explicit(ptr, i64, i32)\n");
+        out.push_str("declare i64 @ifa_rt_atomic_u64_load_explicit(ptr, i32)\n");
+        out.push_str("declare void @ifa_rt_atomic_u64_store_explicit(ptr, i64, i32)\n");
+        out.push_str("declare void @ifa_rt_atomic_fence(i32)\n");
+        out.push_str("declare void @ifa_rt_spin_loop_hint()\n");
         out.push_str("declare ptr @ifa_rt_waitgroup_create()\n");
         out.push_str("declare void @ifa_rt_waitgroup_destroy(ptr)\n");
         out.push_str("declare void @ifa_rt_waitgroup_add(ptr, i64)\n");
@@ -3885,6 +3891,25 @@ impl<'a> LlvmIrEmitter<'a> {
                         "ifa_rt_atomic_u64_fetch_sub"
                     }
                     "sync::atomic_u64_cas" | "atomic_u64_cas" => "ifa_rt_atomic_u64_cas",
+                    "sync::atomic_load_explicit" | "atomic_load_explicit" => {
+                        "ifa_rt_atomic_load_explicit"
+                    }
+                    "sync::atomic_store_explicit" | "atomic_store_explicit" => {
+                        "ifa_rt_atomic_store_explicit"
+                    }
+                    "sync::atomic_u64_load_explicit" | "atomic_u64_load_explicit" => {
+                        "ifa_rt_atomic_u64_load_explicit"
+                    }
+                    "sync::atomic_u64_store_explicit" | "atomic_u64_store_explicit" => {
+                        "ifa_rt_atomic_u64_store_explicit"
+                    }
+                    "sync::fence" | "fence" | "sync::memory_barrier" | "memory_barrier" => {
+                        "ifa_rt_atomic_fence"
+                    }
+                    "sync::spin_loop_hint"
+                    | "spin_loop_hint"
+                    | "sync::cpu_pause"
+                    | "cpu_pause" => "ifa_rt_spin_loop_hint",
                     "sync::waitgroup_create" | "waitgroup_create" => "ifa_rt_waitgroup_create",
                     "sync::waitgroup_destroy" | "waitgroup_destroy" => "ifa_rt_waitgroup_destroy",
                     "sync::waitgroup_add" | "waitgroup_add" => "ifa_rt_waitgroup_add",
@@ -6000,6 +6025,25 @@ impl<'a> LlvmIrEmitter<'a> {
                         "ifa_rt_atomic_u64_fetch_sub"
                     }
                     "sync::atomic_u64_cas" | "atomic_u64_cas" => "ifa_rt_atomic_u64_cas",
+                    "sync::atomic_load_explicit" | "atomic_load_explicit" => {
+                        "ifa_rt_atomic_load_explicit"
+                    }
+                    "sync::atomic_store_explicit" | "atomic_store_explicit" => {
+                        "ifa_rt_atomic_store_explicit"
+                    }
+                    "sync::atomic_u64_load_explicit" | "atomic_u64_load_explicit" => {
+                        "ifa_rt_atomic_u64_load_explicit"
+                    }
+                    "sync::atomic_u64_store_explicit" | "atomic_u64_store_explicit" => {
+                        "ifa_rt_atomic_u64_store_explicit"
+                    }
+                    "sync::fence" | "fence" | "sync::memory_barrier" | "memory_barrier" => {
+                        "ifa_rt_atomic_fence"
+                    }
+                    "sync::spin_loop_hint"
+                    | "spin_loop_hint"
+                    | "sync::cpu_pause"
+                    | "cpu_pause" => "ifa_rt_spin_loop_hint",
                     "sync::waitgroup_create" | "waitgroup_create" => "ifa_rt_waitgroup_create",
                     "sync::waitgroup_destroy" | "waitgroup_destroy" => "ifa_rt_waitgroup_destroy",
                     "sync::waitgroup_add" | "waitgroup_add" => "ifa_rt_waitgroup_add",

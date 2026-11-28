@@ -355,6 +355,47 @@ pub fn atomic_u64_free(inout a: AtomicU64) {
 }
 
 // ---------------------------------------------------------------------------
+// 6c. Memory Ordering & Atomic Hardware Barriers (Lock-free Multicore)
+// ---------------------------------------------------------------------------
+
+pub const ORDERING_RELAXED: i32 = 0;
+pub const ORDERING_ACQUIRE: i32 = 1;
+pub const ORDERING_RELEASE: i32 = 2;
+pub const ORDERING_ACQ_REL: i32 = 3;
+pub const ORDERING_SEQ_CST: i32 = 4;
+
+pub fn atomic_int_get_explicit(a: AtomicInt, ordering: i32) -> i64 {
+    return atomic_load_explicit(a.id, ordering);
+}
+
+pub fn atomic_int_set_explicit(inout a: AtomicInt, val: i64, ordering: i32) {
+    let _ = atomic_store_explicit(a.id, val, ordering);
+}
+
+pub fn atomic_u64_get_explicit(a: AtomicU64, ordering: i32) -> u64 {
+    return atomic_u64_load_explicit(a.id, ordering);
+}
+
+pub fn atomic_u64_set_explicit(inout a: AtomicU64, val: u64, ordering: i32) {
+    let _ = atomic_u64_store_explicit(a.id, val, ordering);
+}
+
+/// Issue an explicit memory fence with the given ordering semantics
+pub fn memory_fence(ordering: i32) {
+    let _ = fence(ordering);
+}
+
+/// Full hardware memory barrier (Sequentially Consistent)
+pub fn memory_barrier() {
+    let _ = fence(4);
+}
+
+/// Emit hardware CPU pause/yield hint for lock-free busy spin loops
+pub fn cpu_pause() {
+    let _ = spin_loop_hint();
+}
+
+// ---------------------------------------------------------------------------
 // 7. Counting Semaphore (`Semaphore`)
 // ---------------------------------------------------------------------------
 
@@ -1055,6 +1096,33 @@ pub fn test_sync_timer_queue() -> bool {
     return timer_queue_is_closed(tq);
 }
 
+pub fn test_sync_lock_free_barriers() -> bool {
+    memory_barrier();
+    memory_fence(ORDERING_ACQUIRE);
+    memory_fence(ORDERING_RELEASE);
+    memory_fence(ORDERING_ACQ_REL);
+    cpu_pause();
+
+    mut a = make_atomic_int(1234);
+    if atomic_int_get_explicit(a, ORDERING_ACQUIRE) != 1234 {
+        return false;
+    }
+    atomic_int_set_explicit(inout a, 5678, ORDERING_RELEASE);
+    if atomic_int_get_explicit(a, ORDERING_SEQ_CST) != 5678 {
+        return false;
+    }
+
+    mut u = make_atomic_u64(9876);
+    if atomic_u64_get_explicit(u, ORDERING_ACQUIRE) != 9876 {
+        atomic_u64_free(inout u);
+        return false;
+    }
+    atomic_u64_set_explicit(inout u, 4321, ORDERING_RELEASE);
+    let ok_u = atomic_u64_get_explicit(u, ORDERING_SEQ_CST) == 4321;
+    atomic_u64_free(inout u);
+    return ok_u;
+}
+
 pub fn test_sync_all() -> bool {
     let t_chan_unbounded = test_sync_channel_unbounded();
     let t_chan_bounded = test_sync_channel_bounded();
@@ -1075,6 +1143,7 @@ pub fn test_sync_all() -> bool {
     let t_concurrency = test_sync_concurrency_advanced();
     let t_prio_chan = test_sync_priority_channel();
     let t_timer_q = test_sync_timer_queue();
+    let t_lock_free = test_sync_lock_free_barriers();
 
     return t_chan_unbounded
         && t_chan_bounded
@@ -1094,5 +1163,6 @@ pub fn test_sync_all() -> bool {
         && t_native_once
         && t_concurrency
         && t_prio_chan
-        && t_timer_q;
+        && t_timer_q
+        && t_lock_free;
 }

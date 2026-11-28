@@ -2844,3 +2844,44 @@ fn test_ffi_sync_primitives_atomic_u64_waitgroup_semaphore_once() {
     assert_eq!(ONCE_COUNTER.load(std::sync::atomic::Ordering::SeqCst), 1);
     ifa_rt_once_destroy(once_ptr);
 }
+
+#[test]
+fn test_lock_free_multicore_atomic_alignment_and_fences() {
+    // 1. Verify 64-byte cacheline alignment to eliminate multicore false sharing
+    assert!(
+        std::mem::align_of::<IfaAtomicHandle>() >= 64,
+        "IfaAtomicHandle must be cacheline-aligned (>= 64 bytes)"
+    );
+    assert!(
+        std::mem::align_of::<IfaAtomicU64Handle>() >= 64,
+        "IfaAtomicU64Handle must be cacheline-aligned (>= 64 bytes)"
+    );
+    assert!(
+        std::mem::align_of::<CachePadded<std::sync::atomic::AtomicUsize>>() >= 64,
+        "CachePadded wrapper must guarantee >= 64 bytes alignment"
+    );
+
+    // 2. Test memory fences and spin loop hints
+    ifa_rt_atomic_fence(0); // Relaxed
+    ifa_rt_atomic_fence(1); // Acquire
+    ifa_rt_atomic_fence(2); // Release
+    ifa_rt_atomic_fence(3); // AcqRel
+    ifa_rt_atomic_fence(4); // SeqCst
+    ifa_rt_spin_loop_hint();
+
+    // 3. Test explicit ordering with 64-bit signed atomics
+    let a = ifa_rt_atomic_create(555);
+    assert!(!a.is_null());
+    assert_eq!(ifa_rt_atomic_load_explicit(a, 1), 555);
+    ifa_rt_atomic_store_explicit(a, 999, 2);
+    assert_eq!(ifa_rt_atomic_load_explicit(a, 4), 999);
+    ifa_rt_atomic_destroy(a);
+
+    // 4. Test explicit ordering with 64-bit unsigned atomics
+    let u = ifa_rt_atomic_u64_create(12345);
+    assert!(!u.is_null());
+    assert_eq!(ifa_rt_atomic_u64_load_explicit(u, 1), 12345);
+    ifa_rt_atomic_u64_store_explicit(u, 67890, 2);
+    assert_eq!(ifa_rt_atomic_u64_load_explicit(u, 4), 67890);
+    ifa_rt_atomic_u64_destroy(u);
+}
