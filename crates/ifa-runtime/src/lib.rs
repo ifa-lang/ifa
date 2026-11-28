@@ -2,6 +2,7 @@
 
 pub mod allocator;
 pub mod async_multipath_egress_gateway;
+pub mod async_multipath_ingress_gateway;
 pub mod benchmarks;
 pub mod blocking;
 pub mod burst_loss_eval;
@@ -66,6 +67,13 @@ pub use async_multipath_egress_gateway::{
     EgressCycleReport, EgressGatewayBenchmarkReport, EgressGatewayError, EgressWireEnvelope,
     EgressWireHeader, PhysicalEgressInterface, EGRESS_HEADER_SIZE, FLAG_BICAST_COPY, FLAG_ECN_CE,
     FLAG_EGRESS_LAST_FRAGMENT, FLAG_ENCRYPTED, FLAG_URGENT, IFA_EGRESS_MAGIC, IFA_EGRESS_VERSION,
+};
+pub use async_multipath_ingress_gateway::{
+    run_async_multipath_ingress_gateway_benchmark, AsyncMultipathIngressGateway,
+    AsyncMultipathIngressGatewayConfig, AsyncMultipathIngressGatewayTelemetry,
+    BicastSlidingWindowDeduplicator, DeduplicationResult, FecParityRecord, FlowDeduplicationWindow,
+    IngestPacketOutcome, IngestPayloadTarget, IngressCycleReport, IngressGatewayBenchmarkReport,
+    IngressGatewayError, PhysicalIngressInterface, SubpathMetricsTracker, ValidatedIngressPacket,
 };
 pub use benchmarks::{
     create_saturated_multipath_snapshot, profile_allocator_engine, run_allocator_multithread_suite,
