@@ -3906,10 +3906,9 @@ impl<'a> LlvmIrEmitter<'a> {
                     "sync::fence" | "fence" | "sync::memory_barrier" | "memory_barrier" => {
                         "ifa_rt_atomic_fence"
                     }
-                    "sync::spin_loop_hint"
-                    | "spin_loop_hint"
-                    | "sync::cpu_pause"
-                    | "cpu_pause" => "ifa_rt_spin_loop_hint",
+                    "sync::spin_loop_hint" | "spin_loop_hint" | "sync::cpu_pause" | "cpu_pause" => {
+                        "ifa_rt_spin_loop_hint"
+                    }
                     "sync::waitgroup_create" | "waitgroup_create" => "ifa_rt_waitgroup_create",
                     "sync::waitgroup_destroy" | "waitgroup_destroy" => "ifa_rt_waitgroup_destroy",
                     "sync::waitgroup_add" | "waitgroup_add" => "ifa_rt_waitgroup_add",
@@ -6040,10 +6039,9 @@ impl<'a> LlvmIrEmitter<'a> {
                     "sync::fence" | "fence" | "sync::memory_barrier" | "memory_barrier" => {
                         "ifa_rt_atomic_fence"
                     }
-                    "sync::spin_loop_hint"
-                    | "spin_loop_hint"
-                    | "sync::cpu_pause"
-                    | "cpu_pause" => "ifa_rt_spin_loop_hint",
+                    "sync::spin_loop_hint" | "spin_loop_hint" | "sync::cpu_pause" | "cpu_pause" => {
+                        "ifa_rt_spin_loop_hint"
+                    }
                     "sync::waitgroup_create" | "waitgroup_create" => "ifa_rt_waitgroup_create",
                     "sync::waitgroup_destroy" | "waitgroup_destroy" => "ifa_rt_waitgroup_destroy",
                     "sync::waitgroup_add" | "waitgroup_add" => "ifa_rt_waitgroup_add",

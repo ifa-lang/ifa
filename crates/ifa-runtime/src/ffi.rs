@@ -5390,7 +5390,10 @@ pub extern "C" fn ifa_rt_atomic_u64_cas(
 
 /// Atomically load 64-bit unsigned integer value with explicit memory ordering.
 #[no_mangle]
-pub extern "C" fn ifa_rt_atomic_u64_load_explicit(a: *mut IfaAtomicU64Handle, ordering: i32) -> u64 {
+pub extern "C" fn ifa_rt_atomic_u64_load_explicit(
+    a: *mut IfaAtomicU64Handle,
+    ordering: i32,
+) -> u64 {
     if a.is_null() {
         return 0;
     }
@@ -5400,7 +5403,11 @@ pub extern "C" fn ifa_rt_atomic_u64_load_explicit(a: *mut IfaAtomicU64Handle, or
 
 /// Atomically store 64-bit unsigned integer value with explicit memory ordering.
 #[no_mangle]
-pub extern "C" fn ifa_rt_atomic_u64_store_explicit(a: *mut IfaAtomicU64Handle, val: u64, ordering: i32) {
+pub extern "C" fn ifa_rt_atomic_u64_store_explicit(
+    a: *mut IfaAtomicU64Handle,
+    val: u64,
+    ordering: i32,
+) {
     if !a.is_null() {
         let handle = unsafe { &*a };
         handle.0.store(val, map_atomic_ordering(ordering));
