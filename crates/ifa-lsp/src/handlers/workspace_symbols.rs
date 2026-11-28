@@ -34,6 +34,9 @@ pub fn handle_workspace_symbols(store: &DocumentStore, query: &str) -> Vec<Symbo
         // 2. Structs & Fields
         for (sym, str_sym) in &analysis.symbols.structs {
             let struct_name = sym.resolve();
+            if struct_name.starts_with("__") {
+                continue;
+            }
             if query_lower.is_empty() || struct_name.to_lowercase().contains(&query_lower) {
                 let range = doc.span_to_range(str_sym.span);
                 symbols.push(SymbolInformation {
@@ -111,6 +114,39 @@ pub fn handle_workspace_symbols(store: &DocumentStore, query: &str) -> Vec<Symbo
                     },
                     container_name: None,
                 });
+            }
+        }
+
+        // 5. Protocols & Channels / Slices
+        for (sym, proto_sym) in &analysis.symbols.protocols {
+            let proto_name = sym.resolve();
+            if query_lower.is_empty() || proto_name.to_lowercase().contains(&query_lower) {
+                let range = doc.span_to_range(proto_sym.span);
+                symbols.push(SymbolInformation {
+                    name: proto_name.clone(),
+                    kind: SymbolKind::Interface as u32,
+                    location: Location {
+                        uri: doc.uri.clone(),
+                        range,
+                    },
+                    container_name: None,
+                });
+            }
+
+            for channel in &proto_sym.channels {
+                let ch_name = channel.name.resolve();
+                if query_lower.is_empty() || ch_name.to_lowercase().contains(&query_lower) {
+                    let range = doc.span_to_range(channel.span);
+                    symbols.push(SymbolInformation {
+                        name: ch_name,
+                        kind: SymbolKind::Field as u32,
+                        location: Location {
+                            uri: doc.uri.clone(),
+                            range,
+                        },
+                        container_name: Some(proto_name.clone()),
+                    });
+                }
             }
         }
     }

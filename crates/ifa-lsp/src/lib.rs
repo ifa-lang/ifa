@@ -1312,4 +1312,146 @@ mod tests {
             contents
         );
     }
+
+    #[test]
+    fn test_lsp_multipath_protocols() {
+        let mut server = LanguageServer::new();
+
+        let doc_code = "pub protocol ResilientNet {\n    slice video: int,\n    telemetry: string\n}\n\nfn main() -> () {\n}\n";
+        let open_notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/protocol_demo.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": doc_code
+                }
+            }
+        })
+        .to_string();
+        server.handle_message(&open_notif);
+
+        // 1. Definition check on ResilientNet (line 0, col 15)
+        let def_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "textDocument/definition",
+            "params": {
+                "textDocument": { "uri": "file:///workspace/protocol_demo.ifa" },
+                "position": { "line": 0, "character": 15 }
+            }
+        })
+        .to_string();
+        let (def_resp, _) = server.handle_message(&def_req);
+        assert!(def_resp.is_some());
+        let def_val: serde_json::Value = serde_json::from_str(&def_resp.unwrap()).unwrap();
+        assert_eq!(
+            def_val["result"]["range"]["start"]["line"], 0,
+            "Protocol definition line mismatch"
+        );
+
+        // 2. Hover check on protocol declaration
+        let hover_proto_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 101,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": { "uri": "file:///workspace/protocol_demo.ifa" },
+                "position": { "line": 0, "character": 15 }
+            }
+        })
+        .to_string();
+        let (hover_proto_resp, _) = server.handle_message(&hover_proto_req);
+        assert!(hover_proto_resp.is_some());
+        let hover_proto_val: serde_json::Value =
+            serde_json::from_str(&hover_proto_resp.unwrap()).unwrap();
+        let hover_text = hover_proto_val["result"]["contents"]["value"]
+            .as_str()
+            .unwrap();
+        assert!(hover_text.contains("pub protocol ResilientNet"));
+        assert!(hover_text.contains("slice video: int"));
+        assert!(hover_text.contains("channel telemetry: string"));
+
+        // 3. Hover check on channel / slice
+        let hover_slice_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 102,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": { "uri": "file:///workspace/protocol_demo.ifa" },
+                "position": { "line": 1, "character": 11 }
+            }
+        })
+        .to_string();
+        let (hover_slice_resp, _) = server.handle_message(&hover_slice_req);
+        assert!(hover_slice_resp.is_some());
+        let hover_slice_val: serde_json::Value =
+            serde_json::from_str(&hover_slice_resp.unwrap()).unwrap();
+        let slice_text = hover_slice_val["result"]["contents"]["value"]
+            .as_str()
+            .unwrap();
+        assert!(slice_text.contains("(slice) ResilientNet.video: int"));
+
+        // 4. Document symbols check
+        let sym_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 103,
+            "method": "textDocument/documentSymbol",
+            "params": {
+                "textDocument": { "uri": "file:///workspace/protocol_demo.ifa" }
+            }
+        })
+        .to_string();
+        let (sym_resp, _) = server.handle_message(&sym_req);
+        assert!(sym_resp.is_some());
+        let sym_val: serde_json::Value = serde_json::from_str(&sym_resp.unwrap()).unwrap();
+        let symbols = sym_val["result"].as_array().unwrap();
+        let proto_sym = symbols
+            .iter()
+            .find(|s| s["name"] == "ResilientNet")
+            .expect("ResilientNet missing in document symbols");
+        assert_eq!(proto_sym["kind"], 11); // SymbolKind::Interface
+        let children = proto_sym["children"].as_array().unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0]["name"], "video");
+        assert_eq!(children[1]["name"], "telemetry");
+
+        // 5. Workspace symbols check
+        let ws_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 104,
+            "method": "workspace/symbol",
+            "params": {
+                "query": "Resilient"
+            }
+        })
+        .to_string();
+        let (ws_resp, _) = server.handle_message(&ws_req);
+        assert!(ws_resp.is_some());
+        let ws_val: serde_json::Value = serde_json::from_str(&ws_resp.unwrap()).unwrap();
+        let ws_matches = ws_val["result"].as_array().unwrap();
+        assert!(ws_matches.iter().any(|m| m["name"] == "ResilientNet"));
+
+        // 6. Completions check for keywords
+        let comp_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 105,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": { "uri": "file:///workspace/protocol_demo.ifa" },
+                "position": { "line": 4, "character": 0 }
+            }
+        })
+        .to_string();
+        let (comp_resp, _) = server.handle_message(&comp_req);
+        assert!(comp_resp.is_some());
+        let comp_val: serde_json::Value = serde_json::from_str(&comp_resp.unwrap()).unwrap();
+        let items = comp_val["result"]["items"].as_array().unwrap();
+        let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+        assert!(labels.contains(&"protocol"), "protocol keyword missing");
+        assert!(labels.contains(&"slice"), "slice keyword missing");
+        assert!(labels.contains(&"channel"), "channel keyword missing");
+    }
 }

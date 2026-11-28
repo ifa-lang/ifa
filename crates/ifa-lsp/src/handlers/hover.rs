@@ -20,6 +20,39 @@ pub fn handle_hover(doc: &Document, position: Position) -> Option<Hover> {
         "ref" => Some("**`ref`** — Safe 128-bit generational reference pointer (`GenRef`) guarded by GenHeader."),
         "defer" => Some("**`defer`** — Schedules an expression to be executed upon leaving the current lexical scope."),
         "catch" => Some("**`catch`** — Inline error-handling block capturing fallible expressions."),
+        "protocol" => Some(
+            "**`protocol`** — Declarative multipath protocol declaration in IFA. Defines resilient communication channels, QoS traffic slices, and transport policies.",
+        ),
+        "slice" => Some(
+            "**`slice`** — Multipath traffic slice declaration. Defines an isolated path/flow partition with dedicated QoS, pacing, and FEC redundancy rules.",
+        ),
+        "channel" => Some(
+            "**`channel`** — Multipath communication channel declaration within a protocol specification.",
+        ),
+        "multipath" | "@multipath" => Some(
+            "**`@multipath`** — Compiler attribute configuring multipath transport policies: resilience, bicasting, FEC redundancy, anti-burst pacing, and subpath selection strategies.",
+        ),
+        "resilient" => Some(
+            "**`resilient`** — Multipath protocol modifier enabling zero-loss subpath failover, heartbeat supervision, and seamless link migration.",
+        ),
+        "redundant" => Some(
+            "**`redundant`** — Multipath slice modifier configuring active subpath replication for mission-critical packet delivery.",
+        ),
+        "bicasting" => Some(
+            "**`bicasting`** — Multipath transmission modifier for zero-loss redundant packet replication over parallel physical links with deduplication.",
+        ),
+        "fec" => Some(
+            "**`fec`** — Forward Error Correction modifier for proactive packet loss recovery across lossy subpaths.",
+        ),
+        "pacing" => Some(
+            "**`pacing`** — Rate regulation modifier enforcing anti-burst pacing across subpaths.",
+        ),
+        "low_latency" => Some(
+            "**`low_latency`** — Path selection objective prioritizing subpaths with minimal round-trip time (RTT).",
+        ),
+        "high_throughput" => Some(
+            "**`high_throughput`** — Path selection objective prioritizing aggregated bandwidth across subpaths.",
+        ),
         _ => None,
     };
 
@@ -357,17 +390,20 @@ pub fn handle_hover(doc: &Document, position: Position) -> Option<Hover> {
 
         // Check structs
         if let Some(str_sym) = analysis.symbols.structs.get(&symbol) {
-            let mut fields_str = String::new();
-            for field in &str_sym.fields {
-                let f_name = field.name.resolve();
-                fields_str.push_str(&format!("    {}: {},\n", f_name, field.ty));
+            let s_name = str_sym.name.resolve();
+            if !s_name.starts_with("__") {
+                let mut fields_str = String::new();
+                for field in &str_sym.fields {
+                    let f_name = field.name.resolve();
+                    fields_str.push_str(&format!("    {}: {},\n", f_name, field.ty));
+                }
+                let pub_prefix = if str_sym.is_pub { "pub " } else { "" };
+                let body = format!("{}struct {} {{\n{}}}", pub_prefix, word, fields_str);
+                return Some(Hover {
+                    contents: MarkupContent::markdown(format!("```ifa\n{}\n```", body)),
+                    range: Some(range),
+                });
             }
-            let pub_prefix = if str_sym.is_pub { "pub " } else { "" };
-            let body = format!("{}struct {} {{\n{}}}", pub_prefix, word, fields_str);
-            return Some(Hover {
-                contents: MarkupContent::markdown(format!("```ifa\n{}\n```", body)),
-                range: Some(range),
-            });
         }
 
         // Check enums
@@ -383,6 +419,22 @@ pub fn handle_hover(doc: &Document, position: Position) -> Option<Hover> {
             }
             let pub_prefix = if enum_sym.is_pub { "pub " } else { "" };
             let body = format!("{}enum {} {{\n{}}}", pub_prefix, word, variants_str);
+            return Some(Hover {
+                contents: MarkupContent::markdown(format!("```ifa\n{}\n```", body)),
+                range: Some(range),
+            });
+        }
+
+        // Check protocols
+        if let Some(proto_sym) = analysis.symbols.protocols.get(&symbol) {
+            let mut channels_str = String::new();
+            for ch in &proto_sym.channels {
+                let kind_str = if ch.is_slice { "slice" } else { "channel" };
+                let ch_name = ch.name.resolve();
+                channels_str.push_str(&format!("    {} {}: {},\n", kind_str, ch_name, ch.ty));
+            }
+            let pub_prefix = if proto_sym.is_pub { "pub " } else { "" };
+            let body = format!("{}protocol {} {{\n{}}}", pub_prefix, word, channels_str);
             return Some(Hover {
                 contents: MarkupContent::markdown(format!("```ifa\n{}\n```", body)),
                 range: Some(range),
@@ -425,10 +477,29 @@ pub fn handle_hover(doc: &Document, position: Position) -> Option<Hover> {
             }
         }
 
+        // Check protocol channels and slices
+        for proto_sym in analysis.symbols.protocols.values() {
+            if let Some(channel) = proto_sym.get_channel(&symbol) {
+                let proto_name = proto_sym.name.resolve();
+                let kind_str = if channel.is_slice { "slice" } else { "channel" };
+                let body = format!(
+                    "```ifa\n({}) {}.{}: {}\n```",
+                    kind_str, proto_name, word, channel.ty
+                );
+                return Some(Hover {
+                    contents: MarkupContent::markdown(body),
+                    range: Some(range),
+                });
+            }
+        }
+
         // Check struct fields
         for str_sym in analysis.symbols.structs.values() {
+            let struct_name = str_sym.name.resolve();
+            if struct_name.starts_with("__") {
+                continue;
+            }
             if let Some(field) = str_sym.get_field(&symbol) {
-                let struct_name = str_sym.name.resolve();
                 let mut content = format!(
                     "```ifa\n(field) {}.{}: {}\n```",
                     struct_name, word, field.ty

@@ -552,6 +552,21 @@ pub fn handle_completion(doc: &Document, position: Position) -> CompletionList {
     // 1. IFA Language Keywords
     let keywords = [
         (
+            "protocol",
+            "Multipath protocol declaration",
+            "protocol <Name> { <channels/slices> }",
+        ),
+        (
+            "slice",
+            "Multipath traffic slice declaration",
+            "slice <name>: <type>",
+        ),
+        (
+            "channel",
+            "Multipath communication channel declaration",
+            "channel <name>: <type>",
+        ),
+        (
             "fn",
             "Function declaration",
             "fn <name>(<params>) -> <ret> { ... }",

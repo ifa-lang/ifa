@@ -18,11 +18,13 @@ pub fn handle_definition(doc: &Document, position: Position) -> Option<Location>
 
     // 2. Check structs
     if let Some(str_sym) = analysis.symbols.structs.get(&symbol) {
-        let range = doc.span_to_range(str_sym.span);
-        return Some(Location {
-            uri: doc.uri.clone(),
-            range,
-        });
+        if !str_sym.name.resolve().starts_with("__") {
+            let range = doc.span_to_range(str_sym.span);
+            return Some(Location {
+                uri: doc.uri.clone(),
+                range,
+            });
+        }
     }
 
     // 3. Check enums
@@ -54,8 +56,31 @@ pub fn handle_definition(doc: &Document, position: Position) -> Option<Location>
         }
     }
 
-    // 6. Check struct fields
+    // 6. Check protocols
+    if let Some(proto_sym) = analysis.symbols.protocols.get(&symbol) {
+        let range = doc.span_to_range(proto_sym.span);
+        return Some(Location {
+            uri: doc.uri.clone(),
+            range,
+        });
+    }
+
+    // 7. Check protocol channels and traffic slices
+    for proto_sym in analysis.symbols.protocols.values() {
+        if let Some(channel) = proto_sym.get_channel(&symbol) {
+            let range = doc.span_to_range(channel.span);
+            return Some(Location {
+                uri: doc.uri.clone(),
+                range,
+            });
+        }
+    }
+
+    // 8. Check struct fields
     for str_sym in analysis.symbols.structs.values() {
+        if str_sym.name.resolve().starts_with("__") {
+            continue;
+        }
         if let Some(field) = str_sym.get_field(&symbol) {
             let range = doc.span_to_range(field.span);
             return Some(Location {

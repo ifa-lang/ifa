@@ -26,6 +26,9 @@ pub fn handle_document_symbols(doc: &Document) -> Vec<DocumentSymbol> {
     // 2. Structs and their fields
     for (sym, str_sym) in &analysis.symbols.structs {
         let name = sym.resolve();
+        if name.starts_with("__") {
+            continue;
+        }
         let range = doc.span_to_range(str_sym.span);
 
         let mut children = Vec::new();
@@ -92,6 +95,36 @@ pub fn handle_document_symbols(doc: &Document) -> Vec<DocumentSymbol> {
             range,
             selection_range: range,
             children: None,
+        });
+    }
+
+    // 5. Protocols and their channels / slices
+    for (sym, proto_sym) in &analysis.symbols.protocols {
+        let name = sym.resolve();
+        let range = doc.span_to_range(proto_sym.span);
+
+        let mut children = Vec::new();
+        for ch in &proto_sym.channels {
+            let ch_name = ch.name.resolve();
+            let ch_range = doc.span_to_range(ch.span);
+            let kind_label = if ch.is_slice { "slice" } else { "channel" };
+            children.push(DocumentSymbol {
+                name: ch_name,
+                detail: Some(format!("{}: {}", kind_label, ch.ty)),
+                kind: SymbolKind::Field as u32,
+                range: ch_range,
+                selection_range: ch_range,
+                children: None,
+            });
+        }
+
+        symbols.push(DocumentSymbol {
+            name,
+            detail: Some(format!("protocol ({} channels/slices)", proto_sym.channels.len())),
+            kind: SymbolKind::Interface as u32,
+            range,
+            selection_range: range,
+            children: Some(children),
         });
     }
 
