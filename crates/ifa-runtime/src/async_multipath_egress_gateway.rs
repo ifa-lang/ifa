@@ -275,7 +275,9 @@ impl<'a> EgressWireEnvelope<'a> {
     }
 
     /// Zero-copy decoding: parses the header and returns an uncopied slice into `data`.
-    pub fn decode_packet(data: &'a [u8]) -> Result<(EgressWireHeader, &'a [u8]), EgressGatewayError> {
+    pub fn decode_packet(
+        data: &'a [u8],
+    ) -> Result<(EgressWireHeader, &'a [u8]), EgressGatewayError> {
         let header = EgressWireHeader::decode_from(data)?;
         let total_size = EGRESS_HEADER_SIZE + header.payload_length as usize;
 
@@ -540,8 +542,7 @@ impl AsyncMultipathEgressGateway {
         self.interfaces.insert(sid, interface);
 
         // Synchronize interface registration into the coupled event scheduler
-        self.scheduler
-            .register_subpath(sid, bw, rtt, pmtu, now_ns);
+        self.scheduler.register_subpath(sid, bw, rtt, pmtu, now_ns);
 
         Ok(())
     }
@@ -678,12 +679,7 @@ impl AsyncMultipathEgressGateway {
     }
 
     /// Feed back an explicit negative acknowledgment / loss signal.
-    pub fn feed_receiver_nack(
-        &mut self,
-        subpath_id: u32,
-        lost_packet_ids: Vec<u64>,
-        now_ns: u64,
-    ) {
+    pub fn feed_receiver_nack(&mut self, subpath_id: u32, lost_packet_ids: Vec<u64>, now_ns: u64) {
         self.scheduler
             .submit_event(MultipathSchedulerEvent::ReceiverNack {
                 subpath_id,
@@ -991,7 +987,8 @@ impl AsyncMultipathEgressGateway {
             if sec_buf.len() >= EGRESS_HEADER_SIZE {
                 sec_buf[7] |= FLAG_BICAST_COPY;
                 // Recompute CRC with updated flag
-                let new_crc = compute_envelope_crc32(&sec_buf[0..40], &sec_buf[EGRESS_HEADER_SIZE..]);
+                let new_crc =
+                    compute_envelope_crc32(&sec_buf[0..40], &sec_buf[EGRESS_HEADER_SIZE..]);
                 sec_buf[40..44].copy_from_slice(&new_crc.to_be_bytes());
             }
 
@@ -1084,31 +1081,68 @@ impl AsyncMultipathEgressGateway {
 
         let _ = writeln!(out, "# HELP ifa_egress_payloads_submitted_total Total application payloads submitted to egress gateway.");
         let _ = writeln!(out, "# TYPE ifa_egress_payloads_submitted_total counter");
-        let _ = writeln!(out, "ifa_egress_payloads_submitted_total {}", t.total_payloads_submitted);
+        let _ = writeln!(
+            out,
+            "ifa_egress_payloads_submitted_total {}",
+            t.total_payloads_submitted
+        );
 
         let _ = writeln!(out, "# HELP ifa_egress_wire_packets_transmitted_total Total zero-copy packets transmitted onto physical interfaces.");
-        let _ = writeln!(out, "# TYPE ifa_egress_wire_packets_transmitted_total counter");
-        let _ = writeln!(out, "ifa_egress_wire_packets_transmitted_total {}", t.total_wire_packets_transmitted);
+        let _ = writeln!(
+            out,
+            "# TYPE ifa_egress_wire_packets_transmitted_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "ifa_egress_wire_packets_transmitted_total {}",
+            t.total_wire_packets_transmitted
+        );
 
         let _ = writeln!(out, "# HELP ifa_egress_wire_bytes_transmitted_total Total wire bytes dispatched over physical network interfaces.");
-        let _ = writeln!(out, "# TYPE ifa_egress_wire_bytes_transmitted_total counter");
-        let _ = writeln!(out, "ifa_egress_wire_bytes_transmitted_total {}", t.total_wire_bytes_transmitted);
+        let _ = writeln!(
+            out,
+            "# TYPE ifa_egress_wire_bytes_transmitted_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "ifa_egress_wire_bytes_transmitted_total {}",
+            t.total_wire_bytes_transmitted
+        );
 
         let _ = writeln!(out, "# HELP ifa_egress_zero_copy_serializations_total Total direct zero-copy wire frame serializations.");
-        let _ = writeln!(out, "# TYPE ifa_egress_zero_copy_serializations_total counter");
-        let _ = writeln!(out, "ifa_egress_zero_copy_serializations_total {}", t.total_zero_copy_serializations);
+        let _ = writeln!(
+            out,
+            "# TYPE ifa_egress_zero_copy_serializations_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "ifa_egress_zero_copy_serializations_total {}",
+            t.total_zero_copy_serializations
+        );
 
         let _ = writeln!(out, "# HELP ifa_egress_backpressure_events_total Total WouldBlock backpressure events captured.");
         let _ = writeln!(out, "# TYPE ifa_egress_backpressure_events_total counter");
-        let _ = writeln!(out, "ifa_egress_backpressure_events_total {}", t.total_backpressure_events);
+        let _ = writeln!(
+            out,
+            "ifa_egress_backpressure_events_total {}",
+            t.total_backpressure_events
+        );
 
         let _ = writeln!(out, "# HELP ifa_egress_backpressure_drained_total Total backpressured packets successfully dispatched upon socket readiness.");
         let _ = writeln!(out, "# TYPE ifa_egress_backpressure_drained_total counter");
-        let _ = writeln!(out, "ifa_egress_backpressure_drained_total {}", t.total_backpressure_drained);
+        let _ = writeln!(
+            out,
+            "ifa_egress_backpressure_drained_total {}",
+            t.total_backpressure_drained
+        );
 
         let _ = writeln!(out, "# HELP ifa_egress_bicasted_packets_total Total 1+1 redundant copies dispatched over secondary interfaces.");
         let _ = writeln!(out, "# TYPE ifa_egress_bicasted_packets_total counter");
-        let _ = writeln!(out, "ifa_egress_bicasted_packets_total {}", t.total_bicasted_packets);
+        let _ = writeln!(
+            out,
+            "ifa_egress_bicasted_packets_total {}",
+            t.total_bicasted_packets
+        );
 
         for iface in self.interfaces.values() {
             let _ = writeln!(
@@ -1190,7 +1224,8 @@ pub struct EgressGatewayBenchmarkReport {
 pub fn run_async_multipath_egress_gateway_benchmark(
     iterations: usize,
 ) -> EgressGatewayBenchmarkReport {
-    let mut gateway = AsyncMultipathEgressGateway::new(AsyncMultipathEgressGatewayConfig::default());
+    let mut gateway =
+        AsyncMultipathEgressGateway::new(AsyncMultipathEgressGatewayConfig::default());
     let now_ns = 1_000_000_000u64;
 
     // Create 2 loopback UDP sockets
