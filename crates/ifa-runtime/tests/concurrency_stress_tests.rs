@@ -275,3 +275,92 @@ fn test_generational_allocator_multithread_contention() {
             .expect("Thread panicked during generational allocator contention");
     }
 }
+
+#[test]
+fn test_adaptive_backoff_progression_and_reset() {
+    let mut backoff = AdaptiveBackoff::new();
+    assert_eq!(backoff.step(), 0);
+    assert!(!backoff.is_completed_spinning());
+    assert!(!backoff.is_completed_yielding());
+
+    // Advance through the spinning stage
+    for s in 0..AdaptiveBackoff::SPIN_LIMIT {
+        assert_eq!(backoff.step(), s);
+        assert!(!backoff.is_completed_spinning());
+        backoff.snooze();
+    }
+    assert!(backoff.is_completed_spinning());
+    assert!(!backoff.is_completed_yielding());
+
+    // Advance through the yield stage
+    for _ in AdaptiveBackoff::SPIN_LIMIT..AdaptiveBackoff::YIELD_LIMIT {
+        assert!(!backoff.is_completed_yielding());
+        backoff.snooze();
+    }
+    assert!(backoff.is_completed_spinning());
+    assert!(backoff.is_completed_yielding());
+
+    // Further snooze stays in completed yielding state
+    backoff.snooze();
+    assert!(backoff.is_completed_yielding());
+
+    // Reset restores initial state
+    backoff.reset();
+    assert_eq!(backoff.step(), 0);
+    assert!(!backoff.is_completed_spinning());
+    assert!(!backoff.is_completed_yielding());
+}
+
+#[test]
+fn test_fiber_scheduler_adaptive_backoff_intense_contention() {
+    let worker_count = 8;
+    let scheduler = Arc::new(FiberScheduler::new(worker_count));
+    let num_pairs = 16;
+    let messages_per_pair = 200;
+
+    let total_received = Arc::new(AtomicUsize::new(0));
+    let mut fiber_ids = Vec::with_capacity(num_pairs * 2);
+
+    for pair_idx in 0..num_pairs {
+        // Highly contended small bounded channel (capacity 2)
+        let ch = Arc::new(Channel::with_capacity(2));
+        let ch_send = Arc::clone(&ch);
+        let ch_recv = Arc::clone(&ch);
+        let counter = Arc::clone(&total_received);
+        let sched = Arc::clone(&scheduler);
+
+        // Producer fiber
+        let prod_id = scheduler.spawn(move || {
+            for m in 1..=messages_per_pair {
+                if m % 25 == 0 {
+                    sched.yield_now();
+                }
+                ch_send.send((pair_idx * 1000 + m) as u64);
+            }
+        });
+        fiber_ids.push(prod_id);
+
+        // Consumer fiber
+        let cons_id = scheduler.spawn(move || {
+            for _ in 1..=messages_per_pair {
+                let val = ch_recv.recv();
+                assert!(val > 0);
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        fiber_ids.push(cons_id);
+    }
+
+    // Join all fibers with adaptive backoff
+    for fid in fiber_ids {
+        let ok = scheduler.join_timeout(fid, Duration::from_secs(10));
+        assert!(ok, "Contended fiber {:?} timed out", fid);
+    }
+
+    assert_eq!(
+        total_received.load(Ordering::SeqCst),
+        num_pairs * messages_per_pair
+    );
+
+    scheduler.shutdown();
+}

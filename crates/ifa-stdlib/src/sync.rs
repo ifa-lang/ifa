@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use ifa_runtime::fiber::{FiberId, FiberScheduler, FiberState};
+pub use ifa_runtime::fiber::{AdaptiveBackoff, FiberId, FiberScheduler, FiberState};
 
 /// Error returned when timed receive expires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

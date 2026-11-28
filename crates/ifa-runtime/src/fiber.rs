@@ -234,6 +234,96 @@ impl Fiber {
     }
 }
 
+/// Adaptive exponential backoff for high-contention synchronization loops and worker scheduling.
+/// Provides staged progressive backoff:
+/// 1. Micro-spinning using CPU hint (`std::hint::spin_loop()`) with exponential step (1, 2, 4, 8, ... up to 64 cycles).
+/// 2. Cooperative yielding (`GLOBAL_SCHEDULER.yield_now()` or `thread::yield_now()`) to avoid cache-line thrashing.
+/// 3. Park/sleep or condition wait when contention is prolonged.
+#[derive(Debug, Clone, Copy)]
+pub struct AdaptiveBackoff {
+    step: u32,
+}
+
+impl Default for AdaptiveBackoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdaptiveBackoff {
+    pub const SPIN_LIMIT: u32 = 6;      // Steps 0..6: 2^0..2^6 spin_loop iterations
+    pub const YIELD_LIMIT: u32 = 10;    // Steps 6..10: yield execution slice
+
+    /// Create a new adaptive backoff instance initialized at step 0.
+    #[inline]
+    pub const fn new() -> Self {
+        Self { step: 0 }
+    }
+
+    /// Reset backoff step upon making progress or acquiring a resource.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.step = 0;
+    }
+
+    /// Current progressive backoff step.
+    #[inline]
+    pub fn step(&self) -> u32 {
+        self.step
+    }
+
+    /// Check if backoff has transitioned beyond the spin stage.
+    #[inline]
+    pub fn is_completed_spinning(&self) -> bool {
+        self.step >= Self::SPIN_LIMIT
+    }
+
+    /// Check if backoff has reached the parking / sleep stage.
+    #[inline]
+    pub fn is_completed_yielding(&self) -> bool {
+        self.step >= Self::YIELD_LIMIT
+    }
+
+    /// Perform one progressive backoff step.
+    /// In early stages (step < SPIN_LIMIT), performs exponential `spin_loop()`s.
+    /// In middle stages (SPIN_LIMIT <= step < YIELD_LIMIT), yields thread execution.
+    /// In late stages (step >= YIELD_LIMIT), performs short micro-sleep (50µs) on platforms supporting it.
+    #[inline]
+    pub fn snooze(&mut self) {
+        if self.step < Self::SPIN_LIMIT {
+            let count = 1usize << self.step;
+            for _ in 0..count {
+                std::hint::spin_loop();
+            }
+        } else if self.step < Self::YIELD_LIMIT {
+            #[cfg(not(target_arch = "wasm32"))]
+            std::thread::yield_now();
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        self.step = self.step.saturating_add(1);
+    }
+
+    /// Snooze cooperatively for fiber contexts.
+    /// Uses fiber yield during yield stage instead of whole-thread yield when possible.
+    #[inline]
+    pub fn snooze_cooperative(&mut self) {
+        if self.step < Self::SPIN_LIMIT {
+            let count = 1usize << self.step;
+            for _ in 0..count {
+                std::hint::spin_loop();
+            }
+        } else if self.step < Self::YIELD_LIMIT {
+            GLOBAL_SCHEDULER.yield_now();
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        self.step = self.step.saturating_add(1);
+    }
+}
+
 /// Global M:N Fiber Scheduler managing colorless asynchronous tasks without GC.
 pub struct FiberScheduler {
     ready_queue: Arc<Mutex<VecDeque<Fiber>>>,
@@ -284,50 +374,71 @@ impl FiberScheduler {
                 let comp_notif = Arc::clone(&completion_notifier);
                 let is_run = Arc::clone(&is_running);
 
-                let handle = thread::spawn(move || loop {
-                    let task = {
-                        let mut lock = queue.lock().unwrap();
-                        let mut spins = 0;
-                        while lock.is_empty() && is_run.load(Ordering::Relaxed) {
-                            drop(lock);
-                            let woken = crate::reactor::GLOBAL_REACTOR.poll_and_wake();
-                            lock = queue.lock().unwrap();
-                            if !lock.is_empty() {
-                                break;
-                            }
-                            if woken > 0 {
-                                continue;
-                            }
-                            let has_io = {
-                                let wm = waiting_io.lock().unwrap();
-                                let cr = completed_io.lock().unwrap();
-                                !wm.is_empty() || !cr.is_empty()
-                            };
-                            if has_io {
-                                let (new_lock, _) = work_notif
-                                    .wait_timeout(lock, Duration::from_millis(2))
-                                    .unwrap();
-                                lock = new_lock;
-                            } else {
-                                spins += 1;
-                                if spins < 32 {
-                                    drop(lock);
-                                    std::hint::spin_loop();
+                let handle = thread::spawn(move || {
+                    let mut backoff = AdaptiveBackoff::new();
+                    loop {
+                        let task = {
+                            let mut lock = queue.lock().unwrap();
+                            while lock.is_empty() && is_run.load(Ordering::Relaxed) {
+                                drop(lock);
+                                let woken = crate::reactor::GLOBAL_REACTOR.poll_and_wake();
+                                if woken > 0 {
+                                    lock = queue.lock().unwrap();
+                                    if !lock.is_empty() {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                let has_io = {
+                                    let wm = waiting_io.lock().unwrap();
+                                    let cr = completed_io.lock().unwrap();
+                                    !wm.is_empty() || !cr.is_empty()
+                                };
+                                if has_io {
+                                    lock = queue.lock().unwrap();
+                                    if !lock.is_empty() {
+                                        break;
+                                    }
+                                    let (new_lock, _) = work_notif
+                                        .wait_timeout(lock, Duration::from_millis(2))
+                                        .unwrap();
+                                    lock = new_lock;
+                                    backoff.reset();
+                                } else if !backoff.is_completed_spinning() {
+                                    backoff.snooze();
+                                    if let Ok(try_guard) = queue.try_lock() {
+                                        lock = try_guard;
+                                        if !lock.is_empty() {
+                                            break;
+                                        }
+                                    } else {
+                                        backoff.snooze();
+                                        lock = queue.lock().unwrap();
+                                    }
+                                } else if !backoff.is_completed_yielding() {
+                                    backoff.snooze();
                                     lock = queue.lock().unwrap();
                                 } else {
+                                    lock = queue.lock().unwrap();
+                                    if !lock.is_empty() {
+                                        break;
+                                    }
                                     let (new_lock, _) = work_notif
                                         .wait_timeout(lock, Duration::from_millis(5))
                                         .unwrap();
                                     lock = new_lock;
-                                    spins = 0;
+                                    backoff.reset();
                                 }
                             }
-                        }
-                        if !is_run.load(Ordering::Relaxed) && lock.is_empty() {
-                            break;
-                        }
-                        lock.pop_front()
-                    };
+                            if !is_run.load(Ordering::Relaxed) && lock.is_empty() {
+                                break;
+                            }
+                            let item = lock.pop_front();
+                            if item.is_some() {
+                                backoff.reset();
+                            }
+                            item
+                        };
 
                     if let Some(mut fiber) = task {
                         let step_res = fiber.step();
@@ -376,7 +487,8 @@ impl FiberScheduler {
                             }
                         }
                     }
-                });
+                }
+            });
 
                 workers.push(handle);
             }
@@ -1046,7 +1158,7 @@ impl<T> Channel<T> {
     /// Cooperatively yields the fiber on backpressure before thread wait.
     pub fn send(&self, mut val: T) {
         if let Some(ring) = &self.ring {
-            let mut spins: u32 = 0;
+            let mut backoff = AdaptiveBackoff::new();
             loop {
                 if self.is_closed.load(Ordering::Acquire) {
                     panic!("Cannot send on closed channel");
@@ -1058,16 +1170,16 @@ impl<T> Channel<T> {
                     }
                     Err(returned_val) => {
                         val = returned_val;
-                        spins += 1;
-                        if spins < 32 {
-                            std::hint::spin_loop();
-                        } else if spins < 64 {
-                            GLOBAL_SCHEDULER.yield_now();
+                        if !backoff.is_completed_spinning() {
+                            backoff.snooze();
+                        } else if !backoff.is_completed_yielding() {
+                            backoff.snooze_cooperative();
                         } else {
                             let guard = self.notif_mutex.lock().unwrap();
                             if ring.is_full() && !self.is_closed.load(Ordering::Relaxed) {
                                 let _ = self.cond.wait_timeout(guard, Duration::from_micros(250));
                             }
+                            backoff.reset();
                         }
                     }
                 }
@@ -1085,7 +1197,7 @@ impl<T> Channel<T> {
     /// Send a value returning Result with typed SendError if closed.
     pub fn send_checked(&self, mut val: T) -> Result<(), SendError<T>> {
         if let Some(ring) = &self.ring {
-            let mut spins: u32 = 0;
+            let mut backoff = AdaptiveBackoff::new();
             loop {
                 if self.is_closed.load(Ordering::Acquire) {
                     return Err(SendError::Closed(val));
@@ -1097,16 +1209,16 @@ impl<T> Channel<T> {
                     }
                     Err(returned_val) => {
                         val = returned_val;
-                        spins += 1;
-                        if spins < 32 {
-                            std::hint::spin_loop();
-                        } else if spins < 64 {
-                            GLOBAL_SCHEDULER.yield_now();
+                        if !backoff.is_completed_spinning() {
+                            backoff.snooze();
+                        } else if !backoff.is_completed_yielding() {
+                            backoff.snooze_cooperative();
                         } else {
                             let guard = self.notif_mutex.lock().unwrap();
                             if ring.is_full() && !self.is_closed.load(Ordering::Relaxed) {
                                 let _ = self.cond.wait_timeout(guard, Duration::from_micros(250));
                             }
+                            backoff.reset();
                         }
                     }
                 }
@@ -1172,7 +1284,7 @@ impl<T> Channel<T> {
     /// Cooperatively yields the fiber when waiting before thread wait.
     pub fn recv(&self) -> T {
         if let Some(ring) = &self.ring {
-            let mut spins: u32 = 0;
+            let mut backoff = AdaptiveBackoff::new();
             loop {
                 if let Some(val) = ring.try_pop() {
                     self.notify_waiters();
@@ -1181,16 +1293,16 @@ impl<T> Channel<T> {
                 if self.is_closed.load(Ordering::Acquire) && ring.is_empty() {
                     panic!("Cannot receive on closed empty channel");
                 }
-                spins += 1;
-                if spins < 32 {
-                    std::hint::spin_loop();
-                } else if spins < 64 {
-                    GLOBAL_SCHEDULER.yield_now();
+                if !backoff.is_completed_spinning() {
+                    backoff.snooze();
+                } else if !backoff.is_completed_yielding() {
+                    backoff.snooze_cooperative();
                 } else {
                     let guard = self.notif_mutex.lock().unwrap();
                     if ring.is_empty() && !self.is_closed.load(Ordering::Relaxed) {
                         let _ = self.cond.wait_timeout(guard, Duration::from_micros(250));
                     }
+                    backoff.reset();
                 }
             }
         } else if let Some(queue) = &self.unbounded {
@@ -1212,7 +1324,7 @@ impl<T> Channel<T> {
     /// Receive a value returning Result with typed RecvError if closed and empty.
     pub fn recv_checked(&self) -> Result<T, RecvError> {
         if let Some(ring) = &self.ring {
-            let mut spins: u32 = 0;
+            let mut backoff = AdaptiveBackoff::new();
             loop {
                 if let Some(val) = ring.try_pop() {
                     self.notify_waiters();
@@ -1221,16 +1333,16 @@ impl<T> Channel<T> {
                 if self.is_closed.load(Ordering::Acquire) && ring.is_empty() {
                     return Err(RecvError::Closed);
                 }
-                spins += 1;
-                if spins < 32 {
-                    std::hint::spin_loop();
-                } else if spins < 64 {
-                    GLOBAL_SCHEDULER.yield_now();
+                if !backoff.is_completed_spinning() {
+                    backoff.snooze();
+                } else if !backoff.is_completed_yielding() {
+                    backoff.snooze_cooperative();
                 } else {
                     let guard = self.notif_mutex.lock().unwrap();
                     if ring.is_empty() && !self.is_closed.load(Ordering::Relaxed) {
                         let _ = self.cond.wait_timeout(guard, Duration::from_micros(250));
                     }
+                    backoff.reset();
                 }
             }
         } else if let Some(queue) = &self.unbounded {
@@ -1299,7 +1411,7 @@ impl<T> Channel<T> {
     pub fn recv_timeout(&self, timeout: Duration) -> Option<T> {
         let deadline = std::time::Instant::now() + timeout;
         if let Some(ring) = &self.ring {
-            let mut spins: u32 = 0;
+            let mut backoff = AdaptiveBackoff::new();
             loop {
                 if let Some(val) = ring.try_pop() {
                     self.notify_waiters();
@@ -1312,11 +1424,10 @@ impl<T> Channel<T> {
                 if now >= deadline {
                     return None;
                 }
-                spins += 1;
-                if spins < 32 {
-                    std::hint::spin_loop();
-                } else if spins < 64 {
-                    GLOBAL_SCHEDULER.yield_now();
+                if !backoff.is_completed_spinning() {
+                    backoff.snooze();
+                } else if !backoff.is_completed_yielding() {
+                    backoff.snooze_cooperative();
                 } else {
                     let remaining = deadline - now;
                     let guard = self.notif_mutex.lock().unwrap();
@@ -1325,6 +1436,7 @@ impl<T> Channel<T> {
                             .cond
                             .wait_timeout(guard, remaining.min(Duration::from_millis(5)));
                     }
+                    backoff.reset();
                 }
             }
         } else if let Some(queue) = &self.unbounded {
