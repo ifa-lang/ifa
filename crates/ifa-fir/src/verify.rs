@@ -102,10 +102,7 @@ impl FirVerifier {
                 if let Some(res) = inst.result {
                     if !defined_values.insert(res) {
                         errors.push(FirVerifyError::new(
-                            format!(
-                                "SSA violation: value {} is defined multiple times",
-                                res
-                            ),
+                            format!("SSA violation: value {} is defined multiple times", res),
                             inst.span,
                         ));
                     }
@@ -149,10 +146,7 @@ impl FirVerifier {
                 for used in inst.expr.uses() {
                     if !defined_values.contains(&used) {
                         errors.push(FirVerifyError::new(
-                            format!(
-                                "Use of undefined value {} in block {}",
-                                used, block.id
-                            ),
+                            format!("Use of undefined value {} in block {}", used, block.id),
                             inst.span,
                         ));
                     } else if let Some(&d_block) = def_block.get(&used) {
@@ -290,10 +284,15 @@ impl FirVerifier {
         }
 
         // 1. Collect all local stack allocas
-        let mut alloca_info: HashMap<ValueId, (crate::types::FirType, Option<ifa_span::Symbol>, Span)> = HashMap::new();
+        let mut alloca_info: HashMap<
+            ValueId,
+            (crate::types::FirType, Option<ifa_span::Symbol>, Span),
+        > = HashMap::new();
         for block in &func.blocks {
             for inst in &block.instructions {
-                if let (Some(res), crate::ir::ValueExpr::Alloca { ty, name }) = (inst.result, &inst.expr) {
+                if let (Some(res), crate::ir::ValueExpr::Alloca { ty, name }) =
+                    (inst.result, &inst.expr)
+                {
                     alloca_info.insert(res, (ty.clone(), *name, inst.span));
                 }
             }
@@ -372,7 +371,9 @@ impl FirVerifier {
                                 }
                             }
                         }
-                        crate::ir::ValueExpr::EnumInit { payload: Some(p), .. } => {
+                        crate::ir::ValueExpr::EnumInit {
+                            payload: Some(p), ..
+                        } => {
                             if let Some(&root) = local_pointers.get(p) {
                                 aggregates_with_local_ptrs.insert(res, root);
                             } else if let Some(&root) = aggregates_with_local_ptrs.get(p) {
@@ -401,7 +402,9 @@ impl FirVerifier {
                                         .with_code("E0029"),
                                     );
                                 } else if let Some((_, name, _)) = alloca_info.get(&root) {
-                                    let name_str = name.map(|s| format!(" ('{}')", s.as_str())).unwrap_or_default();
+                                    let name_str = name
+                                        .map(|s| format!(" ('{}')", s.as_str()))
+                                        .unwrap_or_default();
                                     errors.push(
                                         FirVerifyError::new(
                                             format!(
@@ -429,7 +432,9 @@ impl FirVerifier {
                                         .with_code("E0029"),
                                     );
                                 } else if let Some((_, name, _)) = alloca_info.get(&root) {
-                                    let name_str = name.map(|s| format!(" ('{}')", s.as_str())).unwrap_or_default();
+                                    let name_str = name
+                                        .map(|s| format!(" ('{}')", s.as_str()))
+                                        .unwrap_or_default();
                                     errors.push(
                                         FirVerifyError::new(
                                             format!(
@@ -461,7 +466,9 @@ impl FirVerifier {
                                     .with_code("E0072"),
                                 );
                             } else if let Some((_, name, _)) = alloca_info.get(&root) {
-                                let name_str = name.map(|s| format!(" ('{}')", s.as_str())).unwrap_or_default();
+                                let name_str = name
+                                    .map(|s| format!(" ('{}')", s.as_str()))
+                                    .unwrap_or_default();
                                 errors.push(
                                     FirVerifyError::new(
                                         format!(
@@ -487,7 +494,9 @@ impl FirVerifier {
                                     .with_code("E0072"),
                                 );
                             } else if let Some((_, name, _)) = alloca_info.get(&root) {
-                                let name_str = name.map(|s| format!(" ('{}')", s.as_str())).unwrap_or_default();
+                                let name_str = name
+                                    .map(|s| format!(" ('{}')", s.as_str()))
+                                    .unwrap_or_default();
                                 errors.push(
                                     FirVerifyError::new(
                                         format!(
@@ -507,7 +516,9 @@ impl FirVerifier {
                         if !alloca_info.contains_key(ptr) && !local_pointers.contains_key(ptr) {
                             if let Some(&root) = local_pointers.get(val) {
                                 if let Some((_, name, _)) = alloca_info.get(&root) {
-                                    let name_str = name.map(|s| format!(" ('{}')", s.as_str())).unwrap_or_default();
+                                    let name_str = name
+                                        .map(|s| format!(" ('{}')", s.as_str()))
+                                        .unwrap_or_default();
                                     errors.push(
                                         FirVerifyError::new(
                                             format!(
@@ -533,7 +544,9 @@ impl FirVerifier {
                                 }
                             } else if let Some(&root) = aggregates_with_local_ptrs.get(val) {
                                 if let Some((_, name, _)) = alloca_info.get(&root) {
-                                    let name_str = name.map(|s| format!(" ('{}')", s.as_str())).unwrap_or_default();
+                                    let name_str = name
+                                        .map(|s| format!(" ('{}')", s.as_str()))
+                                        .unwrap_or_default();
                                     errors.push(
                                         FirVerifyError::new(
                                             format!(
@@ -554,7 +567,9 @@ impl FirVerifier {
             }
 
             // Check terminators for escaping local allocations
-            if let Some(Terminator::Return(Some(ret_val)) | Terminator::Fail(ret_val)) = &block.terminator {
+            if let Some(Terminator::Return(Some(ret_val)) | Terminator::Fail(ret_val)) =
+                &block.terminator
+            {
                 if let Some(&root) = local_pointers.get(ret_val) {
                     if call_arena_allocs.contains_key(&root) {
                         errors.push(
@@ -568,7 +583,9 @@ impl FirVerifier {
                             .with_code("E0025"),
                         );
                     } else if let Some((_, name, _)) = alloca_info.get(&root) {
-                        let name_str = name.map(|s| format!(" ('{}')", s.as_str())).unwrap_or_default();
+                        let name_str = name
+                            .map(|s| format!(" ('{}')", s.as_str()))
+                            .unwrap_or_default();
                         errors.push(
                             FirVerifyError::new(
                                 format!(
@@ -594,7 +611,9 @@ impl FirVerifier {
                             .with_code("E0025"),
                         );
                     } else if let Some((_, name, _)) = alloca_info.get(&root) {
-                        let name_str = name.map(|s| format!(" ('{}')", s.as_str())).unwrap_or_default();
+                        let name_str = name
+                            .map(|s| format!(" ('{}')", s.as_str()))
+                            .unwrap_or_default();
                         errors.push(
                             FirVerifyError::new(
                                 format!(
@@ -622,7 +641,12 @@ mod tests {
     use ifa_sema::types::IntType;
     use ifa_span::{Span, INTERNER};
 
-    fn make_test_func(name: &str, params: Vec<FirParam>, ret_ty: FirType, is_strict: bool) -> FirFunction {
+    fn make_test_func(
+        name: &str,
+        params: Vec<FirParam>,
+        ret_ty: FirType,
+        is_strict: bool,
+    ) -> FirFunction {
         FirFunction::new(
             INTERNER.intern(name),
             params,
@@ -678,7 +702,12 @@ mod tests {
 
     #[test]
     fn test_escaping_alloca_direct_return() {
-        let mut func = make_test_func("escape_ret", Vec::new(), FirType::Pointer(Box::new(FirType::Int(IntType::I32))), false);
+        let mut func = make_test_func(
+            "escape_ret",
+            Vec::new(),
+            FirType::Pointer(Box::new(FirType::Int(IntType::I32))),
+            false,
+        );
         let entry = func.get_block_mut(func.entry_block).unwrap();
 
         let v_alloca = ValueId(1);
@@ -693,7 +722,10 @@ mod tests {
         entry.set_terminator(Terminator::Return(Some(v_alloca)));
 
         let res = FirVerifier::verify_function(&func);
-        assert!(res.is_err(), "Expected E0025 error for escaping alloca return");
+        assert!(
+            res.is_err(),
+            "Expected E0025 error for escaping alloca return"
+        );
         let errs = res.unwrap_err();
         assert!(
             errs.iter().any(|e| e.code.as_deref() == Some("E0025")),
@@ -704,7 +736,12 @@ mod tests {
 
     #[test]
     fn test_escaping_alloca_via_gen_ref_return() {
-        let mut func = make_test_func("escape_gen_ref", Vec::new(), FirType::GenerationalRef(Box::new(FirType::Int(IntType::I32))), false);
+        let mut func = make_test_func(
+            "escape_gen_ref",
+            Vec::new(),
+            FirType::GenerationalRef(Box::new(FirType::Int(IntType::I32))),
+            false,
+        );
         let entry = func.get_block_mut(func.entry_block).unwrap();
 
         let v_alloca = ValueId(1);
@@ -737,7 +774,12 @@ mod tests {
 
     #[test]
     fn test_escaping_alloca_via_struct_return() {
-        let mut func = make_test_func("escape_struct", Vec::new(), FirType::Struct(INTERNER.intern("View"), Vec::new()), false);
+        let mut func = make_test_func(
+            "escape_struct",
+            Vec::new(),
+            FirType::Struct(INTERNER.intern("View"), Vec::new()),
+            false,
+        );
         let entry = func.get_block_mut(func.entry_block).unwrap();
 
         let v_alloca = ValueId(1);
@@ -768,7 +810,10 @@ mod tests {
         entry.set_terminator(Terminator::Return(Some(v_struct)));
 
         let res = FirVerifier::verify_function(&func);
-        assert!(res.is_err(), "Expected E0025 error for aggregate containing escaping ref");
+        assert!(
+            res.is_err(),
+            "Expected E0025 error for aggregate containing escaping ref"
+        );
         let errs = res.unwrap_err();
         assert!(
             errs.iter().any(|e| e.code.as_deref() == Some("E0025")),
@@ -810,7 +855,10 @@ mod tests {
         entry.set_terminator(Terminator::Return(None));
 
         let res = FirVerifier::verify_function(&func);
-        assert!(res.is_err(), "Expected E0029 error for stack ref passed to spawn");
+        assert!(
+            res.is_err(),
+            "Expected E0029 error for stack ref passed to spawn"
+        );
         let errs = res.unwrap_err();
         assert!(
             errs.iter().any(|e| e.code.as_deref() == Some("E0029")),
@@ -860,7 +908,10 @@ mod tests {
         entry.set_terminator(Terminator::Return(None));
 
         let res = FirVerifier::verify_function(&func);
-        assert!(res.is_err(), "Expected E0072 error for stack ref sent over channel");
+        assert!(
+            res.is_err(),
+            "Expected E0072 error for stack ref sent over channel"
+        );
         let errs = res.unwrap_err();
         assert!(
             errs.iter().any(|e| e.code.as_deref() == Some("E0072")),
@@ -871,7 +922,12 @@ mod tests {
 
     #[test]
     fn test_escaping_call_arena_return() {
-        let mut func = make_test_func("escape_call_arena", Vec::new(), FirType::Pointer(Box::new(FirType::Int(IntType::I32))), false);
+        let mut func = make_test_func(
+            "escape_call_arena",
+            Vec::new(),
+            FirType::Pointer(Box::new(FirType::Int(IntType::I32))),
+            false,
+        );
         let entry = func.get_block_mut(func.entry_block).unwrap();
 
         let v_arena = ValueId(1);
@@ -885,7 +941,10 @@ mod tests {
         entry.set_terminator(Terminator::Return(Some(v_arena)));
 
         let res = FirVerifier::verify_function(&func);
-        assert!(res.is_err(), "Expected E0025 error for call arena alloc escaping return");
+        assert!(
+            res.is_err(),
+            "Expected E0025 error for call arena alloc escaping return"
+        );
         let errs = res.unwrap_err();
         assert!(
             errs.iter().any(|e| e.code.as_deref() == Some("E0025")),
@@ -899,7 +958,9 @@ mod tests {
         let param = FirParam {
             name: INTERNER.intern("out_ptr"),
             val: ValueId(0),
-            ty: FirType::Pointer(Box::new(FirType::Pointer(Box::new(FirType::Int(IntType::I32))))),
+            ty: FirType::Pointer(Box::new(FirType::Pointer(Box::new(FirType::Int(
+                IntType::I32,
+            ))))),
             mode: ParamMode::InOut,
             noalias: true,
         };
@@ -926,7 +987,10 @@ mod tests {
         entry.set_terminator(Terminator::Return(None));
 
         let res = FirVerifier::verify_function(&func);
-        assert!(res.is_err(), "Expected E0020 error for local alloca stored to param");
+        assert!(
+            res.is_err(),
+            "Expected E0020 error for local alloca stored to param"
+        );
         let errs = res.unwrap_err();
         assert!(
             errs.iter().any(|e| e.code.as_deref() == Some("E0020")),
