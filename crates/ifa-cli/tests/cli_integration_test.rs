@@ -1880,14 +1880,20 @@ pub fn main() -> () {
         .arg(&out_bin)
         .status()
         .expect("Failed to execute `ifa compile`");
-    assert!(compile_status.success(), "AOT standalone compilation failed");
+    assert!(
+        compile_status.success(),
+        "AOT standalone compilation failed"
+    );
     assert!(out_bin.exists(), "Target executable does not exist");
 
     // Execute standalone binary
     let exec_output = Command::new(&out_bin)
         .output()
         .expect("Failed to execute compiled standalone binary");
-    assert!(exec_output.status.success(), "Standalone binary execution failed");
+    assert!(
+        exec_output.status.success(),
+        "Standalone binary execution failed"
+    );
     let exec_out = String::from_utf8_lossy(&exec_output.stdout);
     assert!(
         exec_out.contains("IFA_MULTIPATH_PIPELINE_OK"),

@@ -371,8 +371,10 @@ impl<'a> SemanticAnalyzer<'a> {
         }
 
         // Automatically define Flow Encapsulation Struct and Slice Descriptors in SymbolTable
-        let flow_st_name =
-            INTERNER.intern(&format!("__MultipathFlow_{}", INTERNER.resolve(&proto.name)));
+        let flow_st_name = INTERNER.intern(&format!(
+            "__MultipathFlow_{}",
+            INTERNER.resolve(&proto.name)
+        ));
         let mut flow_fields = vec![
             FieldSymbol {
                 is_pub: proto.is_pub,

@@ -3969,7 +3969,13 @@ impl<'a> FirInterpreter<'a> {
                         if fields.len() > 5 {
                             fields[5] = FirValue::Int(0);
                         }
-                        self.stack_memory.insert(*addr, FirValue::Struct { name: st_name, fields });
+                        self.stack_memory.insert(
+                            *addr,
+                            FirValue::Struct {
+                                name: st_name,
+                                fields,
+                            },
+                        );
                     }
                     Ok(FirValue::Unit)
                 } else if fn_name == "multipath::flow_serialize"
@@ -4016,7 +4022,13 @@ impl<'a> FirInterpreter<'a> {
                             FirValue::Int(0), // loss_rate_ppm
                             FirValue::Int(1), // state: active
                         ];
-                        self.stack_memory.insert(*addr, FirValue::Struct { name: st_name, fields });
+                        self.stack_memory.insert(
+                            *addr,
+                            FirValue::Struct {
+                                name: st_name,
+                                fields,
+                            },
+                        );
                     }
                     Ok(FirValue::Unit)
                 } else if fn_name == "multipath::subpath_meta_update"
@@ -4046,7 +4058,9 @@ impl<'a> FirInterpreter<'a> {
                             })
                             .unwrap_or(1);
 
-                        if let Some(FirValue::Struct { fields, .. }) = self.stack_memory.get_mut(addr) {
+                        if let Some(FirValue::Struct { fields, .. }) =
+                            self.stack_memory.get_mut(addr)
+                        {
                             if fields.len() > 3 {
                                 fields[3] = FirValue::Int(rtt_micros);
                             }

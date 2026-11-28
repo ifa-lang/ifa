@@ -1973,8 +1973,10 @@ impl AotCompiler {
                 &mp_meta_upd_sig,
             )
             .map_err(|e| CodegenError::Module(e.to_string()))?;
-        self.func_ids
-            .insert("ifa_rt_multipath_subpath_meta_update".into(), mp_meta_upd_id);
+        self.func_ids.insert(
+            "ifa_rt_multipath_subpath_meta_update".into(),
+            mp_meta_upd_id,
+        );
 
         let coro_funcs: std::collections::HashSet<ifa_span::Symbol> = fir_module
             .functions
