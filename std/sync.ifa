@@ -282,6 +282,43 @@ pub fn atomic_bool_swap(inout a: AtomicBool, val: bool) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// 6b. Atomic 64-bit Unsigned Integer (`AtomicU64`)
+// ---------------------------------------------------------------------------
+
+pub struct AtomicU64 {
+    id: i64
+}
+
+pub fn make_atomic_u64(initial: u64) -> AtomicU64 {
+    let aid = atomic_u64_create(initial);
+    return AtomicU64(id: aid);
+}
+
+pub fn atomic_u64_get(a: AtomicU64) -> u64 {
+    return atomic_u64_load(a.id);
+}
+
+pub fn atomic_u64_set(inout a: AtomicU64, val: u64) {
+    let _ = atomic_u64_store(a.id, val);
+}
+
+pub fn atomic_u64_add(inout a: AtomicU64, delta: u64) -> u64 {
+    return atomic_u64_fetch_add(a.id, delta);
+}
+
+pub fn atomic_u64_sub(inout a: AtomicU64, delta: u64) -> u64 {
+    return atomic_u64_fetch_sub(a.id, delta);
+}
+
+pub fn atomic_u64_compare_and_swap(inout a: AtomicU64, expected: u64, desired: u64) -> bool {
+    return atomic_u64_cas(a.id, expected, desired);
+}
+
+pub fn atomic_u64_free(inout a: AtomicU64) {
+    let _ = atomic_u64_destroy(a.id);
+}
+
+// ---------------------------------------------------------------------------
 // 7. Counting Semaphore (`Semaphore`)
 // ---------------------------------------------------------------------------
 
@@ -412,6 +449,27 @@ pub fn once_call_flag(inout o: Once) -> bool {
     atomic_bool_set(inout o.done, true);
     mutex_release(inout o.mutex);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// 9b. Native Runtime One-Time Initializer (`NativeOnce`)
+// ---------------------------------------------------------------------------
+
+pub struct NativeOnce {
+    id: i64
+}
+
+pub fn make_native_once() -> NativeOnce {
+    let oid = once_create();
+    return NativeOnce(id: oid);
+}
+
+pub fn native_once_is_completed(o: NativeOnce) -> bool {
+    return once_is_completed(o.id) != 0;
+}
+
+pub fn native_once_free(inout o: NativeOnce) {
+    let _ = once_destroy(o.id);
 }
 
 // ---------------------------------------------------------------------------
@@ -718,6 +776,64 @@ pub fn test_sync_select() -> bool {
     return true;
 }
 
+pub fn test_sync_atomic_u64() -> bool {
+    mut a = make_atomic_u64(100);
+    if atomic_u64_get(a) != 100 {
+        return false;
+    }
+    atomic_u64_set(inout a, 250);
+    if atomic_u64_get(a) != 250 {
+        return false;
+    }
+    let prev_add = atomic_u64_add(inout a, 50);
+    if prev_add != 250 || atomic_u64_get(a) != 300 {
+        return false;
+    }
+    let prev_sub = atomic_u64_sub(inout a, 100);
+    if prev_sub != 300 || atomic_u64_get(a) != 200 {
+        return false;
+    }
+    let cas_res = atomic_u64_compare_and_swap(inout a, 200, 500);
+    let final_val = atomic_u64_get(a);
+    atomic_u64_free(inout a);
+    return cas_res && final_val == 500;
+}
+
+pub fn test_sync_native_once() -> bool {
+    mut o = make_native_once();
+    let is_done_init = native_once_is_completed(o);
+    native_once_free(inout o);
+    return !is_done_init;
+}
+
+pub fn test_sync_concurrency_advanced() -> bool {
+    mut wg = make_wait_group();
+    mut counter = make_atomic_int(0);
+    mut sem = make_semaphore(4);
+    mut ch = make_channel(8);
+
+    wait_group_add(inout wg, 4);
+
+    let _ = channel_send_msg(inout ch, 10);
+    let _ = channel_send_msg(inout ch, 20);
+    let _ = channel_send_msg(inout ch, 30);
+    let _ = channel_send_msg(inout ch, 40);
+
+    mut i: i64 = 0;
+    while i < 4 {
+        semaphore_acquire(inout sem);
+        let val = channel_recv_msg(inout ch);
+        let _ = atomic_int_add(inout counter, val);
+        wait_group_done(inout wg);
+        semaphore_release(inout sem);
+        i = i + 1;
+    }
+
+    wait_group_wait(inout wg);
+    let total = atomic_int_get(counter);
+    return total == 100 && wait_group_is_done(wg);
+}
+
 pub fn test_sync_all() -> bool {
     let t_chan_unbounded = test_sync_channel_unbounded();
     let t_chan_bounded = test_sync_channel_bounded();
@@ -733,6 +849,9 @@ pub fn test_sync_all() -> bool {
     let t_barrier = test_sync_barrier();
     let t_once = test_sync_once();
     let t_sel = test_sync_select();
+    let t_atom_u64 = test_sync_atomic_u64();
+    let t_native_once = test_sync_native_once();
+    let t_concurrency = test_sync_concurrency_advanced();
 
     return t_chan_unbounded
         && t_chan_bounded
@@ -747,5 +866,8 @@ pub fn test_sync_all() -> bool {
         && t_sem
         && t_barrier
         && t_once
-        && t_sel;
+        && t_sel
+        && t_atom_u64
+        && t_native_once
+        && t_concurrency;
 }

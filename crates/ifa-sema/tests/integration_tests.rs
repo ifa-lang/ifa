@@ -4996,3 +4996,16 @@ fn test_std_process_module_semantic_analysis() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_std_sync_module_semantic_analysis() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sync_path = manifest_dir.join("../../std/sync.ifa");
+    let sync_code = std::fs::read_to_string(&sync_path).expect("std/sync.ifa must exist");
+    let res = run_analysis(&sync_code);
+    assert!(
+        !res.has_errors(),
+        "std/sync.ifa semantic analysis should succeed without error: {:?}",
+        res.diagnostics
+    );
+}

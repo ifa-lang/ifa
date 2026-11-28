@@ -2463,6 +2463,126 @@ impl SymbolTable {
             ret_ty: i64_ty.clone(),
             span: dummy,
         });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("sem_create"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("permits"),
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("sem_destroy"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: sem_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("sem_try_acquire"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: sem_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("sem_acquire"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: sem_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("sem_acquire_timeout"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: sem_sym,
+                    ty: i64_ty.clone(),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: timeout_sym,
+                    ty: i64_ty.clone(),
+                    span: dummy,
+                },
+            ],
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("sem_release"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: sem_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("sem_available"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: sem_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
 
         // Once
         let once_sym = INTERNER.intern("o");
@@ -4577,9 +4697,9 @@ impl SymbolTable {
             span: dummy,
         });
 
-        // Semaphore
+        // Semaphore (raw runtime primitives prefixed with sem_ in global scope to avoid collision with std/sync)
         let _ = self.define_function(FunctionSymbol {
-            name: INTERNER.intern("semaphore_create"),
+            name: INTERNER.intern("sem_create"),
             is_pub: true,
             is_strict: false,
             is_comptime: false,
@@ -4595,7 +4715,7 @@ impl SymbolTable {
             span: dummy,
         });
         let _ = self.define_function(FunctionSymbol {
-            name: INTERNER.intern("semaphore_destroy"),
+            name: INTERNER.intern("sem_destroy"),
             is_pub: true,
             is_strict: false,
             is_comptime: false,
@@ -4611,7 +4731,7 @@ impl SymbolTable {
             span: dummy,
         });
         let _ = self.define_function(FunctionSymbol {
-            name: INTERNER.intern("semaphore_try_acquire"),
+            name: INTERNER.intern("sem_try_acquire"),
             is_pub: true,
             is_strict: false,
             is_comptime: false,
@@ -4627,7 +4747,7 @@ impl SymbolTable {
             span: dummy,
         });
         let _ = self.define_function(FunctionSymbol {
-            name: INTERNER.intern("semaphore_acquire"),
+            name: INTERNER.intern("sem_acquire"),
             is_pub: true,
             is_strict: false,
             is_comptime: false,
@@ -4643,7 +4763,7 @@ impl SymbolTable {
             span: dummy,
         });
         let _ = self.define_function(FunctionSymbol {
-            name: INTERNER.intern("semaphore_acquire_timeout"),
+            name: INTERNER.intern("sem_acquire_timeout"),
             is_pub: true,
             is_strict: false,
             is_comptime: false,
@@ -4667,7 +4787,7 @@ impl SymbolTable {
             span: dummy,
         });
         let _ = self.define_function(FunctionSymbol {
-            name: INTERNER.intern("semaphore_release"),
+            name: INTERNER.intern("sem_release"),
             is_pub: true,
             is_strict: false,
             is_comptime: false,
@@ -4683,7 +4803,7 @@ impl SymbolTable {
             span: dummy,
         });
         let _ = self.define_function(FunctionSymbol {
-            name: INTERNER.intern("semaphore_available"),
+            name: INTERNER.intern("sem_available"),
             is_pub: true,
             is_strict: false,
             is_comptime: false,

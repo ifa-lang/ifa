@@ -1049,9 +1049,9 @@ fn test_fir_sync_primitives_execution() {
             waitgroup_done(wg);
             let wg_cnt = waitgroup_count(wg);
 
-            let sem = semaphore_create(3);
-            let acq = semaphore_try_acquire(sem);
-            let sem_avail = semaphore_available(sem);
+            let sem = sem_create(3);
+            let acq = sem_try_acquire(sem);
+            let sem_avail = sem_available(sem);
 
             let o = once_create();
             let o_done = once_is_completed(o);

@@ -4221,9 +4221,11 @@ pub fn register_stdlib_sync_symbols(inout catalog: MultiModuleCatalog) {
     register_module_symbol(inout catalog, "std/sync", "WaitGroup", 4);
     register_module_symbol(inout catalog, "std/sync", "AtomicInt", 4);
     register_module_symbol(inout catalog, "std/sync", "AtomicBool", 4);
+    register_module_symbol(inout catalog, "std/sync", "AtomicU64", 4);
     register_module_symbol(inout catalog, "std/sync", "Semaphore", 4);
     register_module_symbol(inout catalog, "std/sync", "Barrier", 4);
     register_module_symbol(inout catalog, "std/sync", "Once", 4);
+    register_module_symbol(inout catalog, "std/sync", "NativeOnce", 4);
 
     // Channel functions
     register_module_symbol(inout catalog, "std/sync", "make_channel", 6);
@@ -4260,6 +4262,7 @@ pub fn register_stdlib_sync_symbols(inout catalog: MultiModuleCatalog) {
     register_module_symbol(inout catalog, "std/sync", "wait_group_done", 6);
     register_module_symbol(inout catalog, "std/sync", "wait_group_wait", 6);
     register_module_symbol(inout catalog, "std/sync", "wait_group_is_done", 6);
+    register_module_symbol(inout catalog, "std/sync", "wait_group_count", 6);
 
     // Atomics & helpers
     register_module_symbol(inout catalog, "std/sync", "make_atomic_int", 6);
@@ -4272,6 +4275,13 @@ pub fn register_stdlib_sync_symbols(inout catalog: MultiModuleCatalog) {
     register_module_symbol(inout catalog, "std/sync", "atomic_bool_get", 6);
     register_module_symbol(inout catalog, "std/sync", "atomic_bool_set", 6);
     register_module_symbol(inout catalog, "std/sync", "atomic_bool_swap", 6);
+    register_module_symbol(inout catalog, "std/sync", "make_atomic_u64", 6);
+    register_module_symbol(inout catalog, "std/sync", "atomic_u64_get", 6);
+    register_module_symbol(inout catalog, "std/sync", "atomic_u64_set", 6);
+    register_module_symbol(inout catalog, "std/sync", "atomic_u64_add", 6);
+    register_module_symbol(inout catalog, "std/sync", "atomic_u64_sub", 6);
+    register_module_symbol(inout catalog, "std/sync", "atomic_u64_compare_and_swap", 6);
+    register_module_symbol(inout catalog, "std/sync", "atomic_u64_free", 6);
 
     // Sync coordination
     register_module_symbol(inout catalog, "std/sync", "make_semaphore", 6);
@@ -4283,6 +4293,9 @@ pub fn register_stdlib_sync_symbols(inout catalog: MultiModuleCatalog) {
     register_module_symbol(inout catalog, "std/sync", "make_once", 6);
     register_module_symbol(inout catalog, "std/sync", "once_is_done", 6);
     register_module_symbol(inout catalog, "std/sync", "once_call_flag", 6);
+    register_module_symbol(inout catalog, "std/sync", "make_native_once", 6);
+    register_module_symbol(inout catalog, "std/sync", "native_once_is_completed", 6);
+    register_module_symbol(inout catalog, "std/sync", "native_once_free", 6);
     register_module_symbol(inout catalog, "std/sync", "select_two", 6);
     register_module_symbol(inout catalog, "std/sync", "try_select_two", 6);
     register_module_symbol(inout catalog, "std/sync", "select_three", 6);

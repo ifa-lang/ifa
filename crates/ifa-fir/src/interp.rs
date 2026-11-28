@@ -4099,7 +4099,9 @@ impl<'a> FirInterpreter<'a> {
                         Ok(FirValue::Int(0))
                     }
                 } else if fn_name == "sync::semaphore_create"
+                    || fn_name == "sync::sem_create"
                     || fn_name == "semaphore_create"
+                    || fn_name == "sem_create"
                     || fn_name == "ifa_rt_semaphore_create"
                 {
                     let permits = match evaluated_args.first() {
@@ -4111,7 +4113,9 @@ impl<'a> FirInterpreter<'a> {
                     self.sync_semaphores.insert(id, permits);
                     Ok(FirValue::Int(id as i128))
                 } else if fn_name == "sync::semaphore_destroy"
+                    || fn_name == "sync::sem_destroy"
                     || fn_name == "semaphore_destroy"
+                    || fn_name == "sem_destroy"
                     || fn_name == "ifa_rt_semaphore_destroy"
                 {
                     let id = match evaluated_args.first() {
@@ -4121,7 +4125,9 @@ impl<'a> FirInterpreter<'a> {
                     self.sync_semaphores.remove(&id);
                     Ok(FirValue::Bool(true))
                 } else if fn_name == "sync::semaphore_try_acquire"
+                    || fn_name == "sync::sem_try_acquire"
                     || fn_name == "semaphore_try_acquire"
+                    || fn_name == "sem_try_acquire"
                     || fn_name == "ifa_rt_semaphore_try_acquire"
                 {
                     let id = match evaluated_args.first() {
@@ -4139,7 +4145,9 @@ impl<'a> FirInterpreter<'a> {
                         Ok(FirValue::Int(-1))
                     }
                 } else if fn_name == "sync::semaphore_acquire"
+                    || fn_name == "sync::sem_acquire"
                     || fn_name == "semaphore_acquire"
+                    || fn_name == "sem_acquire"
                     || fn_name == "ifa_rt_semaphore_acquire"
                 {
                     let id = match evaluated_args.first() {
@@ -4155,7 +4163,9 @@ impl<'a> FirInterpreter<'a> {
                         Ok(FirValue::Int(-1))
                     }
                 } else if fn_name == "sync::semaphore_acquire_timeout"
+                    || fn_name == "sync::sem_acquire_timeout"
                     || fn_name == "semaphore_acquire_timeout"
+                    || fn_name == "sem_acquire_timeout"
                     || fn_name == "ifa_rt_semaphore_acquire_timeout"
                 {
                     let id = match evaluated_args.first() {
@@ -4173,7 +4183,9 @@ impl<'a> FirInterpreter<'a> {
                         Ok(FirValue::Int(-1))
                     }
                 } else if fn_name == "sync::semaphore_release"
+                    || fn_name == "sync::sem_release"
                     || fn_name == "semaphore_release"
+                    || fn_name == "sem_release"
                     || fn_name == "ifa_rt_semaphore_release"
                 {
                     let id = match evaluated_args.first() {
@@ -4187,7 +4199,9 @@ impl<'a> FirInterpreter<'a> {
                         Ok(FirValue::Int(-1))
                     }
                 } else if fn_name == "sync::semaphore_available"
+                    || fn_name == "sync::sem_available"
                     || fn_name == "semaphore_available"
+                    || fn_name == "sem_available"
                     || fn_name == "ifa_rt_semaphore_available"
                 {
                     let id = match evaluated_args.first() {
