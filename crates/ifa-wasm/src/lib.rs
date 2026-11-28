@@ -345,6 +345,8 @@ mod tests {
             structs: Vec::new(),
             enums: Vec::new(),
             constants: Vec::new(),
+
+            protocols: Vec::new(),
         };
 
         let bundler = WasmBundler::from_fir_module(

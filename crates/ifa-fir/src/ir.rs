@@ -1100,6 +1100,37 @@ pub struct FirConst {
     pub span: Span,
 }
 
+/// Channel or traffic slice definition within an IFA Protocol in FIR.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FirProtocolChannel {
+    pub name: Symbol,
+    pub is_slice: bool,
+    pub is_multipath: bool,
+    pub ty: FirType,
+    pub redundancy: u32,
+    pub fec_enabled: bool,
+    pub pacing_enabled: bool,
+    pub subpath_tags: Vec<Symbol>,
+    pub span: Span,
+}
+
+/// Protocol definition lowered to FIR intermediate representation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FirProtocol {
+    pub name: Symbol,
+    pub is_pub: bool,
+    pub is_multipath: bool,
+    pub channels: Vec<FirProtocolChannel>,
+    pub flow_encapsulation_struct: Symbol,
+    pub span: Span,
+}
+
+impl FirProtocol {
+    pub fn get_channel(&self, name: &Symbol) -> Option<&FirProtocolChannel> {
+        self.channels.iter().find(|ch| &ch.name == name)
+    }
+}
+
 /// Complete module in FIR containing all items.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FirModule {
@@ -1108,6 +1139,13 @@ pub struct FirModule {
     pub enums: Vec<FirEnum>,
     pub constants: Vec<FirConst>,
     pub functions: Vec<FirFunction>,
+    pub protocols: Vec<FirProtocol>,
+}
+
+impl Default for FirModule {
+    fn default() -> Self {
+        Self::new(ifa_span::INTERNER.intern("main"))
+    }
 }
 
 impl FirModule {
@@ -1118,7 +1156,16 @@ impl FirModule {
             enums: Vec::new(),
             constants: Vec::new(),
             functions: Vec::new(),
+            protocols: Vec::new(),
         }
+    }
+
+    pub fn get_protocol(&self, name: &Symbol) -> Option<&FirProtocol> {
+        self.protocols.iter().find(|p| &p.name == name)
+    }
+
+    pub fn get_protocol_mut(&mut self, name: &Symbol) -> Option<&mut FirProtocol> {
+        self.protocols.iter_mut().find(|p| &p.name == name)
     }
 
     pub fn get_function(&self, name: &Symbol) -> Option<&FirFunction> {
@@ -1159,10 +1206,19 @@ impl FirModule {
                 self.functions.push(f);
             }
         }
+        for p in other.protocols {
+            if !self
+                .protocols
+                .iter()
+                .any(|existing| existing.name == p.name)
+            {
+                self.protocols.push(p);
+            }
+        }
         self.sort_deterministically();
     }
 
-    /// Sorts all functions, structs, enums, and constants into canonical lexicographical order
+    /// Sorts all functions, structs, enums, constants, and protocols into canonical lexicographical order
     /// to guarantee bit-for-bit reproducible SSA generation and binary emission.
     pub fn sort_deterministically(&mut self) {
         self.functions.sort_by(|a, b| {
@@ -1181,6 +1237,11 @@ impl FirModule {
                 .cmp(&ifa_span::INTERNER.resolve(&b.name))
         });
         self.constants.sort_by(|a, b| {
+            ifa_span::INTERNER
+                .resolve(&a.name)
+                .cmp(&ifa_span::INTERNER.resolve(&b.name))
+        });
+        self.protocols.sort_by(|a, b| {
             ifa_span::INTERNER
                 .resolve(&a.name)
                 .cmp(&ifa_span::INTERNER.resolve(&b.name))

@@ -6455,6 +6455,370 @@ impl<'a> FunctionLoweringContext<'a> {
     }
 }
 
+fn parse_multipath_attrs(
+    attrs: &[ifa_ast::Attribute],
+    inherited_mp: bool,
+) -> (bool, u32, bool, bool, Vec<Symbol>) {
+    let mut is_mp = inherited_mp;
+    let mut redundancy = 1;
+    let mut fec_enabled = false;
+    let mut pacing_enabled = false;
+    let mut subpath_tags = Vec::new();
+
+    for attr in attrs {
+        if attr.is("multipath") {
+            is_mp = true;
+            for arg in &attr.args {
+                match arg {
+                    ifa_ast::AttributeArg::Ident(sym) => {
+                        let s = INTERNER.resolve(sym);
+                        match s.as_str() {
+                            "resilient" => {
+                                fec_enabled = true;
+                                if redundancy < 2 {
+                                    redundancy = 2;
+                                }
+                            }
+                            "redundant" | "bicasting" => {
+                                if redundancy < 2 {
+                                    redundancy = 2;
+                                }
+                            }
+                            "fec" => {
+                                fec_enabled = true;
+                            }
+                            "pacing" => {
+                                pacing_enabled = true;
+                            }
+                            "low_latency" => {
+                                subpath_tags.push(INTERNER.intern("low_latency"));
+                            }
+                            "high_throughput" => {
+                                subpath_tags.push(INTERNER.intern("high_throughput"));
+                            }
+                            _ => {}
+                        }
+                    }
+                    ifa_ast::AttributeArg::KeyValue(key, lit) => {
+                        let k = INTERNER.resolve(key);
+                        match k.as_str() {
+                            "slices" | "redundancy" => {
+                                if let ifa_ast::Lit::Int(val_sym) = lit {
+                                    if let Ok(n) = INTERNER.resolve(val_sym).parse::<u32>() {
+                                        redundancy = n;
+                                    }
+                                }
+                            }
+                            "fec_ratio" => {
+                                fec_enabled = true;
+                            }
+                            "pacing" | "burst_shaper" => {
+                                pacing_enabled = true;
+                            }
+                            "mode" => {
+                                if let ifa_ast::Lit::String(val_sym) = lit {
+                                    let mode_str = INTERNER.resolve(val_sym);
+                                    if mode_str == "bicasting" || mode_str == "redundant" {
+                                        redundancy = 2;
+                                    } else if mode_str == "resilient" {
+                                        fec_enabled = true;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if subpath_tags.is_empty() {
+        if redundancy > 1 {
+            subpath_tags.push(INTERNER.intern("primary"));
+            subpath_tags.push(INTERNER.intern("secondary"));
+        } else {
+            subpath_tags.push(INTERNER.intern("default"));
+        }
+    }
+
+    (is_mp, redundancy, fec_enabled, pacing_enabled, subpath_tags)
+}
+
+fn lower_protocols_and_multipath_slices(
+    module: &mut FirModule,
+    program: &Program,
+    symbols: &SymbolTable,
+) {
+    let mut has_multipath_items = false;
+
+    // 1. Process Protocol items from AST
+    for item in &program.items {
+        if let Item::Protocol(p_ast) = item {
+            let (is_proto_mp, p_redundancy, p_fec, p_pacing, p_tags) =
+                parse_multipath_attrs(&p_ast.attributes, false);
+
+            let proto_sym = symbols.lookup_protocol(&p_ast.name);
+            let mut channels = Vec::new();
+
+            for ch in &p_ast.channels {
+                let (ch_mp, ch_redundancy, ch_fec, ch_pacing, ch_tags) =
+                    parse_multipath_attrs(&ch.attributes, is_proto_mp);
+                let is_multipath = is_proto_mp || ch_mp || ch.is_slice;
+                if is_multipath {
+                    has_multipath_items = true;
+                }
+
+                let ch_ty = if let Some(ps) = proto_sym {
+                    if let Some(cs) = ps.get_channel(&ch.name) {
+                        FirType::from_sema_type(&cs.ty)
+                    } else {
+                        FirType::Int(IntType::U64)
+                    }
+                } else {
+                    FirType::Int(IntType::U64)
+                };
+
+                let eff_redundancy = if ch.attributes.iter().any(|a| a.is("multipath")) {
+                    ch_redundancy
+                } else {
+                    p_redundancy
+                };
+                let eff_fec = ch_fec || p_fec;
+                let eff_pacing = ch_pacing || p_pacing;
+                let eff_tags = if ch.attributes.iter().any(|a| a.is("multipath")) {
+                    ch_tags
+                } else {
+                    p_tags.clone()
+                };
+
+                channels.push(FirProtocolChannel {
+                    name: ch.name,
+                    is_slice: ch.is_slice,
+                    is_multipath,
+                    ty: ch_ty.clone(),
+                    redundancy: eff_redundancy,
+                    fec_enabled: eff_fec,
+                    pacing_enabled: eff_pacing,
+                    subpath_tags: eff_tags,
+                    span: ch.span,
+                });
+
+                // If channel is a slice, emit its slice descriptor struct
+                if ch.is_slice || is_multipath {
+                    let slice_desc_name = INTERNER.intern(&format!(
+                        "__MultipathSliceDescriptor_{}_{}",
+                        INTERNER.resolve(&p_ast.name),
+                        INTERNER.resolve(&ch.name)
+                    ));
+                    if !module.structs.iter().any(|s| s.name == slice_desc_name) {
+                        module.structs.push(FirStruct {
+                            name: slice_desc_name,
+                            fields: vec![
+                                (INTERNER.intern("slice_id"), FirType::Int(IntType::U32)),
+                                (INTERNER.intern("subpath_id"), FirType::Int(IntType::U32)),
+                                (INTERNER.intern("redundancy"), FirType::Int(IntType::U32)),
+                                (INTERNER.intern("fec_ratio"), FirType::Int(IntType::U32)),
+                                (INTERNER.intern("channel"), ch_ty),
+                            ],
+                            is_pub: p_ast.is_pub,
+                            span: ch.span,
+                        });
+                    }
+                }
+            }
+
+            let is_proto_overall_mp = is_proto_mp || channels.iter().any(|c| c.is_multipath);
+            let flow_struct_name = INTERNER.intern(&format!(
+                "__MultipathFlow_{}",
+                INTERNER.resolve(&p_ast.name)
+            ));
+
+            let fir_proto = FirProtocol {
+                name: p_ast.name,
+                is_pub: p_ast.is_pub,
+                is_multipath: is_proto_overall_mp,
+                channels: channels.clone(),
+                flow_encapsulation_struct: flow_struct_name,
+                span: p_ast.span,
+            };
+            module.protocols.push(fir_proto);
+
+            // Emit Flow Encapsulation Struct for protocol
+            if is_proto_overall_mp || !channels.is_empty() {
+                has_multipath_items = true;
+                if !module.structs.iter().any(|s| s.name == flow_struct_name) {
+                    let mut flow_fields = vec![
+                        (INTERNER.intern("flow_id"), FirType::Int(IntType::U64)),
+                        (INTERNER.intern("subpath_id"), FirType::Int(IntType::U32)),
+                        (INTERNER.intern("seq_num"), FirType::Int(IntType::U64)),
+                        (INTERNER.intern("flags"), FirType::Int(IntType::U32)),
+                        (INTERNER.intern("slice_tag"), FirType::Int(IntType::U16)),
+                        (INTERNER.intern("payload_len"), FirType::Int(IntType::U32)),
+                    ];
+                    for ch in &channels {
+                        flow_fields.push((ch.name, ch.ty.clone()));
+                    }
+                    module.structs.push(FirStruct {
+                        name: flow_struct_name,
+                        fields: flow_fields,
+                        is_pub: p_ast.is_pub,
+                        span: p_ast.span,
+                    });
+                }
+            }
+        }
+    }
+
+    // 2. Process Structs with traffic slice fields or @multipath attributes
+    for item in &program.items {
+        if let Item::Struct(s_ast) = item {
+            let is_struct_mp = s_ast.attributes.iter().any(|a| a.is("multipath"));
+            for f in &s_ast.fields {
+                let f_mp = f.attributes.iter().any(|a| a.is("multipath"));
+                if f.is_slice || is_struct_mp || f_mp {
+                    has_multipath_items = true;
+                    let (_is_mp, _redundancy, _, _, _) =
+                        parse_multipath_attrs(&f.attributes, is_struct_mp);
+                    let slice_desc_name = INTERNER.intern(&format!(
+                        "__MultipathSliceDescriptor_{}_{}",
+                        INTERNER.resolve(&s_ast.name),
+                        INTERNER.resolve(&f.name)
+                    ));
+                    if !module.structs.iter().any(|s| s.name == slice_desc_name) {
+                        let field_ty = if let Some(st_sym) = symbols.lookup_struct(&s_ast.name) {
+                            if let Some(fs) = st_sym.get_field(&f.name) {
+                                FirType::from_sema_type(&fs.ty)
+                            } else {
+                                FirType::Int(IntType::U64)
+                            }
+                        } else {
+                            FirType::Int(IntType::U64)
+                        };
+
+                        module.structs.push(FirStruct {
+                            name: slice_desc_name,
+                            fields: vec![
+                                (INTERNER.intern("slice_id"), FirType::Int(IntType::U32)),
+                                (INTERNER.intern("subpath_id"), FirType::Int(IntType::U32)),
+                                (INTERNER.intern("redundancy"), FirType::Int(IntType::U32)),
+                                (INTERNER.intern("fec_ratio"), FirType::Int(IntType::U32)),
+                                (INTERNER.intern("channel"), field_ty),
+                            ],
+                            is_pub: s_ast.is_pub,
+                            span: f.span,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Process any protocols defined in SymbolTable (e.g. imported) not already lowered
+    let mut sorted_protos: Vec<&ifa_sema::symbol_table::ProtocolSymbol> =
+        symbols.protocols.values().collect();
+    sorted_protos.sort_by_key(|p| INTERNER.resolve(&p.name));
+    for ps in sorted_protos {
+        if !module.protocols.iter().any(|p| p.name == ps.name) {
+            let (is_proto_mp, p_redundancy, p_fec, p_pacing, p_tags) =
+                parse_multipath_attrs(&ps.attributes, false);
+            let mut channels = Vec::new();
+            for ch in &ps.channels {
+                let (ch_mp, ch_redundancy, ch_fec, ch_pacing, ch_tags) =
+                    parse_multipath_attrs(&ch.attributes, is_proto_mp);
+                let is_multipath = is_proto_mp || ch_mp || ch.is_slice;
+                if is_multipath {
+                    has_multipath_items = true;
+                }
+                let ch_ty = FirType::from_sema_type(&ch.ty);
+                let eff_redundancy = if ch.attributes.iter().any(|a| a.is("multipath")) {
+                    ch_redundancy
+                } else {
+                    p_redundancy
+                };
+                let eff_fec = ch_fec || p_fec;
+                let eff_pacing = ch_pacing || p_pacing;
+                let eff_tags = if ch.attributes.iter().any(|a| a.is("multipath")) {
+                    ch_tags
+                } else {
+                    p_tags.clone()
+                };
+
+                channels.push(FirProtocolChannel {
+                    name: ch.name,
+                    is_slice: ch.is_slice,
+                    is_multipath,
+                    ty: ch_ty.clone(),
+                    redundancy: eff_redundancy,
+                    fec_enabled: eff_fec,
+                    pacing_enabled: eff_pacing,
+                    subpath_tags: eff_tags,
+                    span: ch.span,
+                });
+            }
+
+            let flow_struct_name =
+                INTERNER.intern(&format!("__MultipathFlow_{}", INTERNER.resolve(&ps.name)));
+            let fir_proto = FirProtocol {
+                name: ps.name,
+                is_pub: ps.is_pub,
+                is_multipath: is_proto_mp || channels.iter().any(|c| c.is_multipath),
+                channels: channels.clone(),
+                flow_encapsulation_struct: flow_struct_name,
+                span: ps.span,
+            };
+            module.protocols.push(fir_proto);
+
+            if is_proto_mp || !channels.is_empty() {
+                has_multipath_items = true;
+                if !module.structs.iter().any(|s| s.name == flow_struct_name) {
+                    let mut flow_fields = vec![
+                        (INTERNER.intern("flow_id"), FirType::Int(IntType::U64)),
+                        (INTERNER.intern("subpath_id"), FirType::Int(IntType::U32)),
+                        (INTERNER.intern("seq_num"), FirType::Int(IntType::U64)),
+                        (INTERNER.intern("flags"), FirType::Int(IntType::U32)),
+                        (INTERNER.intern("slice_tag"), FirType::Int(IntType::U16)),
+                        (INTERNER.intern("payload_len"), FirType::Int(IntType::U32)),
+                    ];
+                    for ch in &channels {
+                        flow_fields.push((ch.name, ch.ty.clone()));
+                    }
+                    module.structs.push(FirStruct {
+                        name: flow_struct_name,
+                        fields: flow_fields,
+                        is_pub: ps.is_pub,
+                        span: ps.span,
+                    });
+                }
+            }
+        }
+    }
+
+    // 4. Emit standard subpath metadata struct if multipath items are present
+    if has_multipath_items {
+        let meta_name = INTERNER.intern("__MultipathSubpathMeta");
+        if !module.structs.iter().any(|s| s.name == meta_name) {
+            module.structs.push(FirStruct {
+                name: meta_name,
+                fields: vec![
+                    (INTERNER.intern("subpath_id"), FirType::Int(IntType::U32)),
+                    (
+                        INTERNER.intern("interface_index"),
+                        FirType::Int(IntType::U32),
+                    ),
+                    (INTERNER.intern("weight"), FirType::Int(IntType::U32)),
+                    (INTERNER.intern("rtt_micros"), FirType::Int(IntType::U64)),
+                    (INTERNER.intern("loss_rate_ppm"), FirType::Int(IntType::U32)),
+                    (INTERNER.intern("state"), FirType::Int(IntType::U8)),
+                ],
+                is_pub: true,
+                span: Span::DUMMY,
+            });
+        }
+    }
+}
+
 /// Lowers an entire parsed and semantically analyzed IFA program into a FIR module.
 pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
     let module_name = INTERNER.intern("main");
@@ -6573,6 +6937,9 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
             });
         }
     }
+
+    // 2b. Lower protocol declarations, multipath traffic slices, and encapsulation structs
+    lower_protocols_and_multipath_slices(&mut module, program, symbols);
 
     // 3. Collect all functions (free functions and methods in impl blocks)
     let mut all_functions: HashMap<Symbol, ifa_ast::Function> = HashMap::new();

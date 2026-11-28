@@ -929,6 +929,8 @@ fn test_vectorize_pass_direct_reduction_call_specialization() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let mut pass = VectorizePass::new();
@@ -1116,6 +1118,8 @@ fn test_vectorize_pass_direct_count_if_and_filter_specialization() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let mut pass = VectorizePass::new();

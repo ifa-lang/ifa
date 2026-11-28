@@ -958,6 +958,7 @@ fn test_interprocedural_symbolic_constant_propagation_sliding_window() {
         enums: Vec::new(),
         constants: Vec::new(),
         functions: vec![f_callee, f_caller],
+        protocols: Vec::new(),
     };
 
     let mut ipo_pass = IpoPass::new();
@@ -1183,6 +1184,7 @@ fn test_polymorphic_sliding_window_specialization() {
         enums: Vec::new(),
         constants: Vec::new(),
         functions: vec![f_callee, f_caller1, f_caller2],
+        protocols: Vec::new(),
     };
 
     let mut ipo_pass = IpoPass::new();
@@ -1350,6 +1352,7 @@ fn test_ipo_noalias_propagation_and_nested_struct_disambiguation() {
         enums: Vec::new(),
         constants: Vec::new(),
         functions: vec![f_callee, f_caller],
+        protocols: Vec::new(),
     };
 
     let mut ipo_pass = IpoPass::new();

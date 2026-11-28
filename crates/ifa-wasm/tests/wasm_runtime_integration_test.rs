@@ -308,6 +308,8 @@ fn test_end_to_end_wasm_coroutine_inspection_and_validation() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let wasm_path = temp_dir.join("coro_stream.wasm");
@@ -420,6 +422,8 @@ fn test_wasm_stackless_iterator_generator_inspection_and_exports() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let wasm_path = temp_dir.join("prime_stream.wasm");

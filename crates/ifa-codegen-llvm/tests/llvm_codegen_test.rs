@@ -325,6 +325,8 @@ fn test_llvm_simd_slice_vectorization() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
     let ir = emitter.emit_module(&module).unwrap();
 
@@ -2299,6 +2301,8 @@ fn test_llvm_vector_branchcond_and_arena_genalloc() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();
@@ -2416,6 +2420,8 @@ fn test_llvm_coroutine_channel_untyped_and_select_multiplexing() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();
@@ -2509,6 +2515,8 @@ fn test_llvm_wasm32_coroutine_stackless_suspension() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();
@@ -2667,6 +2675,8 @@ fn test_llvm_coroutine_iterator_generator_lowering() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();
@@ -2768,6 +2778,8 @@ fn test_llvm_wasm32_stackless_iterator_generator_lowering() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();
@@ -2893,6 +2905,8 @@ fn test_llvm_blocking_ffi_isolation_and_thunk_lowering() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();
@@ -3119,6 +3133,8 @@ fn test_llvm_coroutine_io_uring_iocp_reactor_lowering_and_native_compile() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).expect("Emission failed");
@@ -3707,6 +3723,8 @@ fn test_llvm_channel_select_wait_table_non_coro_and_default() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();
@@ -3815,6 +3833,8 @@ fn test_llvm_channel_select_priority_and_timeout_zero_heap() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();
@@ -3968,6 +3988,8 @@ fn test_llvm_aot_loop_invariant_disjoint_arena_generation_check_hoisting() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();
@@ -4422,6 +4444,8 @@ fn test_llvm_baremetal_convolution_and_sliding_window_metadata_emission() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let llvm_ir = emitter
@@ -4515,6 +4539,8 @@ fn test_matrix_kernel_tiling_unroll_and_jam_metadata_and_compilation() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let llvm_ir = emitter
@@ -4713,6 +4739,8 @@ fn test_llvm_strided_zero_copy_conv2d_and_conv3d_metadata_emission() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let llvm_ir = emitter
@@ -4837,6 +4865,8 @@ fn test_strided_bounds_check_and_simd_reductions_llvm() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let llvm_ir = emitter
@@ -5033,6 +5063,8 @@ fn test_llvm_coroutine_generator_stream_licm_gen_check_elimination() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();
@@ -5149,6 +5181,8 @@ fn test_llvm_codegen_channel_try_send_nonblocking() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();
@@ -5233,6 +5267,8 @@ fn test_llvm_strided_loop_vectorization_metadata_and_compilation() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();
@@ -5621,6 +5657,8 @@ fn test_llvm_multidim_strided_projection_simd_metadata_and_compilation() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();
@@ -5715,6 +5753,8 @@ fn test_llvm_strict_coroutine_arena_frame_and_slice_exchange() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();
@@ -5811,6 +5851,8 @@ fn test_multi_arena_matrix_kernel_elementwise_fused_llvm_emission() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();
@@ -5908,6 +5950,8 @@ fn test_llvm_multi_arena_fused_convolution_metadata_and_loop_elision() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();
@@ -5983,6 +6027,8 @@ fn test_llvm_multi_arena_conv_definitions_and_codegen() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let ir = emitter.emit_module(&module).unwrap();

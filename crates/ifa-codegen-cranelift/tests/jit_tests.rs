@@ -1650,6 +1650,8 @@ fn test_cranelift_call_arena_lowering_and_execution() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
@@ -1776,6 +1778,8 @@ fn test_cranelift_jit_strided_slice_sum_lowering_without_runtime() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
@@ -1867,6 +1871,8 @@ fn test_cranelift_jit_strided_bounds_check_safety_elimination() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
@@ -1962,6 +1968,8 @@ fn test_cranelift_jit_nonblocking_synchronized_channel_state_machine() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
@@ -2263,6 +2271,8 @@ fn test_cranelift_jit_multi_arena_strided_dot_reduction_i64() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
@@ -2434,6 +2444,8 @@ fn test_cranelift_jit_strided_slice_prod_and_min_max_reductions() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
@@ -2567,6 +2579,8 @@ fn test_cranelift_jit_strided_count_if_reduction() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
@@ -2682,6 +2696,8 @@ fn test_cranelift_jit_contiguous_simd128_vector_sum_and_dot() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
@@ -2974,6 +2990,8 @@ fn test_cranelift_jit_multi_arena_conv2d_i64() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
@@ -3296,6 +3314,8 @@ fn test_cranelift_jit_multi_arena_conv3d_i64() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
@@ -3472,6 +3492,8 @@ fn test_jit_multi_arena_dilated_conv2d_and_pooling() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
@@ -3734,6 +3756,8 @@ fn test_jit_multi_arena_depthwise_conv2d() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
@@ -3928,6 +3952,8 @@ fn test_jit_multi_arena_pointwise_conv2d() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
@@ -4179,6 +4205,8 @@ fn test_jit_multi_arena_batch_norm2d() {
         structs: Vec::new(),
         enums: Vec::new(),
         constants: Vec::new(),
+
+        protocols: Vec::new(),
     };
 
     let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");

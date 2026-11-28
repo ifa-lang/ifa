@@ -38,6 +38,47 @@ impl<'a> FirPrinter<'a> {
             writeln!(self.output, "}}\n")?;
         }
 
+        for proto in &module.protocols {
+            self.indent();
+            let mp_attr = if proto.is_multipath {
+                " @multipath"
+            } else {
+                ""
+            };
+            let pub_attr = if proto.is_pub { "pub " } else { "" };
+            writeln!(
+                self.output,
+                "{}protocol @{}{} {{",
+                pub_attr,
+                proto.name.as_str(),
+                mp_attr
+            )?;
+            self.indent_level += 1;
+            for ch in &proto.channels {
+                self.indent();
+                let slice_kw = if ch.is_slice { "slice " } else { "" };
+                let mp_ch = if ch.is_multipath {
+                    format!(
+                        " [@multipath(redundancy={}, fec={})]",
+                        ch.redundancy, ch.fec_enabled
+                    )
+                } else {
+                    String::new()
+                };
+                writeln!(
+                    self.output,
+                    "{}{}: {}{},",
+                    slice_kw,
+                    ch.name.as_str(),
+                    ch.ty,
+                    mp_ch
+                )?;
+            }
+            self.indent_level -= 1;
+            self.indent();
+            writeln!(self.output, "}}\n")?;
+        }
+
         for func in &module.functions {
             self.print_function(func)?;
             writeln!(self.output)?;

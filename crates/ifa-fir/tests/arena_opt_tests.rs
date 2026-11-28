@@ -354,6 +354,8 @@ fn test_deep_recursive_chain_access_barrier_elimination() {
         enums: Vec::new(),
         constants: Vec::new(),
         functions: vec![chain_fn],
+
+        protocols: Vec::new(),
     };
 
     let mut arena_pass = ArenaFusionPass::new();
@@ -474,6 +476,8 @@ fn test_disjoint_arenas_reconciliation() {
         enums: Vec::new(),
         constants: Vec::new(),
         functions: vec![f],
+
+        protocols: Vec::new(),
     };
 
     let mut pass = ArenaFusionPass::new();
@@ -881,6 +885,8 @@ fn test_interprocedural_nested_streaming_pipeline_arena_fusion() {
         enums: Vec::new(),
         constants: Vec::new(),
         functions: vec![f_produce, f_wrap, f_driver],
+
+        protocols: Vec::new(),
     };
 
     let mut pass = ArenaFusionPass::new();
@@ -1006,6 +1012,8 @@ fn test_interprocedural_streaming_access_barrier_elimination() {
         enums: Vec::new(),
         constants: Vec::new(),
         functions: vec![f_consume, f_caller],
+
+        protocols: Vec::new(),
     };
 
     let mut pass = ArenaFusionPass::new();
@@ -1120,6 +1128,8 @@ fn test_intermediate_call_arena_fusion_in_filter_projection_pipeline() {
         enums: Vec::new(),
         constants: Vec::new(),
         functions: vec![func],
+
+        protocols: Vec::new(),
     };
 
     let mut pass = ArenaFusionPass::new();
@@ -1199,6 +1209,8 @@ fn test_call_arena_scope_consolidation_and_mark_elimination() {
         enums: Vec::new(),
         constants: Vec::new(),
         functions: vec![func],
+
+        protocols: Vec::new(),
     };
 
     let mut pass = ArenaFusionPass::new();
@@ -1333,6 +1345,8 @@ fn test_multidim_strided_projections_folding() {
         enums: Vec::new(),
         constants: Vec::new(),
         functions: vec![func],
+
+        protocols: Vec::new(),
     };
 
     let mut pass = ArenaFusionPass::new();
@@ -1441,6 +1455,8 @@ fn test_nested_call_arena_fusion_eliminates_inner_rewind() {
         enums: Vec::new(),
         constants: Vec::new(),
         functions: vec![func],
+
+        protocols: Vec::new(),
     };
 
     let mut pass = ArenaFusionPass::new();
