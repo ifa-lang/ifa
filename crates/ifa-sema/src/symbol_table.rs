@@ -1500,33 +1500,6 @@ impl SymbolTable {
             span: dummy,
         });
         sync_mod.add_function(FunctionSymbol {
-            name: INTERNER.intern("channel"),
-            is_pub: true,
-            is_strict: false,
-            is_comptime: false,
-            is_extern: None,
-            generics: Vec::new(),
-            params: Vec::new(),
-            ret_ty: Type::Int(crate::types::IntType::I64),
-            span: dummy,
-        });
-        sync_mod.add_function(FunctionSymbol {
-            name: INTERNER.intern("bounded"),
-            is_pub: true,
-            is_strict: false,
-            is_comptime: false,
-            is_extern: None,
-            generics: Vec::new(),
-            params: vec![ParamSymbol {
-                mode: ParamMode::In,
-                name: cap_sym,
-                ty: Type::Int(crate::types::IntType::I64),
-                span: dummy,
-            }],
-            ret_ty: Type::Int(crate::types::IntType::I64),
-            span: dummy,
-        });
-        sync_mod.add_function(FunctionSymbol {
             name: INTERNER.intern("channel_create"),
             is_pub: true,
             is_strict: false,

@@ -3463,8 +3463,6 @@ impl<'a> FirInterpreter<'a> {
                 } else if fn_name == "sync::channel_create"
                     || fn_name == "channel_create"
                     || fn_name == "ifa_rt_channel_create"
-                    || fn_name == "sync::bounded"
-                    || fn_name == "bounded"
                 {
                     let cap = match evaluated_args.first() {
                         Some(FirValue::Int(n)) => *n as usize,
@@ -3476,14 +3474,6 @@ impl<'a> FirInterpreter<'a> {
                         .insert(id, (VecDeque::new(), cap, false));
                     self.sync_string_channels
                         .insert(id, (VecDeque::new(), cap, false));
-                    Ok(FirValue::Int(id as i128))
-                } else if fn_name == "sync::channel" || fn_name == "channel" {
-                    let id = self.next_sync_id;
-                    self.next_sync_id += 1;
-                    self.sync_int_channels
-                        .insert(id, (VecDeque::new(), 0, false));
-                    self.sync_string_channels
-                        .insert(id, (VecDeque::new(), 0, false));
                     Ok(FirValue::Int(id as i128))
                 } else if fn_name == "sync::channel_destroy"
                     || fn_name == "channel_destroy"
