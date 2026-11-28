@@ -3291,11 +3291,8 @@ impl<'a> SemanticAnalyzer<'a> {
                                     elem_ty = args[0].clone();
                                     // E0072 — deep ref check on select arm channel payload
                                     let mut visited = std::collections::HashSet::new();
-                                    if type_contains_ref_deep(
-                                        &elem_ty,
-                                        &self.symbols,
-                                        &mut visited,
-                                    ) {
+                                    if type_contains_ref_deep(&elem_ty, &self.symbols, &mut visited)
+                                    {
                                         self.diagnostics.push(
                                             Diagnostic::error(format!(
                                                 "le type de charge utile '{}' reçu via '{}' dans un bras 'select' ne peut pas contenir de référence locale ('ref') : les références locales ne survivent pas au transfert inter-fibres",
