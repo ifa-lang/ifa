@@ -1199,6 +1199,16 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                     | "memory_virtual"
                     | "sys_memory_virtual"
                     | "sys::resources::memory_virtual" => "ifa_rt_sys_memory_virtual",
+                    "multipath::flow_init" | "flow_init" => "ifa_rt_multipath_flow_init",
+                    "multipath::flow_serialize" | "flow_serialize" => {
+                        "ifa_rt_multipath_flow_serialize"
+                    }
+                    "multipath::flow_deserialize" | "flow_deserialize" => {
+                        "ifa_rt_multipath_flow_deserialize"
+                    }
+                    "multipath::subpath_meta_init" | "subpath_meta_init" => {
+                        "ifa_rt_multipath_subpath_meta_init"
+                    }
                     _ => fn_name.as_str(),
                 };
                 if let Some(res) = self.try_lower_simd_reduction(&fn_name, args) {

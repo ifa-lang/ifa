@@ -517,6 +517,22 @@ impl JitEngine {
             "ifa_rt_sys_memory_virtual",
             ifa_runtime::ffi::ifa_rt_sys_memory_virtual as *const u8,
         );
+        builder.symbol(
+            "ifa_rt_multipath_flow_init",
+            ifa_runtime::ffi::ifa_rt_multipath_flow_init as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_multipath_flow_serialize",
+            ifa_runtime::ffi::ifa_rt_multipath_flow_serialize as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_multipath_flow_deserialize",
+            ifa_runtime::ffi::ifa_rt_multipath_flow_deserialize as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_multipath_subpath_meta_init",
+            ifa_runtime::ffi::ifa_rt_multipath_subpath_meta_init as *const u8,
+        );
 
         let module = JITModule::new(builder);
 
@@ -1232,6 +1248,67 @@ impl JitEngine {
         self.func_ids
             .insert("ifa_rt_coro_destroy".into(), coro_destroy_id);
 
+        // Multipath runtime intrinsics
+        let mut mp_init_sig = Signature::new(call_conv);
+        mp_init_sig.params.push(AbiParam::new(ptr_type));
+        mp_init_sig.params.push(AbiParam::new(types::I64));
+        mp_init_sig.params.push(AbiParam::new(types::I32));
+        mp_init_sig.params.push(AbiParam::new(types::I16));
+        let mp_init_id = self
+            .module
+            .declare_function("ifa_rt_multipath_flow_init", Linkage::Import, &mp_init_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_multipath_flow_init".into(), mp_init_id);
+
+        let mut mp_ser_sig = Signature::new(call_conv);
+        mp_ser_sig.params.push(AbiParam::new(ptr_type));
+        mp_ser_sig.params.push(AbiParam::new(ptr_type));
+        mp_ser_sig.params.push(AbiParam::new(types::I64));
+        mp_ser_sig.returns.push(AbiParam::new(types::I64));
+        let mp_ser_id = self
+            .module
+            .declare_function(
+                "ifa_rt_multipath_flow_serialize",
+                Linkage::Import,
+                &mp_ser_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_multipath_flow_serialize".into(), mp_ser_id);
+
+        let mut mp_deser_sig = Signature::new(call_conv);
+        mp_deser_sig.params.push(AbiParam::new(ptr_type));
+        mp_deser_sig.params.push(AbiParam::new(ptr_type));
+        mp_deser_sig.params.push(AbiParam::new(types::I64));
+        mp_deser_sig.returns.push(AbiParam::new(types::I64));
+        let mp_deser_id = self
+            .module
+            .declare_function(
+                "ifa_rt_multipath_flow_deserialize",
+                Linkage::Import,
+                &mp_deser_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_multipath_flow_deserialize".into(), mp_deser_id);
+
+        let mut mp_meta_sig = Signature::new(call_conv);
+        mp_meta_sig.params.push(AbiParam::new(ptr_type));
+        mp_meta_sig.params.push(AbiParam::new(types::I32));
+        mp_meta_sig.params.push(AbiParam::new(types::I32));
+        mp_meta_sig.params.push(AbiParam::new(types::I32));
+        let mp_meta_id = self
+            .module
+            .declare_function(
+                "ifa_rt_multipath_subpath_meta_init",
+                Linkage::Import,
+                &mp_meta_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_multipath_subpath_meta_init".into(), mp_meta_id);
+
         let coro_funcs: std::collections::HashSet<ifa_span::Symbol> = fir_module
             .functions
             .iter()
@@ -1431,5 +1508,415 @@ impl JitEngine {
         let target_fn: fn() -> i64 = unsafe { std::mem::transmute(code_ptr) };
         let result = target_fn();
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ifa_fir::*;
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    #[test]
+    fn test_cranelift_jit_multipath_flow_initialization_and_wire_serialization() {
+        let proto_name = INTERNER.intern("TelemetryProto");
+        let flow_st_name = INTERNER.intern("__MultipathFlow_TelemetryProto");
+        let meta_st_name = INTERNER.intern("__MultipathSubpathMeta");
+
+        let mut module = FirModule::new(INTERNER.intern("test_mp_jit"));
+
+        module.protocols.push(FirProtocol {
+            name: proto_name,
+            is_pub: true,
+            is_multipath: true,
+            channels: vec![FirProtocolChannel {
+                name: INTERNER.intern("metrics"),
+                is_slice: true,
+                is_multipath: true,
+                ty: FirType::Int(IntType::U64),
+                redundancy: 2,
+                fec_enabled: true,
+                pacing_enabled: false,
+                subpath_tags: vec![INTERNER.intern("primary"), INTERNER.intern("secondary")],
+                span: Span::DUMMY,
+            }],
+            flow_encapsulation_struct: flow_st_name,
+            span: Span::DUMMY,
+        });
+
+        module.structs.push(FirStruct {
+            name: flow_st_name,
+            fields: vec![
+                (INTERNER.intern("flow_id"), FirType::Int(IntType::U64)),
+                (INTERNER.intern("subpath_id"), FirType::Int(IntType::U32)),
+                (INTERNER.intern("seq_num"), FirType::Int(IntType::U64)),
+                (INTERNER.intern("flags"), FirType::Int(IntType::U32)),
+                (INTERNER.intern("slice_tag"), FirType::Int(IntType::U16)),
+                (INTERNER.intern("payload_len"), FirType::Int(IntType::U32)),
+                (INTERNER.intern("metrics"), FirType::Int(IntType::U64)),
+            ],
+            is_pub: true,
+            span: Span::DUMMY,
+        });
+
+        module.structs.push(FirStruct {
+            name: meta_st_name,
+            fields: vec![
+                (INTERNER.intern("subpath_id"), FirType::Int(IntType::U32)),
+                (
+                    INTERNER.intern("interface_index"),
+                    FirType::Int(IntType::U32),
+                ),
+                (INTERNER.intern("weight"), FirType::Int(IntType::U32)),
+                (INTERNER.intern("rtt_micros"), FirType::Int(IntType::U64)),
+                (INTERNER.intern("loss_rate_ppm"), FirType::Int(IntType::U32)),
+                (INTERNER.intern("state"), FirType::Int(IntType::U8)),
+            ],
+            is_pub: true,
+            span: Span::DUMMY,
+        });
+
+        let mut func = FirFunction::new(
+            INTERNER.intern("main"),
+            Vec::new(),
+            FirType::Int(IntType::I64),
+            false,
+            true,
+            false,
+            None,
+            Span::DUMMY,
+        );
+
+        let v_flow1 = func.alloc_value();
+        let v_flow2 = func.alloc_value();
+        let v_buf = func.alloc_value();
+        let v_flow_id = func.alloc_value();
+        let v_subpath_id = func.alloc_value();
+        let v_slice_tag = func.alloc_value();
+        let v_buf_len = func.alloc_value();
+        let v_ser_len = func.alloc_value();
+        let v_deser_len = func.alloc_value();
+        let v_f2_flow_id = func.alloc_value();
+        let v_f2_subpath = func.alloc_value();
+        let v_f2_slice_tag = func.alloc_value();
+        let v_sum1 = func.alloc_value();
+        let v_sum2 = func.alloc_value();
+        let v_sum3 = func.alloc_value();
+        let v_final = func.alloc_value();
+
+        let entry = func.get_block_mut(func.entry_block).unwrap();
+
+        // 1. Alloca flow1
+        entry.push_instruction(Instruction::new(
+            Some(v_flow1),
+            ValueExpr::Alloca {
+                ty: FirType::Struct(flow_st_name, vec![]),
+                name: None,
+            },
+            Span::DUMMY,
+        ));
+
+        // 2. Constants for flow initialization
+        entry.push_instruction(Instruction::new(
+            Some(v_flow_id),
+            ValueExpr::Constant(ConstantValue::Int(12000, IntType::U64)),
+            Span::DUMMY,
+        ));
+        entry.push_instruction(Instruction::new(
+            Some(v_subpath_id),
+            ValueExpr::Constant(ConstantValue::Int(4, IntType::U32)),
+            Span::DUMMY,
+        ));
+        entry.push_instruction(Instruction::new(
+            Some(v_slice_tag),
+            ValueExpr::Constant(ConstantValue::Int(45, IntType::U16)),
+            Span::DUMMY,
+        ));
+
+        // 3. Call ifa_rt_multipath_flow_init(flow1, 12000, 4, 45)
+        entry.push_instruction(Instruction::new(
+            None,
+            ValueExpr::CallDirect {
+                name: INTERNER.intern("ifa_rt_multipath_flow_init"),
+                args: vec![v_flow1, v_flow_id, v_subpath_id, v_slice_tag],
+            },
+            Span::DUMMY,
+        ));
+
+        // 4. Alloca wire byte buffer (64 bytes)
+        entry.push_instruction(Instruction::new(
+            Some(v_buf),
+            ValueExpr::Alloca {
+                ty: FirType::Array(Box::new(FirType::Int(IntType::U8)), 64),
+                name: None,
+            },
+            Span::DUMMY,
+        ));
+        entry.push_instruction(Instruction::new(
+            Some(v_buf_len),
+            ValueExpr::Constant(ConstantValue::Int(64, IntType::I64)),
+            Span::DUMMY,
+        ));
+
+        // 5. Call ifa_rt_multipath_flow_serialize(flow1, buf, 64) -> ser_len (30)
+        entry.push_instruction(Instruction::new(
+            Some(v_ser_len),
+            ValueExpr::CallDirect {
+                name: INTERNER.intern("ifa_rt_multipath_flow_serialize"),
+                args: vec![v_flow1, v_buf, v_buf_len],
+            },
+            Span::DUMMY,
+        ));
+
+        // 6. Alloca flow2 and deserialize into it
+        entry.push_instruction(Instruction::new(
+            Some(v_flow2),
+            ValueExpr::Alloca {
+                ty: FirType::Struct(flow_st_name, vec![]),
+                name: None,
+            },
+            Span::DUMMY,
+        ));
+        entry.push_instruction(Instruction::new(
+            Some(v_deser_len),
+            ValueExpr::CallDirect {
+                name: INTERNER.intern("ifa_rt_multipath_flow_deserialize"),
+                args: vec![v_flow2, v_buf, v_buf_len],
+            },
+            Span::DUMMY,
+        ));
+
+        // 7. Get deserialized fields from flow2
+        entry.push_instruction(Instruction::new(
+            Some(v_f2_flow_id),
+            ValueExpr::GetField {
+                base: v_flow2,
+                field_idx: 0,
+                field_name: INTERNER.intern("flow_id"),
+            },
+            Span::DUMMY,
+        ));
+        entry.push_instruction(Instruction::new(
+            Some(v_f2_subpath),
+            ValueExpr::GetField {
+                base: v_flow2,
+                field_idx: 1,
+                field_name: INTERNER.intern("subpath_id"),
+            },
+            Span::DUMMY,
+        ));
+        entry.push_instruction(Instruction::new(
+            Some(v_f2_slice_tag),
+            ValueExpr::GetField {
+                base: v_flow2,
+                field_idx: 4,
+                field_name: INTERNER.intern("slice_tag"),
+            },
+            Span::DUMMY,
+        ));
+
+        // 8. Compute total: f2_flow_id (12000) + f2_subpath (4) + f2_slice_tag (45) + ser_len (30) + deser_len (30) = 12109
+        entry.push_instruction(Instruction::new(
+            Some(v_sum1),
+            ValueExpr::Binary {
+                op: BinaryOp::Add,
+                lhs: v_f2_flow_id,
+                rhs: v_f2_subpath,
+            },
+            Span::DUMMY,
+        ));
+        entry.push_instruction(Instruction::new(
+            Some(v_sum2),
+            ValueExpr::Binary {
+                op: BinaryOp::Add,
+                lhs: v_sum1,
+                rhs: v_f2_slice_tag,
+            },
+            Span::DUMMY,
+        ));
+        entry.push_instruction(Instruction::new(
+            Some(v_sum3),
+            ValueExpr::Binary {
+                op: BinaryOp::Add,
+                lhs: v_sum2,
+                rhs: v_ser_len,
+            },
+            Span::DUMMY,
+        ));
+        entry.push_instruction(Instruction::new(
+            Some(v_final),
+            ValueExpr::Binary {
+                op: BinaryOp::Add,
+                lhs: v_sum3,
+                rhs: v_deser_len,
+            },
+            Span::DUMMY,
+        ));
+
+        entry.set_terminator(Terminator::Return(Some(v_final)));
+        module.functions.push(func);
+
+        let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+        jit.compile_module(&module)
+            .expect("Failed to compile FIR module to Cranelift JIT");
+        let result = jit.run_main().expect("Failed to execute native main");
+        assert_eq!(result, 12109);
+    }
+
+    #[test]
+    fn test_cranelift_jit_multipath_subpath_meta_initialization() {
+        let meta_st_name = INTERNER.intern("__MultipathSubpathMeta");
+        let mut module = FirModule::new(INTERNER.intern("test_mp_meta_jit"));
+
+        module.structs.push(FirStruct {
+            name: meta_st_name,
+            fields: vec![
+                (INTERNER.intern("subpath_id"), FirType::Int(IntType::U32)),
+                (
+                    INTERNER.intern("interface_index"),
+                    FirType::Int(IntType::U32),
+                ),
+                (INTERNER.intern("weight"), FirType::Int(IntType::U32)),
+                (INTERNER.intern("rtt_micros"), FirType::Int(IntType::U64)),
+                (INTERNER.intern("loss_rate_ppm"), FirType::Int(IntType::U32)),
+                (INTERNER.intern("state"), FirType::Int(IntType::U8)),
+            ],
+            is_pub: true,
+            span: Span::DUMMY,
+        });
+
+        let mut func = FirFunction::new(
+            INTERNER.intern("main"),
+            Vec::new(),
+            FirType::Int(IntType::I64),
+            false,
+            true,
+            false,
+            None,
+            Span::DUMMY,
+        );
+
+        let v_meta = func.alloc_value();
+        let v_subpath_id = func.alloc_value();
+        let v_ifindex = func.alloc_value();
+        let v_weight = func.alloc_value();
+        let v_f_subpath = func.alloc_value();
+        let v_f_ifindex = func.alloc_value();
+        let v_f_weight = func.alloc_value();
+        let v_f_state = func.alloc_value();
+        let v_sum1 = func.alloc_value();
+        let v_sum2 = func.alloc_value();
+        let v_final = func.alloc_value();
+
+        let entry = func.get_block_mut(func.entry_block).unwrap();
+
+        entry.push_instruction(Instruction::new(
+            Some(v_meta),
+            ValueExpr::Alloca {
+                ty: FirType::Struct(meta_st_name, vec![]),
+                name: None,
+            },
+            Span::DUMMY,
+        ));
+
+        entry.push_instruction(Instruction::new(
+            Some(v_subpath_id),
+            ValueExpr::Constant(ConstantValue::Int(10, IntType::U32)),
+            Span::DUMMY,
+        ));
+        entry.push_instruction(Instruction::new(
+            Some(v_ifindex),
+            ValueExpr::Constant(ConstantValue::Int(2, IntType::U32)),
+            Span::DUMMY,
+        ));
+        entry.push_instruction(Instruction::new(
+            Some(v_weight),
+            ValueExpr::Constant(ConstantValue::Int(80, IntType::U32)),
+            Span::DUMMY,
+        ));
+
+        entry.push_instruction(Instruction::new(
+            None,
+            ValueExpr::CallDirect {
+                name: INTERNER.intern("ifa_rt_multipath_subpath_meta_init"),
+                args: vec![v_meta, v_subpath_id, v_ifindex, v_weight],
+            },
+            Span::DUMMY,
+        ));
+
+        entry.push_instruction(Instruction::new(
+            Some(v_f_subpath),
+            ValueExpr::GetField {
+                base: v_meta,
+                field_idx: 0,
+                field_name: INTERNER.intern("subpath_id"),
+            },
+            Span::DUMMY,
+        ));
+        entry.push_instruction(Instruction::new(
+            Some(v_f_ifindex),
+            ValueExpr::GetField {
+                base: v_meta,
+                field_idx: 1,
+                field_name: INTERNER.intern("interface_index"),
+            },
+            Span::DUMMY,
+        ));
+        entry.push_instruction(Instruction::new(
+            Some(v_f_weight),
+            ValueExpr::GetField {
+                base: v_meta,
+                field_idx: 2,
+                field_name: INTERNER.intern("weight"),
+            },
+            Span::DUMMY,
+        ));
+        entry.push_instruction(Instruction::new(
+            Some(v_f_state),
+            ValueExpr::GetField {
+                base: v_meta,
+                field_idx: 5,
+                field_name: INTERNER.intern("state"),
+            },
+            Span::DUMMY,
+        ));
+
+        entry.push_instruction(Instruction::new(
+            Some(v_sum1),
+            ValueExpr::Binary {
+                op: BinaryOp::Add,
+                lhs: v_f_subpath,
+                rhs: v_f_ifindex,
+            },
+            Span::DUMMY,
+        ));
+        entry.push_instruction(Instruction::new(
+            Some(v_sum2),
+            ValueExpr::Binary {
+                op: BinaryOp::Add,
+                lhs: v_sum1,
+                rhs: v_f_weight,
+            },
+            Span::DUMMY,
+        ));
+        entry.push_instruction(Instruction::new(
+            Some(v_final),
+            ValueExpr::Binary {
+                op: BinaryOp::Add,
+                lhs: v_sum2,
+                rhs: v_f_state,
+            },
+            Span::DUMMY,
+        ));
+
+        entry.set_terminator(Terminator::Return(Some(v_final)));
+        module.functions.push(func);
+
+        let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+        jit.compile_module(&module)
+            .expect("Failed to compile FIR module to Cranelift JIT");
+        let result = jit.run_main().expect("Failed to execute native main");
+        assert_eq!(result, 93);
     }
 }

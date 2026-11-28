@@ -2684,3 +2684,64 @@ fn test_resource_telemetry_audit_and_supervision() {
     assert!(cmd_usage.wall_time_ns > 0);
     assert!(cmd_usage.max_rss_bytes > 0);
 }
+
+#[test]
+fn test_multipath_flow_runtime_ffi_init_and_serialization() {
+    use ifa_runtime::ffi::{
+        ifa_rt_multipath_flow_deserialize, ifa_rt_multipath_flow_init,
+        ifa_rt_multipath_flow_serialize, ifa_rt_multipath_subpath_meta_init,
+        IfaMultipathFlowHeader, IfaMultipathSubpathMeta, MULTIPATH_FLOW_WIRE_HEADER_SIZE,
+    };
+
+    let mut flow1 = IfaMultipathFlowHeader::default();
+    let flow1_ptr = &mut flow1 as *mut IfaMultipathFlowHeader as *mut u8;
+
+    ifa_rt_multipath_flow_init(flow1_ptr, 0x1122_3344_5566_7788, 3, 0x0A0B);
+    assert_eq!(flow1.flow_id, 0x1122_3344_5566_7788);
+    assert_eq!(flow1.subpath_id, 3);
+    assert_eq!(flow1.seq_num, 0);
+    assert_eq!(flow1.flags, 0);
+    assert_eq!(flow1.slice_tag, 0x0A0B);
+    assert_eq!(flow1.payload_len, 0);
+
+    flow1.seq_num = 42;
+    flow1.flags = 0x8000_0001;
+    flow1.payload_len = 1024;
+
+    let mut wire_buf = [0u8; 64];
+    let serialized_len =
+        ifa_rt_multipath_flow_serialize(flow1_ptr, wire_buf.as_mut_ptr(), wire_buf.len());
+    assert_eq!(serialized_len, MULTIPATH_FLOW_WIRE_HEADER_SIZE as i64);
+
+    // Verify big-endian wire bytes
+    assert_eq!(&wire_buf[0..8], &0x1122_3344_5566_7788u64.to_be_bytes());
+    assert_eq!(&wire_buf[8..12], &3u32.to_be_bytes());
+    assert_eq!(&wire_buf[12..20], &42u64.to_be_bytes());
+    assert_eq!(&wire_buf[20..24], &0x8000_0001u32.to_be_bytes());
+    assert_eq!(&wire_buf[24..26], &0x0A0Bu16.to_be_bytes());
+    assert_eq!(&wire_buf[26..30], &1024u32.to_be_bytes());
+
+    // Deserialize into a fresh flow header
+    let mut flow2 = IfaMultipathFlowHeader::default();
+    let flow2_ptr = &mut flow2 as *mut IfaMultipathFlowHeader as *mut u8;
+    let deserialized_len =
+        ifa_rt_multipath_flow_deserialize(flow2_ptr, wire_buf.as_ptr(), wire_buf.len());
+    assert_eq!(deserialized_len, MULTIPATH_FLOW_WIRE_HEADER_SIZE as i64);
+    assert_eq!(flow2.flow_id, flow1.flow_id);
+    assert_eq!(flow2.subpath_id, flow1.subpath_id);
+    assert_eq!(flow2.seq_num, flow1.seq_num);
+    assert_eq!(flow2.flags, flow1.flags);
+    assert_eq!(flow2.slice_tag, flow1.slice_tag);
+    assert_eq!(flow2.payload_len, flow1.payload_len);
+
+    // Test subpath metadata init
+    let mut meta = IfaMultipathSubpathMeta::default();
+    let meta_ptr = &mut meta as *mut IfaMultipathSubpathMeta as *mut u8;
+    ifa_rt_multipath_subpath_meta_init(meta_ptr, 7, 2, 100);
+    assert_eq!(meta.subpath_id, 7);
+    assert_eq!(meta.interface_index, 2);
+    assert_eq!(meta.weight, 100);
+    assert_eq!(meta.rtt_micros, 0);
+    assert_eq!(meta.loss_rate_ppm, 0);
+    assert_eq!(meta.state, 1);
+}

@@ -1759,6 +1759,117 @@ impl AotCompiler {
         self.func_ids
             .insert("ifa_rt_coro_destroy".into(), coro_destroy_id);
 
+        // Multipath runtime intrinsics
+        let mut mp_init_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        mp_init_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        mp_init_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        mp_init_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I32,
+            ));
+        mp_init_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I16,
+            ));
+        let mp_init_id = self
+            .module
+            .declare_function("ifa_rt_multipath_flow_init", Linkage::Import, &mp_init_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_multipath_flow_init".into(), mp_init_id);
+
+        let mut mp_ser_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        mp_ser_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        mp_ser_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        mp_ser_sig.params.push(cranelift_codegen::ir::AbiParam::new(
+            cranelift_codegen::ir::types::I64,
+        ));
+        mp_ser_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        let mp_ser_id = self
+            .module
+            .declare_function(
+                "ifa_rt_multipath_flow_serialize",
+                Linkage::Import,
+                &mp_ser_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_multipath_flow_serialize".into(), mp_ser_id);
+
+        let mut mp_deser_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        mp_deser_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        mp_deser_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        mp_deser_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        mp_deser_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        let mp_deser_id = self
+            .module
+            .declare_function(
+                "ifa_rt_multipath_flow_deserialize",
+                Linkage::Import,
+                &mp_deser_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_multipath_flow_deserialize".into(), mp_deser_id);
+
+        let mut mp_meta_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        mp_meta_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        mp_meta_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I32,
+            ));
+        mp_meta_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I32,
+            ));
+        mp_meta_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I32,
+            ));
+        let mp_meta_id = self
+            .module
+            .declare_function(
+                "ifa_rt_multipath_subpath_meta_init",
+                Linkage::Import,
+                &mp_meta_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_multipath_subpath_meta_init".into(), mp_meta_id);
+
         let coro_funcs: std::collections::HashSet<ifa_span::Symbol> = fir_module
             .functions
             .iter()

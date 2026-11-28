@@ -305,6 +305,16 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i64 @ifa_rt_sys_memory_virtual()\n\n");
         }
 
+        // IFA Multipath Transport & Flow Serialization Intrinsics
+        out.push_str("; IFA Multipath Transport & Flow Serialization Intrinsics\n");
+        out.push_str("declare void @ifa_rt_multipath_flow_init(ptr, i64, i32, i16)\n");
+        out.push_str("declare i64 @ifa_rt_multipath_flow_serialize(ptr, ptr, i64)\n");
+        out.push_str("declare i64 @ifa_rt_multipath_flow_deserialize(ptr, ptr, i64)\n");
+        out.push_str("declare void @ifa_rt_multipath_subpath_meta_init(ptr, i32, i32, i32)\n");
+        out.push_str("declare i64 @llvm.bswap.i64(i64)\n");
+        out.push_str("declare i32 @llvm.bswap.i32(i32)\n");
+        out.push_str("declare i16 @llvm.bswap.i16(i16)\n\n");
+
         // LLVM Standard Coroutine Intrinsics
         out.push_str("; LLVM Standard Coroutine Intrinsics\n");
         out.push_str("declare token @llvm.coro.id(i32, ptr, ptr, ptr)\n");
@@ -1869,6 +1879,135 @@ impl<'a> LlvmIrEmitter<'a> {
                 ));
             }
             out.push('\n');
+        }
+
+        // 3.7. Emit Multipath Flow Encapsulation Stubs & Wire Serialization Helpers
+        if !module.protocols.is_empty() {
+            out.push_str("; Multipath Protocol Flow Encapsulation & Serialization Stubs\n");
+            for proto in &module.protocols {
+                let p_name = INTERNER.resolve(&proto.name);
+                let flow_st_name = INTERNER.resolve(&proto.flow_encapsulation_struct);
+
+                // 1. Flow Initialization Stub
+                out.push_str(&format!(
+                    "define linkonce_odr void @__ifa_multipath_flow_init_{}(ptr %flow, i64 %flow_id, i32 %subpath_id, i16 %slice_tag) alwaysinline {{\nentry:\n",
+                    p_name
+                ));
+                out.push_str(&format!(
+                    "  %p0 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 0\n  store i64 %flow_id, ptr %p0, align 8\n",
+                    flow_st_name
+                ));
+                out.push_str(&format!(
+                    "  %p1 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 1\n  store i32 %subpath_id, ptr %p1, align 4\n",
+                    flow_st_name
+                ));
+                out.push_str(&format!(
+                    "  %p2 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 2\n  store i64 0, ptr %p2, align 8\n",
+                    flow_st_name
+                ));
+                out.push_str(&format!(
+                    "  %p3 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 3\n  store i32 0, ptr %p3, align 4\n",
+                    flow_st_name
+                ));
+                out.push_str(&format!(
+                    "  %p4 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 4\n  store i16 %slice_tag, ptr %p4, align 2\n",
+                    flow_st_name
+                ));
+                out.push_str(&format!(
+                    "  %p5 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 5\n  store i32 0, ptr %p5, align 4\n  ret void\n}}\n\n",
+                    flow_st_name
+                ));
+
+                // 2. Binary Wire Serialization Stub (Network Byte Order Big-Endian)
+                out.push_str(&format!(
+                    "define linkonce_odr i64 @__ifa_multipath_flow_serialize_{}(ptr %flow, ptr %out_buf, i64 %buf_len) alwaysinline {{\nentry:\n",
+                    p_name
+                ));
+                out.push_str("  %cmp = icmp ult i64 %buf_len, 30\n  br i1 %cmp, label %err, label %do_ser\ndo_ser:\n");
+                out.push_str(&format!(
+                    "  %p0 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 0\n  %v0 = load i64, ptr %p0, align 8\n",
+                    flow_st_name
+                ));
+                out.push_str(&format!(
+                    "  %p1 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 1\n  %v1 = load i32, ptr %p1, align 4\n",
+                    flow_st_name
+                ));
+                out.push_str(&format!(
+                    "  %p2 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 2\n  %v2 = load i64, ptr %p2, align 8\n",
+                    flow_st_name
+                ));
+                out.push_str(&format!(
+                    "  %p3 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 3\n  %v3 = load i32, ptr %p3, align 4\n",
+                    flow_st_name
+                ));
+                out.push_str(&format!(
+                    "  %p4 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 4\n  %v4 = load i16, ptr %p4, align 2\n",
+                    flow_st_name
+                ));
+                out.push_str(&format!(
+                    "  %p5 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 5\n  %v5 = load i32, ptr %p5, align 4\n",
+                    flow_st_name
+                ));
+                out.push_str("  %v0_be = call i64 @llvm.bswap.i64(i64 %v0)\n  store i64 %v0_be, ptr %out_buf, align 1\n");
+                out.push_str("  %dst1 = getelementptr inbounds i8, ptr %out_buf, i64 8\n  %v1_be = call i32 @llvm.bswap.i32(i32 %v1)\n  store i32 %v1_be, ptr %dst1, align 1\n");
+                out.push_str("  %dst2 = getelementptr inbounds i8, ptr %out_buf, i64 12\n  %v2_be = call i64 @llvm.bswap.i64(i64 %v2)\n  store i64 %v2_be, ptr %dst2, align 1\n");
+                out.push_str("  %dst3 = getelementptr inbounds i8, ptr %out_buf, i64 20\n  %v3_be = call i32 @llvm.bswap.i32(i32 %v3)\n  store i32 %v3_be, ptr %dst3, align 1\n");
+                out.push_str("  %dst4 = getelementptr inbounds i8, ptr %out_buf, i64 24\n  %v4_be = call i16 @llvm.bswap.i16(i16 %v4)\n  store i16 %v4_be, ptr %dst4, align 1\n");
+                out.push_str("  %dst5 = getelementptr inbounds i8, ptr %out_buf, i64 26\n  %v5_be = call i32 @llvm.bswap.i32(i32 %v5)\n  store i32 %v5_be, ptr %dst5, align 1\n");
+                out.push_str("  ret i64 30\nerr:\n  ret i64 -1\n}\n\n");
+
+                // 3. Binary Wire Deserialization Stub (Network Byte Order Big-Endian)
+                out.push_str(&format!(
+                    "define linkonce_odr i64 @__ifa_multipath_flow_deserialize_{}(ptr %flow, ptr %in_buf, i64 %buf_len) alwaysinline {{\nentry:\n",
+                    p_name
+                ));
+                out.push_str("  %cmp = icmp ult i64 %buf_len, 30\n  br i1 %cmp, label %err, label %do_deser\ndo_deser:\n");
+                out.push_str("  %raw0 = load i64, ptr %in_buf, align 1\n  %v0 = call i64 @llvm.bswap.i64(i64 %raw0)\n");
+                out.push_str(&format!(
+                    "  %p0 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 0\n  store i64 %v0, ptr %p0, align 8\n",
+                    flow_st_name
+                ));
+                out.push_str("  %src1 = getelementptr inbounds i8, ptr %in_buf, i64 8\n  %raw1 = load i32, ptr %src1, align 1\n  %v1 = call i32 @llvm.bswap.i32(i32 %raw1)\n");
+                out.push_str(&format!(
+                    "  %p1 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 1\n  store i32 %v1, ptr %p1, align 4\n",
+                    flow_st_name
+                ));
+                out.push_str("  %src2 = getelementptr inbounds i8, ptr %in_buf, i64 12\n  %raw2 = load i64, ptr %src2, align 1\n  %v2 = call i64 @llvm.bswap.i64(i64 %raw2)\n");
+                out.push_str(&format!(
+                    "  %p2 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 2\n  store i64 %v2, ptr %p2, align 8\n",
+                    flow_st_name
+                ));
+                out.push_str("  %src3 = getelementptr inbounds i8, ptr %in_buf, i64 20\n  %raw3 = load i32, ptr %src3, align 1\n  %v3 = call i32 @llvm.bswap.i32(i32 %raw3)\n");
+                out.push_str(&format!(
+                    "  %p3 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 3\n  store i32 %v3, ptr %p3, align 4\n",
+                    flow_st_name
+                ));
+                out.push_str("  %src4 = getelementptr inbounds i8, ptr %in_buf, i64 24\n  %raw4 = load i16, ptr %src4, align 1\n  %v4 = call i16 @llvm.bswap.i16(i16 %raw4)\n");
+                out.push_str(&format!(
+                    "  %p4 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 4\n  store i16 %v4, ptr %p4, align 2\n",
+                    flow_st_name
+                ));
+                out.push_str("  %src5 = getelementptr inbounds i8, ptr %in_buf, i64 26\n  %raw5 = load i32, ptr %src5, align 1\n  %v5 = call i32 @llvm.bswap.i32(i32 %raw5)\n");
+                out.push_str(&format!(
+                    "  %p5 = getelementptr inbounds %struct.{}, ptr %flow, i32 0, i32 5\n  store i32 %v5, ptr %p5, align 4\n  ret i64 30\nerr:\n  ret i64 -1\n}}\n\n",
+                    flow_st_name
+                ));
+            }
+        }
+
+        // Subpath metadata initialization helper if __MultipathSubpathMeta is declared
+        if module
+            .structs
+            .iter()
+            .any(|s| INTERNER.resolve(&s.name) == "__MultipathSubpathMeta")
+        {
+            out.push_str("define linkonce_odr void @__ifa_multipath_subpath_meta_init(ptr %meta, i32 %subpath_id, i32 %ifindex, i32 %weight) alwaysinline {\nentry:\n");
+            out.push_str("  %p0 = getelementptr inbounds %struct.__MultipathSubpathMeta, ptr %meta, i32 0, i32 0\n  store i32 %subpath_id, ptr %p0, align 4\n");
+            out.push_str("  %p1 = getelementptr inbounds %struct.__MultipathSubpathMeta, ptr %meta, i32 0, i32 1\n  store i32 %ifindex, ptr %p1, align 4\n");
+            out.push_str("  %p2 = getelementptr inbounds %struct.__MultipathSubpathMeta, ptr %meta, i32 0, i32 2\n  store i32 %weight, ptr %p2, align 4\n");
+            out.push_str("  %p3 = getelementptr inbounds %struct.__MultipathSubpathMeta, ptr %meta, i32 0, i32 3\n  store i64 0, ptr %p3, align 8\n");
+            out.push_str("  %p4 = getelementptr inbounds %struct.__MultipathSubpathMeta, ptr %meta, i32 0, i32 4\n  store i32 0, ptr %p4, align 4\n");
+            out.push_str("  %p5 = getelementptr inbounds %struct.__MultipathSubpathMeta, ptr %meta, i32 0, i32 5\n  store i8 1, ptr %p5, align 1\n  ret void\n}\n\n");
         }
 
         // 3b. Scan and emit isolated blocking FFI pack structs and execution thunks
@@ -7209,5 +7348,152 @@ fn format_llvm_float(val: f64) -> String {
         }
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ifa_fir::{FirFunction, FirProtocol, FirProtocolChannel, FirStruct, FirType, Terminator};
+    use ifa_sema::types::IntType;
+    use ifa_span::Span;
+
+    #[test]
+    fn test_llvm_multipath_protocol_flow_encapsulation_and_stubs() {
+        let target = LlvmTargetConfig::host();
+        let mut emitter = LlvmIrEmitter::new(&target);
+
+        let proto_name = INTERNER.intern("TelemetryProto");
+        let flow_st_name = INTERNER.intern("__MultipathFlow_TelemetryProto");
+        let meta_st_name = INTERNER.intern("__MultipathSubpathMeta");
+
+        let mut module = FirModule::new(INTERNER.intern("test_mp_proto"));
+
+        module.protocols.push(FirProtocol {
+            name: proto_name,
+            is_pub: true,
+            is_multipath: true,
+            channels: vec![
+                FirProtocolChannel {
+                    name: INTERNER.intern("metrics"),
+                    is_slice: true,
+                    is_multipath: true,
+                    ty: FirType::Int(IntType::U64),
+                    redundancy: 2,
+                    fec_enabled: true,
+                    pacing_enabled: false,
+                    subpath_tags: vec![INTERNER.intern("primary"), INTERNER.intern("secondary")],
+                    span: Span::DUMMY,
+                },
+                FirProtocolChannel {
+                    name: INTERNER.intern("alerts"),
+                    is_slice: false,
+                    is_multipath: false,
+                    ty: FirType::Int(IntType::U64),
+                    redundancy: 1,
+                    fec_enabled: false,
+                    pacing_enabled: true,
+                    subpath_tags: vec![],
+                    span: Span::DUMMY,
+                },
+            ],
+            flow_encapsulation_struct: flow_st_name,
+            span: Span::DUMMY,
+        });
+
+        module.structs.push(FirStruct {
+            name: flow_st_name,
+            fields: vec![
+                (INTERNER.intern("flow_id"), FirType::Int(IntType::U64)),
+                (INTERNER.intern("subpath_id"), FirType::Int(IntType::U32)),
+                (INTERNER.intern("seq_num"), FirType::Int(IntType::U64)),
+                (INTERNER.intern("flags"), FirType::Int(IntType::U32)),
+                (INTERNER.intern("slice_tag"), FirType::Int(IntType::U16)),
+                (INTERNER.intern("payload_len"), FirType::Int(IntType::U32)),
+                (INTERNER.intern("metrics"), FirType::Int(IntType::U64)),
+                (INTERNER.intern("alerts"), FirType::Int(IntType::U64)),
+            ],
+            is_pub: true,
+            span: Span::DUMMY,
+        });
+
+        module.structs.push(FirStruct {
+            name: meta_st_name,
+            fields: vec![
+                (INTERNER.intern("subpath_id"), FirType::Int(IntType::U32)),
+                (
+                    INTERNER.intern("interface_index"),
+                    FirType::Int(IntType::U32),
+                ),
+                (INTERNER.intern("weight"), FirType::Int(IntType::U32)),
+                (INTERNER.intern("rtt_micros"), FirType::Int(IntType::U64)),
+                (INTERNER.intern("loss_rate_ppm"), FirType::Int(IntType::U32)),
+                (INTERNER.intern("state"), FirType::Int(IntType::U8)),
+            ],
+            is_pub: true,
+            span: Span::DUMMY,
+        });
+
+        let main_name = INTERNER.intern("main");
+        let mut func = FirFunction::new(
+            main_name,
+            vec![],
+            FirType::Unit,
+            false,
+            true,
+            false,
+            None,
+            Span::DUMMY,
+        );
+        let entry_bb = func.get_block_mut(BlockId(0)).unwrap();
+        entry_bb.set_terminator(Terminator::Return(None));
+        module.functions.push(func);
+
+        let ir = emitter
+            .emit_module(&module)
+            .expect("Emitting LLVM IR for multipath module must succeed");
+
+        assert!(
+            ir.contains("declare void @ifa_rt_multipath_flow_init(ptr, i64, i32, i16)"),
+            "Missing flow init intrinsic declaration"
+        );
+        assert!(
+            ir.contains("declare i64 @ifa_rt_multipath_flow_serialize(ptr, ptr, i64)"),
+            "Missing flow serialize intrinsic declaration"
+        );
+        assert!(
+            ir.contains("declare i64 @ifa_rt_multipath_flow_deserialize(ptr, ptr, i64)"),
+            "Missing flow deserialize intrinsic declaration"
+        );
+        assert!(
+            ir.contains("declare void @ifa_rt_multipath_subpath_meta_init(ptr, i32, i32, i32)"),
+            "Missing subpath meta intrinsic declaration"
+        );
+
+        assert!(
+            ir.contains("%struct.__MultipathFlow_TelemetryProto = type {"),
+            "Missing struct definition for __MultipathFlow_TelemetryProto"
+        );
+        assert!(
+            ir.contains("%struct.__MultipathSubpathMeta = type {"),
+            "Missing struct definition for __MultipathSubpathMeta"
+        );
+
+        assert!(
+            ir.contains("define linkonce_odr void @__ifa_multipath_flow_init_TelemetryProto"),
+            "Missing flow init stub for TelemetryProto"
+        );
+        assert!(
+            ir.contains("define linkonce_odr i64 @__ifa_multipath_flow_serialize_TelemetryProto"),
+            "Missing flow serialize stub for TelemetryProto"
+        );
+        assert!(
+            ir.contains("define linkonce_odr i64 @__ifa_multipath_flow_deserialize_TelemetryProto"),
+            "Missing flow deserialize stub for TelemetryProto"
+        );
+        assert!(
+            ir.contains("define linkonce_odr void @__ifa_multipath_subpath_meta_init"),
+            "Missing subpath meta init stub"
+        );
     }
 }

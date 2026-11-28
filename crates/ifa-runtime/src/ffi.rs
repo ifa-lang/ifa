@@ -5363,3 +5363,140 @@ pub extern "C" fn ifa_rt_sys_memory_virtual() -> u64 {
     }
     0
 }
+
+// ---------------------------------------------------------------------------
+// Multipath Flow Encapsulation & Serialization Runtime Intrinsics
+// ---------------------------------------------------------------------------
+
+/// Standard 30-byte wire header layout size for Multipath Flow frames.
+pub const MULTIPATH_FLOW_WIRE_HEADER_SIZE: usize = 30;
+
+/// In-memory flow header layout matching SSA struct field offsets.
+#[repr(C, align(8))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IfaMultipathFlowHeader {
+    pub flow_id: u64,
+    pub subpath_id: u64,
+    pub seq_num: u64,
+    pub flags: u64,
+    pub slice_tag: u64,
+    pub payload_len: u64,
+}
+
+/// In-memory subpath metadata layout matching __MultipathSubpathMeta.
+#[repr(C, align(8))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IfaMultipathSubpathMeta {
+    pub subpath_id: u64,
+    pub interface_index: u64,
+    pub weight: u64,
+    pub rtt_micros: u64,
+    pub loss_rate_ppm: u64,
+    pub state: u64,
+}
+
+/// Initialize flow header fields in an allocated flow encapsulation struct.
+#[no_mangle]
+pub extern "C" fn ifa_rt_multipath_flow_init(
+    flow: *mut u8,
+    flow_id: u64,
+    subpath_id: u32,
+    slice_tag: u16,
+) {
+    if flow.is_null() {
+        return;
+    }
+    unsafe {
+        *(flow as *mut u64) = flow_id;
+        *(flow.add(8) as *mut u64) = subpath_id as u64;
+        *(flow.add(16) as *mut u64) = 0;
+        *(flow.add(24) as *mut u64) = 0;
+        *(flow.add(32) as *mut u64) = slice_tag as u64;
+        *(flow.add(40) as *mut u64) = 0;
+    }
+}
+
+/// Serialize flow header fields into binary wire format (big-endian).
+#[no_mangle]
+pub extern "C" fn ifa_rt_multipath_flow_serialize(
+    flow: *const u8,
+    out_buf: *mut u8,
+    buf_len: usize,
+) -> i64 {
+    if flow.is_null() || out_buf.is_null() || buf_len < MULTIPATH_FLOW_WIRE_HEADER_SIZE {
+        return -1;
+    }
+    unsafe {
+        let flow_id = *(flow as *const u64);
+        let subpath_id = *(flow.add(8) as *const u64) as u32;
+        let seq_num = *(flow.add(16) as *const u64);
+        let flags = *(flow.add(24) as *const u64) as u32;
+        let slice_tag = *(flow.add(32) as *const u64) as u16;
+        let payload_len = *(flow.add(40) as *const u64) as u32;
+
+        let out = std::slice::from_raw_parts_mut(out_buf, buf_len);
+        out[0..8].copy_from_slice(&flow_id.to_be_bytes());
+        out[8..12].copy_from_slice(&subpath_id.to_be_bytes());
+        out[12..20].copy_from_slice(&seq_num.to_be_bytes());
+        out[20..24].copy_from_slice(&flags.to_be_bytes());
+        out[24..26].copy_from_slice(&slice_tag.to_be_bytes());
+        out[26..30].copy_from_slice(&payload_len.to_be_bytes());
+
+        MULTIPATH_FLOW_WIRE_HEADER_SIZE as i64
+    }
+}
+
+/// Deserialize binary wire format (big-endian) into flow header fields.
+#[no_mangle]
+pub extern "C" fn ifa_rt_multipath_flow_deserialize(
+    flow: *mut u8,
+    in_buf: *const u8,
+    buf_len: usize,
+) -> i64 {
+    if flow.is_null() || in_buf.is_null() || buf_len < MULTIPATH_FLOW_WIRE_HEADER_SIZE {
+        return -1;
+    }
+    unsafe {
+        let src = std::slice::from_raw_parts(in_buf, buf_len);
+        let flow_id = u64::from_be_bytes([
+            src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
+        ]);
+        let subpath_id = u32::from_be_bytes([src[8], src[9], src[10], src[11]]);
+        let seq_num = u64::from_be_bytes([
+            src[12], src[13], src[14], src[15], src[16], src[17], src[18], src[19],
+        ]);
+        let flags = u32::from_be_bytes([src[20], src[21], src[22], src[23]]);
+        let slice_tag = u16::from_be_bytes([src[24], src[25]]);
+        let payload_len = u32::from_be_bytes([src[26], src[27], src[28], src[29]]);
+
+        *(flow as *mut u64) = flow_id;
+        *(flow.add(8) as *mut u64) = subpath_id as u64;
+        *(flow.add(16) as *mut u64) = seq_num;
+        *(flow.add(24) as *mut u64) = flags as u64;
+        *(flow.add(32) as *mut u64) = slice_tag as u64;
+        *(flow.add(40) as *mut u64) = payload_len as u64;
+
+        MULTIPATH_FLOW_WIRE_HEADER_SIZE as i64
+    }
+}
+
+/// Initialize subpath metadata struct fields.
+#[no_mangle]
+pub extern "C" fn ifa_rt_multipath_subpath_meta_init(
+    meta: *mut u8,
+    subpath_id: u32,
+    ifindex: u32,
+    weight: u32,
+) {
+    if meta.is_null() {
+        return;
+    }
+    unsafe {
+        *(meta as *mut u64) = subpath_id as u64;
+        *(meta.add(8) as *mut u64) = ifindex as u64;
+        *(meta.add(16) as *mut u64) = weight as u64;
+        *(meta.add(24) as *mut u64) = 0; // rtt_micros
+        *(meta.add(32) as *mut u64) = 0; // loss_rate_ppm
+        *(meta.add(40) as *mut u64) = 1; // state: 1 (Active)
+    }
+}
