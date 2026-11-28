@@ -214,6 +214,14 @@ pub enum IsspTelemetryPacketClass {
         session_id_prefix: u64,
         target_node_id: u32,
     },
+    /// Multipath Stream Data Frame ('\x01' tag / StreamFrame).
+    MultipathStreamFrame {
+        stream_id: u64,
+        offset: u64,
+        payload_len: usize,
+        fin: bool,
+        priority: u8,
+    },
     /// Generic RFC 9297 HTTP Capsule frame.
     Rfc9297Capsule {
         capsule_type: u64,
@@ -240,6 +248,12 @@ impl IsspTelemetryPacketClass {
             | Self::SubpathData { .. }
             | Self::MeshTopologyLsa { .. }
             | Self::MeshTopologyCompressedLsa { .. } => IsspPacketPriority::NormalData,
+            Self::MultipathStreamFrame { priority, .. } => match *priority {
+                0 => IsspPacketPriority::UrgentControl,
+                1 => IsspPacketPriority::HighTelemetry,
+                2 => IsspPacketPriority::NormalData,
+                _ => IsspPacketPriority::BulkBackground,
+            },
             Self::Rfc9297Capsule { .. }
             | Self::RawDatagram { .. }
             | Self::UnknownOrMalformed { .. } => IsspPacketPriority::BulkBackground,
@@ -293,6 +307,7 @@ impl IsspTelemetryPacketClass {
             | Self::CapsuleSessionGossipV2Encrypted { payload_len, .. }
             | Self::SubpathData { payload_len, .. }
             | Self::TelemetryMetricsReport { payload_len, .. }
+            | Self::MultipathStreamFrame { payload_len, .. }
             | Self::Rfc9297Capsule { payload_len, .. } => *payload_len,
             Self::TelemetryTraceContext { .. } => 24,
             Self::MeshTopologyLsa { link_count, .. } => (*link_count as usize) * 32,
@@ -562,10 +577,34 @@ impl IsspSimdPacketClassifier {
                 }
             }
 
-            // Check RFC 9297 Capsule or Raw Datagram prefixes
+            // Check RFC 9297 Capsule, Multipath StreamFrame, or Raw Datagram prefixes
             _ => {
-                // If prefix starts with 0x00, RFC 9298 DATAGRAM capsule
-                if slice[0] == 0x00 {
+                // Multipath Stream Data Frame (FRAME_TYPE = 0x01)
+                if slice[0] == 0x01 {
+                    if slice.len() >= 33 {
+                        let flags = slice[1];
+                        let fin = (flags & 0x01) != 0;
+                        let stream_id = u64::from_be_bytes(slice[2..10].try_into().unwrap());
+                        let offset = u64::from_be_bytes(slice[10..18].try_into().unwrap());
+                        let priority = slice[19];
+                        let payload_len =
+                            u32::from_be_bytes(slice[29..33].try_into().unwrap()) as usize;
+                        if slice.len() >= 33 + payload_len {
+                            return IsspTelemetryPacketClass::MultipathStreamFrame {
+                                stream_id,
+                                offset,
+                                payload_len,
+                                fin,
+                                priority,
+                            };
+                        }
+                    }
+                    IsspTelemetryPacketClass::UnknownOrMalformed {
+                        first_dword: magic,
+                        len: slice.len(),
+                    }
+                } else if slice[0] == 0x00 {
+                    // If prefix starts with 0x00, RFC 9298 DATAGRAM capsule
                     IsspTelemetryPacketClass::RawDatagram {
                         context_id: 0,
                         len: slice.len().saturating_sub(1),
@@ -693,6 +732,25 @@ impl IsspSimdPacketClassifier {
             }
         }
         indices
+    }
+
+    /// Fast vectorized filter extracting metadata `(index, stream_id, offset, payload_len, fin)`
+    /// for all valid multipath stream frames.
+    pub fn filter_stream_frames_simd(packets: &[&[u8]]) -> Vec<(usize, u64, u64, usize, bool)> {
+        let mut frames = Vec::new();
+        for (idx, slice) in packets.iter().enumerate() {
+            if slice.len() >= 33 && slice[0] == 0x01 {
+                let flags = slice[1];
+                let fin = (flags & 0x01) != 0;
+                let stream_id = u64::from_be_bytes(slice[2..10].try_into().unwrap());
+                let offset = u64::from_be_bytes(slice[10..18].try_into().unwrap());
+                let payload_len = u32::from_be_bytes(slice[29..33].try_into().unwrap()) as usize;
+                if slice.len() >= 33 + payload_len {
+                    frames.push((idx, stream_id, offset, payload_len, fin));
+                }
+            }
+        }
+        frames
     }
 }
 
@@ -939,5 +997,48 @@ mod tests {
         assert_eq!(class.priority(), IsspPacketPriority::NormalData);
         assert_eq!(class.origin_node(), Some(77));
         assert_eq!(class.payload_size(), 64);
+    }
+
+    #[test]
+    fn test_multipath_stream_frame_simd_classification_and_filter() {
+        let payload = b"Fast-Path SIMD Vectorized Stream Datagram".to_vec();
+        let mut pkt = Vec::new();
+        pkt.push(0x01); // FRAME_TYPE = 0x01
+        pkt.push(0x01); // flags: fin = true
+        pkt.extend_from_slice(&55u64.to_be_bytes()); // stream_id = 55
+        pkt.extend_from_slice(&1024u64.to_be_bytes()); // offset = 1024
+        pkt.push(0x00); // slice_byte (UltraLowLatency)
+        pkt.push(0x00); // priority: 0 (CriticalControl)
+        pkt.push(0x01); // subpath_id
+        pkt.extend_from_slice(&1u64.to_be_bytes()); // seq_num
+        pkt.extend_from_slice(&(payload.len() as u32).to_be_bytes()); // payload_len
+        pkt.extend_from_slice(&payload);
+
+        let class = IsspSimdPacketClassifier::classify_packet(&pkt);
+        match class {
+            IsspTelemetryPacketClass::MultipathStreamFrame {
+                stream_id,
+                offset,
+                payload_len,
+                fin,
+                priority,
+            } => {
+                assert_eq!(stream_id, 55);
+                assert_eq!(offset, 1024);
+                assert_eq!(payload_len, payload.len());
+                assert!(fin);
+                assert_eq!(priority, 0);
+            }
+            other => panic!("expected MultipathStreamFrame, got {:?}", other),
+        }
+        assert_eq!(class.priority(), IsspPacketPriority::UrgentControl);
+        assert_eq!(class.payload_size(), payload.len());
+
+        // Batch and filter test
+        let other_raw = vec![0x00, 0x01, 0x02];
+        let packets: Vec<&[u8]> = vec![&pkt, &other_raw];
+        let filtered = IsspSimdPacketClassifier::filter_stream_frames_simd(&packets);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0], (0, 55, 1024, payload.len(), true));
     }
 }

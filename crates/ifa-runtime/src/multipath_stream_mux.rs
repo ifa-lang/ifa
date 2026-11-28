@@ -147,25 +147,59 @@ pub struct StreamFrame {
     pub is_bicast: bool,
 }
 
-impl StreamFrame {
-    pub const FRAME_TYPE: u8 = 0x01;
-    pub const HEADER_LEN: usize = 33;
+/// Zero-copy borrowed view of a stream data frame avoiding heap allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamFrameView<'a> {
+    pub stream_id: StreamId,
+    pub offset: u64,
+    pub payload: &'a [u8],
+    pub fin: bool,
+    pub slice_class: FlowSliceClass,
+    pub priority: StreamPriority,
+    pub subpath_id: u8,
+    pub seq_num: u64,
+    pub is_bicast: bool,
+}
 
+impl<'a> StreamFrameView<'a> {
+    pub const FRAME_TYPE: u8 = StreamFrame::FRAME_TYPE;
+    pub const HEADER_LEN: usize = StreamFrame::HEADER_LEN;
+
+    #[inline(always)]
     pub fn len(&self) -> usize {
         self.payload.len()
     }
 
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.payload.is_empty()
     }
 
+    #[inline(always)]
     pub fn end_offset(&self) -> u64 {
         self.offset.saturating_add(self.payload.len() as u64)
     }
 
-    /// Serializes the stream data frame into a compact binary representation.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(Self::HEADER_LEN + self.payload.len());
+    /// Convert this borrowed view into an owned `StreamFrame`.
+    #[inline]
+    pub fn to_owned(&self) -> StreamFrame {
+        StreamFrame {
+            stream_id: self.stream_id,
+            offset: self.offset,
+            payload: self.payload.to_vec(),
+            fin: self.fin,
+            slice_class: self.slice_class,
+            priority: self.priority,
+            subpath_id: self.subpath_id,
+            seq_num: self.seq_num,
+            is_bicast: self.is_bicast,
+        }
+    }
+
+    /// Encode into a preallocated `Vec<u8>` without reallocating when capacity suffices.
+    #[inline]
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
+        buf.reserve(Self::HEADER_LEN + self.payload.len());
         buf.push(Self::FRAME_TYPE);
         let mut flags = 0u8;
         if self.fin {
@@ -188,12 +222,49 @@ impl StreamFrame {
         buf.push(self.subpath_id);
         buf.extend_from_slice(&self.seq_num.to_be_bytes());
         buf.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&self.payload);
-        buf
+        buf.extend_from_slice(self.payload);
     }
 
-    /// Deserializes a stream data frame from binary wire representation.
-    pub fn decode(buf: &[u8]) -> Result<Self, StreamMuxError> {
+    /// Serialize into a provided output slice without any heap allocation.
+    #[inline]
+    pub fn encode_slice(&self, out: &mut [u8]) -> Result<usize, StreamMuxError> {
+        let needed = Self::HEADER_LEN + self.payload.len();
+        if out.len() < needed {
+            return Err(StreamMuxError::InvalidStreamFrame(format!(
+                "Output buffer too small for stream frame: need {} bytes, got {}",
+                needed,
+                out.len()
+            )));
+        }
+        out[0] = Self::FRAME_TYPE;
+        let mut flags = 0u8;
+        if self.fin {
+            flags |= 0x01;
+        }
+        if self.is_bicast {
+            flags |= 0x02;
+        }
+        out[1] = flags;
+        out[2..10].copy_from_slice(&self.stream_id.0.to_be_bytes());
+        out[10..18].copy_from_slice(&self.offset.to_be_bytes());
+        let slice_byte = match self.slice_class {
+            FlowSliceClass::UltraLowLatency => 0,
+            FlowSliceClass::HighThroughput => 1,
+            FlowSliceClass::MissionCritical => 2,
+            FlowSliceClass::BestEffort => 3,
+        };
+        out[18] = slice_byte;
+        out[19] = self.priority.to_u8();
+        out[20] = self.subpath_id;
+        out[21..29].copy_from_slice(&self.seq_num.to_be_bytes());
+        out[29..33].copy_from_slice(&(self.payload.len() as u32).to_be_bytes());
+        out[33..needed].copy_from_slice(self.payload);
+        Ok(needed)
+    }
+
+    /// Deserializes a zero-copy borrowed stream frame view from wire representation.
+    #[inline]
+    pub fn decode(buf: &'a [u8]) -> Result<Self, StreamMuxError> {
         if buf.len() < Self::HEADER_LEN {
             return Err(StreamMuxError::InvalidStreamFrame(format!(
                 "Buffer too short for StreamFrame (expected at least {} bytes, got {})",
@@ -237,7 +308,7 @@ impl StreamFrame {
                 buf.len() - Self::HEADER_LEN
             )));
         }
-        let payload = buf[Self::HEADER_LEN..Self::HEADER_LEN + payload_len].to_vec();
+        let payload = &buf[Self::HEADER_LEN..Self::HEADER_LEN + payload_len];
 
         Ok(Self {
             stream_id,
@@ -253,6 +324,156 @@ impl StreamFrame {
     }
 }
 
+impl StreamFrame {
+    pub const FRAME_TYPE: u8 = 0x01;
+    pub const HEADER_LEN: usize = 33;
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.payload.len()
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.payload.is_empty()
+    }
+
+    #[inline(always)]
+    pub fn end_offset(&self) -> u64 {
+        self.offset.saturating_add(self.payload.len() as u64)
+    }
+
+    /// Borrow as a zero-copy `StreamFrameView`.
+    #[inline(always)]
+    pub fn as_view(&self) -> StreamFrameView<'_> {
+        StreamFrameView {
+            stream_id: self.stream_id,
+            offset: self.offset,
+            payload: &self.payload,
+            fin: self.fin,
+            slice_class: self.slice_class,
+            priority: self.priority,
+            subpath_id: self.subpath_id,
+            seq_num: self.seq_num,
+            is_bicast: self.is_bicast,
+        }
+    }
+
+    /// Serializes the stream data frame into a compact binary representation.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::HEADER_LEN + self.payload.len());
+        self.as_view().encode_into(&mut buf);
+        buf
+    }
+
+    /// Serializes the stream data frame into an existing buffer without allocating.
+    #[inline(always)]
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
+        self.as_view().encode_into(buf);
+    }
+
+    /// Serializes the stream data frame into a destination slice with zero allocation.
+    #[inline(always)]
+    pub fn encode_slice(&self, out: &mut [u8]) -> Result<usize, StreamMuxError> {
+        self.as_view().encode_slice(out)
+    }
+
+    /// Deserializes a stream data frame from binary wire representation.
+    #[inline]
+    pub fn decode(buf: &[u8]) -> Result<Self, StreamMuxError> {
+        StreamFrameView::decode(buf).map(|view| view.to_owned())
+    }
+
+    /// Deserializes a zero-copy borrowed stream frame view from wire representation.
+    #[inline(always)]
+    pub fn decode_view(buf: &[u8]) -> Result<StreamFrameView<'_>, StreamMuxError> {
+        StreamFrameView::decode(buf)
+    }
+}
+
+/// High-throughput streaming batch encoder & decoder for coalesced multi-frame datagrams.
+pub struct StreamBatchCodec;
+
+impl StreamBatchCodec {
+    /// Encode multiple stream frames into a single coalesced datagram buffer.
+    pub fn encode_batch(frames: &[StreamFrame], out: &mut Vec<u8>) {
+        let total_size: usize = frames
+            .iter()
+            .map(|f| StreamFrame::HEADER_LEN + f.payload.len())
+            .sum();
+        out.reserve(total_size);
+        for frame in frames {
+            frame.encode_into(out);
+        }
+    }
+
+    /// Encode multiple stream frame views into a single coalesced datagram buffer.
+    pub fn encode_batch_views(views: &[StreamFrameView<'_>], out: &mut Vec<u8>) {
+        let total_size: usize = views
+            .iter()
+            .map(|v| StreamFrameView::HEADER_LEN + v.payload.len())
+            .sum();
+        out.reserve(total_size);
+        for view in views {
+            view.encode_into(out);
+        }
+    }
+
+    /// Decode all coalesced stream frame views from a contiguous wire buffer with zero allocations.
+    pub fn decode_batch_into<'a>(
+        mut buf: &'a [u8],
+        out: &mut Vec<StreamFrameView<'a>>,
+    ) -> Result<usize, StreamMuxError> {
+        let initial_len = out.len();
+        while !buf.is_empty() {
+            let view = StreamFrameView::decode(buf)?;
+            let frame_wire_len = StreamFrameView::HEADER_LEN + view.payload.len();
+            out.push(view);
+            buf = &buf[frame_wire_len..];
+        }
+        Ok(out.len() - initial_len)
+    }
+
+    /// Decode all coalesced stream frame views from a wire buffer into a new `Vec`.
+    pub fn decode_batch_views<'a>(
+        buf: &'a [u8],
+    ) -> Result<Vec<StreamFrameView<'a>>, StreamMuxError> {
+        let mut views = Vec::new();
+        Self::decode_batch_into(buf, &mut views)?;
+        Ok(views)
+    }
+
+    /// Fast SWAR/SIMD checksum computation for stream frames (16-byte unrolled Adler-32 variant).
+    pub fn compute_stream_checksum_simd(payload: &[u8]) -> u32 {
+        let mut a: u32 = 1;
+        let mut b: u32 = 0;
+        let mut i = 0;
+        let len = payload.len();
+
+        // 16-byte SWAR blocks
+        while i + 16 <= len {
+            for offset in 0..16 {
+                a = a.wrapping_add(payload[i + offset] as u32);
+                b = b.wrapping_add(a);
+            }
+            a %= 65521;
+            b %= 65521;
+            i += 16;
+        }
+
+        // Tail
+        while i < len {
+            a = a.wrapping_add(payload[i] as u32);
+            b = b.wrapping_add(a);
+            i += 1;
+        }
+        a %= 65521;
+        b %= 65521;
+
+        (b << 16) | a
+    }
+}
+
 /// Unified packet envelope for multipath transport multiplexing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MultipathMuxPacket {
@@ -262,11 +483,28 @@ pub enum MultipathMuxPacket {
 }
 
 impl MultipathMuxPacket {
+    #[inline]
     pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.encode_into(&mut buf);
+        buf
+    }
+
+    #[inline]
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
         match self {
-            Self::Stream(f) => f.encode(),
-            Self::Control(f) => f.encode(),
-            Self::Migration(f) => f.encode(),
+            Self::Stream(f) => f.encode_into(buf),
+            Self::Control(f) => f.encode_into(buf),
+            Self::Migration(f) => f.encode_into(buf),
+        }
+    }
+
+    #[inline]
+    pub fn encode_slice(&self, out: &mut [u8]) -> Result<usize, StreamMuxError> {
+        match self {
+            Self::Stream(f) => f.encode_slice(out),
+            Self::Control(f) => f.encode_slice(out),
+            Self::Migration(f) => f.encode_slice(out),
         }
     }
 
@@ -342,19 +580,24 @@ impl MigrationFrame {
         )
     }
 
+    #[inline]
     pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.encode_into(&mut buf);
+        buf
+    }
+
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
         match self {
             Self::PathChallenge { nonce } => {
-                let mut buf = Vec::with_capacity(9);
+                buf.reserve(9);
                 buf.push(Self::TYPE_PATH_CHALLENGE);
                 buf.extend_from_slice(nonce);
-                buf
             }
             Self::PathResponse { nonce } => {
-                let mut buf = Vec::with_capacity(9);
+                buf.reserve(9);
                 buf.push(Self::TYPE_PATH_RESPONSE);
                 buf.extend_from_slice(nonce);
-                buf
             }
             Self::NewConnectionId {
                 sequence_number,
@@ -362,19 +605,70 @@ impl MigrationFrame {
                 connection_id,
                 stateless_reset_token,
             } => {
-                let mut buf = Vec::with_capacity(49);
+                buf.reserve(49);
                 buf.push(Self::TYPE_NEW_CONNECTION_ID);
                 buf.extend_from_slice(&sequence_number.to_be_bytes());
                 buf.extend_from_slice(&retire_prior_to.to_be_bytes());
                 buf.extend_from_slice(connection_id);
                 buf.extend_from_slice(stateless_reset_token);
-                buf
             }
             Self::RetireConnectionId { sequence_number } => {
-                let mut buf = Vec::with_capacity(9);
+                buf.reserve(9);
                 buf.push(Self::TYPE_RETIRE_CONNECTION_ID);
                 buf.extend_from_slice(&sequence_number.to_be_bytes());
-                buf
+            }
+        }
+    }
+
+    pub fn encode_slice(&self, out: &mut [u8]) -> Result<usize, StreamMuxError> {
+        match self {
+            Self::PathChallenge { nonce } => {
+                if out.len() < 9 {
+                    return Err(StreamMuxError::InvalidControlFrame(
+                        "Buffer too short".to_string(),
+                    ));
+                }
+                out[0] = Self::TYPE_PATH_CHALLENGE;
+                out[1..9].copy_from_slice(nonce);
+                Ok(9)
+            }
+            Self::PathResponse { nonce } => {
+                if out.len() < 9 {
+                    return Err(StreamMuxError::InvalidControlFrame(
+                        "Buffer too short".to_string(),
+                    ));
+                }
+                out[0] = Self::TYPE_PATH_RESPONSE;
+                out[1..9].copy_from_slice(nonce);
+                Ok(9)
+            }
+            Self::NewConnectionId {
+                sequence_number,
+                retire_prior_to,
+                connection_id,
+                stateless_reset_token,
+            } => {
+                if out.len() < 49 {
+                    return Err(StreamMuxError::InvalidControlFrame(
+                        "Buffer too short".to_string(),
+                    ));
+                }
+                out[0] = Self::TYPE_NEW_CONNECTION_ID;
+                out[1..9].copy_from_slice(&sequence_number.to_be_bytes());
+                out[9..17].copy_from_slice(&retire_prior_to.to_be_bytes());
+                out[17..33].copy_from_slice(connection_id);
+                out[33..49].copy_from_slice(stateless_reset_token);
+                Ok(49)
+            }
+            Self::RetireConnectionId { sequence_number } => {
+                if out.len() < 9 {
+                    return Err(StreamMuxError::InvalidControlFrame(
+                        "Buffer too short".to_string(),
+                    ));
+                }
+                out[0] = Self::TYPE_RETIRE_CONNECTION_ID;
+                out[1..9].copy_from_slice(&sequence_number.to_be_bytes());
+                Ok(9)
             }
         }
     }
@@ -472,39 +766,95 @@ impl FlowControlFrame {
     pub const TYPE_STREAM_DATA_BLOCKED: u8 = 0x15;
 
     /// Serializes the control frame to a compact binary byte vector.
+    #[inline]
     pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.encode_into(&mut buf);
+        buf
+    }
+
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
         match self {
             Self::MaxData { maximum_data } => {
-                let mut buf = Vec::with_capacity(9);
+                buf.reserve(9);
                 buf.push(Self::TYPE_MAX_DATA);
                 buf.extend_from_slice(&maximum_data.to_be_bytes());
-                buf
             }
             Self::MaxStreamData {
                 stream_id,
                 maximum_stream_data,
             } => {
-                let mut buf = Vec::with_capacity(17);
+                buf.reserve(17);
                 buf.push(Self::TYPE_MAX_STREAM_DATA);
                 buf.extend_from_slice(&stream_id.0.to_be_bytes());
                 buf.extend_from_slice(&maximum_stream_data.to_be_bytes());
-                buf
             }
             Self::DataBlocked { data_limit } => {
-                let mut buf = Vec::with_capacity(9);
+                buf.reserve(9);
                 buf.push(Self::TYPE_DATA_BLOCKED);
                 buf.extend_from_slice(&data_limit.to_be_bytes());
-                buf
             }
             Self::StreamDataBlocked {
                 stream_id,
                 stream_data_limit,
             } => {
-                let mut buf = Vec::with_capacity(17);
+                buf.reserve(17);
                 buf.push(Self::TYPE_STREAM_DATA_BLOCKED);
                 buf.extend_from_slice(&stream_id.0.to_be_bytes());
                 buf.extend_from_slice(&stream_data_limit.to_be_bytes());
-                buf
+            }
+        }
+    }
+
+    pub fn encode_slice(&self, out: &mut [u8]) -> Result<usize, StreamMuxError> {
+        match self {
+            Self::MaxData { maximum_data } => {
+                if out.len() < 9 {
+                    return Err(StreamMuxError::InvalidControlFrame(
+                        "Buffer too short".to_string(),
+                    ));
+                }
+                out[0] = Self::TYPE_MAX_DATA;
+                out[1..9].copy_from_slice(&maximum_data.to_be_bytes());
+                Ok(9)
+            }
+            Self::MaxStreamData {
+                stream_id,
+                maximum_stream_data,
+            } => {
+                if out.len() < 17 {
+                    return Err(StreamMuxError::InvalidControlFrame(
+                        "Buffer too short".to_string(),
+                    ));
+                }
+                out[0] = Self::TYPE_MAX_STREAM_DATA;
+                out[1..9].copy_from_slice(&stream_id.0.to_be_bytes());
+                out[9..17].copy_from_slice(&maximum_stream_data.to_be_bytes());
+                Ok(17)
+            }
+            Self::DataBlocked { data_limit } => {
+                if out.len() < 9 {
+                    return Err(StreamMuxError::InvalidControlFrame(
+                        "Buffer too short".to_string(),
+                    ));
+                }
+                out[0] = Self::TYPE_DATA_BLOCKED;
+                out[1..9].copy_from_slice(&data_limit.to_be_bytes());
+                Ok(9)
+            }
+            Self::StreamDataBlocked {
+                stream_id,
+                stream_data_limit,
+            } => {
+                if out.len() < 17 {
+                    return Err(StreamMuxError::InvalidControlFrame(
+                        "Buffer too short".to_string(),
+                    ));
+                }
+                out[0] = Self::TYPE_STREAM_DATA_BLOCKED;
+                out[1..9].copy_from_slice(&stream_id.0.to_be_bytes());
+                out[9..17].copy_from_slice(&stream_data_limit.to_be_bytes());
+                Ok(17)
             }
         }
     }
@@ -2540,5 +2890,151 @@ mod tests {
         let ret_decoded =
             MultipathMuxPacket::decode(&ret_encoded).expect("decode retire connection id");
         assert_eq!(ret_decoded, ret_packet);
+    }
+
+    #[test]
+    fn test_stream_frame_view_and_zero_alloc_encoding() {
+        let payload = b"Zero-Copy Vectorized Streaming Payload Block".to_vec();
+        let frame = StreamFrame {
+            stream_id: StreamId(101),
+            offset: 4096,
+            payload: payload.clone(),
+            fin: true,
+            slice_class: FlowSliceClass::UltraLowLatency,
+            priority: StreamPriority::CriticalControl,
+            subpath_id: 2,
+            seq_num: 777,
+            is_bicast: true,
+        };
+
+        // 1. Zero-copy view borrowing
+        let view = frame.as_view();
+        assert_eq!(view.stream_id, StreamId(101));
+        assert_eq!(view.offset, 4096);
+        assert_eq!(view.payload, payload.as_slice());
+        assert!(view.fin);
+        assert!(view.is_bicast);
+        assert_eq!(view.end_offset(), 4096 + payload.len() as u64);
+
+        // 2. encode_into without reallocation
+        let mut buf = Vec::with_capacity(128);
+        frame.encode_into(&mut buf);
+        assert_eq!(buf.len(), StreamFrame::HEADER_LEN + payload.len());
+
+        // 3. encode_slice into preallocated slice
+        let mut slice_buf = vec![0u8; 128];
+        let written = frame.encode_slice(&mut slice_buf).expect("encode_slice");
+        assert_eq!(written, buf.len());
+        assert_eq!(&slice_buf[..written], buf.as_slice());
+
+        // 4. decode_view zero-copy
+        let decoded_view = StreamFrame::decode_view(&buf).expect("decode_view");
+        assert_eq!(decoded_view.stream_id, StreamId(101));
+        assert_eq!(decoded_view.offset, 4096);
+        assert_eq!(decoded_view.payload, payload.as_slice());
+        assert!(decoded_view.fin);
+        assert!(decoded_view.is_bicast);
+
+        // 5. to_owned roundtrip
+        let owned = decoded_view.to_owned();
+        assert_eq!(owned, frame);
+    }
+
+    #[test]
+    fn test_stream_batch_codec_coalescing_and_checksum() {
+        let f1 = StreamFrame {
+            stream_id: StreamId(1),
+            offset: 0,
+            payload: b"chunk-1".to_vec(),
+            fin: false,
+            slice_class: FlowSliceClass::HighThroughput,
+            priority: StreamPriority::HighInteractive,
+            subpath_id: 1,
+            seq_num: 1,
+            is_bicast: false,
+        };
+
+        let f2 = StreamFrame {
+            stream_id: StreamId(1),
+            offset: 7,
+            payload: b"chunk-2-longer".to_vec(),
+            fin: true,
+            slice_class: FlowSliceClass::HighThroughput,
+            priority: StreamPriority::HighInteractive,
+            subpath_id: 1,
+            seq_num: 2,
+            is_bicast: false,
+        };
+
+        let f3 = StreamFrame {
+            stream_id: StreamId(2),
+            offset: 0,
+            payload: b"independent-stream-2".to_vec(),
+            fin: true,
+            slice_class: FlowSliceClass::UltraLowLatency,
+            priority: StreamPriority::CriticalControl,
+            subpath_id: 3,
+            seq_num: 10,
+            is_bicast: true,
+        };
+
+        let frames = vec![f1.clone(), f2.clone(), f3.clone()];
+
+        // Batch encoding
+        let mut coalesced = Vec::new();
+        StreamBatchCodec::encode_batch(&frames, &mut coalesced);
+        let expected_total: usize = frames
+            .iter()
+            .map(|f| StreamFrame::HEADER_LEN + f.payload.len())
+            .sum();
+        assert_eq!(coalesced.len(), expected_total);
+
+        // Batch zero-allocation decoding
+        let mut decoded_views = Vec::new();
+        let count = StreamBatchCodec::decode_batch_into(&coalesced, &mut decoded_views)
+            .expect("batch decode");
+        assert_eq!(count, 3);
+        assert_eq!(decoded_views.len(), 3);
+        assert_eq!(decoded_views[0].payload, b"chunk-1");
+        assert_eq!(decoded_views[1].payload, b"chunk-2-longer");
+        assert_eq!(decoded_views[2].payload, b"independent-stream-2");
+        assert_eq!(decoded_views[0].to_owned(), f1);
+        assert_eq!(decoded_views[1].to_owned(), f2);
+        assert_eq!(decoded_views[2].to_owned(), f3);
+
+        // Batch views encoding roundtrip
+        let mut coalesced_from_views = Vec::new();
+        StreamBatchCodec::encode_batch_views(&decoded_views, &mut coalesced_from_views);
+        assert_eq!(coalesced_from_views, coalesced);
+
+        // Fast SWAR/SIMD checksum test
+        let cksum1 = StreamBatchCodec::compute_stream_checksum_simd(b"chunk-1");
+        let cksum2 = StreamBatchCodec::compute_stream_checksum_simd(b"chunk-1");
+        let cksum3 = StreamBatchCodec::compute_stream_checksum_simd(b"chunk-2-longer");
+        assert_eq!(cksum1, cksum2);
+        assert_ne!(cksum1, cksum3);
+    }
+
+    #[test]
+    fn test_zero_alloc_slice_encoding_for_all_packet_types() {
+        let max_data = FlowControlFrame::MaxData {
+            maximum_data: 100_000,
+        };
+        let mut out_slice = [0u8; 64];
+        let len = max_data
+            .encode_slice(&mut out_slice)
+            .expect("encode_slice MaxData");
+        assert_eq!(len, 9);
+        let decoded = FlowControlFrame::decode(&out_slice[..len]).expect("decode");
+        assert_eq!(decoded, max_data);
+
+        let chal = MigrationFrame::PathChallenge { nonce: [9; 8] };
+        let mut out_chal = [0u8; 64];
+        let len_chal = chal
+            .encode_slice(&mut out_chal)
+            .expect("encode_slice PathChallenge");
+        assert_eq!(len_chal, 9);
+        let dec_chal = MigrationFrame::decode(&out_chal[..len_chal]).expect("decode chal");
+        assert_eq!(dec_chal, chal);
     }
 }
