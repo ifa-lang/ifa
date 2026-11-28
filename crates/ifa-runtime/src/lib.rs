@@ -29,6 +29,7 @@ pub mod multipath_pacing;
 pub mod multipath_pacing_coordinator;
 pub mod multipath_retransmit;
 pub mod multipath_router;
+pub mod multipath_session_controller;
 pub mod multipath_stream_mux;
 pub mod multipath_transport;
 pub mod panic;
@@ -212,6 +213,14 @@ pub use multipath_router::{
     run_multipath_router_benchmark, DispatchedFrameResult, FailoverEvent, InflightFrameRecord,
     MultipathRouter, MultipathRouterBenchmarkReport, PreventiveMigrationResult, RouterError,
     SubpathHealth, SubpathRoute, SubpathSelection,
+};
+pub use multipath_session_controller::{
+    frame_types, run_multipath_session_controller_benchmark, MultipathSessionBenchmarkReport,
+    MultipathSessionConfig, MultipathSessionController, MultipathSessionTelemetry,
+    SessionCapabilities, SessionControlFrame, SessionCycleReport, SessionError, SessionState,
+    SubpathAdvertisement, SubpathHealthStatus, SubpathSessionState, DEFAULT_DRAIN_TIMEOUT_NS,
+    DEFAULT_HANDSHAKE_TIMEOUT_NS, DEFAULT_INACTIVITY_TIMEOUT_NS, DEFAULT_KEEPALIVE_INTERVAL_NS,
+    IFA_SESSION_CTRL_MAGIC, IFA_SESSION_CTRL_VERSION, SESSION_CTRL_MIN_HEADER_SIZE,
 };
 pub use multipath_stream_mux::{
     run_multipath_stream_mux_benchmark, FlowControlAutotuneConfig, FlowControlFrame,
