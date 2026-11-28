@@ -66,9 +66,7 @@ pub enum MultipathSessionEvent {
         peer_addr: SocketAddr,
     },
     /// A physical subpath was deregistered.
-    SubpathRemoved {
-        subpath_id: u32,
-    },
+    SubpathRemoved { subpath_id: u32 },
     /// Health status of a subpath has transitioned.
     SubpathStatusChanged {
         subpath_id: u32,
@@ -89,19 +87,11 @@ pub enum MultipathSessionEvent {
         bytes: usize,
     },
     /// Multiplexed stream data chunk received.
-    StreamDataReceived {
-        stream_id: StreamId,
-        bytes: usize,
-    },
+    StreamDataReceived { stream_id: StreamId, bytes: usize },
     /// Session initiated graceful drainage before closure.
-    Draining {
-        reason: String,
-    },
+    Draining { reason: String },
     /// Session is fully closed and all resources are released.
-    Closed {
-        graceful: bool,
-        reason: String,
-    },
+    Closed { graceful: bool, reason: String },
 }
 
 /// Fluent builder for constructing and tuning a `MultipathSession`.
@@ -664,16 +654,24 @@ mod tests {
         // Server step 1: processes incoming SYN and sends ACK
         let server_events = server.poll_events_at(base_now + 1_000_000);
         assert!(server.is_active());
-        assert!(server_events
-            .iter()
-            .any(|e| matches!(e, MultipathSessionEvent::Connected { session_id: 999, .. })));
+        assert!(server_events.iter().any(|e| matches!(
+            e,
+            MultipathSessionEvent::Connected {
+                session_id: 999,
+                ..
+            }
+        )));
 
         // Client step 2: processes server ACK
         let client_events2 = client.poll_events_at(base_now + 2_000_000);
         assert!(client.is_active());
-        assert!(client_events2
-            .iter()
-            .any(|e| matches!(e, MultipathSessionEvent::Connected { session_id: 999, .. })));
+        assert!(client_events2.iter().any(|e| matches!(
+            e,
+            MultipathSessionEvent::Connected {
+                session_id: 999,
+                ..
+            }
+        )));
 
         // 2. Application Data Exchange
         let test_message = b"IFA System Language - High Resilience Multipath".to_vec();
