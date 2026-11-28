@@ -5580,30 +5580,97 @@ impl<'a> SemanticAnalyzer<'a> {
             return Type::Unit;
         }
         if m_name == "recv" {
+            for arg in args {
+                self.infer_expr(&arg.value);
+            }
             if let Type::Generic {
                 name,
                 args: gen_args,
             } = &effective_rec_ty
             {
-                if INTERNER.resolve(name) == "Channel" && !gen_args.is_empty() {
-                    return wrap_optional(gen_args[0].clone());
+                let ch_name_str = INTERNER.resolve(name);
+                if matches!(
+                    ch_name_str.as_str(),
+                    "Channel"
+                        | "ReliableChannel"
+                        | "BestEffortChannel"
+                        | "RedundantChannel"
+                        | "Stream"
+                        | "PacketChannel"
+                        | "MultipathChannel"
+                ) && !gen_args.is_empty()
+                {
+                    let payload_ty = &gen_args[0];
+                    let mut visited = std::collections::HashSet::new();
+                    if type_contains_ref_deep(payload_ty, &self.symbols, &mut visited) {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "le type de charge utile '{}' reçu via '{}' ne peut pas contenir de référence locale ('ref') : les références locales ne survivent pas au transfert inter-fibres",
+                                payload_ty, ch_name_str
+                            ))
+                            .with_code("E0072")
+                            .with_primary_label(
+                                span,
+                                "réception d'un type contenant une référence locale depuis un canal",
+                            )
+                            .with_note(
+                                "Utilisez la sémantique de valeur pure (sans 'ref') pour les types transmis par canal.",
+                            ),
+                        );
+                    }
+                    return wrap_optional(payload_ty.clone());
                 }
             }
             return Type::Unknown;
         }
         if m_name == "try_recv" {
+            for arg in args {
+                self.infer_expr(&arg.value);
+            }
             if let Type::Generic {
                 name,
                 args: gen_args,
             } = &effective_rec_ty
             {
-                if INTERNER.resolve(name) == "Channel" && !gen_args.is_empty() {
-                    return Type::Optional(Box::new(gen_args[0].clone()));
+                let ch_name_str = INTERNER.resolve(name);
+                if matches!(
+                    ch_name_str.as_str(),
+                    "Channel"
+                        | "ReliableChannel"
+                        | "BestEffortChannel"
+                        | "RedundantChannel"
+                        | "Stream"
+                        | "PacketChannel"
+                        | "MultipathChannel"
+                ) && !gen_args.is_empty()
+                {
+                    let payload_ty = &gen_args[0];
+                    let mut visited = std::collections::HashSet::new();
+                    if type_contains_ref_deep(payload_ty, &self.symbols, &mut visited) {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "le type de charge utile '{}' reçu via '{}' ne peut pas contenir de référence locale ('ref') : les références locales ne survivent pas au transfert inter-fibres",
+                                payload_ty, ch_name_str
+                            ))
+                            .with_code("E0072")
+                            .with_primary_label(
+                                span,
+                                "réception d'un type contenant une référence locale depuis un canal",
+                            )
+                            .with_note(
+                                "Utilisez la sémantique de valeur pure (sans 'ref') pour les types transmis par canal.",
+                            ),
+                        );
+                    }
+                    return Type::Optional(Box::new(payload_ty.clone()));
                 }
             }
             return Type::Optional(Box::new(Type::Unknown));
         }
         if m_name == "close" {
+            for arg in args {
+                self.infer_expr(&arg.value);
+            }
             return Type::Unit;
         }
 

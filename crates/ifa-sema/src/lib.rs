@@ -942,4 +942,91 @@ mod tests {
             res.diagnostics
         );
     }
+
+    // -----------------------------------------------------------------
+    // E0072 — channel recv & try_recv: ref payload must be rejected
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_channel_recv_ref_payload_rejected() {
+        let code = r#"
+            fn consume(ch: sync::Channel<ref i32>) {
+                let msg = ch.recv();
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(res.has_errors());
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0072")),
+            "Expected E0072 on ch.recv() with ref payload, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_channel_recv_struct_with_ref_field_rejected() {
+        let code = r#"
+            struct Packet {
+                data: ref i64,
+                id: i64,
+            }
+            fn consume(ch: sync::Channel<Packet>) {
+                let pkt = ch.recv();
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(res.has_errors());
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0072")),
+            "Expected E0072 on ch.recv() with struct containing ref field, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_channel_try_recv_ref_payload_rejected() {
+        let code = r#"
+            fn consume(ch: sync::Channel<ref i32>) {
+                let opt = ch.try_recv();
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(res.has_errors());
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0072")),
+            "Expected E0072 on ch.try_recv() with ref payload, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_channel_recv_value_payload_accepted() {
+        let code = r#"
+            struct SafePacket {
+                id: i64,
+                value: i64,
+            }
+            fn consume(ch: sync::Channel<SafePacket>, rch: sync::ReliableChannel<i64>) {
+                let pkt = ch.recv();
+                let opt = ch.try_recv();
+                let num = rch.recv();
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        let has_e0072 = res
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0072"));
+        assert!(
+            !has_e0072,
+            "E0072 must NOT fire for pure value payloads in recv / try_recv, got: {:?}",
+            res.diagnostics
+        );
+    }
 }
