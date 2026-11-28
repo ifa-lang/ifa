@@ -353,6 +353,10 @@ pub struct FirInterpreter<'a> {
     pub sync_mutexes: HashMap<i64, (bool, i64)>,
     pub sync_condvars: HashMap<i64, (u64, usize)>,
     pub sync_atomics: HashMap<i64, i64>,
+    pub sync_atomics_u64: HashMap<i64, u64>,
+    pub sync_waitgroups: HashMap<i64, usize>,
+    pub sync_semaphores: HashMap<i64, usize>,
+    pub sync_onces: HashMap<i64, bool>,
     pub sync_string_channels: HashMap<i64, (VecDeque<String>, usize, bool)>,
     pub sync_int_channels: HashMap<i64, (VecDeque<i64>, usize, bool)>,
     next_sync_id: i64,
@@ -375,6 +379,10 @@ impl<'a> FirInterpreter<'a> {
             sync_mutexes: HashMap::new(),
             sync_condvars: HashMap::new(),
             sync_atomics: HashMap::new(),
+            sync_atomics_u64: HashMap::new(),
+            sync_waitgroups: HashMap::new(),
+            sync_semaphores: HashMap::new(),
+            sync_onces: HashMap::new(),
             sync_string_channels: HashMap::new(),
             sync_int_channels: HashMap::new(),
             next_sync_id: 1,
@@ -3909,6 +3917,313 @@ impl<'a> FirInterpreter<'a> {
                     } else {
                         Ok(FirValue::Bool(false))
                     }
+                } else if fn_name == "sync::atomic_u64_create"
+                    || fn_name == "atomic_u64_create"
+                    || fn_name == "ifa_rt_atomic_u64_create"
+                {
+                    let initial = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as u64,
+                        _ => 0,
+                    };
+                    let id = self.next_sync_id;
+                    self.next_sync_id += 1;
+                    self.sync_atomics_u64.insert(id, initial);
+                    Ok(FirValue::Int(id as i128))
+                } else if fn_name == "sync::atomic_u64_destroy"
+                    || fn_name == "atomic_u64_destroy"
+                    || fn_name == "ifa_rt_atomic_u64_destroy"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    self.sync_atomics_u64.remove(&id);
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::atomic_u64_load"
+                    || fn_name == "atomic_u64_load"
+                    || fn_name == "ifa_rt_atomic_u64_load"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let v = self.sync_atomics_u64.get(&id).copied().unwrap_or(0);
+                    Ok(FirValue::Int(v as i128))
+                } else if fn_name == "sync::atomic_u64_store"
+                    || fn_name == "atomic_u64_store"
+                    || fn_name == "ifa_rt_atomic_u64_store"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let val = match evaluated_args.get(1) {
+                        Some(FirValue::Int(n)) => *n as u64,
+                        _ => 0,
+                    };
+                    self.sync_atomics_u64.insert(id, val);
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::atomic_u64_fetch_add"
+                    || fn_name == "atomic_u64_fetch_add"
+                    || fn_name == "ifa_rt_atomic_u64_fetch_add"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let delta = match evaluated_args.get(1) {
+                        Some(FirValue::Int(n)) => *n as u64,
+                        _ => 0,
+                    };
+                    let prev = self.sync_atomics_u64.get(&id).copied().unwrap_or(0);
+                    self.sync_atomics_u64.insert(id, prev.wrapping_add(delta));
+                    Ok(FirValue::Int(prev as i128))
+                } else if fn_name == "sync::atomic_u64_fetch_sub"
+                    || fn_name == "atomic_u64_fetch_sub"
+                    || fn_name == "ifa_rt_atomic_u64_fetch_sub"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let delta = match evaluated_args.get(1) {
+                        Some(FirValue::Int(n)) => *n as u64,
+                        _ => 0,
+                    };
+                    let prev = self.sync_atomics_u64.get(&id).copied().unwrap_or(0);
+                    self.sync_atomics_u64.insert(id, prev.wrapping_sub(delta));
+                    Ok(FirValue::Int(prev as i128))
+                } else if fn_name == "sync::atomic_u64_cas"
+                    || fn_name == "atomic_u64_cas"
+                    || fn_name == "ifa_rt_atomic_u64_cas"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let expected = match evaluated_args.get(1) {
+                        Some(FirValue::Int(n)) => *n as u64,
+                        _ => 0,
+                    };
+                    let desired = match evaluated_args.get(2) {
+                        Some(FirValue::Int(n)) => *n as u64,
+                        _ => 0,
+                    };
+                    let current = self.sync_atomics_u64.get(&id).copied().unwrap_or(0);
+                    if current == expected {
+                        self.sync_atomics_u64.insert(id, desired);
+                        Ok(FirValue::Bool(true))
+                    } else {
+                        Ok(FirValue::Bool(false))
+                    }
+                } else if fn_name == "sync::waitgroup_create"
+                    || fn_name == "waitgroup_create"
+                    || fn_name == "ifa_rt_waitgroup_create"
+                {
+                    let id = self.next_sync_id;
+                    self.next_sync_id += 1;
+                    self.sync_waitgroups.insert(id, 0);
+                    Ok(FirValue::Int(id as i128))
+                } else if fn_name == "sync::waitgroup_destroy"
+                    || fn_name == "waitgroup_destroy"
+                    || fn_name == "ifa_rt_waitgroup_destroy"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    self.sync_waitgroups.remove(&id);
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::waitgroup_add"
+                    || fn_name == "waitgroup_add"
+                    || fn_name == "ifa_rt_waitgroup_add"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let delta = match evaluated_args.get(1) {
+                        Some(FirValue::Int(n)) => *n as usize,
+                        _ => 0,
+                    };
+                    if let Some(wg) = self.sync_waitgroups.get_mut(&id) {
+                        *wg += delta;
+                    }
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::waitgroup_done"
+                    || fn_name == "waitgroup_done"
+                    || fn_name == "ifa_rt_waitgroup_done"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some(wg) = self.sync_waitgroups.get_mut(&id) {
+                        *wg = wg.saturating_sub(1);
+                    }
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::waitgroup_count"
+                    || fn_name == "waitgroup_count"
+                    || fn_name == "ifa_rt_waitgroup_count"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let cnt = self.sync_waitgroups.get(&id).copied().unwrap_or(0);
+                    Ok(FirValue::Int(cnt as i128))
+                } else if fn_name == "sync::waitgroup_wait"
+                    || fn_name == "waitgroup_wait"
+                    || fn_name == "ifa_rt_waitgroup_wait"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some(wg) = self.sync_waitgroups.get_mut(&id) {
+                        *wg = 0;
+                    }
+                    Ok(FirValue::Int(0))
+                } else if fn_name == "sync::waitgroup_wait_timeout"
+                    || fn_name == "waitgroup_wait_timeout"
+                    || fn_name == "ifa_rt_waitgroup_wait_timeout"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let cnt = self.sync_waitgroups.get(&id).copied().unwrap_or(0);
+                    if cnt == 0 {
+                        Ok(FirValue::Int(1))
+                    } else {
+                        Ok(FirValue::Int(0))
+                    }
+                } else if fn_name == "sync::semaphore_create"
+                    || fn_name == "semaphore_create"
+                    || fn_name == "ifa_rt_semaphore_create"
+                {
+                    let permits = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as usize,
+                        _ => 0,
+                    };
+                    let id = self.next_sync_id;
+                    self.next_sync_id += 1;
+                    self.sync_semaphores.insert(id, permits);
+                    Ok(FirValue::Int(id as i128))
+                } else if fn_name == "sync::semaphore_destroy"
+                    || fn_name == "semaphore_destroy"
+                    || fn_name == "ifa_rt_semaphore_destroy"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    self.sync_semaphores.remove(&id);
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::semaphore_try_acquire"
+                    || fn_name == "semaphore_try_acquire"
+                    || fn_name == "ifa_rt_semaphore_try_acquire"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some(sem) = self.sync_semaphores.get_mut(&id) {
+                        if *sem > 0 {
+                            *sem -= 1;
+                            Ok(FirValue::Int(1))
+                        } else {
+                            Ok(FirValue::Int(0))
+                        }
+                    } else {
+                        Ok(FirValue::Int(-1))
+                    }
+                } else if fn_name == "sync::semaphore_acquire"
+                    || fn_name == "semaphore_acquire"
+                    || fn_name == "ifa_rt_semaphore_acquire"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some(sem) = self.sync_semaphores.get_mut(&id) {
+                        if *sem > 0 {
+                            *sem -= 1;
+                        }
+                        Ok(FirValue::Int(0))
+                    } else {
+                        Ok(FirValue::Int(-1))
+                    }
+                } else if fn_name == "sync::semaphore_acquire_timeout"
+                    || fn_name == "semaphore_acquire_timeout"
+                    || fn_name == "ifa_rt_semaphore_acquire_timeout"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some(sem) = self.sync_semaphores.get_mut(&id) {
+                        if *sem > 0 {
+                            *sem -= 1;
+                            Ok(FirValue::Int(1))
+                        } else {
+                            Ok(FirValue::Int(0))
+                        }
+                    } else {
+                        Ok(FirValue::Int(-1))
+                    }
+                } else if fn_name == "sync::semaphore_release"
+                    || fn_name == "semaphore_release"
+                    || fn_name == "ifa_rt_semaphore_release"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some(sem) = self.sync_semaphores.get_mut(&id) {
+                        *sem += 1;
+                        Ok(FirValue::Int(0))
+                    } else {
+                        Ok(FirValue::Int(-1))
+                    }
+                } else if fn_name == "sync::semaphore_available"
+                    || fn_name == "semaphore_available"
+                    || fn_name == "ifa_rt_semaphore_available"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let avail = self.sync_semaphores.get(&id).copied().unwrap_or(0);
+                    Ok(FirValue::Int(avail as i128))
+                } else if fn_name == "sync::once_create"
+                    || fn_name == "once_create"
+                    || fn_name == "ifa_rt_once_create"
+                {
+                    let id = self.next_sync_id;
+                    self.next_sync_id += 1;
+                    self.sync_onces.insert(id, false);
+                    Ok(FirValue::Int(id as i128))
+                } else if fn_name == "sync::once_destroy"
+                    || fn_name == "once_destroy"
+                    || fn_name == "ifa_rt_once_destroy"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    self.sync_onces.remove(&id);
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::once_is_completed"
+                    || fn_name == "once_is_completed"
+                    || fn_name == "ifa_rt_once_is_completed"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let done = self.sync_onces.get(&id).copied().unwrap_or(false);
+                    Ok(FirValue::Int(if done { 1 } else { 0 }))
                 } else if fn_name == "multipath::flow_init"
                     || fn_name == "flow_init"
                     || fn_name == "ifa_rt_multipath_flow_init"

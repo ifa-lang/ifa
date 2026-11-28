@@ -1035,3 +1035,46 @@ fn test_fir_nested_inout_subfield_lvalue_projection_interp() {
     let res = interp.execute_function("test_main", vec![]).unwrap();
     assert_eq!(res, FirValue::Int(115));
 }
+
+#[test]
+fn test_fir_sync_primitives_execution() {
+    let src = r#"
+        pub fn test_sync_main() -> u64 {
+            let a = atomic_u64_create(100);
+            let prev = atomic_u64_fetch_add(a, 25);
+            let cur = atomic_u64_load(a);
+
+            let wg = waitgroup_create();
+            waitgroup_add(wg, 2);
+            waitgroup_done(wg);
+            let wg_cnt = waitgroup_count(wg);
+
+            let sem = semaphore_create(3);
+            let acq = semaphore_try_acquire(sem);
+            let sem_avail = semaphore_available(sem);
+
+            let o = once_create();
+            let o_done = once_is_completed(o);
+
+            return cur + wg_cnt + sem_avail + o_done;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("sync_prims_test.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, parse_diags) = ifa_parser::parse(fid, tokens);
+    assert!(parse_diags.is_empty(), "Parse diags: {:?}", parse_diags);
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("test_sync_main", vec![]).unwrap();
+    // cur = 125, wg_cnt = 1, sem_avail = 2, o_done = 0 => 125 + 1 + 2 + 0 = 128
+    assert_eq!(res, FirValue::Int(128));
+}

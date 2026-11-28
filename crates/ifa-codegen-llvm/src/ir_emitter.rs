@@ -305,6 +305,52 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i64 @ifa_rt_sys_memory_virtual()\n\n");
         }
 
+        // IFA Synchronization Primitives Intrinsics
+        out.push_str("; IFA Synchronization Primitives Intrinsics\n");
+        out.push_str("declare ptr @ifa_rt_mutex_create()\n");
+        out.push_str("declare void @ifa_rt_mutex_destroy(ptr)\n");
+        out.push_str("declare i32 @ifa_rt_mutex_lock(ptr)\n");
+        out.push_str("declare i32 @ifa_rt_mutex_try_lock(ptr)\n");
+        out.push_str("declare i32 @ifa_rt_mutex_unlock(ptr)\n");
+        out.push_str("declare i32 @ifa_rt_mutex_is_locked(ptr)\n");
+        out.push_str("declare ptr @ifa_rt_condvar_create()\n");
+        out.push_str("declare void @ifa_rt_condvar_destroy(ptr)\n");
+        out.push_str("declare i32 @ifa_rt_condvar_wait(ptr, ptr)\n");
+        out.push_str("declare i32 @ifa_rt_condvar_wait_timeout(ptr, ptr, i64)\n");
+        out.push_str("declare i32 @ifa_rt_condvar_notify_one(ptr)\n");
+        out.push_str("declare i32 @ifa_rt_condvar_notify_all(ptr)\n");
+        out.push_str("declare ptr @ifa_rt_atomic_create(i64)\n");
+        out.push_str("declare void @ifa_rt_atomic_destroy(ptr)\n");
+        out.push_str("declare i64 @ifa_rt_atomic_load(ptr)\n");
+        out.push_str("declare void @ifa_rt_atomic_store(ptr, i64)\n");
+        out.push_str("declare i64 @ifa_rt_atomic_fetch_add(ptr, i64)\n");
+        out.push_str("declare i64 @ifa_rt_atomic_fetch_sub(ptr, i64)\n");
+        out.push_str("declare i64 @ifa_rt_atomic_cas(ptr, i64, i64)\n");
+        out.push_str("declare ptr @ifa_rt_atomic_u64_create(i64)\n");
+        out.push_str("declare void @ifa_rt_atomic_u64_destroy(ptr)\n");
+        out.push_str("declare i64 @ifa_rt_atomic_u64_load(ptr)\n");
+        out.push_str("declare void @ifa_rt_atomic_u64_store(ptr, i64)\n");
+        out.push_str("declare i64 @ifa_rt_atomic_u64_fetch_add(ptr, i64)\n");
+        out.push_str("declare i64 @ifa_rt_atomic_u64_fetch_sub(ptr, i64)\n");
+        out.push_str("declare i64 @ifa_rt_atomic_u64_cas(ptr, i64, i64)\n");
+        out.push_str("declare ptr @ifa_rt_waitgroup_create()\n");
+        out.push_str("declare void @ifa_rt_waitgroup_destroy(ptr)\n");
+        out.push_str("declare void @ifa_rt_waitgroup_add(ptr, i64)\n");
+        out.push_str("declare void @ifa_rt_waitgroup_done(ptr)\n");
+        out.push_str("declare i64 @ifa_rt_waitgroup_count(ptr)\n");
+        out.push_str("declare i32 @ifa_rt_waitgroup_wait(ptr)\n");
+        out.push_str("declare i32 @ifa_rt_waitgroup_wait_timeout(ptr, i64)\n");
+        out.push_str("declare ptr @ifa_rt_semaphore_create(i64)\n");
+        out.push_str("declare void @ifa_rt_semaphore_destroy(ptr)\n");
+        out.push_str("declare i32 @ifa_rt_semaphore_try_acquire(ptr)\n");
+        out.push_str("declare i32 @ifa_rt_semaphore_acquire(ptr)\n");
+        out.push_str("declare i32 @ifa_rt_semaphore_acquire_timeout(ptr, i64)\n");
+        out.push_str("declare i32 @ifa_rt_semaphore_release(ptr)\n");
+        out.push_str("declare i64 @ifa_rt_semaphore_available(ptr)\n");
+        out.push_str("declare ptr @ifa_rt_once_create()\n");
+        out.push_str("declare void @ifa_rt_once_destroy(ptr)\n");
+        out.push_str("declare i32 @ifa_rt_once_is_completed(ptr)\n\n");
+
         // IFA Multipath Transport & Flow Serialization Intrinsics
         out.push_str("; IFA Multipath Transport & Flow Serialization Intrinsics\n");
         out.push_str("declare void @ifa_rt_multipath_flow_init(ptr, i64, i32, i16)\n");
@@ -3799,6 +3845,71 @@ impl<'a> LlvmIrEmitter<'a> {
                     | "memory_virtual"
                     | "sys_memory_virtual"
                     | "sys::resources::memory_virtual" => "ifa_rt_sys_memory_virtual",
+                    "sync::mutex_create" | "mutex_create" => "ifa_rt_mutex_create",
+                    "sync::mutex_destroy" | "mutex_destroy" => "ifa_rt_mutex_destroy",
+                    "sync::mutex_lock" | "mutex_lock" => "ifa_rt_mutex_lock",
+                    "sync::mutex_try_lock" | "mutex_try_lock" => "ifa_rt_mutex_try_lock",
+                    "sync::mutex_unlock" | "mutex_unlock" => "ifa_rt_mutex_unlock",
+                    "sync::mutex_is_locked" | "mutex_is_locked" => "ifa_rt_mutex_is_locked",
+                    "sync::condvar_create" | "condvar_create" => "ifa_rt_condvar_create",
+                    "sync::condvar_destroy" | "condvar_destroy" => "ifa_rt_condvar_destroy",
+                    "sync::condvar_wait" | "condvar_wait" => "ifa_rt_condvar_wait",
+                    "sync::condvar_wait_timeout" | "condvar_wait_timeout" => {
+                        "ifa_rt_condvar_wait_timeout"
+                    }
+                    "sync::condvar_notify_one" | "condvar_notify_one" => {
+                        "ifa_rt_condvar_notify_one"
+                    }
+                    "sync::condvar_notify_all" | "condvar_notify_all" => {
+                        "ifa_rt_condvar_notify_all"
+                    }
+                    "sync::atomic_create" | "atomic_create" => "ifa_rt_atomic_create",
+                    "sync::atomic_destroy" | "atomic_destroy" => "ifa_rt_atomic_destroy",
+                    "sync::atomic_load" | "atomic_load" => "ifa_rt_atomic_load",
+                    "sync::atomic_store" | "atomic_store" => "ifa_rt_atomic_store",
+                    "sync::atomic_fetch_add" | "atomic_fetch_add" => "ifa_rt_atomic_fetch_add",
+                    "sync::atomic_fetch_sub" | "atomic_fetch_sub" => "ifa_rt_atomic_fetch_sub",
+                    "sync::atomic_compare_exchange" | "atomic_compare_exchange" | "atomic_cas" => {
+                        "ifa_rt_atomic_cas"
+                    }
+                    "sync::atomic_u64_create" | "atomic_u64_create" => "ifa_rt_atomic_u64_create",
+                    "sync::atomic_u64_destroy" | "atomic_u64_destroy" => {
+                        "ifa_rt_atomic_u64_destroy"
+                    }
+                    "sync::atomic_u64_load" | "atomic_u64_load" => "ifa_rt_atomic_u64_load",
+                    "sync::atomic_u64_store" | "atomic_u64_store" => "ifa_rt_atomic_u64_store",
+                    "sync::atomic_u64_fetch_add" | "atomic_u64_fetch_add" => {
+                        "ifa_rt_atomic_u64_fetch_add"
+                    }
+                    "sync::atomic_u64_fetch_sub" | "atomic_u64_fetch_sub" => {
+                        "ifa_rt_atomic_u64_fetch_sub"
+                    }
+                    "sync::atomic_u64_cas" | "atomic_u64_cas" => "ifa_rt_atomic_u64_cas",
+                    "sync::waitgroup_create" | "waitgroup_create" => "ifa_rt_waitgroup_create",
+                    "sync::waitgroup_destroy" | "waitgroup_destroy" => "ifa_rt_waitgroup_destroy",
+                    "sync::waitgroup_add" | "waitgroup_add" => "ifa_rt_waitgroup_add",
+                    "sync::waitgroup_done" | "waitgroup_done" => "ifa_rt_waitgroup_done",
+                    "sync::waitgroup_count" | "waitgroup_count" => "ifa_rt_waitgroup_count",
+                    "sync::waitgroup_wait" | "waitgroup_wait" => "ifa_rt_waitgroup_wait",
+                    "sync::waitgroup_wait_timeout" | "waitgroup_wait_timeout" => {
+                        "ifa_rt_waitgroup_wait_timeout"
+                    }
+                    "sync::semaphore_create" | "semaphore_create" => "ifa_rt_semaphore_create",
+                    "sync::semaphore_destroy" | "semaphore_destroy" => "ifa_rt_semaphore_destroy",
+                    "sync::semaphore_try_acquire" | "semaphore_try_acquire" => {
+                        "ifa_rt_semaphore_try_acquire"
+                    }
+                    "sync::semaphore_acquire" | "semaphore_acquire" => "ifa_rt_semaphore_acquire",
+                    "sync::semaphore_acquire_timeout" | "semaphore_acquire_timeout" => {
+                        "ifa_rt_semaphore_acquire_timeout"
+                    }
+                    "sync::semaphore_release" | "semaphore_release" => "ifa_rt_semaphore_release",
+                    "sync::semaphore_available" | "semaphore_available" => {
+                        "ifa_rt_semaphore_available"
+                    }
+                    "sync::once_create" | "once_create" => "ifa_rt_once_create",
+                    "sync::once_destroy" | "once_destroy" => "ifa_rt_once_destroy",
+                    "sync::once_is_completed" | "once_is_completed" => "ifa_rt_once_is_completed",
                     _ => callee.as_str(),
                 };
                 let callee_name = norm_callee;
@@ -5853,6 +5964,71 @@ impl<'a> LlvmIrEmitter<'a> {
                     | "memory_virtual"
                     | "sys_memory_virtual"
                     | "sys::resources::memory_virtual" => "ifa_rt_sys_memory_virtual",
+                    "sync::mutex_create" | "mutex_create" => "ifa_rt_mutex_create",
+                    "sync::mutex_destroy" | "mutex_destroy" => "ifa_rt_mutex_destroy",
+                    "sync::mutex_lock" | "mutex_lock" => "ifa_rt_mutex_lock",
+                    "sync::mutex_try_lock" | "mutex_try_lock" => "ifa_rt_mutex_try_lock",
+                    "sync::mutex_unlock" | "mutex_unlock" => "ifa_rt_mutex_unlock",
+                    "sync::mutex_is_locked" | "mutex_is_locked" => "ifa_rt_mutex_is_locked",
+                    "sync::condvar_create" | "condvar_create" => "ifa_rt_condvar_create",
+                    "sync::condvar_destroy" | "condvar_destroy" => "ifa_rt_condvar_destroy",
+                    "sync::condvar_wait" | "condvar_wait" => "ifa_rt_condvar_wait",
+                    "sync::condvar_wait_timeout" | "condvar_wait_timeout" => {
+                        "ifa_rt_condvar_wait_timeout"
+                    }
+                    "sync::condvar_notify_one" | "condvar_notify_one" => {
+                        "ifa_rt_condvar_notify_one"
+                    }
+                    "sync::condvar_notify_all" | "condvar_notify_all" => {
+                        "ifa_rt_condvar_notify_all"
+                    }
+                    "sync::atomic_create" | "atomic_create" => "ifa_rt_atomic_create",
+                    "sync::atomic_destroy" | "atomic_destroy" => "ifa_rt_atomic_destroy",
+                    "sync::atomic_load" | "atomic_load" => "ifa_rt_atomic_load",
+                    "sync::atomic_store" | "atomic_store" => "ifa_rt_atomic_store",
+                    "sync::atomic_fetch_add" | "atomic_fetch_add" => "ifa_rt_atomic_fetch_add",
+                    "sync::atomic_fetch_sub" | "atomic_fetch_sub" => "ifa_rt_atomic_fetch_sub",
+                    "sync::atomic_compare_exchange" | "atomic_compare_exchange" | "atomic_cas" => {
+                        "ifa_rt_atomic_cas"
+                    }
+                    "sync::atomic_u64_create" | "atomic_u64_create" => "ifa_rt_atomic_u64_create",
+                    "sync::atomic_u64_destroy" | "atomic_u64_destroy" => {
+                        "ifa_rt_atomic_u64_destroy"
+                    }
+                    "sync::atomic_u64_load" | "atomic_u64_load" => "ifa_rt_atomic_u64_load",
+                    "sync::atomic_u64_store" | "atomic_u64_store" => "ifa_rt_atomic_u64_store",
+                    "sync::atomic_u64_fetch_add" | "atomic_u64_fetch_add" => {
+                        "ifa_rt_atomic_u64_fetch_add"
+                    }
+                    "sync::atomic_u64_fetch_sub" | "atomic_u64_fetch_sub" => {
+                        "ifa_rt_atomic_u64_fetch_sub"
+                    }
+                    "sync::atomic_u64_cas" | "atomic_u64_cas" => "ifa_rt_atomic_u64_cas",
+                    "sync::waitgroup_create" | "waitgroup_create" => "ifa_rt_waitgroup_create",
+                    "sync::waitgroup_destroy" | "waitgroup_destroy" => "ifa_rt_waitgroup_destroy",
+                    "sync::waitgroup_add" | "waitgroup_add" => "ifa_rt_waitgroup_add",
+                    "sync::waitgroup_done" | "waitgroup_done" => "ifa_rt_waitgroup_done",
+                    "sync::waitgroup_count" | "waitgroup_count" => "ifa_rt_waitgroup_count",
+                    "sync::waitgroup_wait" | "waitgroup_wait" => "ifa_rt_waitgroup_wait",
+                    "sync::waitgroup_wait_timeout" | "waitgroup_wait_timeout" => {
+                        "ifa_rt_waitgroup_wait_timeout"
+                    }
+                    "sync::semaphore_create" | "semaphore_create" => "ifa_rt_semaphore_create",
+                    "sync::semaphore_destroy" | "semaphore_destroy" => "ifa_rt_semaphore_destroy",
+                    "sync::semaphore_try_acquire" | "semaphore_try_acquire" => {
+                        "ifa_rt_semaphore_try_acquire"
+                    }
+                    "sync::semaphore_acquire" | "semaphore_acquire" => "ifa_rt_semaphore_acquire",
+                    "sync::semaphore_acquire_timeout" | "semaphore_acquire_timeout" => {
+                        "ifa_rt_semaphore_acquire_timeout"
+                    }
+                    "sync::semaphore_release" | "semaphore_release" => "ifa_rt_semaphore_release",
+                    "sync::semaphore_available" | "semaphore_available" => {
+                        "ifa_rt_semaphore_available"
+                    }
+                    "sync::once_create" | "once_create" => "ifa_rt_once_create",
+                    "sync::once_destroy" | "once_destroy" => "ifa_rt_once_destroy",
+                    "sync::once_is_completed" | "once_is_completed" => "ifa_rt_once_is_completed",
                     _ => callee.as_str(),
                 };
                 let callee_name = norm_callee;

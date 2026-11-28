@@ -2059,6 +2059,457 @@ impl SymbolTable {
             span: dummy,
         });
 
+        let u64_ty = Type::Int(crate::types::IntType::U64);
+        let i64_ty = Type::Int(crate::types::IntType::I64);
+
+        // AtomicU64
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("atomic_u64_create"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: val_sym,
+                ty: u64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("atomic_u64_destroy"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: atom_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("atomic_u64_load"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: atom_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: u64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("atomic_u64_store"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: atom_sym,
+                    ty: i64_ty.clone(),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: val_sym,
+                    ty: u64_ty.clone(),
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("atomic_u64_fetch_add"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: atom_sym,
+                    ty: i64_ty.clone(),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: delta_sym,
+                    ty: u64_ty.clone(),
+                    span: dummy,
+                },
+            ],
+            ret_ty: u64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("atomic_u64_fetch_sub"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: atom_sym,
+                    ty: i64_ty.clone(),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: delta_sym,
+                    ty: u64_ty.clone(),
+                    span: dummy,
+                },
+            ],
+            ret_ty: u64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("atomic_u64_cas"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: atom_sym,
+                    ty: i64_ty.clone(),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: expected_sym,
+                    ty: u64_ty.clone(),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: desired_sym,
+                    ty: u64_ty.clone(),
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+
+        // WaitGroup
+        let wg_sym = INTERNER.intern("wg");
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("waitgroup_create"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("waitgroup_destroy"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: wg_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("waitgroup_add"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: wg_sym,
+                    ty: i64_ty.clone(),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: delta_sym,
+                    ty: i64_ty.clone(),
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("waitgroup_done"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: wg_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("waitgroup_count"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: wg_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("waitgroup_wait"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: wg_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("waitgroup_wait_timeout"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: wg_sym,
+                    ty: i64_ty.clone(),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: timeout_sym,
+                    ty: i64_ty.clone(),
+                    span: dummy,
+                },
+            ],
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+
+        // Semaphore
+        let sem_sym = INTERNER.intern("sem");
+        let permits_sym = INTERNER.intern("permits");
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("semaphore_create"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: permits_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("semaphore_destroy"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: sem_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("semaphore_try_acquire"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: sem_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("semaphore_acquire"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: sem_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("semaphore_acquire_timeout"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: sem_sym,
+                    ty: i64_ty.clone(),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: timeout_sym,
+                    ty: i64_ty.clone(),
+                    span: dummy,
+                },
+            ],
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("semaphore_release"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: sem_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("semaphore_available"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: sem_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+
+        // Once
+        let once_sym = INTERNER.intern("o");
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("once_create"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: i64_ty.clone(),
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("once_destroy"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: once_sym,
+                ty: i64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("once_is_completed"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: once_sym,
+                ty: i64_ty,
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+
         self.modules.insert(sync_name, sync_mod.clone());
         self.modules.insert(std_sync_name, sync_mod);
 
@@ -3848,6 +4299,448 @@ impl SymbolTable {
                 },
             ],
             ret_ty: Type::Bool,
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("atomic_u64_create"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("val"),
+                ty: Type::Int(crate::types::IntType::U64),
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("atomic_u64_destroy"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("a"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("atomic_u64_load"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("a"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::U64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("atomic_u64_store"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("a"),
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("val"),
+                    ty: Type::Int(crate::types::IntType::U64),
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("atomic_u64_fetch_add"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("a"),
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("delta"),
+                    ty: Type::Int(crate::types::IntType::U64),
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Int(crate::types::IntType::U64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("atomic_u64_fetch_sub"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("a"),
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("delta"),
+                    ty: Type::Int(crate::types::IntType::U64),
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Int(crate::types::IntType::U64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("atomic_u64_cas"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("a"),
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("expected"),
+                    ty: Type::Int(crate::types::IntType::U64),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("desired"),
+                    ty: Type::Int(crate::types::IntType::U64),
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+
+        // WaitGroup
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("waitgroup_create"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("waitgroup_destroy"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("wg"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("waitgroup_add"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("wg"),
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("delta"),
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("waitgroup_done"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("wg"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("waitgroup_count"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("wg"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("waitgroup_wait"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("wg"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("waitgroup_wait_timeout"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("wg"),
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("timeout"),
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+
+        // Semaphore
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("semaphore_create"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("permits"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("semaphore_destroy"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("sem"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("semaphore_try_acquire"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("sem"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("semaphore_acquire"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("sem"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("semaphore_acquire_timeout"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("sem"),
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("timeout"),
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("semaphore_release"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("sem"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("semaphore_available"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("sem"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+
+        // Once
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("once_create"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("once_destroy"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("o"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("once_is_completed"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("o"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
             span: dummy,
         });
     }

@@ -640,6 +640,10 @@ char* ifa_rt_args_get(int64_t index);
 typedef struct ifa_mutex_handle ifa_mutex_handle_t;
 typedef struct ifa_condvar_handle ifa_condvar_handle_t;
 typedef struct ifa_atomic_handle ifa_atomic_handle_t;
+typedef struct ifa_atomic_u64_handle ifa_atomic_u64_handle_t;
+typedef struct ifa_waitgroup_handle ifa_waitgroup_handle_t;
+typedef struct ifa_semaphore_handle ifa_semaphore_handle_t;
+typedef struct ifa_once_handle ifa_once_handle_t;
 
 ifa_mutex_handle_t* ifa_rt_mutex_create(void);
 void ifa_rt_mutex_destroy(ifa_mutex_handle_t* m);
@@ -662,6 +666,35 @@ void ifa_rt_atomic_store(ifa_atomic_handle_t* a, int64_t val);
 int64_t ifa_rt_atomic_fetch_add(ifa_atomic_handle_t* a, int64_t delta);
 int64_t ifa_rt_atomic_fetch_sub(ifa_atomic_handle_t* a, int64_t delta);
 int64_t ifa_rt_atomic_cas(ifa_atomic_handle_t* a, int64_t expected, int64_t desired);
+
+ifa_atomic_u64_handle_t* ifa_rt_atomic_u64_create(uint64_t initial_val);
+void ifa_rt_atomic_u64_destroy(ifa_atomic_u64_handle_t* a);
+uint64_t ifa_rt_atomic_u64_load(ifa_atomic_u64_handle_t* a);
+void ifa_rt_atomic_u64_store(ifa_atomic_u64_handle_t* a, uint64_t val);
+uint64_t ifa_rt_atomic_u64_fetch_add(ifa_atomic_u64_handle_t* a, uint64_t delta);
+uint64_t ifa_rt_atomic_u64_fetch_sub(ifa_atomic_u64_handle_t* a, uint64_t delta);
+uint64_t ifa_rt_atomic_u64_cas(ifa_atomic_u64_handle_t* a, uint64_t expected, uint64_t desired);
+
+ifa_waitgroup_handle_t* ifa_rt_waitgroup_create(void);
+void ifa_rt_waitgroup_destroy(ifa_waitgroup_handle_t* wg);
+void ifa_rt_waitgroup_add(ifa_waitgroup_handle_t* wg, size_t delta);
+void ifa_rt_waitgroup_done(ifa_waitgroup_handle_t* wg);
+size_t ifa_rt_waitgroup_count(ifa_waitgroup_handle_t* wg);
+int32_t ifa_rt_waitgroup_wait(ifa_waitgroup_handle_t* wg);
+int32_t ifa_rt_waitgroup_wait_timeout(ifa_waitgroup_handle_t* wg, uint64_t timeout_ms);
+
+ifa_semaphore_handle_t* ifa_rt_semaphore_create(size_t initial_permits);
+void ifa_rt_semaphore_destroy(ifa_semaphore_handle_t* sem);
+int32_t ifa_rt_semaphore_try_acquire(ifa_semaphore_handle_t* sem);
+int32_t ifa_rt_semaphore_acquire(ifa_semaphore_handle_t* sem);
+int32_t ifa_rt_semaphore_acquire_timeout(ifa_semaphore_handle_t* sem, uint64_t timeout_ms);
+int32_t ifa_rt_semaphore_release(ifa_semaphore_handle_t* sem);
+size_t ifa_rt_semaphore_available(ifa_semaphore_handle_t* sem);
+
+ifa_once_handle_t* ifa_rt_once_create(void);
+void ifa_rt_once_destroy(ifa_once_handle_t* o);
+int32_t ifa_rt_once_call(ifa_once_handle_t* o, void (*func)(void*), void* arg);
+int32_t ifa_rt_once_is_completed(ifa_once_handle_t* o);
 
 int32_t ifa_rt_channel_send_int(ifa_channel_handle_t* chan, int64_t val);
 int32_t ifa_rt_channel_recv_int(ifa_channel_handle_t* chan, int64_t* out_val);
