@@ -1082,6 +1082,8 @@ impl<'a> SemanticAnalyzer<'a> {
                         | "PacketChannel"
                         | "Session"
                         | "MultipathChannel"
+                        | "PriorityChannel"
+                        | "TimerQueue"
                 )
             }
             _ => false,
@@ -3290,6 +3292,8 @@ impl<'a> SemanticAnalyzer<'a> {
                                         | "Stream"
                                         | "PacketChannel"
                                         | "MultipathChannel"
+                                        | "PriorityChannel"
+                                        | "TimerQueue"
                                 ) && !args.is_empty()
                                 {
                                     elem_ty = args[0].clone();
@@ -5534,7 +5538,12 @@ impl<'a> SemanticAnalyzer<'a> {
         if m_name == "is_empty" {
             return wrap_optional(Type::Bool);
         }
-        if m_name == "send" {
+        if m_name == "send"
+            || m_name == "send_priority"
+            || m_name == "send_with_priority"
+            || m_name == "schedule"
+            || m_name == "enqueue"
+        {
             // E0072 — check that the channel payload type does not carry a local reference.
             // We inspect the receiver type: Channel<T> → check T deeply via the symbol table.
             if let Type::Generic {
@@ -5552,6 +5561,8 @@ impl<'a> SemanticAnalyzer<'a> {
                         | "Stream"
                         | "PacketChannel"
                         | "MultipathChannel"
+                        | "PriorityChannel"
+                        | "TimerQueue"
                 ) && !gen_args.is_empty()
                 {
                     let payload_ty = &gen_args[0];
@@ -5579,7 +5590,7 @@ impl<'a> SemanticAnalyzer<'a> {
             }
             return Type::Unit;
         }
-        if m_name == "recv" {
+        if m_name == "recv" || m_name == "dequeue" || m_name == "pop" {
             for arg in args {
                 self.infer_expr(&arg.value);
             }
@@ -5598,6 +5609,8 @@ impl<'a> SemanticAnalyzer<'a> {
                         | "Stream"
                         | "PacketChannel"
                         | "MultipathChannel"
+                        | "PriorityChannel"
+                        | "TimerQueue"
                 ) && !gen_args.is_empty()
                 {
                     let payload_ty = &gen_args[0];
@@ -5623,7 +5636,7 @@ impl<'a> SemanticAnalyzer<'a> {
             }
             return Type::Unknown;
         }
-        if m_name == "try_recv" {
+        if m_name == "try_recv" || m_name == "peek" {
             for arg in args {
                 self.infer_expr(&arg.value);
             }
@@ -5642,6 +5655,8 @@ impl<'a> SemanticAnalyzer<'a> {
                         | "Stream"
                         | "PacketChannel"
                         | "MultipathChannel"
+                        | "PriorityChannel"
+                        | "TimerQueue"
                 ) && !gen_args.is_empty()
                 {
                     let payload_ty = &gen_args[0];
@@ -5667,7 +5682,7 @@ impl<'a> SemanticAnalyzer<'a> {
             }
             return Type::Optional(Box::new(Type::Unknown));
         }
-        if m_name == "close" {
+        if m_name == "close" || m_name == "cancel" {
             for arg in args {
                 self.infer_expr(&arg.value);
             }

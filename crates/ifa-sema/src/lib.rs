@@ -1029,4 +1029,172 @@ mod tests {
             res.diagnostics
         );
     }
+
+    // -----------------------------------------------------------------
+    // E0072 — PriorityChannel & TimerQueue inter-fiber verification
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_priority_channel_send_ref_payload_rejected() {
+        let code = r#"
+            struct TaskWithRef {
+                ptr: ref i32,
+                id: i64,
+            }
+            fn schedule_task(pch: sync::PriorityChannel<TaskWithRef>, task: TaskWithRef) {
+                pch.send(task);
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(res.has_errors());
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0072")),
+            "Expected E0072 on PriorityChannel.send with struct containing ref, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_priority_channel_recv_ref_payload_rejected() {
+        let code = r#"
+            fn consume_prio(pch: sync::PriorityChannel<ref i64>) {
+                let item = pch.recv();
+                let opt = pch.try_recv();
+                let popped = pch.pop();
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(res.has_errors());
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0072")),
+            "Expected E0072 on PriorityChannel receive with ref payload, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_timer_queue_schedule_and_recv_ref_payload_rejected() {
+        let code = r#"
+            struct TimeoutRef {
+                token: ref u8,
+            }
+            fn manage_timer(tq: sync::TimerQueue<TimeoutRef>, ev: TimeoutRef) {
+                tq.schedule(ev);
+                let fired = tq.recv();
+                let peeked = tq.peek();
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(res.has_errors());
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0072")),
+            "Expected E0072 on TimerQueue with ref payload, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_priority_channel_and_timer_queue_select_rejected() {
+        let code = r#"
+            fn select_prio(pch: sync::PriorityChannel<ref i32>) {
+                select {
+                    let x = pch => {
+                        let _ = x;
+                    }
+                }
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(res.has_errors());
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0072")),
+            "Expected E0072 on select arm with PriorityChannel<ref i32>, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_priority_channel_and_timer_queue_multipath_protocol() {
+        let bad_code = r#"
+            @multipath(resilient)
+            protocol FiberScheduler {
+                slice high: PriorityChannel<ref i64>,
+                slice timer: TimerQueue<i64>,
+            }
+        "#;
+        let bad_res = parse_and_analyze(bad_code);
+        assert!(bad_res.has_errors());
+        assert!(
+            bad_res
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0072")),
+            "Expected E0072 for PriorityChannel with ref in multipath protocol, got: {:?}",
+            bad_res.diagnostics
+        );
+
+        let good_code = r#"
+            struct SafeTask {
+                id: i64,
+                deadline: u64,
+            }
+            @multipath(resilient)
+            protocol FiberSchedulerSafe {
+                slice high: PriorityChannel<SafeTask>,
+                slice timer: TimerQueue<SafeTask>,
+            }
+        "#;
+        let good_res = parse_and_analyze(good_code);
+        assert!(
+            !good_res.has_errors(),
+            "Multipath protocol with PriorityChannel and TimerQueue holding safe value types must succeed, got: {:?}",
+            good_res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_priority_channel_and_timer_queue_value_payload_accepted() {
+        let code = r#"
+            struct SafeEvent {
+                id: i64,
+                prio: i32,
+            }
+            fn dispatch(
+                pch: sync::PriorityChannel<SafeEvent>,
+                tq: sync::TimerQueue<SafeEvent>,
+                ev: SafeEvent
+            ) {
+                pch.send(ev);
+                pch.send_priority(ev);
+                tq.schedule(ev);
+                let p1 = pch.recv();
+                let p2 = pch.try_recv();
+                let p3 = pch.pop();
+                let t1 = tq.recv();
+                let t2 = tq.try_recv();
+                let t3 = tq.pop();
+                let t4 = tq.peek();
+                pch.close();
+                tq.cancel();
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        let has_e0072 = res
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0072"));
+        assert!(
+            !has_e0072,
+            "E0072 must NOT fire for pure value payloads in PriorityChannel and TimerQueue, got: {:?}",
+            res.diagnostics
+        );
+    }
 }
