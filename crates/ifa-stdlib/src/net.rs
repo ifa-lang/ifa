@@ -133,6 +133,186 @@ fn sock_get_send_buffer<T: AsRawFd>(socket: &T) -> io::Result<usize> {
     }
 }
 
+#[cfg(unix)]
+fn sock_set_keepalive<T: AsRawFd>(socket: &T, keepalive: bool) -> io::Result<()> {
+    let fd = socket.as_raw_fd();
+    let val: libc::c_int = if keepalive { 1 } else { 0 };
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn sock_get_keepalive<T: AsRawFd>(socket: &T) -> io::Result<bool> {
+    let fd = socket.as_raw_fd();
+    let mut val: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&val) as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            &mut val as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret == 0 {
+        Ok(val != 0)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn sock_set_reuse_address<T: AsRawFd>(socket: &T, reuse: bool) -> io::Result<()> {
+    let fd = socket.as_raw_fd();
+    let val: libc::c_int = if reuse { 1 } else { 0 };
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn sock_get_reuse_address<T: AsRawFd>(socket: &T) -> io::Result<bool> {
+    let fd = socket.as_raw_fd();
+    let mut val: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&val) as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &mut val as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret == 0 {
+        Ok(val != 0)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn sock_set_reuse_port<T: AsRawFd>(socket: &T, reuse: bool) -> io::Result<()> {
+    let fd = socket.as_raw_fd();
+    let val: libc::c_int = if reuse { 1 } else { 0 };
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn sock_get_reuse_port<T: AsRawFd>(socket: &T) -> io::Result<bool> {
+    let fd = socket.as_raw_fd();
+    let mut val: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&val) as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            &mut val as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret == 0 {
+        Ok(val != 0)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn sock_set_linger<T: AsRawFd>(socket: &T, linger: Option<Duration>) -> io::Result<()> {
+    let fd = socket.as_raw_fd();
+    let val = match linger {
+        Some(dur) => libc::linger {
+            l_onoff: 1,
+            l_linger: dur.as_secs().min(i32::MAX as u64) as libc::c_int,
+        },
+        None => libc::linger {
+            l_onoff: 0,
+            l_linger: 0,
+        },
+    };
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn sock_get_linger<T: AsRawFd>(socket: &T) -> io::Result<Option<Duration>> {
+    let fd = socket.as_raw_fd();
+    let mut val = libc::linger {
+        l_onoff: 0,
+        l_linger: 0,
+    };
+    let mut len = std::mem::size_of_val(&val) as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &mut val as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret == 0 {
+        if val.l_onoff != 0 {
+            Ok(Some(Duration::from_secs(val.l_linger.max(0) as u64)))
+        } else {
+            Ok(None)
+        }
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 #[cfg(not(unix))]
 fn sock_set_recv_buffer<T>(_socket: &T, _size: usize) -> io::Result<()> {
     Ok(())
@@ -153,6 +333,46 @@ fn sock_get_send_buffer<T>(_socket: &T) -> io::Result<usize> {
     Ok(65536)
 }
 
+#[cfg(not(unix))]
+fn sock_set_keepalive<T>(_socket: &T, _keepalive: bool) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sock_get_keepalive<T>(_socket: &T) -> io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(not(unix))]
+fn sock_set_reuse_address<T>(_socket: &T, _reuse: bool) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sock_get_reuse_address<T>(_socket: &T) -> io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(not(unix))]
+fn sock_set_reuse_port<T>(_socket: &T, _reuse: bool) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sock_get_reuse_port<T>(_socket: &T) -> io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(not(unix))]
+fn sock_set_linger<T>(_socket: &T, _linger: Option<Duration>) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sock_get_linger<T>(_socket: &T) -> io::Result<Option<Duration>> {
+    Ok(None)
+}
+
 /// Managed non-blocking TCP Stream.
 pub struct TcpStream {
     inner: StdTcpStream,
@@ -163,6 +383,18 @@ impl TcpStream {
     /// Connect to a remote host and set the socket to non-blocking mode.
     pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let stream = StdTcpStream::connect(addr)?;
+        stream.set_nonblocking(true)?;
+        stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+        stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+        Ok(Self {
+            inner: stream,
+            is_open: true,
+        })
+    }
+
+    /// Connect to a remote host with a specified timeout and set the socket to non-blocking mode.
+    pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<Self> {
+        let stream = StdTcpStream::connect_timeout(addr, timeout)?;
         stream.set_nonblocking(true)?;
         stream.set_read_timeout(Some(Duration::from_millis(500)))?;
         stream.set_write_timeout(Some(Duration::from_millis(500)))?;
@@ -361,6 +593,46 @@ impl TcpStream {
         sock_get_send_buffer(&self.inner)
     }
 
+    /// Sets the value of the `SO_KEEPALIVE` option on this socket.
+    pub fn set_keepalive(&self, keepalive: bool) -> io::Result<()> {
+        sock_set_keepalive(&self.inner, keepalive)
+    }
+
+    /// Gets the value of the `SO_KEEPALIVE` option on this socket.
+    pub fn keepalive(&self) -> io::Result<bool> {
+        sock_get_keepalive(&self.inner)
+    }
+
+    /// Sets the value of the `SO_LINGER` option on this socket.
+    pub fn set_linger(&self, linger: Option<Duration>) -> io::Result<()> {
+        sock_set_linger(&self.inner, linger)
+    }
+
+    /// Gets the value of the `SO_LINGER` option on this socket.
+    pub fn linger(&self) -> io::Result<Option<Duration>> {
+        sock_get_linger(&self.inner)
+    }
+
+    /// Sets the value of the `SO_REUSEADDR` option on this socket.
+    pub fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
+        sock_set_reuse_address(&self.inner, reuse)
+    }
+
+    /// Gets the value of the `SO_REUSEADDR` option on this socket.
+    pub fn reuse_address(&self) -> io::Result<bool> {
+        sock_get_reuse_address(&self.inner)
+    }
+
+    /// Sets the value of the `SO_REUSEPORT` option on this socket.
+    pub fn set_reuse_port(&self, reuse: bool) -> io::Result<()> {
+        sock_set_reuse_port(&self.inner, reuse)
+    }
+
+    /// Gets the value of the `SO_REUSEPORT` option on this socket.
+    pub fn reuse_port(&self) -> io::Result<bool> {
+        sock_get_reuse_port(&self.inner)
+    }
+
     /// Apply standard configuration options to this stream.
     pub fn apply_config(&self, config: &SocketConfig) -> io::Result<()> {
         config.apply_tcp(self)
@@ -498,6 +770,31 @@ impl TcpListener {
     /// Get and clear the last socket error if any.
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
         self.inner.take_error()
+    }
+
+    /// Sets the value of the `SO_REUSEADDR` option on this socket.
+    pub fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
+        sock_set_reuse_address(&self.inner, reuse)
+    }
+
+    /// Gets the value of the `SO_REUSEADDR` option on this socket.
+    pub fn reuse_address(&self) -> io::Result<bool> {
+        sock_get_reuse_address(&self.inner)
+    }
+
+    /// Sets the value of the `SO_REUSEPORT` option on this socket.
+    pub fn set_reuse_port(&self, reuse: bool) -> io::Result<()> {
+        sock_set_reuse_port(&self.inner, reuse)
+    }
+
+    /// Gets the value of the `SO_REUSEPORT` option on this socket.
+    pub fn reuse_port(&self) -> io::Result<bool> {
+        sock_get_reuse_port(&self.inner)
+    }
+
+    /// Apply standard configuration options to this listener.
+    pub fn apply_config(&self, config: &SocketConfig) -> io::Result<()> {
+        config.apply_listener(self)
     }
 }
 
@@ -777,6 +1074,26 @@ impl UdpSocket {
         self.send_to(&packet.data, packet.sender)
     }
 
+    /// Sets the value of the `SO_REUSEADDR` option on this socket.
+    pub fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
+        sock_set_reuse_address(&self.inner, reuse)
+    }
+
+    /// Gets the value of the `SO_REUSEADDR` option on this socket.
+    pub fn reuse_address(&self) -> io::Result<bool> {
+        sock_get_reuse_address(&self.inner)
+    }
+
+    /// Sets the value of the `SO_REUSEPORT` option on this socket.
+    pub fn set_reuse_port(&self, reuse: bool) -> io::Result<()> {
+        sock_set_reuse_port(&self.inner, reuse)
+    }
+
+    /// Gets the value of the `SO_REUSEPORT` option on this socket.
+    pub fn reuse_port(&self) -> io::Result<bool> {
+        sock_get_reuse_port(&self.inner)
+    }
+
     /// Apply standard configuration options to this socket.
     pub fn apply_config(&self, config: &SocketConfig) -> io::Result<()> {
         config.apply_udp(self)
@@ -817,6 +1134,10 @@ pub struct SocketConfig {
     pub recv_buffer_size: Option<usize>,
     pub send_buffer_size: Option<usize>,
     pub broadcast: Option<bool>,
+    pub keepalive: Option<bool>,
+    pub linger: Option<Option<Duration>>,
+    pub reuse_address: Option<bool>,
+    pub reuse_port: Option<bool>,
 }
 
 impl SocketConfig {
@@ -867,6 +1188,30 @@ impl SocketConfig {
         self
     }
 
+    /// Set SO_KEEPALIVE option for TCP sockets.
+    pub fn keepalive(mut self, enabled: bool) -> Self {
+        self.keepalive = Some(enabled);
+        self
+    }
+
+    /// Set SO_LINGER option for TCP sockets.
+    pub fn linger(mut self, linger: Option<Duration>) -> Self {
+        self.linger = Some(linger);
+        self
+    }
+
+    /// Set SO_REUSEADDR option for sockets.
+    pub fn reuse_address(mut self, enabled: bool) -> Self {
+        self.reuse_address = Some(enabled);
+        self
+    }
+
+    /// Set SO_REUSEPORT option for sockets.
+    pub fn reuse_port(mut self, enabled: bool) -> Self {
+        self.reuse_port = Some(enabled);
+        self
+    }
+
     /// Apply configured options to a TCP stream.
     pub fn apply_tcp(&self, stream: &TcpStream) -> io::Result<()> {
         if let Some(nd) = self.nodelay {
@@ -886,6 +1231,18 @@ impl SocketConfig {
         }
         if let Some(sz) = self.send_buffer_size {
             stream.set_send_buffer_size(sz)?;
+        }
+        if let Some(ka) = self.keepalive {
+            stream.set_keepalive(ka)?;
+        }
+        if let Some(lg) = self.linger {
+            stream.set_linger(lg)?;
+        }
+        if let Some(ra) = self.reuse_address {
+            stream.set_reuse_address(ra)?;
+        }
+        if let Some(rp) = self.reuse_port {
+            stream.set_reuse_port(rp)?;
         }
         Ok(())
     }
@@ -909,6 +1266,26 @@ impl SocketConfig {
         }
         if let Some(sz) = self.send_buffer_size {
             socket.set_send_buffer_size(sz)?;
+        }
+        if let Some(ra) = self.reuse_address {
+            socket.set_reuse_address(ra)?;
+        }
+        if let Some(rp) = self.reuse_port {
+            socket.set_reuse_port(rp)?;
+        }
+        Ok(())
+    }
+
+    /// Apply configured options to a TCP listener.
+    pub fn apply_listener(&self, listener: &TcpListener) -> io::Result<()> {
+        if let Some(ttl) = self.ttl {
+            listener.set_ttl(ttl)?;
+        }
+        if let Some(ra) = self.reuse_address {
+            listener.set_reuse_address(ra)?;
+        }
+        if let Some(rp) = self.reuse_port {
+            listener.set_reuse_port(rp)?;
         }
         Ok(())
     }
@@ -30181,6 +30558,102 @@ mod tests {
         let dg = received.expect("datagram received");
         assert_eq!(&dg.data, b"DATAGRAM_PACKET");
         assert_eq!(dg.sender.port(), udp1.port().unwrap());
+    }
+
+    #[test]
+    fn test_tcp_stream_connect_timeout_and_advanced_socket_options() {
+        use super::{SocketConfig, TcpListener, TcpStream, UdpSocket};
+
+        // 1. TcpListener and connect_timeout
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let listener_addr = listener.local_addr().expect("listener local_addr");
+
+        // Advanced listener socket options & apply_config
+        listener
+            .set_reuse_address(true)
+            .expect("listener set_reuse_address");
+        #[cfg(unix)]
+        assert!(listener.reuse_address().expect("listener reuse_address"));
+
+        listener
+            .set_reuse_port(true)
+            .expect("listener set_reuse_port");
+        #[cfg(unix)]
+        assert!(listener.reuse_port().expect("listener reuse_port"));
+
+        let listener_config = SocketConfig::new()
+            .ttl(128)
+            .reuse_address(true)
+            .reuse_port(true);
+        listener
+            .apply_config(&listener_config)
+            .expect("listener apply_config");
+        assert_eq!(listener.ttl().expect("listener ttl"), 128);
+
+        // connect_timeout
+        let client = TcpStream::connect_timeout(&listener_addr, Duration::from_secs(3))
+            .expect("client connect_timeout");
+        assert!(client.is_open());
+        assert_eq!(client.peer_addr().expect("peer_addr"), listener_addr);
+
+        // 2. Advanced TCP stream options (keepalive, linger, reuse)
+        client.set_keepalive(true).expect("set_keepalive");
+        #[cfg(unix)]
+        assert!(client.keepalive().expect("keepalive"));
+
+        client
+            .set_linger(Some(Duration::from_secs(2)))
+            .expect("set_linger");
+        #[cfg(unix)]
+        assert_eq!(
+            client.linger().expect("linger"),
+            Some(Duration::from_secs(2))
+        );
+
+        client.set_linger(None).expect("clear linger");
+        #[cfg(unix)]
+        assert_eq!(client.linger().expect("linger none"), None);
+
+        client
+            .set_reuse_address(true)
+            .expect("client set_reuse_address");
+        #[cfg(unix)]
+        assert!(client.reuse_address().expect("client reuse_address"));
+
+        client.set_reuse_port(true).expect("client set_reuse_port");
+        #[cfg(unix)]
+        assert!(client.reuse_port().expect("client reuse_port"));
+
+        // 3. SocketConfig with advanced TCP options
+        let stream_config = SocketConfig::new()
+            .nodelay(true)
+            .ttl(48)
+            .keepalive(true)
+            .linger(Some(Duration::from_secs(1)))
+            .reuse_address(true)
+            .reuse_port(true);
+        client
+            .apply_config(&stream_config)
+            .expect("client apply_config");
+        assert!(client.nodelay().expect("nodelay"));
+        assert_eq!(client.ttl().expect("ttl"), 48);
+
+        // 4. Advanced UDP socket options
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("bind udp");
+        udp.set_reuse_address(true).expect("udp set_reuse_address");
+        #[cfg(unix)]
+        assert!(udp.reuse_address().expect("udp reuse_address"));
+
+        udp.set_reuse_port(true).expect("udp set_reuse_port");
+        #[cfg(unix)]
+        assert!(udp.reuse_port().expect("udp reuse_port"));
+
+        let udp_cfg = SocketConfig::new()
+            .ttl(60)
+            .reuse_address(true)
+            .reuse_port(true);
+        udp.apply_config(&udp_cfg).expect("udp apply_config");
+        assert_eq!(udp.ttl().expect("udp ttl"), 60);
     }
 
     #[test]
