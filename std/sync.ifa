@@ -49,6 +49,14 @@ pub fn make_unbounded_channel() -> Channel {
     return make_channel(0);
 }
 
+pub fn channel() -> Channel {
+    return make_unbounded_channel();
+}
+
+pub fn bounded(capacity: i64) -> Channel {
+    return make_channel(capacity);
+}
+
 pub fn channel_send_msg(inout chan: Channel, val: i64) -> bool {
     if chan.is_closed {
         return false;
@@ -56,8 +64,16 @@ pub fn channel_send_msg(inout chan: Channel, val: i64) -> bool {
     return channel_send(chan.id, val);
 }
 
+pub fn channel_send_i64(inout chan: Channel, val: i64) -> bool {
+    return channel_send_msg(inout chan, val);
+}
+
 pub fn channel_recv_msg(inout chan: Channel) -> i64 {
     return channel_recv(chan.id);
+}
+
+pub fn channel_recv_i64(inout chan: Channel) -> i64 {
+    return channel_recv_msg(inout chan);
 }
 
 pub fn channel_try_send_msg(inout chan: Channel, val: i64) -> bool {
@@ -67,8 +83,16 @@ pub fn channel_try_send_msg(inout chan: Channel, val: i64) -> bool {
     return channel_try_send(chan.id, val);
 }
 
+pub fn channel_try_send_i64(inout chan: Channel, val: i64) -> bool {
+    return channel_try_send_msg(inout chan, val);
+}
+
 pub fn channel_try_recv_msg(inout chan: Channel) -> i64 {
     return channel_try_recv(chan.id);
+}
+
+pub fn channel_try_recv_i64(inout chan: Channel) -> i64 {
+    return channel_try_recv_msg(inout chan);
 }
 
 pub fn channel_send_text(inout chan: Channel, text: String) -> bool {
@@ -78,13 +102,25 @@ pub fn channel_send_text(inout chan: Channel, text: String) -> bool {
     return channel_send_string(chan.id, text);
 }
 
+pub fn channel_send_str(inout chan: Channel, text: String) -> bool {
+    return channel_send_text(inout chan, text);
+}
+
 pub fn channel_recv_text(inout chan: Channel) -> String {
     return channel_recv_string(chan.id);
+}
+
+pub fn channel_recv_str(inout chan: Channel) -> String {
+    return channel_recv_text(inout chan);
 }
 
 pub fn channel_close_endpoint(inout chan: Channel) {
     chan.is_closed = true;
     let _ = channel_close(chan.id);
+}
+
+pub fn channel_close(inout chan: Channel) {
+    channel_close_endpoint(inout chan);
 }
 
 pub fn channel_get_len(chan: Channel) -> i64 {
@@ -814,21 +850,27 @@ pub fn test_sync_concurrency_advanced() -> bool {
     mut wg = make_wait_group();
     mut counter = make_atomic_int(0);
     mut sem = make_semaphore(4);
-    mut ch = make_channel(8);
+    mut ch = bounded(8);
+    mut ch_str = channel();
 
     yield_now();
 
+    let s_str = channel_send_str(inout ch_str, "cooperative_typed_channel");
+    let r_str = channel_recv_str(inout ch_str);
+    channel_close(inout ch_str);
+    let str_closed = channel_check_closed(ch_str);
+
     wait_group_add(inout wg, 4);
 
-    let _ = channel_send_msg(inout ch, 10);
-    let _ = channel_send_msg(inout ch, 20);
-    let _ = channel_send_msg(inout ch, 30);
-    let _ = channel_send_msg(inout ch, 40);
+    let _ = channel_send_i64(inout ch, 10);
+    let _ = channel_send_i64(inout ch, 20);
+    let _ = channel_send_i64(inout ch, 30);
+    let _ = channel_send_i64(inout ch, 40);
 
     mut i: i64 = 0;
     while i < 4 {
         semaphore_acquire(inout sem);
-        let val = channel_recv_msg(inout ch);
+        let val = channel_recv_i64(inout ch);
         let _ = atomic_int_add(inout counter, val);
         wait_group_done(inout wg);
         semaphore_release(inout sem);
@@ -837,7 +879,11 @@ pub fn test_sync_concurrency_advanced() -> bool {
 
     wait_group_wait(inout wg);
     let total = atomic_int_get(counter);
-    return total == 100 && wait_group_is_done(wg);
+    return total == 100
+        && wait_group_is_done(wg)
+        && s_str
+        && r_str == "cooperative_typed_channel"
+        && str_closed;
 }
 
 pub fn test_sync_all() -> bool {
