@@ -119,10 +119,6 @@ pub fn channel_close_endpoint(inout chan: Channel) {
     let _ = channel_close(chan.id);
 }
 
-pub fn channel_close(inout chan: Channel) {
-    channel_close_endpoint(inout chan);
-}
-
 pub fn channel_get_len(chan: Channel) -> i64 {
     return channel_len(chan.id);
 }
@@ -857,7 +853,7 @@ pub fn test_sync_concurrency_advanced() -> bool {
 
     let s_str = channel_send_str(inout ch_str, "cooperative_typed_channel");
     let r_str = channel_recv_str(inout ch_str);
-    channel_close(inout ch_str);
+    channel_close_endpoint(inout ch_str);
     let str_closed = channel_check_closed(ch_str);
 
     wait_group_add(inout wg, 4);
