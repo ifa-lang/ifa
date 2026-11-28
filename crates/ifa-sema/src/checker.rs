@@ -968,7 +968,11 @@ impl<'a> SemanticAnalyzer<'a> {
                 self.check_multipath_attribute(attr);
             }
 
-            if let Some(ch_sym) = self.symbols.lookup_protocol(&proto.name).and_then(|p| p.get_channel(&ch.name)) {
+            if let Some(ch_sym) = self
+                .symbols
+                .lookup_protocol(&proto.name)
+                .and_then(|p| p.get_channel(&ch.name))
+            {
                 if (ch.is_slice || is_multipath || !ch.attributes.is_empty())
                     && !self.is_valid_multipath_channel_type(&ch_sym.ty)
                 {

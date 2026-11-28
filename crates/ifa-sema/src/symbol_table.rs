@@ -141,7 +141,9 @@ impl ProtocolSymbol {
     }
 
     pub fn get_channel(&self, name: &Symbol) -> Option<&ProtocolChannelSymbol> {
-        self.channel_indices.get(name).map(|&idx| &self.channels[idx])
+        self.channel_indices
+            .get(name)
+            .map(|&idx| &self.channels[idx])
     }
 }
 

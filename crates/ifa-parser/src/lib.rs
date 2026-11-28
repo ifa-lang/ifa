@@ -199,7 +199,10 @@ impl Parser {
             }
             _ => {
                 let diag = Diagnostic::error(format!("littéral attendu, trouvé '{}'", cur.kind))
-                    .with_primary_label(cur.span, "littéral attendu (entier, chaîne, booléen, etc.)");
+                    .with_primary_label(
+                        cur.span,
+                        "littéral attendu (entier, chaîne, booléen, etc.)",
+                    );
                 self.diagnostics.push(diag.clone());
                 Err(diag)
             }

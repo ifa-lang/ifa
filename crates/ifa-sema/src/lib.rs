@@ -636,7 +636,9 @@ mod tests {
             "Expected valid multipath protocol to analyze with 0 errors, got: {:?}",
             res.diagnostics
         );
-        let proto_sym = res.symbols.lookup_protocol(&INTERNER.intern("MediaDistribution"));
+        let proto_sym = res
+            .symbols
+            .lookup_protocol(&INTERNER.intern("MediaDistribution"));
         assert!(proto_sym.is_some());
         let proto = proto_sym.unwrap();
         assert_eq!(proto.channels.len(), 3);
