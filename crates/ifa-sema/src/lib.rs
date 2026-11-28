@@ -742,6 +742,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_multipath_channel_struct_with_ref_field_rejected() {
+        let code = r#"
+            struct PacketRef {
+                payload: ref u8,
+            }
+
+            @multipath(resilient)
+            protocol VideoProto {
+                slice data: Channel<PacketRef>,
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(res.has_errors());
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0072")),
+            "Expected E0072 error for struct containing ref field in multipath payload, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_multipath_channel_value_struct_accepted() {
+        let code = r#"
+            struct PacketValue {
+                seq: u64,
+                len: usize,
+            }
+
+            @multipath(resilient)
+            protocol VideoProto {
+                slice data: Channel<PacketValue>,
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(
+            !res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0072")),
+            "E0072 must NOT fire for a pure value struct in multipath channel, got: {:?}",
+            res.diagnostics
+        );
+    }
+
     // -----------------------------------------------------------------
     // E0072 — custom struct with ref field sent over a channel
     // -----------------------------------------------------------------

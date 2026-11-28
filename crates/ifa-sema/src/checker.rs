@@ -1142,14 +1142,18 @@ impl<'a> SemanticAnalyzer<'a> {
                     );
                 }
 
-                if crate::escape::type_contains_ref(&ch_sym.ty) {
+                let mut visited = std::collections::HashSet::new();
+                if type_contains_ref_deep(&ch_sym.ty, &self.symbols, &mut visited) {
                     self.diagnostics.push(
                         Diagnostic::error(format!(
                             "le type de charge utile '{}' dans le canal multipath '{}' ne peut pas contenir de référence locale ('ref')",
                             ch_sym.ty, ch_name
                         ))
                         .with_code("E0072")
-                        .with_primary_label(ch.span, "référence locale non transférable sur canal multipath"),
+                        .with_primary_label(ch.span, "référence locale non transférable sur canal multipath")
+                        .with_note(
+                            "Utilisez la sémantique de valeur pure (sans 'ref') pour les types transmis par canal.",
+                        ),
                     );
                 }
             }
