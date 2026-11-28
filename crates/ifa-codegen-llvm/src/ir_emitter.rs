@@ -3894,34 +3894,15 @@ impl<'a> LlvmIrEmitter<'a> {
                     "sync::waitgroup_wait_timeout" | "waitgroup_wait_timeout" => {
                         "ifa_rt_waitgroup_wait_timeout"
                     }
-                    "sync::semaphore_create"
-                    | "sync::sem_create"
-                    | "semaphore_create"
-                    | "sem_create" => "ifa_rt_semaphore_create",
-                    "sync::semaphore_destroy"
-                    | "sync::sem_destroy"
-                    | "semaphore_destroy"
-                    | "sem_destroy" => "ifa_rt_semaphore_destroy",
-                    "sync::semaphore_try_acquire"
-                    | "sync::sem_try_acquire"
-                    | "semaphore_try_acquire"
-                    | "sem_try_acquire" => "ifa_rt_semaphore_try_acquire",
-                    "sync::semaphore_acquire"
-                    | "sync::sem_acquire"
-                    | "semaphore_acquire"
-                    | "sem_acquire" => "ifa_rt_semaphore_acquire",
-                    "sync::semaphore_acquire_timeout"
-                    | "sync::sem_acquire_timeout"
-                    | "semaphore_acquire_timeout"
-                    | "sem_acquire_timeout" => "ifa_rt_semaphore_acquire_timeout",
-                    "sync::semaphore_release"
-                    | "sync::sem_release"
-                    | "semaphore_release"
-                    | "sem_release" => "ifa_rt_semaphore_release",
-                    "sync::semaphore_available"
-                    | "sync::sem_available"
-                    | "semaphore_available"
-                    | "sem_available" => "ifa_rt_semaphore_available",
+                    "sync::sem_create" | "sem_create" => "ifa_rt_semaphore_create",
+                    "sync::sem_destroy" | "sem_destroy" => "ifa_rt_semaphore_destroy",
+                    "sync::sem_try_acquire" | "sem_try_acquire" => "ifa_rt_semaphore_try_acquire",
+                    "sync::sem_acquire" | "sem_acquire" => "ifa_rt_semaphore_acquire",
+                    "sync::sem_acquire_timeout" | "sem_acquire_timeout" => {
+                        "ifa_rt_semaphore_acquire_timeout"
+                    }
+                    "sync::sem_release" | "sem_release" => "ifa_rt_semaphore_release",
+                    "sync::sem_available" | "sem_available" => "ifa_rt_semaphore_available",
                     "sync::once_create" | "once_create" => "ifa_rt_once_create",
                     "sync::once_destroy" | "once_destroy" => "ifa_rt_once_destroy",
                     "sync::once_is_completed" | "once_is_completed" => "ifa_rt_once_is_completed",
@@ -6028,34 +6009,15 @@ impl<'a> LlvmIrEmitter<'a> {
                     "sync::waitgroup_wait_timeout" | "waitgroup_wait_timeout" => {
                         "ifa_rt_waitgroup_wait_timeout"
                     }
-                    "sync::semaphore_create"
-                    | "sync::sem_create"
-                    | "semaphore_create"
-                    | "sem_create" => "ifa_rt_semaphore_create",
-                    "sync::semaphore_destroy"
-                    | "sync::sem_destroy"
-                    | "semaphore_destroy"
-                    | "sem_destroy" => "ifa_rt_semaphore_destroy",
-                    "sync::semaphore_try_acquire"
-                    | "sync::sem_try_acquire"
-                    | "semaphore_try_acquire"
-                    | "sem_try_acquire" => "ifa_rt_semaphore_try_acquire",
-                    "sync::semaphore_acquire"
-                    | "sync::sem_acquire"
-                    | "semaphore_acquire"
-                    | "sem_acquire" => "ifa_rt_semaphore_acquire",
-                    "sync::semaphore_acquire_timeout"
-                    | "sync::sem_acquire_timeout"
-                    | "semaphore_acquire_timeout"
-                    | "sem_acquire_timeout" => "ifa_rt_semaphore_acquire_timeout",
-                    "sync::semaphore_release"
-                    | "sync::sem_release"
-                    | "semaphore_release"
-                    | "sem_release" => "ifa_rt_semaphore_release",
-                    "sync::semaphore_available"
-                    | "sync::sem_available"
-                    | "semaphore_available"
-                    | "sem_available" => "ifa_rt_semaphore_available",
+                    "sync::sem_create" | "sem_create" => "ifa_rt_semaphore_create",
+                    "sync::sem_destroy" | "sem_destroy" => "ifa_rt_semaphore_destroy",
+                    "sync::sem_try_acquire" | "sem_try_acquire" => "ifa_rt_semaphore_try_acquire",
+                    "sync::sem_acquire" | "sem_acquire" => "ifa_rt_semaphore_acquire",
+                    "sync::sem_acquire_timeout" | "sem_acquire_timeout" => {
+                        "ifa_rt_semaphore_acquire_timeout"
+                    }
+                    "sync::sem_release" | "sem_release" => "ifa_rt_semaphore_release",
+                    "sync::sem_available" | "sem_available" => "ifa_rt_semaphore_available",
                     "sync::once_create" | "once_create" => "ifa_rt_once_create",
                     "sync::once_destroy" | "once_destroy" => "ifa_rt_once_destroy",
                     "sync::once_is_completed" | "once_is_completed" => "ifa_rt_once_is_completed",

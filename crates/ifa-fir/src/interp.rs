@@ -4098,9 +4098,7 @@ impl<'a> FirInterpreter<'a> {
                     } else {
                         Ok(FirValue::Int(0))
                     }
-                } else if fn_name == "sync::semaphore_create"
-                    || fn_name == "sync::sem_create"
-                    || fn_name == "semaphore_create"
+                } else if fn_name == "sync::sem_create"
                     || fn_name == "sem_create"
                     || fn_name == "ifa_rt_semaphore_create"
                 {
@@ -4112,9 +4110,7 @@ impl<'a> FirInterpreter<'a> {
                     self.next_sync_id += 1;
                     self.sync_semaphores.insert(id, permits);
                     Ok(FirValue::Int(id as i128))
-                } else if fn_name == "sync::semaphore_destroy"
-                    || fn_name == "sync::sem_destroy"
-                    || fn_name == "semaphore_destroy"
+                } else if fn_name == "sync::sem_destroy"
                     || fn_name == "sem_destroy"
                     || fn_name == "ifa_rt_semaphore_destroy"
                 {
@@ -4124,9 +4120,7 @@ impl<'a> FirInterpreter<'a> {
                     };
                     self.sync_semaphores.remove(&id);
                     Ok(FirValue::Bool(true))
-                } else if fn_name == "sync::semaphore_try_acquire"
-                    || fn_name == "sync::sem_try_acquire"
-                    || fn_name == "semaphore_try_acquire"
+                } else if fn_name == "sync::sem_try_acquire"
                     || fn_name == "sem_try_acquire"
                     || fn_name == "ifa_rt_semaphore_try_acquire"
                 {
@@ -4144,9 +4138,7 @@ impl<'a> FirInterpreter<'a> {
                     } else {
                         Ok(FirValue::Int(-1))
                     }
-                } else if fn_name == "sync::semaphore_acquire"
-                    || fn_name == "sync::sem_acquire"
-                    || fn_name == "semaphore_acquire"
+                } else if fn_name == "sync::sem_acquire"
                     || fn_name == "sem_acquire"
                     || fn_name == "ifa_rt_semaphore_acquire"
                 {
@@ -4162,9 +4154,7 @@ impl<'a> FirInterpreter<'a> {
                     } else {
                         Ok(FirValue::Int(-1))
                     }
-                } else if fn_name == "sync::semaphore_acquire_timeout"
-                    || fn_name == "sync::sem_acquire_timeout"
-                    || fn_name == "semaphore_acquire_timeout"
+                } else if fn_name == "sync::sem_acquire_timeout"
                     || fn_name == "sem_acquire_timeout"
                     || fn_name == "ifa_rt_semaphore_acquire_timeout"
                 {
@@ -4182,9 +4172,7 @@ impl<'a> FirInterpreter<'a> {
                     } else {
                         Ok(FirValue::Int(-1))
                     }
-                } else if fn_name == "sync::semaphore_release"
-                    || fn_name == "sync::sem_release"
-                    || fn_name == "semaphore_release"
+                } else if fn_name == "sync::sem_release"
                     || fn_name == "sem_release"
                     || fn_name == "ifa_rt_semaphore_release"
                 {
@@ -4198,9 +4186,7 @@ impl<'a> FirInterpreter<'a> {
                     } else {
                         Ok(FirValue::Int(-1))
                     }
-                } else if fn_name == "sync::semaphore_available"
-                    || fn_name == "sync::sem_available"
-                    || fn_name == "semaphore_available"
+                } else if fn_name == "sync::sem_available"
                     || fn_name == "sem_available"
                     || fn_name == "ifa_rt_semaphore_available"
                 {
