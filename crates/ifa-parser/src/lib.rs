@@ -78,6 +78,16 @@ impl Parser {
         }
     }
 
+    fn match_slice(&mut self) -> bool {
+        if let TokenKind::Ident(s) = self.current().kind {
+            if s.as_str() == "slice" {
+                self.advance();
+                return true;
+            }
+        }
+        false
+    }
+
     fn eat_semicolons(&mut self) {
         while self.match_token(&TokenKind::Semicolon) {}
     }
@@ -147,7 +157,8 @@ impl Parser {
                 | TokenKind::Struct
                 | TokenKind::Enum
                 | TokenKind::Import
-                | TokenKind::Const => return,
+                | TokenKind::Const
+                | TokenKind::Protocol => return,
                 _ => {
                     self.advance();
                 }
@@ -155,8 +166,105 @@ impl Parser {
         }
     }
 
+    fn parse_literal(&mut self) -> Result<Lit, Diagnostic> {
+        let cur = self.current();
+        match cur.kind {
+            TokenKind::IntLiteral(s) => {
+                self.advance();
+                Ok(Lit::Int(s))
+            }
+            TokenKind::FloatLiteral(s) => {
+                self.advance();
+                Ok(Lit::Float(s))
+            }
+            TokenKind::StringLiteral(s) => {
+                self.advance();
+                Ok(Lit::String(s))
+            }
+            TokenKind::CharLiteral(c) => {
+                self.advance();
+                Ok(Lit::Char(c))
+            }
+            TokenKind::True => {
+                self.advance();
+                Ok(Lit::Bool(true))
+            }
+            TokenKind::False => {
+                self.advance();
+                Ok(Lit::Bool(false))
+            }
+            TokenKind::Null => {
+                self.advance();
+                Ok(Lit::Null)
+            }
+            _ => {
+                let diag = Diagnostic::error(format!("littéral attendu, trouvé '{}'", cur.kind))
+                    .with_primary_label(cur.span, "littéral attendu (entier, chaîne, booléen, etc.)");
+                self.diagnostics.push(diag.clone());
+                Err(diag)
+            }
+        }
+    }
+
+    fn parse_attributes(&mut self) -> Result<Vec<Attribute>, Diagnostic> {
+        let mut attrs = Vec::new();
+        while self.match_token(&TokenKind::At) {
+            let start = self.current().span.start;
+            let name = match self.current().kind {
+                TokenKind::Ident(s) => {
+                    self.advance();
+                    s
+                }
+                _ => {
+                    let cur = self.current();
+                    let diag = Diagnostic::error("nom d'attribut attendu après '@'")
+                        .with_primary_label(cur.span, "identifiant attendu");
+                    self.diagnostics.push(diag.clone());
+                    return Err(diag);
+                }
+            };
+
+            let mut args = Vec::new();
+            let end = if self.match_token(&TokenKind::OpenParen) {
+                while !self.check(&TokenKind::CloseParen) && !self.check(&TokenKind::Eof) {
+                    if let TokenKind::Ident(key) = self.current().kind {
+                        self.advance();
+                        if self.match_token(&TokenKind::Eq) {
+                            let lit = self.parse_literal()?;
+                            args.push(AttributeArg::KeyValue(key, lit));
+                        } else {
+                            args.push(AttributeArg::Ident(key));
+                        }
+                    } else {
+                        let lit = self.parse_literal()?;
+                        args.push(AttributeArg::Lit(lit));
+                    }
+
+                    if !self.match_token(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                let close = self.expect(TokenKind::CloseParen)?;
+                close.span.end
+            } else {
+                self.current().span.start
+            };
+
+            attrs.push(Attribute {
+                name,
+                args,
+                span: Span::new(self.file_id, start, end),
+            });
+        }
+        Ok(attrs)
+    }
+
     fn parse_item(&mut self) -> Result<Item, Diagnostic> {
+        let mut attributes = self.parse_attributes()?;
         let is_pub = self.match_token(&TokenKind::Pub);
+        if attributes.is_empty() {
+            attributes = self.parse_attributes()?;
+        }
         let mut is_strict = false;
         let mut is_comptime = false;
         let mut is_extern = None;
@@ -180,20 +288,21 @@ impl Parser {
 
         match self.current().kind {
             TokenKind::Fn => self
-                .parse_function(is_pub, is_strict, is_comptime, is_extern)
+                .parse_function(is_pub, is_strict, is_comptime, is_extern, attributes)
                 .map(Item::Function),
-            TokenKind::Struct => self.parse_struct(is_pub).map(Item::Struct),
+            TokenKind::Struct => self.parse_struct(is_pub, attributes).map(Item::Struct),
             TokenKind::Enum => self.parse_enum(is_pub).map(Item::Enum),
             TokenKind::Import => self.parse_import().map(Item::Import),
             TokenKind::Const => self.parse_const(is_pub).map(Item::Const),
             TokenKind::Trait | TokenKind::Interface => self.parse_trait(is_pub).map(Item::Trait),
             TokenKind::Impl => self.parse_impl().map(Item::Impl),
+            TokenKind::Protocol => self.parse_protocol(is_pub, attributes).map(Item::Protocol),
             _ => {
                 let cur = self.current();
                 let diag = Diagnostic::error(format!("déclaration inattendue '{}'", cur.kind))
                     .with_primary_label(
                         cur.span,
-                        "déclaration attendue (fn, struct, enum, import, const, trait, interface, impl)",
+                        "déclaration attendue (fn, struct, enum, import, const, trait, interface, impl, protocol)",
                     );
                 self.diagnostics.push(diag.clone());
                 Err(diag)
@@ -207,6 +316,7 @@ impl Parser {
         is_strict: bool,
         is_comptime: bool,
         is_extern: Option<String>,
+        attributes: Vec<Attribute>,
     ) -> Result<Function, Diagnostic> {
         let fn_tok = self.expect(TokenKind::Fn)?;
         let name_tok = match self.current().kind {
@@ -306,6 +416,7 @@ impl Parser {
             is_strict,
             is_comptime,
             is_extern,
+            attributes,
             name: name_tok,
             generics,
             where_clauses,
@@ -316,7 +427,11 @@ impl Parser {
         })
     }
 
-    fn parse_struct(&mut self, is_pub: bool) -> Result<Struct, Diagnostic> {
+    fn parse_struct(
+        &mut self,
+        is_pub: bool,
+        attributes: Vec<Attribute>,
+    ) -> Result<Struct, Diagnostic> {
         let struct_tok = self.expect(TokenKind::Struct)?;
         let name = match self.current().kind {
             TokenKind::Ident(s) => {
@@ -341,7 +456,10 @@ impl Parser {
         self.expect(TokenKind::OpenBrace)?;
         let mut fields = Vec::new();
         while !self.check(&TokenKind::CloseBrace) && !self.check(&TokenKind::Eof) {
+            let field_start = self.current().span.start;
+            let field_attrs = self.parse_attributes()?;
             let field_pub = self.match_token(&TokenKind::Pub);
+            let is_slice = self.match_slice();
             let field_name = match self.current().kind {
                 TokenKind::Ident(s) => {
                     self.advance();
@@ -357,9 +475,11 @@ impl Parser {
             };
             self.expect(TokenKind::Colon)?;
             let field_ty = self.parse_type()?;
-            let span = Span::new(self.file_id, self.current().span.start, field_ty.span.end);
+            let span = Span::new(self.file_id, field_start, field_ty.span.end);
             fields.push(StructField {
                 is_pub: field_pub,
+                is_slice,
+                attributes: field_attrs,
                 name: field_name,
                 ty: field_ty,
                 span,
@@ -372,11 +492,81 @@ impl Parser {
 
         Ok(Struct {
             is_pub,
+            attributes,
             name,
             generics,
             where_clauses,
             fields,
             span: Span::new(self.file_id, struct_tok.span.start, close.span.end),
+        })
+    }
+
+    fn parse_protocol(
+        &mut self,
+        is_pub: bool,
+        attributes: Vec<Attribute>,
+    ) -> Result<Protocol, Diagnostic> {
+        let proto_tok = self.expect(TokenKind::Protocol)?;
+        let name = match self.current().kind {
+            TokenKind::Ident(s) => {
+                self.advance();
+                s
+            }
+            _ => {
+                let cur = self.current();
+                let diag = Diagnostic::error("nom de protocole attendu après 'protocol'")
+                    .with_primary_label(cur.span, "identifiant attendu");
+                self.diagnostics.push(diag.clone());
+                return Err(diag);
+            }
+        };
+
+        self.expect(TokenKind::OpenBrace)?;
+        let mut channels = Vec::new();
+
+        while !self.check(&TokenKind::CloseBrace) && !self.check(&TokenKind::Eof) {
+            let channel_start = self.current().span.start;
+            let channel_attrs = self.parse_attributes()?;
+            let is_slice = self.match_slice();
+
+            let channel_name = match self.current().kind {
+                TokenKind::Ident(s) => {
+                    self.advance();
+                    s
+                }
+                _ => {
+                    let cur = self.current();
+                    let diag = Diagnostic::error("nom de canal ou slice attendu dans le protocole")
+                        .with_primary_label(cur.span, "identifiant attendu");
+                    self.diagnostics.push(diag.clone());
+                    return Err(diag);
+                }
+            };
+
+            self.expect(TokenKind::Colon)?;
+            let ty = self.parse_type()?;
+            let end_pos = ty.span.end;
+
+            self.match_token(&TokenKind::Comma);
+            self.eat_semicolons();
+
+            channels.push(ProtocolChannel {
+                is_slice,
+                attributes: channel_attrs,
+                name: channel_name,
+                ty,
+                span: Span::new(self.file_id, channel_start, end_pos),
+            });
+        }
+
+        let close = self.expect(TokenKind::CloseBrace)?;
+
+        Ok(Protocol {
+            is_pub,
+            attributes,
+            name,
+            channels,
+            span: Span::new(self.file_id, proto_tok.span.start, close.span.end),
         })
     }
 
@@ -857,8 +1047,9 @@ impl Parser {
         self.expect(TokenKind::OpenBrace)?;
         let mut methods = Vec::new();
         while !self.check(&TokenKind::CloseBrace) && !self.check(&TokenKind::Eof) {
+            let m_attrs = self.parse_attributes()?;
             let m_pub = self.match_token(&TokenKind::Pub);
-            methods.push(self.parse_function(m_pub, false, false, None)?);
+            methods.push(self.parse_function(m_pub, false, false, None, m_attrs)?);
         }
         let close = self.expect(TokenKind::CloseBrace)?;
 
@@ -3541,6 +3732,88 @@ mod tests {
             } else {
                 panic!("Expected ExprKind::Select");
             }
+        }
+    }
+
+    #[test]
+    fn test_parse_multipath_protocol_and_slices() {
+        let src = r#"
+            @multipath(resilient)
+            pub protocol VideoStreaming {
+                slice control: Channel<u32>,
+                @multipath(redundant)
+                slice audio: Channel<String>,
+                slice video: Channel<u8>,
+            }
+        "#;
+        let fid = FileId(0);
+        let tokens = tokenize(fid, src);
+        let (prog, diags) = parse(fid, tokens);
+        assert!(diags.is_empty(), "Parse diagnostics: {:?}", diags);
+        assert_eq!(prog.items.len(), 1);
+        if let Item::Protocol(proto) = &prog.items[0] {
+            assert!(proto.is_pub);
+            assert_eq!(INTERNER.resolve(&proto.name), "VideoStreaming");
+            assert_eq!(proto.attributes.len(), 1);
+            assert!(proto.attributes[0].is("multipath"));
+            assert!(proto.attributes[0].has_arg("resilient"));
+            assert_eq!(proto.channels.len(), 3);
+            assert!(proto.channels[0].is_slice);
+            assert_eq!(INTERNER.resolve(&proto.channels[0].name), "control");
+            assert!(proto.channels[1].is_slice);
+            assert_eq!(INTERNER.resolve(&proto.channels[1].name), "audio");
+            assert_eq!(proto.channels[1].attributes.len(), 1);
+            assert!(proto.channels[1].attributes[0].has_arg("redundant"));
+            assert!(proto.channels[2].is_slice);
+            assert_eq!(INTERNER.resolve(&proto.channels[2].name), "video");
+        } else {
+            panic!("Expected Item::Protocol");
+        }
+    }
+
+    #[test]
+    fn test_parse_multipath_struct_and_function_attributes() {
+        let src = r#"
+            @multipath(pacing = 1000)
+            struct VideoSession {
+                pub id: u64,
+                @multipath(resilient)
+                slice stream: Channel<u8>,
+            }
+
+            @multipath(resilient)
+            fn process_session(inout s: VideoSession) -> bool {
+                true
+            }
+        "#;
+        let fid = FileId(0);
+        let tokens = tokenize(fid, src);
+        let (prog, diags) = parse(fid, tokens);
+        assert!(diags.is_empty(), "Parse diagnostics: {:?}", diags);
+        assert_eq!(prog.items.len(), 2);
+
+        if let Item::Struct(st) = &prog.items[0] {
+            assert_eq!(INTERNER.resolve(&st.name), "VideoSession");
+            assert_eq!(st.attributes.len(), 1);
+            assert!(st.attributes[0].is("multipath"));
+            assert!(matches!(
+                st.attributes[0].get_key_value("pacing"),
+                Some(Lit::Int(_))
+            ));
+            assert_eq!(st.fields.len(), 2);
+            assert!(!st.fields[0].is_slice);
+            assert!(st.fields[1].is_slice);
+            assert!(st.fields[1].attributes[0].has_arg("resilient"));
+        } else {
+            panic!("Expected Item::Struct");
+        }
+
+        if let Item::Function(f) = &prog.items[1] {
+            assert_eq!(INTERNER.resolve(&f.name), "process_session");
+            assert_eq!(f.attributes.len(), 1);
+            assert!(f.attributes[0].has_arg("resilient"));
+        } else {
+            panic!("Expected Item::Function");
         }
     }
 }

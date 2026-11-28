@@ -82,6 +82,8 @@ pub enum RawToken {
     Impl,
     #[token("where")]
     Where,
+    #[token("protocol")]
+    Protocol,
     #[token("true")]
     True,
     #[token("false")]
@@ -197,6 +199,8 @@ pub enum RawToken {
     DotDot,
     #[token(".")]
     Dot,
+    #[token("@")]
+    At,
 
     // Delimiters
     #[token("(")]
@@ -253,6 +257,7 @@ pub enum TokenKind {
     Interface,
     Impl,
     Where,
+    Protocol,
     True,
     False,
     Null,
@@ -309,6 +314,7 @@ pub enum TokenKind {
     DotDotEq,
     DotDot,
     Dot,
+    At,
 
     // Delimiters
     OpenParen,
@@ -363,6 +369,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Interface => write!(f, "interface"),
             TokenKind::Impl => write!(f, "impl"),
             TokenKind::Where => write!(f, "where"),
+            TokenKind::Protocol => write!(f, "protocol"),
             TokenKind::True => write!(f, "true"),
             TokenKind::False => write!(f, "false"),
             TokenKind::Null => write!(f, "null"),
@@ -416,6 +423,7 @@ impl fmt::Display for TokenKind {
             TokenKind::DotDotEq => write!(f, "..="),
             TokenKind::DotDot => write!(f, ".."),
             TokenKind::Dot => write!(f, "."),
+            TokenKind::At => write!(f, "@"),
 
             TokenKind::OpenParen => write!(f, "("),
             TokenKind::CloseParen => write!(f, ")"),

@@ -67,6 +67,7 @@ impl<'a> Lexer<'a> {
                     RawToken::Interface => TokenKind::Interface,
                     RawToken::Impl => TokenKind::Impl,
                     RawToken::Where => TokenKind::Where,
+                    RawToken::Protocol => TokenKind::Protocol,
                     RawToken::True => TokenKind::True,
                     RawToken::False => TokenKind::False,
                     RawToken::Null => TokenKind::Null,
@@ -131,6 +132,7 @@ impl<'a> Lexer<'a> {
                     RawToken::DotDotEq => TokenKind::DotDotEq,
                     RawToken::DotDot => TokenKind::DotDot,
                     RawToken::Dot => TokenKind::Dot,
+                    RawToken::At => TokenKind::At,
 
                     RawToken::OpenParen => TokenKind::OpenParen,
                     RawToken::CloseParen => TokenKind::CloseParen,

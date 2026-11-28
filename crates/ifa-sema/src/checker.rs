@@ -5,7 +5,8 @@ use crate::exclusivity::{
 };
 use crate::symbol_table::{
     CapturedVariable, ConstSymbol, EnumSymbol, FieldSymbol, FunctionSymbol, ParamSymbol,
-    StructSymbol, SymbolTable, TraitMethodSymbol, TraitSymbol,
+    ProtocolChannelSymbol, ProtocolSymbol, StructSymbol, SymbolTable, TraitMethodSymbol,
+    TraitSymbol,
 };
 use crate::types::{IntType, Type};
 use ifa_ast::{
@@ -212,6 +213,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 Item::Struct(st) => self.declare_struct(st),
                 Item::Enum(en) => self.declare_enum(en),
                 Item::Trait(tr) => self.declare_trait(tr),
+                Item::Protocol(pr) => self.declare_protocol(pr),
                 _ => {}
             }
         }
@@ -331,6 +333,40 @@ impl<'a> SemanticAnalyzer<'a> {
             span: tr.span,
         };
         if let Err(diag) = self.symbols.define_trait(trait_sym) {
+            self.diagnostics.push(diag);
+        }
+    }
+
+    fn declare_protocol(&mut self, proto: &ifa_ast::Protocol) {
+        let known_structs = self.get_known_struct_types();
+        let known_enums = self.get_known_enum_types();
+
+        let mut channels = Vec::new();
+        for ch in &proto.channels {
+            let ty = match Type::from_ast(&ch.ty, &known_structs, &known_enums) {
+                Ok(t) => t,
+                Err(d) => {
+                    self.diagnostics.push(d);
+                    Type::Unknown
+                }
+            };
+            channels.push(ProtocolChannelSymbol {
+                name: ch.name,
+                is_slice: ch.is_slice,
+                attributes: ch.attributes.clone(),
+                ty,
+                span: ch.span,
+            });
+        }
+
+        let proto_sym = ProtocolSymbol::new(
+            proto.name,
+            proto.is_pub,
+            proto.attributes.clone(),
+            channels,
+            proto.span,
+        );
+        if let Err(diag) = self.symbols.define_protocol(proto_sym) {
             self.diagnostics.push(diag);
         }
     }
@@ -715,6 +751,8 @@ impl<'a> SemanticAnalyzer<'a> {
             match item {
                 Item::Function(f) => self.check_function(f),
                 Item::Const(c) => self.check_const(c),
+                Item::Protocol(pr) => self.check_protocol(pr),
+                Item::Struct(st) => self.check_struct_multipath(st),
                 Item::Impl(im) => {
                     let known_structs = self.get_known_struct_types();
                     let known_enums = self.get_known_enum_types();
@@ -814,7 +852,187 @@ impl<'a> SemanticAnalyzer<'a> {
         }
     }
 
+    fn check_multipath_attribute(&mut self, attr: &ifa_ast::Attribute) {
+        if !attr.is("multipath") {
+            return;
+        }
+        for arg in &attr.args {
+            match arg {
+                ifa_ast::AttributeArg::Ident(sym) => {
+                    let name = INTERNER.resolve(sym);
+                    let valid = matches!(
+                        name.as_str(),
+                        "resilient"
+                            | "redundant"
+                            | "fec"
+                            | "pacing"
+                            | "low_latency"
+                            | "high_throughput"
+                            | "bicasting"
+                            | "reliable"
+                            | "best_effort"
+                    );
+                    if !valid {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "modificateur multipath inconnu '{}' : attendu 'resilient', 'redundant', 'fec', 'pacing', 'low_latency', 'high_throughput', 'bicasting'",
+                                name
+                            ))
+                            .with_code("E0070")
+                            .with_primary_label(attr.span, format!("modificateur '{}' non reconnu", name)),
+                        );
+                    }
+                }
+                ifa_ast::AttributeArg::KeyValue(key, _lit) => {
+                    let k = INTERNER.resolve(key);
+                    let valid = matches!(
+                        k.as_str(),
+                        "strategy" | "slices" | "pacing" | "fec_ratio" | "mode" | "burst_shaper"
+                    );
+                    if !valid {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "paramètre multipath inconnu '{}' : attendu 'strategy', 'slices', 'pacing', 'fec_ratio', 'mode'",
+                                k
+                            ))
+                            .with_code("E0070")
+                            .with_primary_label(attr.span, format!("paramètre '{}' non reconnu", k)),
+                        );
+                    }
+                }
+                ifa_ast::AttributeArg::Lit(_) => {
+                    self.diagnostics.push(
+                        Diagnostic::error("littéral direct non supporté dans '@multipath' (utilisez un paramètre 'clef = valeur')")
+                            .with_code("E0070")
+                            .with_primary_label(attr.span, "paramètre invalide"),
+                    );
+                }
+            }
+        }
+    }
+
+    fn is_valid_multipath_channel_type(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Generic { name, .. } | Type::Struct { name, .. } => {
+                let s = INTERNER.resolve(name);
+                matches!(
+                    s.as_str(),
+                    "Channel"
+                        | "Stream"
+                        | "ReliableChannel"
+                        | "BestEffortChannel"
+                        | "RedundantChannel"
+                        | "MultipathSession"
+                        | "PacketChannel"
+                        | "Session"
+                        | "MultipathChannel"
+                )
+            }
+            _ => false,
+        }
+    }
+
+    fn check_protocol(&mut self, proto: &ifa_ast::Protocol) {
+        let is_multipath = proto.attributes.iter().any(|a| a.is("multipath"));
+        for attr in &proto.attributes {
+            self.check_multipath_attribute(attr);
+        }
+
+        let proto_name = INTERNER.resolve(&proto.name);
+        if is_multipath && proto.channels.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "le protocole multipath résilient '{}' doit déclarer au moins un canal ou slice de trafic",
+                    proto_name
+                ))
+                .with_code("E0073")
+                .with_primary_label(proto.span, "aucun slice de trafic déclaré"),
+            );
+        }
+
+        let mut seen_channels = HashSet::new();
+        for ch in &proto.channels {
+            let ch_name = INTERNER.resolve(&ch.name);
+            if !seen_channels.insert(ch.name) {
+                self.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "le canal ou slice de trafic '{}' est déjà déclaré dans le protocole '{}'",
+                        ch_name, proto_name
+                    ))
+                    .with_code("E0074")
+                    .with_primary_label(ch.span, format!("redéfinition du slice '{}'", ch_name)),
+                );
+            }
+
+            for attr in &ch.attributes {
+                self.check_multipath_attribute(attr);
+            }
+
+            if let Some(ch_sym) = self.symbols.lookup_protocol(&proto.name).and_then(|p| p.get_channel(&ch.name)) {
+                if (ch.is_slice || is_multipath || !ch.attributes.is_empty())
+                    && !self.is_valid_multipath_channel_type(&ch_sym.ty)
+                {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "type de canal incompatible pour le slice de trafic '{}' dans le protocole '{}' : attendu un type de canal (ex: 'Channel<T>', 'Stream<T>'), mais trouvé '{}'",
+                            ch_name, proto_name, ch_sym.ty
+                        ))
+                        .with_code("E0071")
+                        .with_primary_label(ch.span, format!("type '{}' non compatible pour un canal multipath", ch_sym.ty)),
+                    );
+                }
+
+                if crate::escape::type_contains_ref(&ch_sym.ty) {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "le type de charge utile '{}' dans le canal multipath '{}' ne peut pas contenir de référence locale ('ref')",
+                            ch_sym.ty, ch_name
+                        ))
+                        .with_code("E0072")
+                        .with_primary_label(ch.span, "référence locale non transférable sur canal multipath"),
+                    );
+                }
+            }
+        }
+    }
+
+    fn check_struct_multipath(&mut self, st: &ifa_ast::Struct) {
+        let is_multipath = st.attributes.iter().any(|a| a.is("multipath"));
+        for attr in &st.attributes {
+            self.check_multipath_attribute(attr);
+        }
+
+        let st_name = INTERNER.resolve(&st.name);
+        for f in &st.fields {
+            for attr in &f.attributes {
+                self.check_multipath_attribute(attr);
+            }
+
+            if f.is_slice || (is_multipath && !f.attributes.is_empty()) {
+                if let Some(st_sym) = self.symbols.lookup_struct(&st.name) {
+                    if let Some(f_sym) = st_sym.get_field(&f.name) {
+                        if !self.is_valid_multipath_channel_type(&f_sym.ty) {
+                            let f_name = INTERNER.resolve(&f.name);
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "type de canal incompatible pour le slice de trafic '{}' dans la structure '{}' : attendu un type de canal (ex: 'Channel<T>', 'Stream<T>'), mais trouvé '{}'",
+                                    f_name, st_name, f_sym.ty
+                                ))
+                                .with_code("E0071")
+                                .with_primary_label(f.span, format!("type '{}' non compatible pour un slice multipath", f_sym.ty)),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn check_function(&mut self, f: &Function) {
+        for attr in &f.attributes {
+            self.check_multipath_attribute(attr);
+        }
+
         // Run escape analysis on this function
         let mut escape_analyzer =
             EscapeAnalyzer::new(&self.symbols, f.is_strict, f.span).with_comptime(f.is_comptime);

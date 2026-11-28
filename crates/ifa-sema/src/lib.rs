@@ -14,7 +14,8 @@ pub use escape::{
 };
 pub use exclusivity::{check_call_exclusivity, AccessPath, PathAliasKind, PathSegment};
 pub use symbol_table::{
-    CapturedVariable, FunctionSymbol, ModuleSymbol, StructSymbol, SymbolTable, VariableSymbol,
+    CapturedVariable, FunctionSymbol, ModuleSymbol, ProtocolChannelSymbol, ProtocolSymbol,
+    StructSymbol, SymbolTable, VariableSymbol,
 };
 pub use types::{FloatType, IntType, Type};
 
@@ -79,7 +80,7 @@ mod tests {
     use super::*;
     use ifa_lexer::tokenize;
     use ifa_parser::parse;
-    use ifa_span::SourceMap;
+    use ifa_span::{SourceMap, INTERNER};
 
     fn parse_and_analyze(src: &str) -> AnalysisResult {
         let mut source_map = SourceMap::new();
@@ -608,6 +609,133 @@ mod tests {
         assert!(
             !res.has_errors(),
             "Expected system telemetry builtins to resolve without errors, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_multipath_protocol_declaration_valid() {
+        let code = r#"
+            @multipath(resilient)
+            pub protocol MediaDistribution {
+                slice control: ReliableChannel<u32>,
+                @multipath(redundant)
+                slice audio: Channel<String>,
+                @multipath(pacing = 2000)
+                slice video: Stream<u8>,
+            }
+
+            @multipath(resilient)
+            fn session_handler(inout s: MultipathSession) -> bool {
+                true
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(
+            !res.has_errors(),
+            "Expected valid multipath protocol to analyze with 0 errors, got: {:?}",
+            res.diagnostics
+        );
+        let proto_sym = res.symbols.lookup_protocol(&INTERNER.intern("MediaDistribution"));
+        assert!(proto_sym.is_some());
+        let proto = proto_sym.unwrap();
+        assert_eq!(proto.channels.len(), 3);
+        assert!(proto.channels[0].is_slice);
+        assert_eq!(INTERNER.resolve(&proto.channels[0].name), "control");
+    }
+
+    #[test]
+    fn test_multipath_protocol_empty_error() {
+        let code = r#"
+            @multipath(resilient)
+            protocol EmptyMultipath {
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(res.has_errors());
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0073")),
+            "Expected E0073 error for empty multipath protocol, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_multipath_protocol_incompatible_channel_type() {
+        let code = r#"
+            @multipath(resilient)
+            protocol VideoProto {
+                slice valid_ch: Channel<u32>,
+                slice invalid_ch: i64,
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(res.has_errors());
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0071")),
+            "Expected E0071 error for non-channel slice type, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_multipath_protocol_duplicate_slice() {
+        let code = r#"
+            @multipath(resilient)
+            protocol VideoProto {
+                slice stream: Channel<u32>,
+                slice stream: Channel<u8>,
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(res.has_errors());
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0074")),
+            "Expected E0074 error for duplicate slice name, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_multipath_attribute_invalid_modifier() {
+        let code = r#"
+            @multipath(invalid_modifier_mode)
+            protocol VideoProto {
+                slice data: Channel<u8>,
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(res.has_errors());
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0070")),
+            "Expected E0070 error for invalid multipath modifier, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_multipath_channel_ref_payload_rejected() {
+        let code = r#"
+            @multipath(resilient)
+            protocol VideoProto {
+                slice leaky: Channel<ref i32>,
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(res.has_errors());
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0072")),
+            "Expected E0072 error for local reference in multipath payload, got: {:?}",
             res.diagnostics
         );
     }

@@ -100,6 +100,52 @@ pub struct TraitSymbol {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolChannelSymbol {
+    pub name: Symbol,
+    pub is_slice: bool,
+    pub attributes: Vec<ifa_ast::Attribute>,
+    pub ty: Type,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolSymbol {
+    pub name: Symbol,
+    pub is_pub: bool,
+    pub attributes: Vec<ifa_ast::Attribute>,
+    pub channels: Vec<ProtocolChannelSymbol>,
+    pub channel_indices: HashMap<Symbol, usize>,
+    pub span: Span,
+}
+
+impl ProtocolSymbol {
+    pub fn new(
+        name: Symbol,
+        is_pub: bool,
+        attributes: Vec<ifa_ast::Attribute>,
+        channels: Vec<ProtocolChannelSymbol>,
+        span: Span,
+    ) -> Self {
+        let mut channel_indices = HashMap::new();
+        for (idx, ch) in channels.iter().enumerate() {
+            channel_indices.insert(ch.name, idx);
+        }
+        Self {
+            name,
+            is_pub,
+            attributes,
+            channels,
+            channel_indices,
+            span,
+        }
+    }
+
+    pub fn get_channel(&self, name: &Symbol) -> Option<&ProtocolChannelSymbol> {
+        self.channel_indices.get(name).map(|&idx| &self.channels[idx])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct EnumSymbol {
     pub name: Symbol,
     pub is_pub: bool,
@@ -203,6 +249,7 @@ pub struct SymbolTable {
     pub enums: HashMap<Symbol, EnumSymbol>,
     pub consts: HashMap<Symbol, ConstSymbol>,
     pub traits: HashMap<Symbol, TraitSymbol>,
+    pub protocols: HashMap<Symbol, ProtocolSymbol>,
     pub trait_impls: HashMap<Symbol, Vec<Type>>,
     pub generic_trait_impls: Vec<GenericTraitImplSymbol>,
     pub type_methods: HashMap<Symbol, HashMap<Symbol, FunctionSymbol>>,
@@ -231,6 +278,7 @@ impl SymbolTable {
             enums: HashMap::new(),
             consts: HashMap::new(),
             traits: HashMap::new(),
+            protocols: HashMap::new(),
             trait_impls: HashMap::new(),
             generic_trait_impls: Vec::new(),
             type_methods: HashMap::new(),
@@ -4047,6 +4095,24 @@ impl SymbolTable {
 
     pub fn lookup_trait(&self, name: &Symbol) -> Option<&TraitSymbol> {
         self.traits.get(name)
+    }
+
+    pub fn define_protocol(&mut self, proto: ProtocolSymbol) -> Result<(), Diagnostic> {
+        if let Some(existing) = self.protocols.get(&proto.name) {
+            let proto_name = INTERNER.resolve(&proto.name);
+            return Err(
+                Diagnostic::error(format!("protocole '{}' déjà défini", proto_name))
+                    .with_code("E0008")
+                    .with_primary_label(proto.span, "redéfinition du protocole")
+                    .with_secondary_label(existing.span, "première définition ici"),
+            );
+        }
+        self.protocols.insert(proto.name, proto);
+        Ok(())
+    }
+
+    pub fn lookup_protocol(&self, name: &Symbol) -> Option<&ProtocolSymbol> {
+        self.protocols.get(name)
     }
 
     pub fn register_trait_impl(&mut self, trait_name: Symbol, ty: Type) {

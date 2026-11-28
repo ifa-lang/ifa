@@ -8,6 +8,41 @@ pub struct Program {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Attribute {
+    pub name: Symbol,
+    pub args: Vec<AttributeArg>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttributeArg {
+    Ident(Symbol),
+    KeyValue(Symbol, Lit),
+    Lit(Lit),
+}
+
+impl Attribute {
+    pub fn is(&self, name: &str) -> bool {
+        ifa_span::INTERNER.resolve(&self.name) == name
+    }
+
+    pub fn has_arg(&self, arg_name: &str) -> bool {
+        self.args.iter().any(|arg| match arg {
+            AttributeArg::Ident(s) => ifa_span::INTERNER.resolve(s) == arg_name,
+            AttributeArg::KeyValue(k, _) => ifa_span::INTERNER.resolve(k) == arg_name,
+            _ => false,
+        })
+    }
+
+    pub fn get_key_value(&self, key: &str) -> Option<&Lit> {
+        self.args.iter().find_map(|arg| match arg {
+            AttributeArg::KeyValue(k, lit) if ifa_span::INTERNER.resolve(k) == key => Some(lit),
+            _ => None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     Function(Function),
     Struct(Struct),
@@ -16,6 +51,7 @@ pub enum Item {
     Const(Const),
     Trait(Trait),
     Impl(Impl),
+    Protocol(Protocol),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -81,6 +117,7 @@ pub struct Function {
     pub is_strict: bool,
     pub is_comptime: bool,
     pub is_extern: Option<String>,
+    pub attributes: Vec<Attribute>,
     pub name: Symbol,
     pub generics: Vec<GenericParam>,
     pub where_clauses: Vec<WherePredicate>,
@@ -93,6 +130,8 @@ pub struct Function {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructField {
     pub is_pub: bool,
+    pub is_slice: bool,
+    pub attributes: Vec<Attribute>,
     pub name: Symbol,
     pub ty: Type,
     pub span: Span,
@@ -101,10 +140,29 @@ pub struct StructField {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Struct {
     pub is_pub: bool,
+    pub attributes: Vec<Attribute>,
     pub name: Symbol,
     pub generics: Vec<GenericParam>,
     pub where_clauses: Vec<WherePredicate>,
     pub fields: Vec<StructField>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolChannel {
+    pub is_slice: bool,
+    pub attributes: Vec<Attribute>,
+    pub name: Symbol,
+    pub ty: Type,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Protocol {
+    pub is_pub: bool,
+    pub attributes: Vec<Attribute>,
+    pub name: Symbol,
+    pub channels: Vec<ProtocolChannel>,
     pub span: Span,
 }
 
@@ -714,6 +772,7 @@ pub trait Visitor<'ast>: Sized {
             Item::Const(c) => self.visit_const(c),
             Item::Trait(t) => self.visit_trait(t),
             Item::Impl(i) => self.visit_impl(i),
+            Item::Protocol(p) => self.visit_protocol(p),
         }
     }
 
@@ -730,6 +789,7 @@ pub trait Visitor<'ast>: Sized {
         self.visit_expr(&c.value);
     }
     fn visit_trait(&mut self, _t: &'ast Trait) {}
+    fn visit_protocol(&mut self, _p: &'ast Protocol) {}
     fn visit_impl(&mut self, i: &'ast Impl) {
         for m in &i.methods {
             self.visit_function(m);
