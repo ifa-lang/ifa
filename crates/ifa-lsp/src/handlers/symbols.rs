@@ -120,7 +120,10 @@ pub fn handle_document_symbols(doc: &Document) -> Vec<DocumentSymbol> {
 
         symbols.push(DocumentSymbol {
             name,
-            detail: Some(format!("protocol ({} channels/slices)", proto_sym.channels.len())),
+            detail: Some(format!(
+                "protocol ({} channels/slices)",
+                proto_sym.channels.len()
+            )),
             kind: SymbolKind::Interface as u32,
             range,
             selection_range: range,
