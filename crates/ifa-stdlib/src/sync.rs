@@ -1256,7 +1256,10 @@ mod tests {
         assert_eq!(tq.len(), 1);
 
         // Only second remains
-        assert_eq!(tq.poll(now + Duration::from_millis(150)), Some("second".to_string()));
+        assert_eq!(
+            tq.poll(now + Duration::from_millis(150)),
+            Some("second".to_string())
+        );
         assert!(tq.is_empty());
     }
 }
