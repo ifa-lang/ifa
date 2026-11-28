@@ -3,7 +3,7 @@
 use ifa_runtime::fiber::{
     Channel as RtChannel, RecvError, SendError, TryRecvError, TrySendError, GLOBAL_SCHEDULER,
 };
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,9 +17,27 @@ pub enum RecvTimeoutError {
 }
 
 /// Sending endpoint of a typed IFA channel.
-#[derive(Clone)]
 pub struct Sender<T> {
     inner: Arc<RtChannel<T>>,
+    sender_count: Arc<AtomicUsize>,
+}
+
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        self.sender_count.fetch_add(1, Ordering::SeqCst);
+        Self {
+            inner: Arc::clone(&self.inner),
+            sender_count: Arc::clone(&self.sender_count),
+        }
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        if self.sender_count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.inner.close();
+        }
+    }
 }
 
 /// Receiving endpoint of a typed IFA channel.
@@ -31,9 +49,11 @@ pub struct Receiver<T> {
 /// Create an unbounded asynchronous channel between fibers.
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let inner = Arc::new(RtChannel::new());
+    let sender_count = Arc::new(AtomicUsize::new(1));
     (
         Sender {
             inner: Arc::clone(&inner),
+            sender_count,
         },
         Receiver { inner },
     )
@@ -42,9 +62,11 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 /// Create a bounded channel with lock-free atomic ring buffer backpressure.
 pub fn bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     let inner = Arc::new(RtChannel::with_capacity(capacity));
+    let sender_count = Arc::new(AtomicUsize::new(1));
     (
         Sender {
             inner: Arc::clone(&inner),
+            sender_count,
         },
         Receiver { inner },
     )
@@ -338,6 +360,130 @@ impl AtomicFlag {
     }
 }
 
+/// Ergonomic 64-bit unsigned atomic integer wrapper with explicit memory semantics.
+#[derive(Debug, Default)]
+pub struct AtomicUint(AtomicU64);
+
+impl AtomicUint {
+    pub fn new(val: u64) -> Self {
+        Self(AtomicU64::new(val))
+    }
+
+    pub fn load(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    pub fn store(&self, val: u64) {
+        self.0.store(val, Ordering::SeqCst)
+    }
+
+    pub fn fetch_add(&self, delta: u64) -> u64 {
+        self.0.fetch_add(delta, Ordering::SeqCst)
+    }
+
+    pub fn fetch_sub(&self, delta: u64) -> u64 {
+        self.0.fetch_sub(delta, Ordering::SeqCst)
+    }
+
+    pub fn compare_exchange(&self, current: u64, new: u64) -> Result<u64, u64> {
+        self.0
+            .compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst)
+    }
+}
+
+/// Thread-safe and fiber-safe one-time initialization primitive.
+#[derive(Default, Debug)]
+pub struct Once {
+    inner: std::sync::Once,
+}
+
+impl Once {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Once::new(),
+        }
+    }
+
+    pub fn call_once<F: FnOnce()>(&self, f: F) {
+        self.inner.call_once(f);
+    }
+
+    pub fn is_completed(&self) -> bool {
+        self.inner.is_completed()
+    }
+}
+
+/// Fiber-cooperative counting semaphore for managing shared resources.
+#[derive(Debug)]
+pub struct Semaphore {
+    permits: Arc<AtomicUsize>,
+    notif: Arc<std::sync::Condvar>,
+    mutex: Arc<std::sync::Mutex<()>>,
+}
+
+impl Semaphore {
+    /// Create a counting semaphore with an initial number of permits.
+    pub fn new(permits: usize) -> Self {
+        Self {
+            permits: Arc::new(AtomicUsize::new(permits)),
+            notif: Arc::new(std::sync::Condvar::new()),
+            mutex: Arc::new(std::sync::Mutex::new(())),
+        }
+    }
+
+    /// Try to acquire one permit immediately without blocking.
+    pub fn try_acquire(&self) -> bool {
+        let mut current = self.permits.load(Ordering::Acquire);
+        loop {
+            if current == 0 {
+                return false;
+            }
+            match self.permits.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Acquire one permit, yielding or waiting cooperatively until available.
+    pub fn acquire(&self) {
+        let mut spins: u32 = 0;
+        loop {
+            if self.try_acquire() {
+                return;
+            }
+            spins += 1;
+            if spins < 32 {
+                std::hint::spin_loop();
+            } else if spins < 64 {
+                GLOBAL_SCHEDULER.yield_now();
+            } else {
+                let guard = self.mutex.lock().unwrap();
+                if self.try_acquire() {
+                    return;
+                }
+                let _ = self.notif.wait_timeout(guard, Duration::from_micros(250));
+            }
+        }
+    }
+
+    /// Release one permit back to the semaphore and notify waiting fibers/threads.
+    pub fn release(&self) {
+        self.permits.fetch_add(1, Ordering::Release);
+        self.notif.notify_one();
+    }
+
+    /// Return the number of currently available permits.
+    pub fn available_permits(&self) -> usize {
+        self.permits.load(Ordering::Acquire)
+    }
+}
+
 pub use ifa_runtime::fiber::AtomicRingBuffer as RingBuffer;
 
 #[cfg(test)]
@@ -550,5 +696,112 @@ mod tests {
         let (_tx1, rx1) = channel::<i32>();
         let (_tx2, rx2) = channel::<i32>();
         assert!(Select::try_select(&[&rx1, &rx2]).is_none());
+    }
+
+    // ── AtomicUint ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn atomic_uint_load_store() {
+        let u = AtomicUint::new(100);
+        assert_eq!(u.load(), 100);
+        u.store(200);
+        assert_eq!(u.load(), 200);
+    }
+
+    #[test]
+    fn atomic_uint_fetch_add_sub() {
+        let u = AtomicUint::new(50);
+        assert_eq!(u.fetch_add(25), 50);
+        assert_eq!(u.load(), 75);
+        assert_eq!(u.fetch_sub(15), 75);
+        assert_eq!(u.load(), 60);
+    }
+
+    #[test]
+    fn atomic_uint_compare_exchange() {
+        let u = AtomicUint::new(10);
+        assert_eq!(u.compare_exchange(10, 42), Ok(10));
+        assert_eq!(u.load(), 42);
+        assert_eq!(u.compare_exchange(99, 100), Err(42));
+        assert_eq!(u.load(), 42);
+    }
+
+    // ── Once ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn once_call_once_executes_only_once() {
+        let once = Once::new();
+        let mut count = 0;
+        assert!(!once.is_completed());
+        once.call_once(|| {
+            count += 1;
+        });
+        assert_eq!(count, 1);
+        assert!(once.is_completed());
+
+        once.call_once(|| {
+            count += 1;
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn once_cross_thread_execution() {
+        let once = Arc::new(Once::new());
+        let count = Arc::new(AtomicInt::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let o = Arc::clone(&once);
+            let c = Arc::clone(&count);
+            handles.push(thread::spawn(move || {
+                o.call_once(|| {
+                    c.fetch_add(1);
+                });
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(count.load(), 1);
+        assert!(once.is_completed());
+    }
+
+    // ── Semaphore ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn semaphore_try_acquire_and_release() {
+        let sem = Semaphore::new(2);
+        assert_eq!(sem.available_permits(), 2);
+
+        assert!(sem.try_acquire());
+        assert_eq!(sem.available_permits(), 1);
+
+        assert!(sem.try_acquire());
+        assert_eq!(sem.available_permits(), 0);
+
+        // No permits left
+        assert!(!sem.try_acquire());
+
+        sem.release();
+        assert_eq!(sem.available_permits(), 1);
+        assert!(sem.try_acquire());
+    }
+
+    #[test]
+    fn semaphore_cross_thread_acquire_release() {
+        let sem = Arc::new(Semaphore::new(0));
+        let sem_clone = Arc::clone(&sem);
+
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            sem_clone.release();
+        });
+
+        sem.acquire();
+        assert_eq!(sem.available_permits(), 0);
+        handle.join().unwrap();
     }
 }

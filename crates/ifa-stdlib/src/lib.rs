@@ -176,7 +176,8 @@ pub use simd_parser::{
     QPACK_STATIC_TABLE,
 };
 pub use sync::{
-    bounded, channel, AtomicFlag, AtomicInt, Receiver, RingBuffer, Select, Sender, WaitGroup,
+    bounded, channel, AtomicFlag, AtomicInt, AtomicUint, Once, Receiver, RingBuffer, Select,
+    Semaphore, Sender, WaitGroup,
 };
 pub use sys::{
     cpu_count, get_children_resource_usage, get_current_process_memory_info, get_host_memory_info,
