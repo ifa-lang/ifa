@@ -45,6 +45,11 @@ pub use ifa_runtime::subpath_shaper::{
 pub use ifa_runtime::FlowSliceClass;
 
 pub mod http;
+pub mod multipath;
+
+pub use multipath::{
+    MultipathSession, MultipathSessionBuilder, MultipathSessionEvent, MultipathSessionRole,
+};
 
 #[cfg(unix)]
 fn sock_set_recv_buffer<T: AsRawFd>(socket: &T, size: usize) -> io::Result<()> {

@@ -8,6 +8,7 @@ pub mod fmt;
 pub mod lockfile;
 pub mod manifest;
 pub mod module_metadata;
+pub mod multipath;
 pub mod packager;
 pub mod resolver;
 pub mod test_runner;
@@ -24,6 +25,10 @@ pub use manifest::{
     ProfileConfig, ProfilesConfig,
 };
 pub use module_metadata::{ModuleMetadata, IFAM_MAGIC, IFAM_VERSION};
+pub use multipath::{
+    spawn_loopback_multipath_pair, MultipathProfileKind, MultipathServiceProfile, MultipathSession,
+    MultipathSessionBuilder, MultipathSessionEvent, MultipathSessionRole,
+};
 pub use packager::{PackageIndexEntry, PackageReport, Packager, PublishReport};
 pub use resolver::{DependencyResolver, ResolvedPackage};
 pub use test_runner::{
