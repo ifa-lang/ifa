@@ -5268,6 +5268,428 @@ pub extern "C" fn ifa_rt_channel_try_recv_int(
     res
 }
 
+/// Opaque wrapper around an atomic 64-bit unsigned integer for C-ABI FFI.
+pub struct IfaAtomicU64Handle(pub(crate) std::sync::atomic::AtomicU64);
+
+/// Create a new atomic 64-bit unsigned integer initialized to the specified value.
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_u64_create(initial_val: u64) -> *mut IfaAtomicU64Handle {
+    Box::into_raw(Box::new(IfaAtomicU64Handle(
+        std::sync::atomic::AtomicU64::new(initial_val),
+    )))
+}
+
+/// Destroy an atomic 64-bit unsigned integer handle and release allocated memory.
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_u64_destroy(a: *mut IfaAtomicU64Handle) {
+    if !a.is_null() {
+        unsafe {
+            drop(Box::from_raw(a));
+        }
+    }
+}
+
+/// Atomically load 64-bit unsigned integer value with SeqCst ordering.
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_u64_load(a: *mut IfaAtomicU64Handle) -> u64 {
+    if a.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*a };
+    handle.0.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Atomically store 64-bit unsigned integer value with SeqCst ordering.
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_u64_store(a: *mut IfaAtomicU64Handle, val: u64) {
+    if !a.is_null() {
+        let handle = unsafe { &*a };
+        handle.0.store(val, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Atomically add delta to 64-bit unsigned integer value and return previous value.
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_u64_fetch_add(a: *mut IfaAtomicU64Handle, delta: u64) -> u64 {
+    if a.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*a };
+    handle
+        .0
+        .fetch_add(delta, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Atomically subtract delta from 64-bit unsigned integer value and return previous value.
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_u64_fetch_sub(a: *mut IfaAtomicU64Handle, delta: u64) -> u64 {
+    if a.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*a };
+    handle
+        .0
+        .fetch_sub(delta, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Atomically compare and exchange 64-bit unsigned integer value.
+/// Returns previous value (equals expected if exchange succeeded).
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_u64_cas(
+    a: *mut IfaAtomicU64Handle,
+    expected: u64,
+    desired: u64,
+) -> u64 {
+    if a.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*a };
+    match handle.0.compare_exchange(
+        expected,
+        desired,
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+    ) {
+        Ok(v) => v,
+        Err(v) => v,
+    }
+}
+
+/// Opaque wrapper around a cooperative fiber WaitGroup for C-ABI FFI.
+pub struct IfaWaitGroupHandle {
+    counter: std::sync::atomic::AtomicUsize,
+    notif: std::sync::Condvar,
+    mutex: std::sync::Mutex<()>,
+}
+
+/// Create a new cooperative fiber WaitGroup with initial counter of 0.
+#[no_mangle]
+pub extern "C" fn ifa_rt_waitgroup_create() -> *mut IfaWaitGroupHandle {
+    Box::into_raw(Box::new(IfaWaitGroupHandle {
+        counter: std::sync::atomic::AtomicUsize::new(0),
+        notif: std::sync::Condvar::new(),
+        mutex: std::sync::Mutex::new(()),
+    }))
+}
+
+/// Destroy a cooperative fiber WaitGroup and release associated memory.
+#[no_mangle]
+pub extern "C" fn ifa_rt_waitgroup_destroy(wg: *mut IfaWaitGroupHandle) {
+    if !wg.is_null() {
+        unsafe {
+            drop(Box::from_raw(wg));
+        }
+    }
+}
+
+/// Add delta to WaitGroup counter.
+#[no_mangle]
+pub extern "C" fn ifa_rt_waitgroup_add(wg: *mut IfaWaitGroupHandle, delta: usize) {
+    if !wg.is_null() {
+        let handle = unsafe { &*wg };
+        handle
+            .counter
+            .fetch_add(delta, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Mark one unit of work completed in WaitGroup, waking waiters if counter hits zero.
+#[no_mangle]
+pub extern "C" fn ifa_rt_waitgroup_done(wg: *mut IfaWaitGroupHandle) {
+    if !wg.is_null() {
+        let handle = unsafe { &*wg };
+        let prev = handle
+            .counter
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if prev == 1 {
+            let _guard = handle.mutex.lock().unwrap();
+            handle.notif.notify_all();
+        }
+    }
+}
+
+/// Retrieve current counter value of WaitGroup.
+#[no_mangle]
+pub extern "C" fn ifa_rt_waitgroup_count(wg: *mut IfaWaitGroupHandle) -> usize {
+    if wg.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*wg };
+    handle.counter.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Cooperatively wait until WaitGroup counter reaches zero.
+/// Returns 0 on success, -1 on null handle.
+#[no_mangle]
+pub extern "C" fn ifa_rt_waitgroup_wait(wg: *mut IfaWaitGroupHandle) -> i32 {
+    if wg.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*wg };
+    let mut spins: u32 = 0;
+    while handle.counter.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        spins += 1;
+        if spins < 32 {
+            std::hint::spin_loop();
+        } else if spins < 64 {
+            GLOBAL_SCHEDULER.yield_now();
+        } else {
+            let guard = handle.mutex.lock().unwrap();
+            if handle.counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                let _ = handle
+                    .notif
+                    .wait_timeout(guard, std::time::Duration::from_micros(250));
+            }
+        }
+    }
+    0
+}
+
+/// Timed wait on WaitGroup with timeout in milliseconds.
+/// Returns 1 if counter reached zero, 0 if timed out, -1 on null handle.
+#[no_mangle]
+pub extern "C" fn ifa_rt_waitgroup_wait_timeout(
+    wg: *mut IfaWaitGroupHandle,
+    timeout_ms: u64,
+) -> i32 {
+    if wg.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*wg };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let mut spins: u32 = 0;
+    while handle.counter.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return if handle.counter.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                1
+            } else {
+                0
+            };
+        }
+        spins += 1;
+        if spins < 32 {
+            std::hint::spin_loop();
+        } else if spins < 64 {
+            GLOBAL_SCHEDULER.yield_now();
+        } else {
+            let guard = handle.mutex.lock().unwrap();
+            if handle.counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let _ = handle
+                    .notif
+                    .wait_timeout(guard, remaining.min(std::time::Duration::from_millis(5)));
+            }
+        }
+    }
+    1
+}
+
+/// Opaque wrapper around a cooperative fiber Semaphore for C-ABI FFI.
+pub struct IfaSemaphoreHandle {
+    permits: std::sync::atomic::AtomicUsize,
+    notif: std::sync::Condvar,
+    mutex: std::sync::Mutex<()>,
+}
+
+/// Create a new counting Semaphore with initial permits.
+#[no_mangle]
+pub extern "C" fn ifa_rt_semaphore_create(initial_permits: usize) -> *mut IfaSemaphoreHandle {
+    Box::into_raw(Box::new(IfaSemaphoreHandle {
+        permits: std::sync::atomic::AtomicUsize::new(initial_permits),
+        notif: std::sync::Condvar::new(),
+        mutex: std::sync::Mutex::new(()),
+    }))
+}
+
+/// Destroy a counting Semaphore and release allocated memory.
+#[no_mangle]
+pub extern "C" fn ifa_rt_semaphore_destroy(sem: *mut IfaSemaphoreHandle) {
+    if !sem.is_null() {
+        unsafe {
+            drop(Box::from_raw(sem));
+        }
+    }
+}
+
+/// Try to acquire one permit immediately without blocking.
+/// Returns 1 on success, 0 if no permits available, -1 on null handle.
+#[no_mangle]
+pub extern "C" fn ifa_rt_semaphore_try_acquire(sem: *mut IfaSemaphoreHandle) -> i32 {
+    if sem.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*sem };
+    let mut current = handle.permits.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        if current == 0 {
+            return 0;
+        }
+        match handle.permits.compare_exchange_weak(
+            current,
+            current - 1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return 1,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Cooperatively acquire one permit, yielding fiber execution when permits are exhausted.
+/// Returns 0 on success, -1 on null handle.
+#[no_mangle]
+pub extern "C" fn ifa_rt_semaphore_acquire(sem: *mut IfaSemaphoreHandle) -> i32 {
+    if sem.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*sem };
+    let mut spins: u32 = 0;
+    loop {
+        if ifa_rt_semaphore_try_acquire(sem) == 1 {
+            return 0;
+        }
+        spins += 1;
+        if spins < 32 {
+            std::hint::spin_loop();
+        } else if spins < 64 {
+            GLOBAL_SCHEDULER.yield_now();
+        } else {
+            let guard = handle.mutex.lock().unwrap();
+            if handle.permits.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                let _ = handle
+                    .notif
+                    .wait_timeout(guard, std::time::Duration::from_micros(250));
+            }
+        }
+    }
+}
+
+/// Timed acquire on Semaphore with timeout in milliseconds.
+/// Returns 1 on success, 0 if timed out, -1 on null handle.
+#[no_mangle]
+pub extern "C" fn ifa_rt_semaphore_acquire_timeout(
+    sem: *mut IfaSemaphoreHandle,
+    timeout_ms: u64,
+) -> i32 {
+    if sem.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*sem };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let mut spins: u32 = 0;
+    loop {
+        if ifa_rt_semaphore_try_acquire(sem) == 1 {
+            return 1;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return 0;
+        }
+        spins += 1;
+        if spins < 32 {
+            std::hint::spin_loop();
+        } else if spins < 64 {
+            GLOBAL_SCHEDULER.yield_now();
+        } else {
+            let guard = handle.mutex.lock().unwrap();
+            if handle.permits.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let _ = handle
+                    .notif
+                    .wait_timeout(guard, remaining.min(std::time::Duration::from_millis(5)));
+            }
+        }
+    }
+}
+
+/// Release one permit back to Semaphore and notify waiting fibers.
+/// Returns 0 on success, -1 on null handle.
+#[no_mangle]
+pub extern "C" fn ifa_rt_semaphore_release(sem: *mut IfaSemaphoreHandle) -> i32 {
+    if sem.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*sem };
+    handle
+        .permits
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+    let _guard = handle.mutex.lock().unwrap();
+    handle.notif.notify_one();
+    0
+}
+
+/// Return number of currently available permits in Semaphore.
+#[no_mangle]
+pub extern "C" fn ifa_rt_semaphore_available(sem: *mut IfaSemaphoreHandle) -> usize {
+    if sem.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*sem };
+    handle.permits.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Opaque wrapper around a thread/fiber-safe one-time initialization primitive for C-ABI FFI.
+pub struct IfaOnceHandle {
+    inner: std::sync::Once,
+}
+
+/// Create a new one-time initialization primitive.
+#[no_mangle]
+pub extern "C" fn ifa_rt_once_create() -> *mut IfaOnceHandle {
+    Box::into_raw(Box::new(IfaOnceHandle {
+        inner: std::sync::Once::new(),
+    }))
+}
+
+/// Destroy a one-time initialization primitive and release memory.
+#[no_mangle]
+pub extern "C" fn ifa_rt_once_destroy(o: *mut IfaOnceHandle) {
+    if !o.is_null() {
+        unsafe {
+            drop(Box::from_raw(o));
+        }
+    }
+}
+
+/// Execute callback exactly once across threads/fibers. Subsequent calls are no-ops.
+/// Returns 0 on success, -1 on null handle or missing callback.
+#[no_mangle]
+pub extern "C" fn ifa_rt_once_call(
+    o: *mut IfaOnceHandle,
+    callback: Option<extern "C" fn(ctx: *mut u8)>,
+    ctx: *mut u8,
+) -> i32 {
+    if o.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*o };
+    if let Some(cb) = callback {
+        handle.inner.call_once(|| {
+            cb(ctx);
+        });
+        0
+    } else {
+        -1
+    }
+}
+
+/// Check if the one-time initialization primitive has already completed execution.
+/// Returns 1 if completed, 0 if not completed or null handle.
+#[no_mangle]
+pub extern "C" fn ifa_rt_once_is_completed(o: *mut IfaOnceHandle) -> i32 {
+    if o.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*o };
+    if handle.inner.is_completed() {
+        1
+    } else {
+        0
+    }
+}
+
 // ============================================================================
 // System Resource and Memory Telemetry Primitives
 // ============================================================================

@@ -2745,3 +2745,102 @@ fn test_multipath_flow_runtime_ffi_init_and_serialization() {
     assert_eq!(meta.loss_rate_ppm, 0);
     assert_eq!(meta.state, 1);
 }
+
+#[test]
+fn test_ffi_sync_primitives_atomic_u64_waitgroup_semaphore_once() {
+    // 1. AtomicU64 FFI test
+    let atomic_ptr = ifa_rt_atomic_u64_create(10);
+    assert!(!atomic_ptr.is_null());
+    assert_eq!(ifa_rt_atomic_u64_load(atomic_ptr), 10);
+    ifa_rt_atomic_u64_store(atomic_ptr, 20);
+    assert_eq!(ifa_rt_atomic_u64_load(atomic_ptr), 20);
+    assert_eq!(ifa_rt_atomic_u64_fetch_add(atomic_ptr, 5), 20);
+    assert_eq!(ifa_rt_atomic_u64_load(atomic_ptr), 25);
+    assert_eq!(ifa_rt_atomic_u64_fetch_sub(atomic_ptr, 3), 25);
+    assert_eq!(ifa_rt_atomic_u64_load(atomic_ptr), 22);
+    assert_eq!(ifa_rt_atomic_u64_cas(atomic_ptr, 22, 100), 22);
+    assert_eq!(ifa_rt_atomic_u64_load(atomic_ptr), 100);
+    assert_eq!(ifa_rt_atomic_u64_cas(atomic_ptr, 999, 500), 100);
+    assert_eq!(ifa_rt_atomic_u64_load(atomic_ptr), 100);
+    ifa_rt_atomic_u64_destroy(atomic_ptr);
+
+    // 2. WaitGroup FFI test
+    let wg_ptr = ifa_rt_waitgroup_create();
+    assert!(!wg_ptr.is_null());
+    assert_eq!(ifa_rt_waitgroup_count(wg_ptr), 0);
+    ifa_rt_waitgroup_add(wg_ptr, 2);
+    assert_eq!(ifa_rt_waitgroup_count(wg_ptr), 2);
+
+    // Concurrently decrement
+    let wg_addr = wg_ptr as usize;
+    let handle = std::thread::spawn(move || {
+        let ptr = wg_addr as *mut IfaWaitGroupHandle;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        ifa_rt_waitgroup_done(ptr);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        ifa_rt_waitgroup_done(ptr);
+    });
+
+    assert_eq!(ifa_rt_waitgroup_wait(wg_ptr), 0);
+    assert_eq!(ifa_rt_waitgroup_count(wg_ptr), 0);
+    handle.join().unwrap();
+
+    // Timed wait test
+    ifa_rt_waitgroup_add(wg_ptr, 1);
+    assert_eq!(ifa_rt_waitgroup_wait_timeout(wg_ptr, 10), 0); // times out
+    ifa_rt_waitgroup_done(wg_ptr);
+    assert_eq!(ifa_rt_waitgroup_wait_timeout(wg_ptr, 10), 1); // zero already
+    ifa_rt_waitgroup_destroy(wg_ptr);
+
+    // 3. Semaphore FFI test
+    let sem_ptr = ifa_rt_semaphore_create(2);
+    assert!(!sem_ptr.is_null());
+    assert_eq!(ifa_rt_semaphore_available(sem_ptr), 2);
+    assert_eq!(ifa_rt_semaphore_try_acquire(sem_ptr), 1);
+    assert_eq!(ifa_rt_semaphore_available(sem_ptr), 1);
+    assert_eq!(ifa_rt_semaphore_acquire(sem_ptr), 0);
+    assert_eq!(ifa_rt_semaphore_available(sem_ptr), 0);
+    assert_eq!(ifa_rt_semaphore_try_acquire(sem_ptr), 0); // empty
+
+    assert_eq!(ifa_rt_semaphore_acquire_timeout(sem_ptr, 10), 0); // timeout
+    assert_eq!(ifa_rt_semaphore_release(sem_ptr), 0);
+    assert_eq!(ifa_rt_semaphore_available(sem_ptr), 1);
+    assert_eq!(ifa_rt_semaphore_acquire_timeout(sem_ptr, 10), 1); // acquired
+    assert_eq!(ifa_rt_semaphore_available(sem_ptr), 0);
+
+    // Release from thread
+    let sem_addr = sem_ptr as usize;
+    let sem_handle = std::thread::spawn(move || {
+        let ptr = sem_addr as *mut IfaSemaphoreHandle;
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        ifa_rt_semaphore_release(ptr);
+    });
+    assert_eq!(ifa_rt_semaphore_acquire(sem_ptr), 0);
+    sem_handle.join().unwrap();
+    ifa_rt_semaphore_destroy(sem_ptr);
+
+    // 4. Once FFI test
+    let once_ptr = ifa_rt_once_create();
+    assert!(!once_ptr.is_null());
+    assert_eq!(ifa_rt_once_is_completed(once_ptr), 0);
+
+    static ONCE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    extern "C" fn test_once_cb(_ctx: *mut u8) {
+        ONCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    assert_eq!(
+        ifa_rt_once_call(once_ptr, Some(test_once_cb), std::ptr::null_mut()),
+        0
+    );
+    assert_eq!(ONCE_COUNTER.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(ifa_rt_once_is_completed(once_ptr), 1);
+
+    // Second call should be a no-op
+    assert_eq!(
+        ifa_rt_once_call(once_ptr, Some(test_once_cb), std::ptr::null_mut()),
+        0
+    );
+    assert_eq!(ONCE_COUNTER.load(std::sync::atomic::Ordering::SeqCst), 1);
+    ifa_rt_once_destroy(once_ptr);
+}
