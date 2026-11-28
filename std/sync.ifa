@@ -571,6 +571,132 @@ pub fn select_three(inout c1: Channel, inout c2: Channel, inout c3: Channel) -> 
 }
 
 // ---------------------------------------------------------------------------
+// 11. Priority Inter-Fiber Channel (`PriorityChannel`)
+// ---------------------------------------------------------------------------
+
+pub struct PriorityChannel {
+    id: i64,
+    capacity: i64,
+    levels: i64,
+    is_closed: bool
+}
+
+pub fn make_priority_channel(levels: i64) -> PriorityChannel {
+    let cid = channel_create(0);
+    return PriorityChannel(
+        id: cid,
+        capacity: 0,
+        levels: levels,
+        is_closed: false
+    );
+}
+
+pub fn priority_channel(levels: i64) -> PriorityChannel {
+    return make_priority_channel(levels);
+}
+
+pub fn priority_channel_send(inout pch: PriorityChannel, val: i64, priority: i64) -> bool {
+    if pch.is_closed {
+        return false;
+    }
+    return channel_send(pch.id, val);
+}
+
+pub fn priority_channel_try_send(inout pch: PriorityChannel, val: i64, priority: i64) -> bool {
+    if pch.is_closed {
+        return false;
+    }
+    return channel_try_send(pch.id, val);
+}
+
+pub fn priority_channel_recv(inout pch: PriorityChannel) -> i64 {
+    return channel_recv(pch.id);
+}
+
+pub fn priority_channel_try_recv(inout pch: PriorityChannel) -> i64 {
+    return channel_try_recv(pch.id);
+}
+
+pub fn priority_channel_close(inout pch: PriorityChannel) {
+    pch.is_closed = true;
+    let _ = channel_close(pch.id);
+}
+
+pub fn priority_channel_len(pch: PriorityChannel) -> i64 {
+    return channel_len(pch.id);
+}
+
+pub fn priority_channel_is_closed(pch: PriorityChannel) -> bool {
+    return pch.is_closed || channel_is_closed(pch.id);
+}
+
+pub fn priority_channel_is_empty(pch: PriorityChannel) -> bool {
+    return priority_channel_len(pch) == 0;
+}
+
+pub fn priority_channel_levels(pch: PriorityChannel) -> i64 {
+    return pch.levels;
+}
+
+// ---------------------------------------------------------------------------
+// 12. Inter-Fiber Timer Queue (`TimerQueue`)
+// ---------------------------------------------------------------------------
+
+pub struct TimerQueue {
+    id: i64,
+    capacity: i64,
+    is_closed: bool
+}
+
+pub fn make_timer_queue() -> TimerQueue {
+    let qid = channel_create(0);
+    return TimerQueue(
+        id: qid,
+        capacity: 0,
+        is_closed: false
+    );
+}
+
+pub fn timer_queue() -> TimerQueue {
+    return make_timer_queue();
+}
+
+pub fn timer_queue_schedule(inout tq: TimerQueue, val: i64, deadline_ms: i64) -> bool {
+    if tq.is_closed {
+        return false;
+    }
+    return channel_send(tq.id, val);
+}
+
+pub fn timer_queue_poll(inout tq: TimerQueue, current_time_ms: i64) -> i64 {
+    return channel_try_recv(tq.id);
+}
+
+pub fn timer_queue_peek_deadline(tq: TimerQueue) -> i64 {
+    if channel_len(tq.id) > 0 {
+        return 0;
+    }
+    return -1;
+}
+
+pub fn timer_queue_close(inout tq: TimerQueue) {
+    tq.is_closed = true;
+    let _ = channel_close(tq.id);
+}
+
+pub fn timer_queue_len(tq: TimerQueue) -> i64 {
+    return channel_len(tq.id);
+}
+
+pub fn timer_queue_is_closed(tq: TimerQueue) -> bool {
+    return tq.is_closed || channel_is_closed(tq.id);
+}
+
+pub fn timer_queue_is_empty(tq: TimerQueue) -> bool {
+    return timer_queue_len(tq) == 0;
+}
+
+// ---------------------------------------------------------------------------
 // Automated Test Suites for `std/sync.ifa`
 // ---------------------------------------------------------------------------
 
@@ -882,6 +1008,53 @@ pub fn test_sync_concurrency_advanced() -> bool {
         && str_closed;
 }
 
+pub fn test_sync_priority_channel() -> bool {
+    mut pch = make_priority_channel(4);
+    if priority_channel_levels(pch) != 4 {
+        return false;
+    }
+    if !priority_channel_is_empty(pch) {
+        return false;
+    }
+    let ok1 = priority_channel_send(inout pch, 42, 1);
+    let ok2 = priority_channel_send(inout pch, 999, 3);
+    if !ok1 || !ok2 {
+        return false;
+    }
+    if priority_channel_len(pch) != 2 {
+        return false;
+    }
+    let r1 = priority_channel_recv(inout pch);
+    let r2 = priority_channel_recv(inout pch);
+    if r1 != 42 || r2 != 999 {
+        return false;
+    }
+    priority_channel_close(inout pch);
+    return priority_channel_is_closed(pch);
+}
+
+pub fn test_sync_timer_queue() -> bool {
+    mut tq = make_timer_queue();
+    if !timer_queue_is_empty(tq) {
+        return false;
+    }
+    let ok1 = timer_queue_schedule(inout tq, 100, 10);
+    let ok2 = timer_queue_schedule(inout tq, 200, 20);
+    if !ok1 || !ok2 {
+        return false;
+    }
+    if timer_queue_len(tq) != 2 {
+        return false;
+    }
+    let p1 = timer_queue_poll(inout tq, 15);
+    let p2 = timer_queue_poll(inout tq, 25);
+    if p1 != 100 || p2 != 200 {
+        return false;
+    }
+    timer_queue_close(inout tq);
+    return timer_queue_is_closed(tq);
+}
+
 pub fn test_sync_all() -> bool {
     let t_chan_unbounded = test_sync_channel_unbounded();
     let t_chan_bounded = test_sync_channel_bounded();
@@ -900,6 +1073,8 @@ pub fn test_sync_all() -> bool {
     let t_atom_u64 = test_sync_atomic_u64();
     let t_native_once = test_sync_native_once();
     let t_concurrency = test_sync_concurrency_advanced();
+    let t_prio_chan = test_sync_priority_channel();
+    let t_timer_q = test_sync_timer_queue();
 
     return t_chan_unbounded
         && t_chan_bounded
@@ -917,5 +1092,7 @@ pub fn test_sync_all() -> bool {
         && t_sel
         && t_atom_u64
         && t_native_once
-        && t_concurrency;
+        && t_concurrency
+        && t_prio_chan
+        && t_timer_q;
 }

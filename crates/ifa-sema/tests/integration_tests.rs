@@ -5009,3 +5009,16 @@ fn test_std_sync_module_semantic_analysis() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_std_net_module_semantic_analysis() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let net_path = manifest_dir.join("../../std/net.ifa");
+    let net_code = std::fs::read_to_string(&net_path).expect("std/net.ifa must exist");
+    let res = run_analysis(&net_code);
+    assert!(
+        !res.has_errors(),
+        "std/net.ifa semantic analysis should succeed without error: {:?}",
+        res.diagnostics
+    );
+}

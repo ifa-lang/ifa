@@ -3,9 +3,10 @@
 use ifa_runtime::fiber::{
     Channel as RtChannel, RecvError, SendError, TryRecvError, TrySendError, GLOBAL_SCHEDULER,
 };
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub use ifa_runtime::fiber::{AdaptiveBackoff, FiberId, FiberScheduler, FiberState};
 
@@ -484,6 +485,368 @@ impl Semaphore {
     }
 }
 
+// ── PriorityChannel ──────────────────────────────────────────────────────────
+
+/// Inter-fiber prioritized communication channel.
+/// Supports multi-level priority scheduling (0 = lowest, levels - 1 = highest priority).
+/// Strictly enforces memory invariance (`T: Send + 'static`) to guarantee that no local
+/// references can escape across fiber or thread scheduling boundaries.
+pub struct PriorityChannel<T> {
+    levels: usize,
+    queues: Vec<Mutex<VecDeque<T>>>,
+    notif_mutex: Mutex<()>,
+    cond: std::sync::Condvar,
+    is_closed: AtomicBool,
+    total_len: AtomicUsize,
+}
+
+impl<T: Send + 'static> PriorityChannel<T> {
+    /// Create a priority channel with the given number of priority levels.
+    /// `levels` is clamped to at least 1.
+    pub fn new(levels: usize) -> Self {
+        let actual_levels = levels.max(1);
+        let mut queues = Vec::with_capacity(actual_levels);
+        for _ in 0..actual_levels {
+            queues.push(Mutex::new(VecDeque::new()));
+        }
+        Self {
+            levels: actual_levels,
+            queues,
+            notif_mutex: Mutex::new(()),
+            cond: std::sync::Condvar::new(),
+            is_closed: AtomicBool::new(false),
+            total_len: AtomicUsize::new(0),
+        }
+    }
+
+    /// Return the number of priority levels.
+    pub fn levels(&self) -> usize {
+        self.levels
+    }
+
+    /// Send a message with a specific priority level.
+    /// The priority is clamped to `self.levels - 1`.
+    /// Returns `Err(SendError(item))` if the channel is closed.
+    pub fn send(&self, item: T, priority: usize) -> Result<(), SendError<T>> {
+        if self.is_closed.load(Ordering::Acquire) {
+            return Err(SendError::Closed(item));
+        }
+        let prio = priority.min(self.levels - 1);
+        {
+            let mut q = self.queues[prio].lock().unwrap();
+            q.push_back(item);
+        }
+        self.total_len.fetch_add(1, Ordering::SeqCst);
+        self.cond.notify_one();
+        Ok(())
+    }
+
+    /// Non-blocking send.
+    pub fn try_send(&self, item: T, priority: usize) -> Result<(), TrySendError<T>> {
+        if self.is_closed.load(Ordering::Acquire) {
+            return Err(TrySendError::Closed(item));
+        }
+        let prio = priority.min(self.levels - 1);
+        {
+            let mut q = self.queues[prio].lock().unwrap();
+            q.push_back(item);
+        }
+        self.total_len.fetch_add(1, Ordering::SeqCst);
+        self.cond.notify_one();
+        Ok(())
+    }
+
+    /// Receive the highest-priority available message.
+    /// Cooperatively yields the current fiber when waiting.
+    pub fn recv(&self) -> Result<T, RecvError> {
+        let mut backoff = AdaptiveBackoff::new();
+        loop {
+            if let Ok(item) = self.try_recv() {
+                return Ok(item);
+            }
+            if self.is_closed.load(Ordering::Acquire) {
+                if let Ok(item) = self.try_recv() {
+                    return Ok(item);
+                }
+                return Err(RecvError::Closed);
+            }
+
+            if !backoff.is_completed_spinning() {
+                backoff.snooze();
+            } else if !backoff.is_completed_yielding() {
+                backoff.snooze_cooperative();
+            } else {
+                let guard = self.notif_mutex.lock().unwrap();
+                if self.total_len.load(Ordering::Acquire) == 0
+                    && !self.is_closed.load(Ordering::Acquire)
+                {
+                    let _ = self.cond.wait_timeout(guard, Duration::from_micros(250));
+                }
+                backoff.reset();
+            }
+        }
+    }
+
+    /// Try receiving the highest-priority available message immediately without blocking.
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        if self.total_len.load(Ordering::Acquire) == 0 {
+            if self.is_closed.load(Ordering::Acquire) {
+                return Err(TryRecvError::Closed);
+            }
+            return Err(TryRecvError::Empty);
+        }
+
+        // Scan from highest priority to lowest priority (strict priority arbitration)
+        for prio in (0..self.levels).rev() {
+            let mut q = self.queues[prio].lock().unwrap();
+            if let Some(item) = q.pop_front() {
+                self.total_len.fetch_sub(1, Ordering::SeqCst);
+                return Ok(item);
+            }
+        }
+
+        if self.is_closed.load(Ordering::Acquire) {
+            Err(TryRecvError::Closed)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+
+    /// Close the priority channel. Pending messages remain readable.
+    pub fn close(&self) {
+        self.is_closed.store(true, Ordering::Release);
+        self.cond.notify_all();
+    }
+
+    /// Check if the priority channel is closed.
+    pub fn is_closed(&self) -> bool {
+        self.is_closed.load(Ordering::Acquire)
+    }
+
+    /// Return the total number of queued messages across all priority levels.
+    pub fn len(&self) -> usize {
+        self.total_len.load(Ordering::Acquire)
+    }
+
+    /// Return true if there are no messages in any priority level.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Return the highest priority level that currently has at least one message, or None if empty.
+    pub fn peek_highest_priority(&self) -> Option<usize> {
+        if self.is_empty() {
+            return None;
+        }
+        for prio in (0..self.levels).rev() {
+            let q = self.queues[prio].lock().unwrap();
+            if !q.is_empty() {
+                return Some(prio);
+            }
+        }
+        None
+    }
+}
+
+// ── TimerQueue ───────────────────────────────────────────────────────────────
+
+/// Internal timer entry with ordered deadline and unique identifier.
+struct TimerEntry<T> {
+    id: u64,
+    deadline: Instant,
+    payload: T,
+}
+
+impl<T> PartialEq for TimerEntry<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.id == other.id
+    }
+}
+
+impl<T> Eq for TimerEntry<T> {}
+
+impl<T> PartialOrd for TimerEntry<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> Ord for TimerEntry<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse ordering so BinaryHeap acts as a min-heap (earliest deadline at top)
+        other
+            .deadline
+            .cmp(&self.deadline)
+            .then_with(|| other.id.cmp(&self.id))
+    }
+}
+
+/// Thread-safe and fiber-safe priority timer queue.
+/// Dispatches scheduled events strictly based on deadline expiration.
+/// Guarantees static memory invariance (`T: Send + 'static`) preventing reference escapes.
+pub struct TimerQueue<T> {
+    heap: Mutex<BinaryHeap<TimerEntry<T>>>,
+    next_id: AtomicU64,
+    notif_mutex: Mutex<()>,
+    cond: std::sync::Condvar,
+    is_closed: AtomicBool,
+}
+
+impl<T: Send + 'static> Default for TimerQueue<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Send + 'static> TimerQueue<T> {
+    /// Construct a new empty timer queue.
+    pub fn new() -> Self {
+        Self {
+            heap: Mutex::new(BinaryHeap::new()),
+            next_id: AtomicU64::new(1),
+            notif_mutex: Mutex::new(()),
+            cond: std::sync::Condvar::new(),
+            is_closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Schedule an item to be dispatched at `deadline`. Returns a unique timer ID.
+    pub fn schedule(&self, item: T, deadline: Instant) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut heap = self.heap.lock().unwrap();
+            heap.push(TimerEntry {
+                id,
+                deadline,
+                payload: item,
+            });
+        }
+        self.cond.notify_one();
+        id
+    }
+
+    /// Schedule an item to be dispatched after `delay`. Returns a unique timer ID.
+    pub fn schedule_after(&self, item: T, delay: Duration) -> u64 {
+        self.schedule(item, Instant::now() + delay)
+    }
+
+    /// Poll for an expired timer entry up to `now`. Returns `Some(payload)` if ready.
+    pub fn poll(&self, now: Instant) -> Option<T> {
+        let mut heap = self.heap.lock().unwrap();
+        if let Some(top) = heap.peek() {
+            if top.deadline <= now {
+                return heap.pop().map(|e| e.payload);
+            }
+        }
+        None
+    }
+
+    /// Peek at the deadline of the earliest scheduled item without removing it.
+    pub fn peek_deadline(&self) -> Option<Instant> {
+        let heap = self.heap.lock().unwrap();
+        heap.peek().map(|e| e.deadline)
+    }
+
+    /// Cancel a scheduled timer by its unique ID. Returns true if found and removed.
+    pub fn cancel(&self, timer_id: u64) -> bool {
+        let mut heap = self.heap.lock().unwrap();
+        let initial_len = heap.len();
+        let entries: Vec<TimerEntry<T>> = heap.drain().filter(|e| e.id != timer_id).collect();
+        let removed = entries.len() < initial_len;
+        for entry in entries {
+            heap.push(entry);
+        }
+        removed
+    }
+
+    /// Wait for the next timer to expire or for the queue to close.
+    /// Cooperatively yields current fiber/thread when waiting.
+    pub fn wait_next(&self) -> Result<T, RecvError> {
+        let mut backoff = AdaptiveBackoff::new();
+        loop {
+            let now = Instant::now();
+            if let Some(item) = self.poll(now) {
+                return Ok(item);
+            }
+            if self.is_closed.load(Ordering::Acquire) {
+                let now = Instant::now();
+                if let Some(item) = self.poll(now) {
+                    return Ok(item);
+                }
+                return Err(RecvError::Closed);
+            }
+
+            let peek = self.peek_deadline();
+            match peek {
+                Some(deadline) if deadline <= now => {
+                    continue;
+                }
+                Some(deadline) => {
+                    let wait_dur = deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_millis(50));
+                    if !backoff.is_completed_spinning() && wait_dur < Duration::from_micros(10) {
+                        backoff.snooze();
+                    } else if !backoff.is_completed_yielding()
+                        && wait_dur < Duration::from_micros(100)
+                    {
+                        backoff.snooze_cooperative();
+                    } else {
+                        let guard = self.notif_mutex.lock().unwrap();
+                        let _ = self.cond.wait_timeout(guard, wait_dur);
+                        backoff.reset();
+                    }
+                }
+                None => {
+                    let guard = self.notif_mutex.lock().unwrap();
+                    if self.is_empty() && !self.is_closed.load(Ordering::Acquire) {
+                        let _ = self.cond.wait_timeout(guard, Duration::from_millis(50));
+                    }
+                    backoff.reset();
+                }
+            }
+        }
+    }
+
+    /// Close the timer queue.
+    pub fn close(&self) {
+        self.is_closed.store(true, Ordering::Release);
+        self.cond.notify_all();
+    }
+
+    /// Check if the timer queue is closed.
+    pub fn is_closed(&self) -> bool {
+        self.is_closed.load(Ordering::Acquire)
+    }
+
+    /// Return the number of scheduled timers.
+    pub fn len(&self) -> usize {
+        let heap = self.heap.lock().unwrap();
+        heap.len()
+    }
+
+    /// Return true if the timer queue has no scheduled items.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Clear all pending timers.
+    pub fn clear(&self) {
+        let mut heap = self.heap.lock().unwrap();
+        heap.clear();
+    }
+}
+
+/// Create a new priority channel with `levels` priority tiers.
+pub fn priority_channel<T: Send + 'static>(levels: usize) -> PriorityChannel<T> {
+    PriorityChannel::new(levels)
+}
+
+/// Create a new timer queue for scheduled events.
+pub fn timer_queue<T: Send + 'static>() -> TimerQueue<T> {
+    TimerQueue::new()
+}
+
 pub use ifa_runtime::fiber::AtomicRingBuffer as RingBuffer;
 
 #[cfg(test)]
@@ -803,5 +1166,97 @@ mod tests {
         sem.acquire();
         assert_eq!(sem.available_permits(), 0);
         handle.join().unwrap();
+    }
+
+    // ── PriorityChannel ──────────────────────────────────────────────────────
+
+    #[test]
+    fn priority_channel_order_preservation() {
+        let chan = PriorityChannel::<i64>::new(4);
+        assert_eq!(chan.levels(), 4);
+        assert!(chan.is_empty());
+
+        // Send messages at priority 1 and priority 3
+        chan.send(10, 1).unwrap();
+        chan.send(20, 1).unwrap();
+        chan.send(99, 3).unwrap();
+        chan.send(100, 3).unwrap();
+
+        assert_eq!(chan.len(), 4);
+        assert_eq!(chan.peek_highest_priority(), Some(3));
+
+        // Highest priority messages (prio 3) must come out first in FIFO order
+        assert_eq!(chan.recv().unwrap(), 99);
+        assert_eq!(chan.recv().unwrap(), 100);
+        // Then priority 1
+        assert_eq!(chan.recv().unwrap(), 10);
+        assert_eq!(chan.recv().unwrap(), 20);
+
+        assert!(chan.is_empty());
+        assert_eq!(chan.peek_highest_priority(), None);
+    }
+
+    #[test]
+    fn priority_channel_try_recv_and_close() {
+        let chan = PriorityChannel::<String>::new(2);
+        assert!(chan.try_recv().is_err());
+
+        chan.try_send("low".to_string(), 0).unwrap();
+        chan.try_send("high".to_string(), 1).unwrap();
+
+        assert_eq!(chan.try_recv().unwrap(), "high");
+        chan.close();
+        assert!(chan.is_closed());
+
+        // Low message is still drained after close
+        assert_eq!(chan.try_recv().unwrap(), "low");
+        // Subsequent calls return Closed
+        assert_eq!(chan.try_recv().unwrap_err(), TryRecvError::Closed);
+    }
+
+    // ── TimerQueue ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn timer_queue_schedule_and_poll() {
+        let tq = TimerQueue::<i64>::new();
+        assert!(tq.is_empty());
+
+        let now = Instant::now();
+        // Schedule in reverse deadline order
+        let _id2 = tq.schedule(200, now + Duration::from_millis(50));
+        let _id1 = tq.schedule(100, now + Duration::from_millis(10));
+        let _id3 = tq.schedule(300, now + Duration::from_millis(100));
+
+        assert_eq!(tq.len(), 3);
+        // Immediately, nothing has expired yet
+        assert_eq!(tq.poll(now), None);
+
+        // At now + 15ms, id1 (100) expires
+        assert_eq!(tq.poll(now + Duration::from_millis(15)), Some(100));
+        assert_eq!(tq.len(), 2);
+
+        // At now + 60ms, id2 (200) expires
+        assert_eq!(tq.poll(now + Duration::from_millis(60)), Some(200));
+
+        // At now + 120ms, id3 (300) expires
+        assert_eq!(tq.poll(now + Duration::from_millis(120)), Some(300));
+        assert!(tq.is_empty());
+    }
+
+    #[test]
+    fn timer_queue_cancel() {
+        let tq = TimerQueue::<String>::new();
+        let now = Instant::now();
+        let id1 = tq.schedule("first".to_string(), now + Duration::from_millis(50));
+        let _id2 = tq.schedule("second".to_string(), now + Duration::from_millis(100));
+
+        assert_eq!(tq.len(), 2);
+        assert!(tq.cancel(id1));
+        assert!(!tq.cancel(id1)); // already cancelled
+        assert_eq!(tq.len(), 1);
+
+        // Only second remains
+        assert_eq!(tq.poll(now + Duration::from_millis(150)), Some("second".to_string()));
+        assert!(tq.is_empty());
     }
 }
