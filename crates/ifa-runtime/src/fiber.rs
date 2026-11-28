@@ -251,8 +251,8 @@ impl Default for AdaptiveBackoff {
 }
 
 impl AdaptiveBackoff {
-    pub const SPIN_LIMIT: u32 = 6;      // Steps 0..6: 2^0..2^6 spin_loop iterations
-    pub const YIELD_LIMIT: u32 = 10;    // Steps 6..10: yield execution slice
+    pub const SPIN_LIMIT: u32 = 6; // Steps 0..6: 2^0..2^6 spin_loop iterations
+    pub const YIELD_LIMIT: u32 = 10; // Steps 6..10: yield execution slice
 
     /// Create a new adaptive backoff instance initialized at step 0.
     #[inline]
@@ -440,55 +440,55 @@ impl FiberScheduler {
                             item
                         };
 
-                    if let Some(mut fiber) = task {
-                        let step_res = fiber.step();
-                        match step_res {
-                            FiberStepResult::Completed | FiberStepResult::Panicked => {
-                                if let Some(arena_id) = fiber.arena_id {
-                                    crate::allocator::GLOBAL_ALLOCATOR.destroy_arena(arena_id);
-                                }
-                                let mut comp = completed.lock().unwrap();
-                                comp.insert(fiber.id, fiber.state);
-                                comp_notif.notify_all();
-                            }
-                            FiberStepResult::Suspended => {
-                                let mut q = queue.lock().unwrap();
-                                fiber.state = FiberState::Ready;
-                                q.push_back(fiber);
-                                work_notif.notify_one();
-                            }
-                            FiberStepResult::WaitingIo(token, slot) => {
-                                let mut wm = waiting_io.lock().unwrap();
-                                let mut cr = completed_io.lock().unwrap();
-                                if let Some(res) = cr.remove(&token) {
-                                    drop(cr);
-                                    drop(wm);
-                                    if let Some(s) = slot {
-                                        if !s.is_null() {
-                                            unsafe {
-                                                *s = res;
-                                            }
-                                        }
+                        if let Some(mut fiber) = task {
+                            let step_res = fiber.step();
+                            match step_res {
+                                FiberStepResult::Completed | FiberStepResult::Panicked => {
+                                    if let Some(arena_id) = fiber.arena_id {
+                                        crate::allocator::GLOBAL_ALLOCATOR.destroy_arena(arena_id);
                                     }
+                                    let mut comp = completed.lock().unwrap();
+                                    comp.insert(fiber.id, fiber.state);
+                                    comp_notif.notify_all();
+                                }
+                                FiberStepResult::Suspended => {
                                     let mut q = queue.lock().unwrap();
                                     fiber.state = FiberState::Ready;
                                     q.push_back(fiber);
                                     work_notif.notify_one();
-                                } else {
-                                    fiber.state = FiberState::WaitingIo(token);
-                                    wm.insert(
-                                        token,
-                                        IoWaitEntry {
-                                            fiber,
-                                            result_slot: slot,
-                                        },
-                                    );
+                                }
+                                FiberStepResult::WaitingIo(token, slot) => {
+                                    let mut wm = waiting_io.lock().unwrap();
+                                    let mut cr = completed_io.lock().unwrap();
+                                    if let Some(res) = cr.remove(&token) {
+                                        drop(cr);
+                                        drop(wm);
+                                        if let Some(s) = slot {
+                                            if !s.is_null() {
+                                                unsafe {
+                                                    *s = res;
+                                                }
+                                            }
+                                        }
+                                        let mut q = queue.lock().unwrap();
+                                        fiber.state = FiberState::Ready;
+                                        q.push_back(fiber);
+                                        work_notif.notify_one();
+                                    } else {
+                                        fiber.state = FiberState::WaitingIo(token);
+                                        wm.insert(
+                                            token,
+                                            IoWaitEntry {
+                                                fiber,
+                                                result_slot: slot,
+                                            },
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            });
+                });
 
                 workers.push(handle);
             }
