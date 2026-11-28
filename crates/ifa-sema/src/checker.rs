@@ -1,4 +1,4 @@
-use crate::escape::{is_arena_symbol, is_arena_type, EscapeAnalyzer};
+use crate::escape::{is_arena_symbol, is_arena_type, type_contains_ref_deep, EscapeAnalyzer};
 use crate::exclusivity::{
     check_assignment_target_with_active, check_call_exclusivity_interproc, extract_access_path,
     AccessPath, BorrowKind, BorrowRecord, InterproceduralAccessMap,
@@ -5501,6 +5501,45 @@ impl<'a> SemanticAnalyzer<'a> {
             return wrap_optional(Type::Bool);
         }
         if m_name == "send" {
+            // E0072 — check that the channel payload type does not carry a local reference.
+            // We inspect the receiver type: Channel<T> → check T deeply via the symbol table.
+            if let Type::Generic {
+                name: ch_name,
+                args: gen_args,
+            } = &effective_rec_ty
+            {
+                let ch_name_str = INTERNER.resolve(ch_name);
+                if matches!(
+                    ch_name_str.as_str(),
+                    "Channel"
+                        | "ReliableChannel"
+                        | "BestEffortChannel"
+                        | "RedundantChannel"
+                        | "Stream"
+                        | "PacketChannel"
+                        | "MultipathChannel"
+                ) && !gen_args.is_empty()
+                {
+                    let payload_ty = &gen_args[0];
+                    let mut visited = std::collections::HashSet::new();
+                    if type_contains_ref_deep(payload_ty, &self.symbols, &mut visited) {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "le type de charge utile '{}' transmis via '{}' ne peut pas contenir de référence locale ('ref') : les références locales ne survivent pas au transfert inter-fibres",
+                                payload_ty, ch_name_str
+                            ))
+                            .with_code("E0072")
+                            .with_primary_label(
+                                span,
+                                "envoi d'un type contenant une référence locale sur un canal",
+                            )
+                            .with_note(
+                                "Utilisez la sémantique de valeur pure (sans 'ref') pour les types transmis par canal.",
+                            ),
+                        );
+                    }
+                }
+            }
             for arg in args {
                 self.infer_expr(&arg.value);
             }

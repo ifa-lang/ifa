@@ -22,6 +22,81 @@ pub fn type_contains_ref(ty: &Type) -> bool {
     }
 }
 
+/// Symbol-table-aware version of [`type_contains_ref`].
+///
+/// Resolves named user-defined struct types (represented as
+/// `Type::Generic { name, args: [] }` or `Type::Struct { name, fields: [] }` with no
+/// inline fields) by looking them up in the symbol table and checking their actual field
+/// types recursively.  This catches the common case where a custom struct carrying a `ref`
+/// field is used as a channel payload type (e.g. `Channel<MyStruct>`).
+///
+/// `visited` guards against infinite recursion in mutually-recursive struct definitions.
+pub fn type_contains_ref_deep(
+    ty: &Type,
+    symbols: &SymbolTable,
+    visited: &mut HashSet<Symbol>,
+) -> bool {
+    match ty {
+        Type::Ref(_) => true,
+        Type::Optional(inner) => type_contains_ref_deep(inner, symbols, visited),
+        Type::Slice(inner) => type_contains_ref_deep(inner, symbols, visited),
+        Type::Array(inner, _) => type_contains_ref_deep(inner, symbols, visited),
+        Type::Range { elem, .. } => type_contains_ref_deep(elem, symbols, visited),
+        Type::ErrorUnion { err, ok } => {
+            type_contains_ref_deep(err, symbols, visited)
+                || type_contains_ref_deep(ok, symbols, visited)
+        }
+        Type::Tuple(elems) => elems
+            .iter()
+            .any(|e| type_contains_ref_deep(e, symbols, visited)),
+        // Inline struct with known fields — recurse into each field type.
+        Type::Struct { name, fields } if !fields.is_empty() => {
+            fields
+                .iter()
+                .any(|(_, fty)| type_contains_ref_deep(fty, symbols, visited))
+                // Also resolve via symbol table in case the inline fields are partial.
+                || {
+                    if visited.insert(*name) {
+                        let result = symbols
+                            .lookup_struct(name)
+                            .map(|st| {
+                                st.fields
+                                    .iter()
+                                    .any(|f| type_contains_ref_deep(&f.ty, symbols, visited))
+                            })
+                            .unwrap_or(false);
+                        result
+                    } else {
+                        false
+                    }
+                }
+        }
+        // Named struct with no inline fields — look up and check via symbol table.
+        Type::Struct { name, .. } | Type::Generic { name, .. }
+            if symbols.lookup_struct(name).is_some() =>
+        {
+            if visited.insert(*name) {
+                symbols
+                    .lookup_struct(name)
+                    .map(|st| {
+                        st.fields
+                            .iter()
+                            .any(|f| type_contains_ref_deep(&f.ty, symbols, visited))
+                    })
+                    .unwrap_or(false)
+            } else {
+                // Already visiting — stop recursion (no ref found on this path).
+                false
+            }
+        }
+        // Generic type (e.g. Channel<T>, List<T>): recurse into type arguments only.
+        Type::Generic { args, .. } => args
+            .iter()
+            .any(|a| type_contains_ref_deep(a, symbols, visited)),
+        _ => false,
+    }
+}
+
 /// Determines if a type contains a self-referential or recursive definition.
 pub fn is_recursive_type(
     ty: &Type,

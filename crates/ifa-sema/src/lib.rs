@@ -741,4 +741,86 @@ mod tests {
             res.diagnostics
         );
     }
+
+    // -----------------------------------------------------------------
+    // E0072 — custom struct with ref field sent over a channel
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_channel_send_struct_with_ref_field_rejected() {
+        // A custom struct whose field is a local reference must not be sent
+        // through a Channel: E0072 must fire on the .send() call site.
+        let code = r#"
+            struct Packet {
+                data: ref i64,
+                id: i64,
+            }
+            fn emit(ch: sync::Channel<Packet>, val: ref i64) {
+                let pkt = Packet { data: val, id: 1 };
+                ch.send(pkt);
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(res.has_errors());
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0072")),
+            "Expected E0072 error for custom struct with ref field sent over Channel, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_channel_send_plain_struct_allowed() {
+        // A struct with purely value-semantic fields must NOT trigger E0072.
+        let code = r#"
+            struct SafePacket {
+                id: i64,
+                value: i64,
+            }
+            fn emit_safe(ch: sync::Channel<SafePacket>) {
+                let pkt = SafePacket { id: 42, value: 100 };
+                ch.send(pkt);
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        let has_e0072 = res
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0072"));
+        assert!(
+            !has_e0072,
+            "E0072 must NOT fire for a plain value-semantic struct sent over Channel, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_channel_send_nested_struct_with_ref_rejected() {
+        // A struct that embeds another struct containing a ref field must
+        // also be rejected — the deep traversal must catch this.
+        let code = r#"
+            struct Inner {
+                ptr: ref i64,
+            }
+            struct Outer {
+                inner: Inner,
+                tag: i64,
+            }
+            fn relay(ch: sync::Channel<Outer>, r: ref i64) {
+                let o = Outer { inner: Inner { ptr: r }, tag: 7 };
+                ch.send(o);
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(res.has_errors());
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code.as_deref() == Some("E0072")),
+            "Expected E0072 for nested struct with ref field sent over Channel, got: {:?}",
+            res.diagnostics
+        );
+    }
 }
