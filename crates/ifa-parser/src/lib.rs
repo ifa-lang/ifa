@@ -3819,4 +3819,31 @@ mod tests {
             panic!("Expected Item::Function");
         }
     }
+
+    #[test]
+    fn test_parse_channel_benchmark_example() {
+        let src = include_str!("../../../examples/channel_benchmark.ifa");
+        let fid = FileId(0);
+        let tokens = tokenize(fid, src);
+        let (prog, diags) = parse(fid, tokens);
+        assert!(diags.is_empty(), "Parse diagnostics: {:?}", diags);
+        assert!(!prog.items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_select_with_priority_and_let() {
+        let src = r#"
+            fn worker(ch1: Channel, ch2: Channel) {
+                select {
+                    priority(100) let x = ch1 => 1,
+                    priority(50) y = ch2 => 2,
+                    default => 0,
+                }
+            }
+        "#;
+        let fid = FileId(0);
+        let tokens = tokenize(fid, src);
+        let (_prog, diags) = parse(fid, tokens);
+        assert!(diags.is_empty(), "Parse diagnostics: {:?}", diags);
+    }
 }

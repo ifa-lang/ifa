@@ -1,10 +1,27 @@
-// IFA High-Throughput Inter-Fiber Message Passing Benchmark
-// Benchmarks lock-free MPMC atomic ring buffer channels under fiber multiplexing.
+// IFA High-Throughput Inter-Fiber Message Passing & Multiplexing Benchmark
+// Comprehensive benchmark suite for colorless M:N fibers and lock-free channels:
+// 1. SPSC (Single-Producer Single-Consumer) bounded atomic ring buffer streaming.
+// 2. MPSC (Multi-Producer Single-Consumer) fan-in aggregation with structured packets.
+// 3. Priority-based multi-channel `select` multiplexing (urgent, telemetry, bulk).
+// 4. Token Ring inter-fiber context-switch relay pipeline.
+// All executed with zero garbage collector pauses, zero async/await coloration, and stack value semantics.
 
 import std::sync;
 import std::io;
 
-fn producer_fiber(ch: sync::Channel<i64>, total_messages: i64) {
+// Structured packet transferred by value with zero heap allocation
+struct BenchmarkPacket {
+    packet_id: i64,
+    producer_id: i64,
+    sequence_nr: i64,
+    checksum: i64,
+}
+
+// ---------------------------------------------------------------------------
+// 1. SPSC Bounded Stream Benchmark
+// ---------------------------------------------------------------------------
+
+fn spsc_producer(ch: sync::Channel<i64>, total_messages: i64) {
     mut counter: i64 = 0;
     while counter < total_messages {
         ch.send(counter);
@@ -12,12 +29,10 @@ fn producer_fiber(ch: sync::Channel<i64>, total_messages: i64) {
     }
 }
 
-pub fn main() -> () {
-    let total_messages: i64 = 100000;
+fn run_spsc_benchmark(total_messages: i64) -> i64 {
     let chan: sync::Channel<i64> = sync::bounded(1024);
 
-    // Spawn producer fiber without async/await overhead
-    spawn producer_fiber(chan, total_messages);
+    spawn spsc_producer(chan, total_messages);
 
     mut received_count: i64 = 0;
     while received_count < total_messages {
@@ -30,8 +45,190 @@ pub fn main() -> () {
             }
         }
     }
+    return received_count;
+}
 
-    io::println("IFA Colorless Fiber Channel Benchmark completed:");
-    io::println_i64(received_count);
-    io::println("Messages processed without GC pauses or color contagion.");
+// ---------------------------------------------------------------------------
+// 2. MPSC Structured Fan-In Benchmark
+// ---------------------------------------------------------------------------
+
+fn mpsc_worker(ch: sync::Channel<BenchmarkPacket>, producer_id: i64, messages_per_worker: i64) {
+    mut seq: i64 = 0;
+    while seq < messages_per_worker {
+        let pkt = BenchmarkPacket {
+            packet_id: producer_id * 1000000 + seq,
+            producer_id: producer_id,
+            sequence_nr: seq,
+            checksum: (producer_id ^ seq) * 31,
+        };
+        ch.send(pkt);
+        seq += 1;
+    }
+}
+
+fn run_mpsc_benchmark(num_producers: i64, messages_per_producer: i64) -> i64 {
+    let total_expected = num_producers * messages_per_producer;
+    let chan: sync::Channel<BenchmarkPacket> = sync::bounded(2048);
+
+    mut p: i64 = 0;
+    while p < num_producers {
+        spawn mpsc_worker(chan, p + 1, messages_per_producer);
+        p += 1;
+    }
+
+    mut total_received: i64 = 0;
+    mut checksum_acc: i64 = 0;
+
+    while total_received < total_expected {
+        select {
+            let pkt = chan => {
+                total_received += 1;
+                checksum_acc += pkt.checksum;
+            },
+            default => {
+                sync::yield_now();
+            }
+        }
+    }
+    return total_received;
+}
+
+// ---------------------------------------------------------------------------
+// 3. Multi-Channel Priority-Based `select` Multiplexing
+// ---------------------------------------------------------------------------
+
+fn priority_producer(
+    urgent_ch: sync::Channel<i64>,
+    telemetry_ch: sync::Channel<i64>,
+    bulk_ch: sync::Channel<i64>,
+    total_cycles: i64
+) {
+    mut i: i64 = 0;
+    while i < total_cycles {
+        if i % 10 == 0 {
+            urgent_ch.send(i);
+        } else if i % 3 == 0 {
+            telemetry_ch.send(i);
+        } else {
+            bulk_ch.send(i);
+        }
+        i += 1;
+    }
+}
+
+fn run_priority_multiplex_benchmark(total_cycles: i64) -> i64 {
+    let urgent_ch: sync::Channel<i64> = sync::bounded(128);
+    let telemetry_ch: sync::Channel<i64> = sync::bounded(256);
+    let bulk_ch: sync::Channel<i64> = sync::bounded(1024);
+
+    spawn priority_producer(urgent_ch, telemetry_ch, bulk_ch, total_cycles);
+
+    mut urgent_handled: i64 = 0;
+    mut telemetry_handled: i64 = 0;
+    mut bulk_handled: i64 = 0;
+    mut total_handled: i64 = 0;
+
+    while total_handled < total_cycles {
+        select {
+            priority(100) let u_msg = urgent_ch => {
+                urgent_handled += 1;
+                total_handled += 1;
+            },
+            priority(50) let t_msg = telemetry_ch => {
+                telemetry_handled += 1;
+                total_handled += 1;
+            },
+            priority(10) let b_msg = bulk_ch => {
+                bulk_handled += 1;
+                total_handled += 1;
+            },
+            default => {
+                sync::yield_now();
+            }
+        }
+    }
+    return total_handled;
+}
+
+// ---------------------------------------------------------------------------
+// 4. Token Ring Pipeline Relay Benchmark
+// ---------------------------------------------------------------------------
+
+fn ring_node(in_ch: sync::Channel<i64>, out_ch: sync::Channel<i64>, node_id: i64, total_hops: i64) {
+    loop {
+        select {
+            let hop_count = in_ch => {
+                if hop_count >= total_hops {
+                    out_ch.send(hop_count);
+                    return;
+                }
+                out_ch.send(hop_count + 1);
+            },
+            default => {
+                sync::yield_now();
+            }
+        }
+    }
+}
+
+fn run_token_ring_benchmark(total_hops: i64) -> i64 {
+    let ch0: sync::Channel<i64> = sync::bounded(16);
+    let ch1: sync::Channel<i64> = sync::bounded(16);
+    let ch2: sync::Channel<i64> = sync::bounded(16);
+    let ch3: sync::Channel<i64> = sync::bounded(16);
+
+    spawn ring_node(ch0, ch1, 0, total_hops);
+    spawn ring_node(ch1, ch2, 1, total_hops);
+    spawn ring_node(ch2, ch3, 2, total_hops);
+    spawn ring_node(ch3, ch0, 3, total_hops);
+
+    // Inject initial token into ring
+    ch0.send(0);
+
+    mut final_hops: i64 = 0;
+    while final_hops < total_hops {
+        select {
+            let hops = ch0 => {
+                final_hops = hops;
+                if final_hops < total_hops {
+                    ch1.send(final_hops + 1);
+                }
+            },
+            default => {
+                sync::yield_now();
+            }
+        }
+    }
+    return final_hops;
+}
+
+// ---------------------------------------------------------------------------
+// Main Benchmark Runner & Telemetry Reporting
+// ---------------------------------------------------------------------------
+
+pub fn main() -> () {
+    io::println("=== IFA Colorless Fiber Channel & Multiplexing Benchmark ===");
+
+    // 1. SPSC Benchmark
+    let spsc_count = run_spsc_benchmark(100000);
+    io::println("1. SPSC Bounded Stream (100,000 messages): COMPLETED");
+    io::println_i64(spsc_count);
+
+    // 2. MPSC Fan-In Benchmark
+    let mpsc_count = run_mpsc_benchmark(4, 25000);
+    io::println("2. MPSC Structured Fan-In (4 producers x 25,000 msgs = 100,000): COMPLETED");
+    io::println_i64(mpsc_count);
+
+    // 3. Priority-Based Select Multiplexing Benchmark
+    let prio_count = run_priority_multiplex_benchmark(50000);
+    io::println("3. Priority Multiplexing (50,000 cycles across 3 tiers): COMPLETED");
+    io::println_i64(prio_count);
+
+    // 4. Token Ring Inter-Fiber Relay Benchmark
+    let ring_hops = run_token_ring_benchmark(10000);
+    io::println("4. Token Ring Context Switching (10,000 hops across 4 fibers): COMPLETED");
+    io::println_i64(ring_hops);
+
+    io::println("All fiber benchmarks completed successfully.");
+    io::println("Zero GC pauses, zero async/await coloration, deterministic value semantics.");
 }
