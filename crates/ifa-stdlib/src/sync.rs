@@ -339,3 +339,216 @@ impl AtomicFlag {
 }
 
 pub use ifa_runtime::fiber::AtomicRingBuffer as RingBuffer;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    // ── channel (unbounded) ───────────────────────────────────────────────────
+
+    #[test]
+    fn channel_send_recv_roundtrip() {
+        let (tx, rx) = channel::<u32>();
+        tx.send(42).unwrap();
+        assert_eq!(rx.recv().unwrap(), 42);
+    }
+
+    #[test]
+    fn channel_send_multiple_values_fifo() {
+        let (tx, rx) = channel::<i32>();
+        for i in 0..5 {
+            tx.send(i).unwrap();
+        }
+        for i in 0..5 {
+            assert_eq!(rx.recv().unwrap(), i);
+        }
+    }
+
+    #[test]
+    fn channel_try_recv_empty_returns_none() {
+        let (_tx, rx) = channel::<u8>();
+        assert!(rx.try_recv().is_err()); // TryRecvError::Empty
+    }
+
+    #[test]
+    fn channel_closed_sender_recv_returns_error() {
+        let (tx, rx) = channel::<u8>();
+        drop(tx);
+        assert!(rx.recv().is_err());
+    }
+
+    #[test]
+    fn channel_sender_clone_still_works() {
+        let (tx, rx) = channel::<u8>();
+        let tx2 = tx.clone();
+        tx2.send(7).unwrap();
+        assert_eq!(rx.recv().unwrap(), 7);
+    }
+
+    #[test]
+    fn channel_is_closed_after_explicit_close() {
+        let (tx, _rx) = channel::<u8>();
+        assert!(!tx.is_closed());
+        tx.close();
+        assert!(tx.is_closed());
+    }
+
+    // ── bounded channel ───────────────────────────────────────────────────────
+
+    #[test]
+    fn bounded_channel_try_send_full_returns_error() {
+        let (tx, _rx) = bounded::<u8>(1);
+        tx.send(1).unwrap();
+        // channel is full — try_send must fail
+        assert!(tx.try_send(2).is_err());
+    }
+
+    #[test]
+    fn bounded_channel_len_tracks_pending_messages() {
+        let (tx, rx) = bounded::<i32>(4);
+        assert_eq!(rx.len(), 0);
+        tx.send(10).unwrap();
+        tx.send(20).unwrap();
+        assert_eq!(rx.len(), 2);
+        rx.recv().unwrap();
+        assert_eq!(rx.len(), 1);
+    }
+
+    #[test]
+    fn bounded_channel_is_empty_initial() {
+        let (_tx, rx) = bounded::<u8>(8);
+        assert!(rx.is_empty());
+    }
+
+    // ── cross-thread channel ──────────────────────────────────────────────────
+
+    #[test]
+    fn channel_cross_thread_send_recv() {
+        let (tx, rx) = channel::<u32>();
+        let handle = thread::spawn(move || {
+            tx.send(99).unwrap();
+        });
+        handle.join().unwrap();
+        assert_eq!(rx.recv().unwrap(), 99);
+    }
+
+    // ── Receiver::iter ────────────────────────────────────────────────────────
+
+    #[test]
+    fn receiver_iter_drains_all_messages() {
+        let (tx, rx) = channel::<i32>();
+        for v in [1, 2, 3] {
+            tx.send(v).unwrap();
+        }
+        drop(tx); // close sender so iterator terminates
+        let collected: Vec<i32> = rx.iter().collect();
+        assert_eq!(collected, vec![1, 2, 3]);
+    }
+
+    // ── WaitGroup ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn waitgroup_add_done_wait() {
+        let wg = WaitGroup::new();
+        wg.add(3);
+        for _ in 0..3 {
+            wg.done();
+        }
+        // Should return immediately (counter already 0)
+        wg.wait();
+    }
+
+    #[test]
+    fn waitgroup_cross_thread() {
+        let wg = Arc::new(WaitGroup::new());
+        wg.add(2);
+        let wg2 = Arc::clone(&wg);
+        let wg3 = Arc::clone(&wg);
+        thread::spawn(move || wg2.done()).join().unwrap();
+        thread::spawn(move || wg3.done()).join().unwrap();
+        wg.wait();
+    }
+
+    #[test]
+    fn waitgroup_wait_timeout_expires() {
+        let wg = WaitGroup::new();
+        wg.add(1); // never done — timeout must fire
+        let done = wg.wait_timeout(Duration::from_millis(20));
+        assert!(!done);
+    }
+
+    // ── AtomicInt ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn atomic_int_load_store() {
+        let a = AtomicInt::new(0);
+        assert_eq!(a.load(), 0);
+        a.store(42);
+        assert_eq!(a.load(), 42);
+    }
+
+    #[test]
+    fn atomic_int_fetch_add_sub() {
+        let a = AtomicInt::new(10);
+        assert_eq!(a.fetch_add(5), 10);
+        assert_eq!(a.load(), 15);
+        assert_eq!(a.fetch_sub(3), 15);
+        assert_eq!(a.load(), 12);
+    }
+
+    #[test]
+    fn atomic_int_compare_exchange_success() {
+        let a = AtomicInt::new(1);
+        let result = a.compare_exchange(1, 99);
+        assert_eq!(result, Ok(1));
+        assert_eq!(a.load(), 99);
+    }
+
+    #[test]
+    fn atomic_int_compare_exchange_failure() {
+        let a = AtomicInt::new(5);
+        let result = a.compare_exchange(0, 99); // wrong current value
+        assert_eq!(result, Err(5));
+        assert_eq!(a.load(), 5); // unchanged
+    }
+
+    // ── AtomicFlag ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn atomic_flag_load_store() {
+        let f = AtomicFlag::new(false);
+        assert!(!f.load());
+        f.store(true);
+        assert!(f.load());
+    }
+
+    #[test]
+    fn atomic_flag_swap() {
+        let f = AtomicFlag::new(true);
+        let old = f.swap(false);
+        assert!(old);
+        assert!(!f.load());
+    }
+
+    // ── Select ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn select_try_select_picks_ready_receiver() {
+        let (tx1, rx1) = channel::<i32>();
+        let (_tx2, rx2) = channel::<i32>();
+        tx1.send(7).unwrap();
+        let result = Select::try_select(&[&rx1, &rx2]);
+        assert!(result.is_some());
+        let (idx, val) = result.unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(val, 7);
+    }
+
+    #[test]
+    fn select_try_select_empty_channels_returns_none() {
+        let (_tx1, rx1) = channel::<i32>();
+        let (_tx2, rx2) = channel::<i32>();
+        assert!(Select::try_select(&[&rx1, &rx2]).is_none());
+    }
+}
