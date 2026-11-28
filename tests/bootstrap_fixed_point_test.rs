@@ -2103,8 +2103,13 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("332 passed; 0 failed"),
-        "Expected 332 passed std unit tests, got:\n{}",
+        stdout.contains("test test_sync_lock_free_barriers ... ok"),
+        "Std sync lock-free barriers test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("334 passed; 0 failed"),
+        "Expected 334 passed std unit tests, got:\n{}",
         stdout
     );
 }
