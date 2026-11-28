@@ -88,6 +88,7 @@ pub fn handle_semantic_tokens(doc: &Document) -> SemanticTokens {
             | TokenKind::Default
             | TokenKind::Trait
             | TokenKind::Interface
+            | TokenKind::Protocol
             | TokenKind::Impl
             | TokenKind::Where
             | TokenKind::True
@@ -137,7 +138,8 @@ pub fn handle_semantic_tokens(doc: &Document) -> SemanticTokens {
             | TokenKind::Pipe
             | TokenKind::Caret
             | TokenKind::Question
-            | TokenKind::Colon => (11, 0),
+            | TokenKind::Colon
+            | TokenKind::At => (11, 0),
 
             // Identifiers: disambiguate using semantic analysis
             TokenKind::Ident(symbol) => {
