@@ -18,6 +18,10 @@ pub fn fiber_yield_slice() {
     fiber_yield();
 }
 
+pub fn yield_now() {
+    fiber_yield();
+}
+
 pub fn fiber_get_current_id() -> i64 {
     return fiber_current_id();
 }
@@ -811,6 +815,8 @@ pub fn test_sync_concurrency_advanced() -> bool {
     mut counter = make_atomic_int(0);
     mut sem = make_semaphore(4);
     mut ch = make_channel(8);
+
+    yield_now();
 
     wait_group_add(inout wg, 4);
 
