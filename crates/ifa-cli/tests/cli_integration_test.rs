@@ -1803,3 +1803,112 @@ fn test_cli_net_session_jitter_anomaly_and_thresholds() {
     assert!(metrics_str.contains("ifa_dynamic_ledbat_target_us"));
     assert!(metrics_str.contains("ifa_dynamic_bbr_pacing_gain"));
 }
+
+#[test]
+fn test_cli_multipath_protocol_end_to_end_pipeline() {
+    let ifa_bin = get_ifa_binary();
+    let temp_dir = std::env::temp_dir().join(format!("ifa_cli_mp_e2e_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let src_file = temp_dir.join("multipath_app.ifa");
+    let code = r#"
+@multipath(resilient)
+protocol TelemetryStream {
+    slice control: Channel<u32>,
+    slice metrics: Stream<u8>,
+    slice video: Stream<u8>,
+}
+
+pub fn main() -> () {
+    mut meta = __MultipathSubpathMeta {
+        subpath_id: 42,
+        interface_index: 3,
+        weight: 100,
+        rtt_micros: 350,
+        loss_rate_ppm: 10,
+        state: 1,
+    };
+    println("IFA_MULTIPATH_PIPELINE_OK");
+}
+"#;
+    fs::write(&src_file, code).unwrap();
+
+    // 1. End-to-end execution with internal FIR Interpreter (`ifa run`)
+    let run_interp = Command::new(&ifa_bin)
+        .arg("run")
+        .arg(&src_file)
+        .output()
+        .expect("Failed to execute `ifa run` with multipath protocol");
+    assert!(
+        run_interp.status.success(),
+        "Interpreter execution failed: {}",
+        String::from_utf8_lossy(&run_interp.stderr)
+    );
+    let interp_out = String::from_utf8_lossy(&run_interp.stdout);
+    assert!(
+        interp_out.contains("IFA_MULTIPATH_PIPELINE_OK"),
+        "Missing expected output in interpreter run: {}",
+        interp_out
+    );
+
+    // 2. End-to-end execution with Cranelift JIT (`ifa run --native`)
+    let run_native = Command::new(&ifa_bin)
+        .arg("run")
+        .arg("--native")
+        .arg(&src_file)
+        .output()
+        .expect("Failed to execute `ifa run --native` with multipath protocol");
+    assert!(
+        run_native.status.success(),
+        "JIT execution failed: {}",
+        String::from_utf8_lossy(&run_native.stderr)
+    );
+    let native_out = String::from_utf8_lossy(&run_native.stdout);
+    assert!(
+        native_out.contains("IFA_MULTIPATH_PIPELINE_OK"),
+        "Missing expected output in JIT run: {}",
+        native_out
+    );
+
+    // 3. Ahead-of-Time compilation via `ifa compile` (CLI driver alias for `build`)
+    let out_bin = temp_dir.join("multipath_exec");
+    let compile_status = Command::new(&ifa_bin)
+        .arg("compile")
+        .arg(&src_file)
+        .arg("-o")
+        .arg(&out_bin)
+        .status()
+        .expect("Failed to execute `ifa compile`");
+    assert!(compile_status.success(), "AOT standalone compilation failed");
+    assert!(out_bin.exists(), "Target executable does not exist");
+
+    // Execute standalone binary
+    let exec_output = Command::new(&out_bin)
+        .output()
+        .expect("Failed to execute compiled standalone binary");
+    assert!(exec_output.status.success(), "Standalone binary execution failed");
+    let exec_out = String::from_utf8_lossy(&exec_output.stdout);
+    assert!(
+        exec_out.contains("IFA_MULTIPATH_PIPELINE_OK"),
+        "Missing expected output in standalone binary: {}",
+        exec_out
+    );
+
+    // 4. Object emission via `ifa compile --emit-obj`
+    let out_obj = temp_dir.join("multipath_obj.o");
+    let obj_status = Command::new(&ifa_bin)
+        .arg("compile")
+        .arg("--emit-obj")
+        .arg(&src_file)
+        .arg("-o")
+        .arg(&out_obj)
+        .status()
+        .expect("Failed to emit object file via `ifa compile --emit-obj`");
+    assert!(obj_status.success(), "Object file emission failed");
+    assert!(out_obj.exists(), "Object file does not exist");
+    let obj_meta = fs::metadata(&out_obj).unwrap();
+    assert!(obj_meta.len() > 0, "Object file must not be empty");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

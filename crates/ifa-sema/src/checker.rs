@@ -363,11 +363,165 @@ impl<'a> SemanticAnalyzer<'a> {
             proto.name,
             proto.is_pub,
             proto.attributes.clone(),
-            channels,
+            channels.clone(),
             proto.span,
         );
         if let Err(diag) = self.symbols.define_protocol(proto_sym) {
             self.diagnostics.push(diag);
+        }
+
+        // Automatically define Flow Encapsulation Struct and Slice Descriptors in SymbolTable
+        let flow_st_name =
+            INTERNER.intern(&format!("__MultipathFlow_{}", INTERNER.resolve(&proto.name)));
+        let mut flow_fields = vec![
+            FieldSymbol {
+                is_pub: proto.is_pub,
+                name: INTERNER.intern("flow_id"),
+                ty: Type::Int(IntType::U64),
+                span: proto.span,
+            },
+            FieldSymbol {
+                is_pub: proto.is_pub,
+                name: INTERNER.intern("subpath_id"),
+                ty: Type::Int(IntType::U32),
+                span: proto.span,
+            },
+            FieldSymbol {
+                is_pub: proto.is_pub,
+                name: INTERNER.intern("seq_num"),
+                ty: Type::Int(IntType::U64),
+                span: proto.span,
+            },
+            FieldSymbol {
+                is_pub: proto.is_pub,
+                name: INTERNER.intern("flags"),
+                ty: Type::Int(IntType::U32),
+                span: proto.span,
+            },
+            FieldSymbol {
+                is_pub: proto.is_pub,
+                name: INTERNER.intern("slice_tag"),
+                ty: Type::Int(IntType::U16),
+                span: proto.span,
+            },
+            FieldSymbol {
+                is_pub: proto.is_pub,
+                name: INTERNER.intern("payload_len"),
+                ty: Type::Int(IntType::U32),
+                span: proto.span,
+            },
+        ];
+        for ch in &channels {
+            flow_fields.push(FieldSymbol {
+                is_pub: proto.is_pub,
+                name: ch.name,
+                ty: ch.ty.clone(),
+                span: ch.span,
+            });
+        }
+        let flow_st = StructSymbol::new(
+            flow_st_name,
+            proto.is_pub,
+            Vec::new(),
+            flow_fields,
+            proto.span,
+        );
+        let _ = self.symbols.define_struct(flow_st);
+
+        // Define Slice Descriptors
+        for ch in &channels {
+            let slice_desc_name = INTERNER.intern(&format!(
+                "__MultipathSliceDescriptor_{}_{}",
+                INTERNER.resolve(&proto.name),
+                INTERNER.resolve(&ch.name)
+            ));
+            if self.symbols.lookup_struct(&slice_desc_name).is_none() {
+                let desc_fields = vec![
+                    FieldSymbol {
+                        is_pub: proto.is_pub,
+                        name: INTERNER.intern("slice_id"),
+                        ty: Type::Int(IntType::U32),
+                        span: ch.span,
+                    },
+                    FieldSymbol {
+                        is_pub: proto.is_pub,
+                        name: INTERNER.intern("subpath_id"),
+                        ty: Type::Int(IntType::U32),
+                        span: ch.span,
+                    },
+                    FieldSymbol {
+                        is_pub: proto.is_pub,
+                        name: INTERNER.intern("redundancy"),
+                        ty: Type::Int(IntType::U32),
+                        span: ch.span,
+                    },
+                    FieldSymbol {
+                        is_pub: proto.is_pub,
+                        name: INTERNER.intern("fec_ratio"),
+                        ty: Type::Int(IntType::U32),
+                        span: ch.span,
+                    },
+                    FieldSymbol {
+                        is_pub: proto.is_pub,
+                        name: INTERNER.intern("channel"),
+                        ty: ch.ty.clone(),
+                        span: ch.span,
+                    },
+                ];
+                let desc_st = StructSymbol::new(
+                    slice_desc_name,
+                    proto.is_pub,
+                    Vec::new(),
+                    desc_fields,
+                    ch.span,
+                );
+                let _ = self.symbols.define_struct(desc_st);
+            }
+        }
+
+        // Define __MultipathSubpathMeta struct
+        let meta_name = INTERNER.intern("__MultipathSubpathMeta");
+        if self.symbols.lookup_struct(&meta_name).is_none() {
+            let meta_fields = vec![
+                FieldSymbol {
+                    is_pub: true,
+                    name: INTERNER.intern("subpath_id"),
+                    ty: Type::Int(IntType::U32),
+                    span: proto.span,
+                },
+                FieldSymbol {
+                    is_pub: true,
+                    name: INTERNER.intern("interface_index"),
+                    ty: Type::Int(IntType::U32),
+                    span: proto.span,
+                },
+                FieldSymbol {
+                    is_pub: true,
+                    name: INTERNER.intern("weight"),
+                    ty: Type::Int(IntType::U32),
+                    span: proto.span,
+                },
+                FieldSymbol {
+                    is_pub: true,
+                    name: INTERNER.intern("rtt_micros"),
+                    ty: Type::Int(IntType::U64),
+                    span: proto.span,
+                },
+                FieldSymbol {
+                    is_pub: true,
+                    name: INTERNER.intern("loss_rate_ppm"),
+                    ty: Type::Int(IntType::U32),
+                    span: proto.span,
+                },
+                FieldSymbol {
+                    is_pub: true,
+                    name: INTERNER.intern("state"),
+                    ty: Type::Int(IntType::U8),
+                    span: proto.span,
+                },
+            ];
+            let meta_st = StructSymbol::new(meta_name, true, Vec::new(), meta_fields, proto.span);
+            let _ = self.symbols.define_struct(meta_st);
         }
     }
 
@@ -4845,6 +4999,8 @@ impl<'a> SemanticAnalyzer<'a> {
                     || callee_name.starts_with("ifa_rt_process_")
                     || callee_name.starts_with("ifa_rt_args_")
                     || callee_name.starts_with("ifa_rt_string_")
+                    || callee_name.starts_with("ifa_rt_multipath_")
+                    || callee_name.starts_with("multipath::")
                     || callee_name == "ifa_rt_env_var";
                 if !is_allowed_intrinsic {
                     self.diagnostics.push(
@@ -5096,6 +5252,8 @@ impl<'a> SemanticAnalyzer<'a> {
                 || fn_name.starts_with("ifa_rt_process_")
                 || fn_name.starts_with("ifa_rt_args_")
                 || fn_name.starts_with("ifa_rt_string_")
+                || fn_name.starts_with("ifa_rt_multipath_")
+                || fn_name.starts_with("multipath::")
                 || fn_name == "ifa_rt_env_var";
 
             if !is_allowed_intrinsic {

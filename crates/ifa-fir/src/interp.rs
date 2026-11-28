@@ -620,10 +620,26 @@ impl<'a> FirInterpreter<'a> {
                 ConstantValue::Null => FirValue::Null,
             }),
 
-            ValueExpr::Alloca { .. } => {
+            ValueExpr::Alloca { ty, .. } => {
                 let addr = self.next_stack_addr;
                 self.next_stack_addr += 8;
-                self.stack_memory.insert(addr, FirValue::Unit);
+                let default_val = match ty {
+                    FirType::Struct(st_name, _) => {
+                        let field_count = self
+                            .module
+                            .structs
+                            .iter()
+                            .find(|s| s.name == *st_name)
+                            .map(|s| s.fields.len())
+                            .unwrap_or(0);
+                        FirValue::Struct {
+                            name: *st_name,
+                            fields: vec![FirValue::Int(0); field_count],
+                        }
+                    }
+                    _ => FirValue::Unit,
+                };
+                self.stack_memory.insert(addr, default_val);
                 Ok(FirValue::Pointer(addr))
             }
 
@@ -3893,6 +3909,156 @@ impl<'a> FirInterpreter<'a> {
                     } else {
                         Ok(FirValue::Bool(false))
                     }
+                } else if fn_name == "multipath::flow_init"
+                    || fn_name == "flow_init"
+                    || fn_name == "ifa_rt_multipath_flow_init"
+                {
+                    if let Some(FirValue::Pointer(addr)) = evaluated_args.first() {
+                        let flow_id = evaluated_args
+                            .get(1)
+                            .and_then(|v| match v {
+                                FirValue::Int(n) => Some(*n),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        let subpath_id = evaluated_args
+                            .get(2)
+                            .and_then(|v| match v {
+                                FirValue::Int(n) => Some(*n),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        let slice_tag = evaluated_args
+                            .get(3)
+                            .and_then(|v| match v {
+                                FirValue::Int(n) => Some(*n),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+
+                        let st_name = if let Some(FirValue::Struct { name, .. }) =
+                            self.stack_memory.get(addr)
+                        {
+                            *name
+                        } else {
+                            INTERNER.intern("__MultipathFlow")
+                        };
+                        let field_count = self
+                            .module
+                            .structs
+                            .iter()
+                            .find(|s| s.name == st_name)
+                            .map(|s| s.fields.len())
+                            .unwrap_or(6);
+                        let mut fields = vec![FirValue::Int(0); field_count];
+                        if !fields.is_empty() {
+                            fields[0] = FirValue::Int(flow_id);
+                        }
+                        if fields.len() > 1 {
+                            fields[1] = FirValue::Int(subpath_id);
+                        }
+                        if fields.len() > 2 {
+                            fields[2] = FirValue::Int(0);
+                        }
+                        if fields.len() > 3 {
+                            fields[3] = FirValue::Int(0);
+                        }
+                        if fields.len() > 4 {
+                            fields[4] = FirValue::Int(slice_tag);
+                        }
+                        if fields.len() > 5 {
+                            fields[5] = FirValue::Int(0);
+                        }
+                        self.stack_memory.insert(*addr, FirValue::Struct { name: st_name, fields });
+                    }
+                    Ok(FirValue::Unit)
+                } else if fn_name == "multipath::flow_serialize"
+                    || fn_name == "flow_serialize"
+                    || fn_name == "ifa_rt_multipath_flow_serialize"
+                    || fn_name == "multipath::flow_deserialize"
+                    || fn_name == "flow_deserialize"
+                    || fn_name == "ifa_rt_multipath_flow_deserialize"
+                {
+                    Ok(FirValue::Int(30))
+                } else if fn_name == "multipath::subpath_meta_init"
+                    || fn_name == "subpath_meta_init"
+                    || fn_name == "ifa_rt_multipath_subpath_meta_init"
+                {
+                    if let Some(FirValue::Pointer(addr)) = evaluated_args.first() {
+                        let subpath_id = evaluated_args
+                            .get(1)
+                            .and_then(|v| match v {
+                                FirValue::Int(n) => Some(*n),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        let ifindex = evaluated_args
+                            .get(2)
+                            .and_then(|v| match v {
+                                FirValue::Int(n) => Some(*n),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        let weight = evaluated_args
+                            .get(3)
+                            .and_then(|v| match v {
+                                FirValue::Int(n) => Some(*n),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+
+                        let st_name = INTERNER.intern("__MultipathSubpathMeta");
+                        let fields = vec![
+                            FirValue::Int(subpath_id),
+                            FirValue::Int(ifindex),
+                            FirValue::Int(weight),
+                            FirValue::Int(0), // rtt_micros
+                            FirValue::Int(0), // loss_rate_ppm
+                            FirValue::Int(1), // state: active
+                        ];
+                        self.stack_memory.insert(*addr, FirValue::Struct { name: st_name, fields });
+                    }
+                    Ok(FirValue::Unit)
+                } else if fn_name == "multipath::subpath_meta_update"
+                    || fn_name == "subpath_meta_update"
+                    || fn_name == "ifa_rt_multipath_subpath_meta_update"
+                {
+                    if let Some(FirValue::Pointer(addr)) = evaluated_args.first() {
+                        let rtt_micros = evaluated_args
+                            .get(1)
+                            .and_then(|v| match v {
+                                FirValue::Int(n) => Some(*n),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        let loss_rate_ppm = evaluated_args
+                            .get(2)
+                            .and_then(|v| match v {
+                                FirValue::Int(n) => Some(*n),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        let state = evaluated_args
+                            .get(3)
+                            .and_then(|v| match v {
+                                FirValue::Int(n) => Some(*n),
+                                _ => None,
+                            })
+                            .unwrap_or(1);
+
+                        if let Some(FirValue::Struct { fields, .. }) = self.stack_memory.get_mut(addr) {
+                            if fields.len() > 3 {
+                                fields[3] = FirValue::Int(rtt_micros);
+                            }
+                            if fields.len() > 4 {
+                                fields[4] = FirValue::Int(loss_rate_ppm);
+                            }
+                            if fields.len() > 5 {
+                                fields[5] = FirValue::Int(state);
+                            }
+                        }
+                    }
+                    Ok(FirValue::Unit)
                 } else if let Some(target_func) = self.find_function(&fn_name) {
                     // Direct function call to another FIR function in module
                     let func_clone = target_func.clone();

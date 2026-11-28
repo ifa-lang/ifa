@@ -133,6 +133,7 @@ enum Commands {
         args: Vec<String>,
     },
     /// Compile an IFA package or single source file
+    #[command(alias = "compile")]
     Build {
         /// Source file path (.ifa) or project directory
         file: Option<PathBuf>,

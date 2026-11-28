@@ -533,6 +533,10 @@ impl JitEngine {
             "ifa_rt_multipath_subpath_meta_init",
             ifa_runtime::ffi::ifa_rt_multipath_subpath_meta_init as *const u8,
         );
+        builder.symbol(
+            "ifa_rt_multipath_subpath_meta_update",
+            ifa_runtime::ffi::ifa_rt_multipath_subpath_meta_update as *const u8,
+        );
 
         let module = JITModule::new(builder);
 
@@ -1308,6 +1312,22 @@ impl JitEngine {
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids
             .insert("ifa_rt_multipath_subpath_meta_init".into(), mp_meta_id);
+
+        let mut mp_meta_upd_sig = Signature::new(call_conv);
+        mp_meta_upd_sig.params.push(AbiParam::new(ptr_type));
+        mp_meta_upd_sig.params.push(AbiParam::new(types::I64));
+        mp_meta_upd_sig.params.push(AbiParam::new(types::I32));
+        mp_meta_upd_sig.params.push(AbiParam::new(types::I8));
+        let mp_meta_upd_id = self
+            .module
+            .declare_function(
+                "ifa_rt_multipath_subpath_meta_update",
+                Linkage::Import,
+                &mp_meta_upd_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_multipath_subpath_meta_update".into(), mp_meta_upd_id);
 
         let coro_funcs: std::collections::HashSet<ifa_span::Symbol> = fir_module
             .functions

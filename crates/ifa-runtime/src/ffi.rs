@@ -5500,3 +5500,21 @@ pub extern "C" fn ifa_rt_multipath_subpath_meta_init(
         *(meta.add(40) as *mut u64) = 1; // state: 1 (Active)
     }
 }
+
+/// Update subpath telemetry metrics (rtt, loss, state).
+#[no_mangle]
+pub extern "C" fn ifa_rt_multipath_subpath_meta_update(
+    meta: *mut u8,
+    rtt_micros: u64,
+    loss_rate_ppm: u32,
+    state: u8,
+) {
+    if meta.is_null() {
+        return;
+    }
+    unsafe {
+        *(meta.add(24) as *mut u64) = rtt_micros;
+        *(meta.add(32) as *mut u64) = loss_rate_ppm as u64;
+        *(meta.add(40) as *mut u64) = state as u64;
+    }
+}

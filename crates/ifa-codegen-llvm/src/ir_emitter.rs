@@ -311,6 +311,7 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("declare i64 @ifa_rt_multipath_flow_serialize(ptr, ptr, i64)\n");
         out.push_str("declare i64 @ifa_rt_multipath_flow_deserialize(ptr, ptr, i64)\n");
         out.push_str("declare void @ifa_rt_multipath_subpath_meta_init(ptr, i32, i32, i32)\n");
+        out.push_str("declare void @ifa_rt_multipath_subpath_meta_update(ptr, i64, i32, i8)\n");
         out.push_str("declare i64 @llvm.bswap.i64(i64)\n");
         out.push_str("declare i32 @llvm.bswap.i32(i32)\n");
         out.push_str("declare i16 @llvm.bswap.i16(i16)\n\n");
@@ -2008,6 +2009,10 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("  %p3 = getelementptr inbounds %struct.__MultipathSubpathMeta, ptr %meta, i32 0, i32 3\n  store i64 0, ptr %p3, align 8\n");
             out.push_str("  %p4 = getelementptr inbounds %struct.__MultipathSubpathMeta, ptr %meta, i32 0, i32 4\n  store i32 0, ptr %p4, align 4\n");
             out.push_str("  %p5 = getelementptr inbounds %struct.__MultipathSubpathMeta, ptr %meta, i32 0, i32 5\n  store i8 1, ptr %p5, align 1\n  ret void\n}\n\n");
+            out.push_str("define linkonce_odr void @__ifa_multipath_subpath_meta_update(ptr %meta, i64 %rtt_micros, i32 %loss_rate_ppm, i8 %state) alwaysinline {\nentry:\n");
+            out.push_str("  %p3 = getelementptr inbounds %struct.__MultipathSubpathMeta, ptr %meta, i32 0, i32 3\n  store i64 %rtt_micros, ptr %p3, align 8\n");
+            out.push_str("  %p4 = getelementptr inbounds %struct.__MultipathSubpathMeta, ptr %meta, i32 0, i32 4\n  store i32 %loss_rate_ppm, ptr %p4, align 4\n");
+            out.push_str("  %p5 = getelementptr inbounds %struct.__MultipathSubpathMeta, ptr %meta, i32 0, i32 5\n  store i8 %state, ptr %p5, align 1\n  ret void\n}\n\n");
         }
 
         // 3b. Scan and emit isolated blocking FFI pack structs and execution thunks

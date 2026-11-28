@@ -1209,6 +1209,9 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                     "multipath::subpath_meta_init" | "subpath_meta_init" => {
                         "ifa_rt_multipath_subpath_meta_init"
                     }
+                    "multipath::subpath_meta_update" | "subpath_meta_update" => {
+                        "ifa_rt_multipath_subpath_meta_update"
+                    }
                     _ => fn_name.as_str(),
                 };
                 if let Some(res) = self.try_lower_simd_reduction(&fn_name, args) {

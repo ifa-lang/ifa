@@ -877,6 +877,82 @@ uint64_t ifa_rt_sys_cpu_time_ns(void) { return 0; }
 int64_t ifa_rt_sys_cpu_count(void) { return 1; }
 uint64_t ifa_rt_sys_memory_resident(void) { return 0; }
 uint64_t ifa_rt_sys_memory_virtual(void) { return 0; }
+
+// Multipath Flow Encapsulation & Subpath Metadata Runtime Stubs
+void ifa_rt_multipath_flow_init(void* flow, uint64_t flow_id, uint32_t subpath_id, uint16_t slice_tag) {
+    if (!flow) return;
+    uint64_t* p = (uint64_t*)flow;
+    p[0] = flow_id;
+    p[1] = (uint64_t)subpath_id;
+    p[2] = 0; // seq_num
+    p[3] = 0; // flags
+    p[4] = (uint64_t)slice_tag;
+    p[5] = 0; // payload_len
+}
+
+int64_t ifa_rt_multipath_flow_serialize(const void* flow, void* out_buf, uint64_t buf_len) {
+    if (!flow || !out_buf || buf_len < 30) return -1;
+    const uint64_t* p = (const uint64_t*)flow;
+    uint64_t flow_id = p[0];
+    uint32_t subpath_id = (uint32_t)p[1];
+    uint64_t seq_num = p[2];
+    uint32_t flags = (uint32_t)p[3];
+    uint16_t slice_tag = (uint16_t)p[4];
+    uint32_t payload_len = (uint32_t)p[5];
+
+    uint8_t* out = (uint8_t*)out_buf;
+    for (int i = 0; i < 8; i++) out[i] = (uint8_t)(flow_id >> (56 - i * 8));
+    for (int i = 0; i < 4; i++) out[8 + i] = (uint8_t)(subpath_id >> (24 - i * 8));
+    for (int i = 0; i < 8; i++) out[12 + i] = (uint8_t)(seq_num >> (56 - i * 8));
+    for (int i = 0; i < 4; i++) out[20 + i] = (uint8_t)(flags >> (24 - i * 8));
+    for (int i = 0; i < 2; i++) out[24 + i] = (uint8_t)(slice_tag >> (8 - i * 8));
+    for (int i = 0; i < 4; i++) out[26 + i] = (uint8_t)(payload_len >> (24 - i * 8));
+    return 30;
+}
+
+int64_t ifa_rt_multipath_flow_deserialize(void* flow, const void* in_buf, uint64_t buf_len) {
+    if (!flow || !in_buf || buf_len < 30) return -1;
+    const uint8_t* in = (const uint8_t*)in_buf;
+    uint64_t flow_id = 0;
+    for (int i = 0; i < 8; i++) flow_id = (flow_id << 8) | in[i];
+    uint32_t subpath_id = 0;
+    for (int i = 0; i < 4; i++) subpath_id = (subpath_id << 8) | in[8 + i];
+    uint64_t seq_num = 0;
+    for (int i = 0; i < 8; i++) seq_num = (seq_num << 8) | in[12 + i];
+    uint32_t flags = 0;
+    for (int i = 0; i < 4; i++) flags = (flags << 8) | in[20 + i];
+    uint16_t slice_tag = (uint16_t)((in[24] << 8) | in[25]);
+    uint32_t payload_len = 0;
+    for (int i = 0; i < 4; i++) payload_len = (payload_len << 8) | in[26 + i];
+
+    uint64_t* p = (uint64_t*)flow;
+    p[0] = flow_id;
+    p[1] = (uint64_t)subpath_id;
+    p[2] = seq_num;
+    p[3] = (uint64_t)flags;
+    p[4] = (uint64_t)slice_tag;
+    p[5] = (uint64_t)payload_len;
+    return 30;
+}
+
+void ifa_rt_multipath_subpath_meta_init(void* meta, uint32_t subpath_id, uint32_t ifindex, uint32_t weight) {
+    if (!meta) return;
+    uint64_t* p = (uint64_t*)meta;
+    p[0] = (uint64_t)subpath_id;
+    p[1] = (uint64_t)ifindex;
+    p[2] = (uint64_t)weight;
+    p[3] = 0; // rtt_micros
+    p[4] = 0; // loss_rate_ppm
+    p[5] = 1; // state: active
+}
+
+void ifa_rt_multipath_subpath_meta_update(void* meta, uint64_t rtt_micros, uint32_t loss_rate_ppm, uint8_t state) {
+    if (!meta) return;
+    uint64_t* p = (uint64_t*)meta;
+    p[3] = rtt_micros;
+    p[4] = (uint64_t)loss_rate_ppm;
+    p[5] = (uint64_t)state;
+}
 "#;
 
 /// Ahead-of-Time (AOT) compiler producing native object files (.o) and linked ELF binaries.
@@ -1869,6 +1945,36 @@ impl AotCompiler {
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids
             .insert("ifa_rt_multipath_subpath_meta_init".into(), mp_meta_id);
+
+        let mut mp_meta_upd_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        mp_meta_upd_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        mp_meta_upd_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        mp_meta_upd_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I32,
+            ));
+        mp_meta_upd_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I8,
+            ));
+        let mp_meta_upd_id = self
+            .module
+            .declare_function(
+                "ifa_rt_multipath_subpath_meta_update",
+                Linkage::Import,
+                &mp_meta_upd_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_multipath_subpath_meta_update".into(), mp_meta_upd_id);
 
         let coro_funcs: std::collections::HashSet<ifa_span::Symbol> = fir_module
             .functions
