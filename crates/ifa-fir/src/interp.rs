@@ -3477,9 +3477,7 @@ impl<'a> FirInterpreter<'a> {
                     self.sync_string_channels
                         .insert(id, (VecDeque::new(), cap, false));
                     Ok(FirValue::Int(id as i128))
-                } else if fn_name == "sync::channel"
-                    || fn_name == "channel"
-                {
+                } else if fn_name == "sync::channel" || fn_name == "channel" {
                     let id = self.next_sync_id;
                     self.next_sync_id += 1;
                     self.sync_int_channels
